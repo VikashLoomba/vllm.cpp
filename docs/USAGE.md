@@ -362,6 +362,206 @@ which names several speculators in preference order. It is parsed and checked
 today and **refused at startup**, because nothing resolves a chain yet; the same
 page says what the document looks like and what each rule refuses.
 
+## Reuse the NVFP4 tactic draw between runs
+
+An NVFP4 W4A4 model runs its general matrix multiplications through CUTLASS, and
+the engine picks one tactic for each matrix shape. The first run on a device
+times every candidate tactic for a shape and keeps the fastest. The engine
+writes the winners to a JSON document, and a later run on the same device and
+the same build reads that document instead of timing again.
+
+Read this cache as a reproducibility and warmup control, not as a speed feature.
+The measured steady-state component of a frozen plan map on the GB10 lane is
+1.0045x at concurrency 2 and 1.0050x at concurrency 16, and the strict component
+result FAILED at 39 of 40 timing axes and 1 of 8 memory axes. [The row
+spec](../.agents/specs/nvfp4-persistent-plan-cache.md) records that run. What
+the cache gives you is that two runs of the same binary on the same device start
+from the same kernel plan, and that a run which loaded a document does not pay a
+tuning pass. A throughput claim beyond that needs its own measurement.
+
+The cache covers one process on one device. Tensor parallelism above one rank
+is out of scope for it, and [the row
+spec](../.agents/specs/nvfp4-persistent-plan-cache.md) records why.
+
+### The cache is on by default
+
+`VT_FP4_PERSISTENT_CACHE` defaults to on. The engine reads a document if one
+matches, tunes the shapes that are missing, and writes the merged result back at
+the end of the warmup. Set the variable to `0`, `false`, or `off` to keep the
+tuning in memory and write nothing. The engine refuses any other value at
+startup with `invalid boolean value for VT_FP4_PERSISTENT_CACHE`.
+
+Without a path override, the document lands under `$XDG_CACHE_HOME`, or under
+`$HOME/.cache` when `XDG_CACHE_HOME` is unset. The path names every input that
+the document is valid for:
+
+```text
+<root>/vllm.cpp/nvfp4_autotune/vllm.cpp_nvfp4_autotune_v1/sm_<architecture>/
+  device_<ordinal>-gpu_<device name>/
+  cuda_<runtime version>-driver_<driver version>/
+  cutlass_<version>/
+  tactics_<descriptor digest>-set_<tactic set version>/
+  dtype_<output dtype>-id_<dtype id>-fp4_<fp4 layout>-sf_<scale layout>/
+  timing_w<warmups>-r<repeats>-d<delay microseconds>-bucket_<bucket version>/
+  build_<tactic ABI digest>/autotune_configs.json
+```
+
+That is one path. The example wraps it for reading, and the indentation is not
+part of it. Every character outside `A-Z`, `a-z`, `0-9`, `.`, `_`, and `-`
+becomes `_` in a path component, so a device name such as `NVIDIA GB10` reads as
+`NVIDIA_GB10`.
+
+If `XDG_CACHE_HOME` and `HOME` are both unset, the engine has no cache root. It
+then turns the cache off for that run and tunes in memory. In read-only mode,
+with no imported document, the same condition is refused with
+`read-only NVFP4 cache requested without a cache path/root`.
+
+These are the variables that control the cache:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `VT_FP4_PERSISTENT_CACHE` | on | Off turns the persistent document off for the run. Takes `1`, `true`, `on`, `0`, `false`, or `off` |
+| `VT_FP4_AUTOTUNE_CACHE_PATH` | None | Names the native document file and replaces the derived path |
+| `VT_FP4_FLASHINFER_CACHE_PATH` | None | Imports a FlashInfer `autotune_configs.json` before the native document loads |
+| `VT_FP4_AUTOTUNE_CACHE_READONLY` | off | Loads plans, tunes nothing, and writes nothing. A missing plan is refused |
+| `VT_FP4_AUTOTUNE_DELAY_US` | `5000` | Idle microseconds before the timed repeats of one candidate. Maximum `1000000` |
+| `VT_FP4_AUTOTUNE_VERBOSE` | off | Prints one `[VT_FP4_AUTOTUNE]` line for each tactic the engine times |
+
+The timing recipe is FlashInfer's. For each candidate tactic the engine runs 3
+warmup launches, synchronizes the stream, holds it idle for 5,000 microseconds,
+and then takes the mean of 10 event-timed launches.
+`VT_FP4_AUTOTUNE_DELAY_US` changes that idle time, and it also changes the cache
+path, because the recipe is part of the document identity. The value `0` removes
+the delay and keeps the no-delay diagnostic arm.
+
+### Import an existing FlashInfer cache
+
+If you already ran vLLM with the FlashInfer autotuner on the same box, point the
+engine at the file that run produced:
+
+```sh
+VT_FP4_FLASHINFER_CACHE_PATH=$HOME/.cache/vllm/flashinfer_autotune_cache/0.6.13/121a/<config hash>/autotune_configs.json \
+build/examples/vllm-server --model /path/to/nvfp4-model
+```
+
+The import reads the file and never writes to it. The engine installs the
+imported plans before it reads the native document, so an imported plan wins
+over a native one for the same shape.
+
+The import is strict, and a failed import stops the load rather than falling
+back. The file's `_metadata` object must declare FlashInfer version `0.6.13`,
+cuBLAS version `13.1.0`, cuDNN version `91900`, and cuDNN frontend version
+`1.26.0`. Its `cuda_version` must equal the running CUDA runtime version, and
+its `gpu` must equal the running device name. The literal value `*` in any one of
+those six fields matches anything. The engine reads only the entries whose key
+starts with `('fp4_gemm'` and whose value is the pair
+`["CutlassFp4GemmRunner", <tactic id>]`. It counts and ignores every other
+entry, and it refuses a duplicate `fp4_gemm` key.
+
+### Freeze a draw for a benchmark run
+
+Tuning re-times the candidates in every fresh process, and CUTLASS reduction
+order follows the tactic. Two runs that each tuned for themselves can therefore
+select different tactics and produce different token ids for the same prompt.
+Freeze the draw so that tactic selection is not a variable in your measurement:
+
+```sh
+VT_FP4_AUTOTUNE_CACHE_READONLY=1 \
+build/examples/vllm-server --model /path/to/nvfp4-model
+```
+
+In this mode the engine loads the document, tunes nothing, and writes nothing.
+A shape with no plan in the document is refused before the server is ready, with
+`NVFP4 frozen persistent cache miss before readiness:` and the M bucket, N, K,
+device ordinal, and streaming multiprocessor architecture that missed. Take one
+normal read-write run first, so the document covers the shapes your workload
+uses, then freeze it.
+
+The tree ships no measured draw, so a fresh checkout tunes its first run.
+[Issue #2752](https://github.com/mudler/vllm.cpp/issues/2752) owes a pinned GB10
+draw and its install step.
+
+### Confirm the cache was used
+
+The engine prints two `[VT_FP4_CACHE]` lines on stderr. The first reports what it
+resolved, before it serves:
+
+```text
+[VT_FP4_CACHE] prepared mode=read-write native=<path> flashinfer=<path> loaded=64 (flashinfer=0 native=64) rejected=0 delay_us=5000 metadata=<fingerprint> selected=64
+```
+
+The second reports what it published, after the warmup, and one
+`[VT_FP4_CACHE] selected M=<bucket> N=<n> K=<k> tactic=<id>` line follows it for
+each plan in the map:
+
+```text
+[VT_FP4_CACHE] complete mode=read-write loaded=64 tuned=0 rejected=0 saved=64 selected=64 metadata=<fingerprint>
+```
+
+Read the fields as follows:
+
+| Field | Meaning |
+|---|---|
+| `mode` | `read-write` is the default, `read-only` is the frozen mode, and `disabled` means the cache was off. `read-write-native-rejected` and `read-only-native-rejected` mean the document did not match. `read-write-save-failed` means the write did not happen |
+| `native` | The resolved native document path. Empty when no path resolved |
+| `flashinfer` | The imported FlashInfer file. Empty when you set no import path |
+| `loaded` | Plans installed from a document, split into the FlashInfer and native counts |
+| `rejected` | Documents refused for a metadata mismatch, not plans |
+| `delay_us` | The resolved tuning delay, which is part of the document identity |
+| `metadata` | A 16-digit hexadecimal fingerprint of the resolved identity. Two runs that print the same value agree on every keyed input |
+| `selected` | Plans in the live map at that moment |
+| `tuned` | Shapes this process timed itself |
+| `saved` | Plans written to the native document |
+
+A run that reused a document prints `loaded` equal to `selected` and `tuned=0`.
+A run that tuned prints `loaded=0` and a non-zero `tuned`. A `rejected=1` with a
+non-zero `tuned` means the engine found a document, refused it, and tuned
+instead.
+
+Two other lines report a problem by name. A refused native document prints
+`[VT_FP4_CACHE] rejected native cache path=<path> error=<reason>` and names what
+the engine did next. A shape that misses after the pre-serve warmup prints
+`[VT_FP4_AUTOTUNE] lazy-miss after pre-serve warmup` with the shape, which means
+your workload reached a shape the warmup did not cover.
+
+### What invalidates a document
+
+The path carries the identity, and the document repeats it in a `_metadata`
+object. The engine compares the two and refuses a document that does not
+describe the running configuration, rather than serving plans that were measured
+somewhere else. A change to any of these values gives a different path and
+leaves the old document in place, unread:
+
+- the streaming multiprocessor architecture, the device name, and the device
+  ordinal
+- the CUDA runtime version and the CUDA driver version
+- the CUTLASS version
+- the tactic descriptor digest and the tactic set version
+- the output dtype, the FP4 layout, and the scale layout
+- the timing recipe, which is the warmup count, the repeat count, the delay in
+  microseconds, and the M bucket version
+- the tactic ABI digest, which is a SHA-256 over the CUTLASS version and the
+  tactic source files
+
+A rebuild that changes no tactic source keeps the same tactic ABI digest, so an
+ordinary rebuild does not invalidate your cache. A driver update does, and so
+does moving the same file to a second GPU.
+
+In the default read-write mode, a refused native document is not fatal. The
+engine tunes the run, and it does not overwrite the file it could not read. In
+read-only mode with no imported file, a refused document stops the load.
+
+### Tune every shape before the first request
+
+By default the engine tunes the whole hybrid profile set before it serves, using
+one internal greedy request of `max_num_batched_tokens` tokens. This moves the
+tuning cost out of your first real request. It runs only when the model is NVFP4
+W4A4, the device is a CUDA device of compute capability 10.0 to 12.9, and none
+of `VT_FP4_PRE_SERVE_WARMUP`, `VT_FP4_AUTOTUNE`, and `VT_FP4_PLAN_CACHE` is set
+to a value that starts with `0`. Each of the three defaults to on when it is
+unset. Setting any one of them to `0` turns the pre-serve warmup off and moves
+the tuning back into the first requests that meet each shape.
+
 ## Use the C ABI
 
 For an installed library, use the stable public interface in
@@ -688,7 +888,7 @@ repository in this project's history.
 | Qwen3.5-0.8B (Tenstorrent P150 arm) | `model.safetensors-00001-of-00001.safetensors` | 1,746,942,600 bytes | `Qwen/Qwen3.5-0.8B` @ `2fc06364715b967f1860aea9cf38778875588b17`, authorized 2026-08-23 | `04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696` (non-quantized; hashed anyway from the local bytes the gates and the eager profile consumed) | bf16 on the Tenstorrent P150: the sacred greedy pair, both ambient legs, and the #1715/#2107 profile legs all ran from this snapshot | **Arms refused by name:** GGUF k-quant arms on TT — no TT kernels exist for them, refused at load; Qwen3.8-27B on TT — no arm fits the P150 (bf16 53.8 GB), refused at load |
 | dots3-note bf16 language tower | `model-000{01..131}-of-00131.safetensors` | 561,371,869,568 bytes total (522.82 GiB), of which the MoE is 545,823,175,680 | `dots-studio/dots3-note-prev` @ `1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b` | Owed: **no tensor byte has been fetched**, so no local hash exists to state, and an unauthenticated tree hash is not a pin here | The bf16 text tower this port loads: 46 backbone layers, both MLA geometries, and since W5 the 45 MoE layers — the ungrouped noaux_tc router at 256/8 plus one shared expert at `moe_intermediate_size * n_shared_experts` = 1536. Everything except `mlp.gate.e_score_correction_bias` is BF16; that one is F32, on both sides | **Nothing has ever loaded these bytes.** The tower alone is 522.82 GiB against a 122 GiB ceiling on the largest host this project reaches (spec §6.2), so the arm is representable and unfeedable, and the e2e gate is an OPEN GAP by construction. GGUF k-quants are refused by name (W9). The 19-tensor nextn tail is a NAMED W10 deferral rather than a refusal since #2176 |
 | dots3-note vision tower | `model-vision.safetensors` | 13,742,557,056 bytes | `dots-studio/dots3-note-prev` @ `1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b` | Owed, as above | none | **W6a ported the DENSE half and W6b ([#2613](https://github.com/mudler/vllm.cpp/issues/2613)) the PYRAMID one, so this checkpoint's tower LOADS.** All 2195 of its `vision_encoder.*` tensors are read: 235 dense (`patch_embed`, blocks 0-24, the `patch_merger` adapter) plus the 1960 the pyramid adds (17 routed blocks x 8, and 608 routed experts x 3). The 17 F32 tensors in this otherwise all-BF16 file are exactly the `mlp.router_bias` buffers, one per routed block, which is upstream's own `dtype=torch.float32` (`vision.py:152-155` @ `9035151d6`) and is asserted in both directions at load. An image request against this tower is SERVED, and since W6c ([#2537](https://github.com/mudler/vllm.cpp/issues/2537)) it no longer has to be a multiple of 28 on each side: `PilResizeBicubicRgb` ports Pillow's own `Image.Resampling.BICUBIC` — support scaled by `max(1, in/out)` on a downscale, weights normalized per output pixel, 22-bit fixed point across two passes over a uint8 intermediate — so the resample upstream always performs now happens here too instead of being refused. What still refuses BY NAME is the blockwise-FP8 sibling below (W9); no bf16 dots3-note `vision_config` published so far selects the `use_bias` arm ([#2616](https://github.com/mudler/vllm.cpp/issues/2616)) or the softmax / top-k-below-2 router arms ([#2615](https://github.com/mudler/vllm.cpp/issues/2615)), which are the only bf16 configurations left owed |
-| dots3-note audio tower | `model-audio.safetensors` | 1,772,399,360 bytes | `dots-studio/dots3-note-prev` @ `1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b` | Owed, as above | none | **Refused as a NAMED W7 deferral**: 430 `audio_encoder.*` tensors. The `dots` Whisper-variant stem is W7 |
+| dots3-note audio tower | `model-audio.safetensors` | 1,772,399,360 bytes | `dots-studio/dots3-note-prev` @ `1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b` | Owed, as above | `added_tokens.json` sha256 `1aa71a4e0dbab80a72fd925389fd6c9cc52d1cb9da5dee8282784c15c6fa789b`; `tokenizer.json` sha256 `7f4e21a1d9fa472439f70201b4849977da5ec11e73df5a36552ab5ee99af554b` | **W7a ([#2703](https://github.com/mudler/vllm.cpp/issues/2703)) puts this tower on a SERVED request.** All 430 `audio_encoder.*` tensors are read and every one is BF16 — not one F32 in the file. An OpenAI `input_audio` part reaches the 32-layer `dots` speech encoder through `ApiServer::handle_chat_completions` on the default configuration. The three audio markers are resolved BY STRING from this checkpoint's own tokenizer, which carries them as special added tokens `<|audio_comp_start|>` 151718, `<|audio_comp_end|>` 151719, `<|audio_comp_pad|>` 151720 — note `pad == start + 2`, not `start + 1`. **Refused BY NAME**: a waveform longer than `chunk_seconds` (60 s), owed to W7b; any container but PCM16 mono RIFF/WAVE and any rate but 16 kHz, owed to W7c; and the unshipped `audio_config` arms (`use_causal`, `use_conv1d_stem`, `use_latent_input`, `merge_factor != 1`, a non-`dots` `encoder_type`), none of which this checkpoint selects. The blockwise-FP8 sibling below is still W9 |
 | dots3-note blockwise-FP8 sibling | `model-000{01..131}-of-00131.safetensors` plus the two tower files | 298,673,280,504 bytes total (278.16 GiB) across 133 safetensors, read 2026-08-28 | `dots-studio/dots3-note-prev-fp8` @ `7c14222e22423d6df6848eb0d1c5c3a88a00311a` | Owed: only `config.json` and `model.safetensors.index.json` were read | none | **Refused BY NAME at the forward, naming W9.** Its `quantization_config` is `{"quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic", "weight_block_size": [128, 128]}` and its index (73,029 entries) ships a `weight_scale_inv` beside every projection — at the routed experts' `[1536, 5120]` that scale is `[12, 40]`. This port's bf16 loaders read a per-tensor or per-output-ROW `<name>_scale` and nothing else, so without the named refusal the load would fail with a bare "tensor not found". It does not fit either: 278.16 GiB against the same 122 GiB ceiling |
 | Qwen3.8-Flash-Next GGUF | `Qwen3.8-Flash-Next-UD-IQ1_S-0000{1..3}-of-00003.gguf` | 72,546,461,344 bytes total (67.564 GiB) across three shards (10,946,624 + 49,990,818,368 + 22,544,696,352); 1224 tensors | `unsloth/Qwen3.8-Flash-Next-GGUF` @ `8bdc666649440e9bdc97e16f3f75782c98478ff5`, path `UD-IQ1_S` | `88a1420825a9304063e882ada29d438263617f51ac8923d438d927496693bafd` (shard 1); `3a62e35bbf9add4733bd1438ebd3a67649d5edd6cb0e72bb78e33c913992b2b6` (shard 2); `0e25ceaeb89b8a80aa973c6c0c7448943682f7408c2855b2ebd016b7643a861a` (shard 3). Shard 1's digest was recomputed TWICE for this row -- on the development box and again INSIDE the `thor` lease against the bytes the server actually opened. Shards 2 and 3 carry the digests recorded in [the ladder-arm evidence file](bench-evidence/qwen4exp-llamacpp-ladder-arm-20260829.md), which recomputed all three on the staged copy on 29 August 2026; **this wave did not re-derive those two**, because the hash was killed mid-run for reading the same CIFS share as the load being measured | **LOADS on `--device cpu`, and the server LISTENS -- it produces NO TOKEN.** Measured on `thor:gpu0` 2026-08-30 (`rc` job `0f188dd1`, [evidence](bench-evidence/qwen4exp-released-checkpoint-serve-20260830.md)): all three shards load through `LoadedEngine::FromModelDir`, the engine sizes all three published cache groups, the tokenizer and the 9993-character chat template come out of the GGUF's own metadata, and `examples/server` answers on `/health`. **Load wall time 4446 s (74.1 min); peak RSS `VmHWM` 69.206 GiB against a 67.564 GiB artifact.** Residency is keep-quant: anonymous memory moved 4 -> 11 GiB across a load whose n-gram table alone would have added 95.368 GiB there, so all nine encodings in the file (F32, Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ1_S, IQ4_NL, BF16) keep their blocks. `POST /v1/completions` then returns **500** and zero tokens | **THE FORWARD REFUSED THIS ARTIFACT BY NAME ON THAT RUN, AND W5p REMOVED THE REFUSAL**: `vt: qwen4_exp_gated_residual: input_mix_weight_down must be float (f32/bf16 for outputs)`. The file stores all **194** hyper-connection mix weights (`blk.N.hc_{attn,ffn}_{down,up}.weight` and `output_hc_{down,up}.weight`) as **Q8_0**; our loader correctly keeps them quantized (`qwen4_exp_weights.cpp` -> `LoadMatmul`), and `vt::Qwen4ExpGatedResidual` accepted only float, while every arm of the synthetic fixture wrote those same names as ggml type 0 (F32) -- so every prior wave gated the float case only and none could see this. Since W5p the three PROJECTION operands (`mix_down`, `mix_up`, `block_inject`) accept a block-quantized `[N,K]` weight and route through `vt::MatmulBT`/`kMatmulBTQuant`, mirroring llama.cpp, which merged this architecture on 2026-08-27 (`6c84c7d5d`, first tag `b10660`) and declares all six of them `GGML_OP_MUL_MAT`; the ELEMENTWISE `hc_*_norm` gamma is still refused by name, which is llama.cpp's own split. `FixtureOpts::hc_mix_q8_0` is the fixture arm that was missing. **W5q RE-RAN THIS ARTIFACT ON 2026-08-31** ([evidence](bench-evidence/qwen4exp-released-checkpoint-serve-20260831.md)): staged to worker-local disk it loads in **61 s** rather than 4446 s, `VmHWM` 73.935 GiB, the prefill and eight decode steps complete with nothing thrown, and `POST /v1/completions` returns **200** with 8 tokens. **Every token was id 0 (`!`) and two different prompts returned a byte-identical answer.** **W5s RE-RAN IT ON 2026-08-31 ON `origin/main` `52f7ccbfc`, WHICH CARRIES W5r, AND THE TOKENS ARE REAL** ([evidence](bench-evidence/qwen4exp-released-checkpoint-tokens-20260831.md)): `"The capital of France is"` -> `" Paris. Given this fact, what is"` and `"Water boils at"` -> `" 100°C at sea level"`, eight distinct token ids none of them 0, loaded in 60 s from the staged copy at `VmHWM` 73.93 GiB with system `used` flat at 11 GiB. **The cause of W5q's degeneracy was the dropped repack marker W5r fixed**: on this aarch64 i8mm box `kMatmulBTQuant` had been reading `block_q8_0x4` buffers as flat `q8_0`, putting a NaN in layer 0 that collapsed to an all-zero logit row, and `argmax` over a row with no maximum returns index 0. `VT_CPU_QUANT_REPACK=0` now gives byte-identical output to the default. **WHAT RUNS IS EXACTLY THIS AND NO MORE: `--device cpu`, ONE SEQUENCE AT A TIME, the UD-IQ1_S arm.** It is **NOT a token gate** — no oracle decoded these prompts, and there is no speed number. ISSUE OWED (this account is suspended for GitHub **API** writes -- `gh issue create` returns `HTTP 403: Sorry. Your account was suspended`, while `git push` over SSH succeeds, which is how this row reached `main`); scoped under `## Owed` in [the spec](../.agents/specs/qwen4-exp-flash-next.md). **Also refused or absent:** the other six published quants (UD-IQ1_M, UD-Q2_K_XL, UD-IQ3_XXS, UD-Q3_K_XL, UD-IQ4_XS, UD-Q4_K_XL) are staged but **none has been run**; every safetensors artifact (~360 GB bf16, ~180 GB FP8, ~128 GB NVFP4) exceeds the 122.80 GiB of the largest box in this fleet; the n-gram table stays HOST-side on every arm, because `DeviceQuantGatherSupported` is true for `kCPU` alone and moving it would expand it from 26.822 GiB to 95.368 GiB ([#2083](https://github.com/mudler/vllm.cpp/issues/2083)) -- the clause here previously said that "any non-CPU device refuses by name ahead of tensor I/O", which the CUDA run below falsifies; **`--device cuda` NOW SERVES THIS ARTIFACT, FLUENTLY BUT NOT TOKEN-EXACTLY** (the sentence here previously read that `ModelRegistry::Forward` is all-or-nothing and "no `qwen4_exp` step reaches a CUDA queue", which stopped being true once every op on the path had a device arm): on `thor:gpu0` `sm_110` the same binary answers `The capital of France is` with `11751 13 15767 411 1928 11 628 567` against the CPU control's `11751 13 15767 411 2029 11 1092 369` -- five of eight ids, both continuations grammatical English. **`--device cuda` is the arm that MIRRORS vLLM; `--device cpu` is the arm that is more accurate.** Those are different things and the CPU arm is not the authority: it runs an exact sequential recurrence and lands `1.15e-08` from the exact answer, where vLLM's own chunked kernel lands `2.29e-04` ([decomposition](bench-evidence/gdn-chunked-decomposition-20260902.md), [#2612](https://github.com/mudler/vllm.cpp/issues/2612)), so the CPU ids are the ids of an answer vLLM does not compute. Reach for `--device cpu` when you want the ids this table records, not when you want the ids vLLM would emit. The two arms are not a defect apart: the first tensor that differs is decoder layer 0's Gated DeltaNet block output, from a bit-identical input, because the CUDA arm runs vLLM's chunked prefill decomposition and the CPU arm an exact sequential recurrence ([evidence](bench-evidence/qwen4exp-cuda-prefill-divergence-20260902.md), [#2547](https://github.com/mudler/vllm.cpp/issues/2547)); `num_reqs > 1` is refused by name; MTP is absent (**zero** `nextn`/`mtp` tensors of 1224 against 31 in the safetensors repo, [#1993](https://github.com/mudler/vllm.cpp/issues/1993)); and the file is TEXT-ONLY (no `v.blk.*`), so the multimodal arm has no artifact |
 <!-- checkpoint-registry:end -->

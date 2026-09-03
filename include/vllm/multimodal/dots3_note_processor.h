@@ -40,9 +40,12 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "vllm/multimodal/audio_processor.h"
 #include "vllm/multimodal/inputs.h"
 
 namespace vllm::multimodal {
@@ -126,6 +129,173 @@ class Dots3NoteImageProcessor {
 
  private:
   Dots3NoteProcessorConfig cfg_;
+};
+
+// ─── THE AUDIO PROCESSOR (W7a, #2703) ───────────────────────────────────────
+//
+// Ported from `vllm/models/dots3_note/nvidia/audio.py` @ `9035151d6`:
+//   SAMPLE_RATE / N_FFT / HOP_LENGTH               :15-17
+//   DEFAULT_CHUNK_LENGTH_S / _CONV_TEMPORAL_STRIDE :18-19
+//   Dots3NoteAudioConfig.__init__                  :26-60
+//   .conv_temporal_stride / .token_stride          :67-73
+//   .chunk_samples / .chunk_mel_frames             :75-81
+//   pad_or_trim                                    :84-93
+//   _mel_filters                                   :96-107
+//   log_mel_spectrogram                            :117-126
+//   the per-segment token count                    :210-212
+// and from `common/processor.py` @ `9035151d6`:
+//   AUDIO_START / AUDIO_PAD / AUDIO_END            :44-46
+//   _HOP_LENGTH                                    :49
+//   the stride and `ceil(length / stride)` rule    :762-771
+//
+// THE FRONT END IS NOT RE-WRITTEN HERE, and that is the point of this class.
+// `log_mel_spectrogram` (`audio.py:117-126`) is Whisper's verbatim, and
+// `WhisperAudioProcessor::ProcessWaveform`
+// (src/vllm/multimodal/audio_processor.cpp:91-199) already is that function in
+// double precision: reflect pad, dropped last frame, PERIODIC Hann, POWER
+// spectrogram, `clamp(1e-10)` + `log10`, GLOBAL-max `-8` floor, `(x+4)/4`. The
+// only dots3 deltas are CONFIG — `chunk_length_s` 30 -> 60, `n_mels` 80 -> 128 —
+// so this class CONFIGURES that processor rather than writing a second one
+// (AGENTS.md, "Shared seams": never a parallel path). The mel bank comes from
+// the shared `MelFilterBankSlaney` seam, which reproduces the committed
+// `voxtral_mel_filters_f32.bin` bit-for-bit; see mel_filter_bank.h.
+//
+// WHAT THIS CLASS ADDS ON TOP: `pad_or_trim` to `chunk_samples`, the
+// `ceil(num_samples / token_stride)` token count, the VALID mel-frame count the
+// tower's temporal mask needs, and the two refusals W7b and W7c own.
+struct Dots3NoteAudioProcessorConfig {
+  // False when `config.json` carries no `audio_config`. Upstream builds no
+  // `Dots3NoteAudioModel` in that case (`multimodal.py:119-126` @ `9035151d6`).
+  bool present = false;
+
+  int sampling_rate = 16000;   // `audio_config.sampling_rate`, audio.py:36
+  int chunk_seconds = 60;      // `chunk_seconds`, audio.py:41
+  int merge_factor = 1;        // `merge_factor`, audio.py:40
+  int n_mels = 128;            // `whisper_config.num_mel_bins`
+  // N_FFT and HOP_LENGTH are MODULE CONSTANTS upstream (`audio.py:16-17`), not
+  // config keys. They are fields here so the front end can be driven at another
+  // geometry by a test, and they are NOT read from `config.json`.
+  int n_fft = 400;
+  int hop_length = 160;
+  // `conv_temporal_stride` (`audio.py:67-69`): 8 with the conv2d stem, 2 with
+  // the conv1d one. The conv1d stem is refused by name, so this is 8 in
+  // practice; it is a field because it is what `token_stride` multiplies.
+  int conv_temporal_stride = 8;
+
+  // `audio_comp_start` / `audio_comp_span` / `audio_comp_end`
+  // (`audio.py:37-39`). The MIDDLE one is spelled `span` upstream and is the
+  // PAD token; the naming is upstream's and is kept so the two can be diffed.
+  std::string audio_comp_start = "<|audio_comp_start|>";
+  std::string audio_comp_span = "<|audio_comp_pad|>";
+  std::string audio_comp_end = "<|audio_comp_end|>";
+
+  // Resolved from the TOKENIZER, never from `config.json`, and -1 until they
+  // are. `processor.py:758-760` reads `vocab[AUDIO_START]` and friends off the
+  // tokenizer; `multimodal.py:82-89` reads `added_tokens.json` off the
+  // checkpoint. Both are the tokenizer's added tokens, and resolving from the
+  // LIVE tokenizer is the one that makes "the marker string encodes to this id"
+  // true by construction rather than by agreement between two files.
+  //
+  // MEASURED on `dots-studio/dots3-note-prev` @
+  // `1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b`: start 151718, END 151719, PAD
+  // 151720. Note the ORDER — a port that assumed the three were consecutive in
+  // start/pad/end order would swap pad and end and produce a well-formed prompt
+  // that no shape check could reject.
+  int32_t audio_token_id = -1;        // <|audio_comp_pad|>
+  int32_t audio_start_token_id = -1;  // <|audio_comp_start|>
+  int32_t audio_end_token_id = -1;    // <|audio_comp_end|>
+
+  std::string model_id = "dots-studio/dots3-note-prev";  // for the mm-hash
+
+  // `chunk_samples` (`audio.py:75-77`) = 60 * 16000 = 960000.
+  int64_t chunk_samples() const {
+    return static_cast<int64_t>(chunk_seconds) * sampling_rate;
+  }
+  // `token_stride` (`audio.py:71-73`) = 160 * 8 * 1 = 1280.
+  int64_t token_stride() const {
+    return static_cast<int64_t>(hop_length) * conv_temporal_stride *
+           merge_factor;
+  }
+  // `chunk_mel_frames` (`audio.py:79-81`) = 60 * 100 = 6000, which is also
+  // `chunk_samples / hop_length` and the assert upstream makes at
+  // `audio.py:215`.
+  int chunk_mel_frames() const { return chunk_seconds * 100; }
+  int num_freq_bins() const { return 1 + n_fft / 2; }
+};
+
+// Read `audio_config` out of `config.json`. Returns `present=false` when the key
+// is absent. Leaves the three token ids at -1: only a tokenizer can resolve
+// them, and `Dots3NoteResolveAudioTokenIds` below is where that happens.
+Dots3NoteAudioProcessorConfig LoadDots3NoteAudioProcessorConfig(
+    const std::string& config_json_path, const std::string& model_id);
+
+// Resolve the three `<|audio_comp_*|>` marker ids from the TOKENIZER'S added
+// tokens BY STRING — `vocab[AUDIO_START]` and friends, `processor.py:757-760` @
+// `9035151d6`. `lookup` answers with the added-token id for a marker string, or
+// -1 when the tokenizer does not carry it.
+//
+// THROWS BY NAME on -1 rather than defaulting. The three ids are NOT
+// consecutive in the order a reader expects: the released checkpoint has
+// start 151718, END 151719, PAD 151720, so a port that guessed "start, start+1,
+// start+2" would swap the pad and end markers and build a prompt that is
+// well-formed, wrongly ordered, and invisible to every shape check.
+//
+// A CALLBACK RATHER THAN A `Tokenizer&`, so that `vllm::multimodal` does not
+// depend on `vllm::tok` for three string lookups and so the refusal can be
+// gated without building a tokenizer.
+void Dots3NoteResolveAudioTokenIds(
+    Dots3NoteAudioProcessorConfig* cfg,
+    const std::function<int32_t(const std::string&)>& lookup);
+
+// Why the audio tower cannot be served under this `audio_config`, or "" when it
+// can. Names ONE thing and the brick that owes it, exactly as
+// `Dots3NoteVisionRefusal` does, and for the same measured reason: a refusal
+// raised from inside `encode_mm` runs in the engine's busy loop and turns every
+// LATER request, text ones included, into a 500.
+std::string Dots3NoteAudioProcessorRefusal(
+    const Dots3NoteAudioProcessorConfig& cfg);
+
+// The output is the shared `AudioKwargs`, with the PADDED
+// `[n_mels, chunk_mel_frames]` mel `DotsSpeechEncoder.forward` takes
+// (`audio_encoder.py:611-620`) plus the two lengths W7a added to that struct —
+// `num_samples` (`audio_sample_lens`, `audio.py:218`, which the stem's temporal
+// mask is derived from) and `num_tokens` (the placeholder run length). See
+// `inputs.h` for why those two cannot be derived from each other.
+
+class Dots3NoteAudioProcessor {
+ public:
+  explicit Dots3NoteAudioProcessor(Dots3NoteAudioProcessorConfig cfg);
+
+  const Dots3NoteAudioProcessorConfig& config() const { return cfg_; }
+  // The [num_freq_bins, n_mels] slaney bank this processor was built with,
+  // exposed so the gate can compare it against `voxtral_mel_filters_f32.bin`
+  // through the same object the front end actually uses.
+  const std::vector<float>& mel_filters() const;
+
+  // `pad_or_trim` + `log_mel_spectrogram` + the token count
+  // (`audio.py:208-218`). REFUSES BY NAME, before any arithmetic:
+  //   * `sample_rate != cfg.sampling_rate`  -> W7c (no resampler is ported)
+  //   * `num_samples > cfg.chunk_samples()` -> W7b (no segmentation is ported)
+  // The second is not a convenience. Past one chunk upstream's tower sums
+  // `ceil(chunk_len / stride)` PER SEGMENT (`audio.py:141-146`) while the
+  // prompt side computes one `ceil(total / stride)` (`processor.py:771`); the
+  // two agree at or under one chunk and diverge past it, and a divergence is a
+  // masked scatter that does not balance.
+  AudioKwargs ProcessWaveform(const float* samples, int64_t num_samples,
+                              int sample_rate) const;
+
+  // `ceil(num_samples / token_stride)`, exposed because the chat seam needs the
+  // placeholder count and the encoder needs the row count and they must be the
+  // same function rather than two copies of the same formula.
+  int64_t NumAudioTokens(int64_t num_samples) const;
+
+  std::string HashAudio(const float* samples, int64_t num_samples) const;
+
+ private:
+  Dots3NoteAudioProcessorConfig cfg_;
+  // Held by value rather than rebuilt per request: the front end is otherwise
+  // stateless, and the bank is 201 x 128 floats of pure config.
+  std::shared_ptr<const WhisperAudioProcessor> front_end_;
 };
 
 }  // namespace vllm::multimodal

@@ -1,5 +1,6 @@
 // Device combine/scatter kernels for async-scheduling overlap (W3 ENG-ASYNC-SCHED
-// runner leaf). Ports vllm/v1/worker/gpu/input_batch.py:304-406 @ e24d1b24
+// runner leaf). Ports vllm/v1/worker/gpu/input_batch.py:303-406 @ the parity
+// pin 5559679229bc961848b121ccdeaa8fa5d79bec98
 // (_combine_sampled_and_draft_tokens_kernel + the post_update last_sampled
 // scatter) to CUDA. These replace the host scatter + its pre-sync
 // (GPUModelRunner::sample_tokens_async's Synchronize before the host loop): the
@@ -34,14 +35,32 @@ namespace vt::cuda {
 // say the same thing, and that includes what they REFUSE: where the host throws
 // a VT_CHECK this kernel calls __trap(), because a kernel cannot throw. A device
 // arm that continued where the host refused would score stale draft slots, and
-// no token gate in this tree could see it. That header carries the full contract
-// and the upstream line-by-line anchors, and this one records only what the
-// pointer signature adds.
+// no token gate in this tree could see it. That source file carries the full
+// contract and the upstream line-by-line anchors, and this header records only
+// what the pointer signature adds.
 //
 // ONE host check has no device counterpart, and it is recorded rather than
 // silently dropped: the host also bounds `req_state * stride + num_draft_tokens`
 // against `draft_tokens.size()`, and no length reaches this side. The caller
 // owns that allocation. Everything else refuses alike.
+//
+// State the consequence, because it is not "the check is merely absent". The
+// scatter below reads draft_tokens[req_state_idx * draft_tokens_stride + b]
+// with NOTHING bounding it, so an over-long row is an unchecked out-of-bounds
+// DEVICE READ, and it has two outcomes. The loud one is an illegal memory
+// access. The quiet one is the dangerous one: the read lands inside another
+// allocation, garbage arrives in the draft slots, and because speculative
+// decoding is lossless a wrong draft costs acceptance and NOTHING ELSE. No
+// token gate in this tree can see that — it is reason A's class exactly
+// (.agents/specs/dflash2-async-spec-sampler.md).
+//
+// A2-3 is where this becomes live, and the shape is concrete: A2-3 sizes the
+// draft buffer by the ACTIVE REQUEST COUNT, while req_state_idx is a req_state
+// POOL SLOT (that is the indirection idx_mapping documents below, the one that
+// "matters after an abort/finish reorder"). A pool slot can exceed the active
+// count, so a high slot indexes past the allocation with every host check
+// satisfied. Whoever wires A2-3 either passes a length and refuses on it here
+// as the host does, or sizes the buffer by num_req_states and not by num_reqs.
 //
 // For each request row b: num_logits comes from cu_num_logits (1 + k_i on a
 // verify step), num_draft_tokens == num_logits - num_new_sampled_tokens, the
@@ -81,7 +100,7 @@ namespace vt::cuda {
 //
 // REACHABILITY: the draft lane is UNREACHED on `main`, exactly as on the host
 // side. `async_input_combine_` is vetoed for every speculative engine, at BOTH
-// GPUModelRunner constructors (src/vllm/v1/worker/gpu/runner.cpp:472 and :537 —
+// GPUModelRunner constructors (src/vllm/v1/worker/gpu/runner.cpp:480 and :553 —
 // the assignment, not the comment above it), so both call sites pass a null
 // draft_tokens and a null cu_num_logits and the kernel degenerates to the
 // pre-A2-1 single splice. Row `SPEC-DFLASH2` owns the wiring (waves A2-2, A2-3),

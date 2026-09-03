@@ -445,29 +445,37 @@ GPUModelRunner::GPUModelRunner(
   max_num_reqs_ = max_num_reqs;
   max_num_batched_tokens_ = max_num_batched_tokens;
   // SPEC-MTP I5e: the async input-combine splices the device-resident
-  // last_sampled token over each decode row's input id with
-  // num_new_sampled_tokens==1; it is NOT spec-aware and would overwrite the
-  // draft token at a verify step's draft position with the committed token.
-  // A speculator therefore keeps the sync HOST INPUT path (its drafts are
-  // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
-  // and its sampler is the sync one, so the host arrays stay fresh).
+  // last_sampled token over each decode row's input id. A speculator keeps the
+  // sync HOST INPUT path instead (its drafts are spliced into token_ids_cpu by
+  // update_req_spec_token_ids + prepare_inputs, and its sampler is the sync
+  // one, so the host arrays stay fresh).
   // Since SPEC-DFLASH2 W7 (#1824) this veto is INPUT-side only: async
   // SCHEDULING stays on for the Eagle-type family via async_sched_supported_
   // below. Byte-identical for non-spec (spec_config_ is nullopt there, so
   // this is AsyncRunnerEnvDefault()).
   //
-  // SPEC-DFLASH2 A2 (#2116): the combine is the SMALLER of the two reasons,
-  // and naming only it has read as "make the combine draft-aware, then flip
-  // this". sample_tokens_async has NO verify arm at all — no rejection
-  // sampler, no propose — so with the veto lifted a spec engine samples the
-  // EXPANDED (1 + k) verify rows as if they were decode rows, proposes
-  // nothing, and refuses at the async draft fill below ("no drafts proposed
-  // for request"). Measured on the CPU tier: deleting !spec_config_.has_value()
-  // here reds test_mtp_depth's W7 identity case through that refusal, and
-  // SEPARATELY overwrites the last draft of every verify block with the
-  // previous step's committed token — a change no token gate in this tree can
-  // see, because the verify is lossless and only acceptance moves. Both
-  // halves, the wave order and the gate that would catch the second one are in
+  // SPEC-DFLASH2 A2-1 (#2644) REMOVED the reason this comment used to lead
+  // with. The combine was not spec-aware and overwrote a verify step's last
+  // draft with the committed token; it now takes each row's num_logits from
+  // cu_num_logits, so a verify step keeps that draft. Do not read the veto as
+  // waiting on the combine's arithmetic — that half has landed.
+  //
+  // TWO reasons keep it standing, and A2-2 and A2-3 own them:
+  //   Reason B — sample_tokens_async has NO verify arm at all: no rejection
+  //   sampler, no propose. With the veto lifted a spec engine would sample the
+  //   EXPANDED (1 + k) verify rows as if they were decode rows and propose
+  //   nothing. A2-2 closes this.
+  //   The draft buffer is still UNWIRED — pending_drafts_ is host-resident and
+  //   per-request, so the draft_tokens argument A2-1's scatter reads does not
+  //   exist yet. A2-3 supplies it, and until it does the async input-combine
+  //   call site refuses any step that scheduled drafts.
+  // Measured on the CPU tier at this head: deleting !spec_config_.has_value()
+  // at both construction sites reds test_mtp_depth to 5 of 10 cases failed
+  // (29 assertions, exit 1). Every one of the five throws at that call site's
+  // own VT_CHECK ("the draft buffer the combine scatters from is not wired
+  // yet"), which fires ahead of the combine, so no verify block is reached and
+  // reason B's own refusal below never gets the chance to fire. The wave
+  // order and the gates are in
   // .agents/specs/dflash2-async-spec-sampler.md.
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
                          QueueSupportsAsyncInputCombine(queue_);
@@ -510,29 +518,37 @@ GPUModelRunner::GPUModelRunner(
   max_num_reqs_ = max_num_reqs;
   max_num_batched_tokens_ = max_num_batched_tokens;
   // SPEC-MTP I5e: the async input-combine splices the device-resident
-  // last_sampled token over each decode row's input id with
-  // num_new_sampled_tokens==1; it is NOT spec-aware and would overwrite the
-  // draft token at a verify step's draft position with the committed token.
-  // A speculator therefore keeps the sync HOST INPUT path (its drafts are
-  // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
-  // and its sampler is the sync one, so the host arrays stay fresh).
+  // last_sampled token over each decode row's input id. A speculator keeps the
+  // sync HOST INPUT path instead (its drafts are spliced into token_ids_cpu by
+  // update_req_spec_token_ids + prepare_inputs, and its sampler is the sync
+  // one, so the host arrays stay fresh).
   // Since SPEC-DFLASH2 W7 (#1824) this veto is INPUT-side only: async
   // SCHEDULING stays on for the Eagle-type family via async_sched_supported_
   // below. Byte-identical for non-spec (spec_config_ is nullopt there, so
   // this is AsyncRunnerEnvDefault()).
   //
-  // SPEC-DFLASH2 A2 (#2116): the combine is the SMALLER of the two reasons,
-  // and naming only it has read as "make the combine draft-aware, then flip
-  // this". sample_tokens_async has NO verify arm at all — no rejection
-  // sampler, no propose — so with the veto lifted a spec engine samples the
-  // EXPANDED (1 + k) verify rows as if they were decode rows, proposes
-  // nothing, and refuses at the async draft fill below ("no drafts proposed
-  // for request"). Measured on the CPU tier: deleting !spec_config_.has_value()
-  // here reds test_mtp_depth's W7 identity case through that refusal, and
-  // SEPARATELY overwrites the last draft of every verify block with the
-  // previous step's committed token — a change no token gate in this tree can
-  // see, because the verify is lossless and only acceptance moves. Both
-  // halves, the wave order and the gate that would catch the second one are in
+  // SPEC-DFLASH2 A2-1 (#2644) REMOVED the reason this comment used to lead
+  // with. The combine was not spec-aware and overwrote a verify step's last
+  // draft with the committed token; it now takes each row's num_logits from
+  // cu_num_logits, so a verify step keeps that draft. Do not read the veto as
+  // waiting on the combine's arithmetic — that half has landed.
+  //
+  // TWO reasons keep it standing, and A2-2 and A2-3 own them:
+  //   Reason B — sample_tokens_async has NO verify arm at all: no rejection
+  //   sampler, no propose. With the veto lifted a spec engine would sample the
+  //   EXPANDED (1 + k) verify rows as if they were decode rows and propose
+  //   nothing. A2-2 closes this.
+  //   The draft buffer is still UNWIRED — pending_drafts_ is host-resident and
+  //   per-request, so the draft_tokens argument A2-1's scatter reads does not
+  //   exist yet. A2-3 supplies it, and until it does the async input-combine
+  //   call site refuses any step that scheduled drafts.
+  // Measured on the CPU tier at this head: deleting !spec_config_.has_value()
+  // at both construction sites reds test_mtp_depth to 5 of 10 cases failed
+  // (29 assertions, exit 1). Every one of the five throws at that call site's
+  // own VT_CHECK ("the draft buffer the combine scatters from is not wired
+  // yet"), which fires ahead of the combine, so no verify block is reached and
+  // reason B's own refusal below never gets the chance to fire. The wave
+  // order and the gates are in
   // .agents/specs/dflash2-async-spec-sampler.md.
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
                          QueueSupportsAsyncInputCombine(queue_);

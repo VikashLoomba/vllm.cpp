@@ -104,8 +104,16 @@ __global__ void CombineKernel(int32_t* input_ids, const int32_t* idx_mapping,
     // VT_CHECKs here (prepare_inputs.cpp: a stride narrower than this row's
     // count, and a draft buffer that holds no row for this req_state — an empty
     // buffer, which is what a null pointer is on this side). A kernel cannot
-    // throw, so it traps, this tree's device-side contract violation
-    // (cuda_ops.cu:2740, cuda_paged_attn.cu:1012).
+    // throw, so it traps: __trap() is the only device-abort primitive this
+    // tree has. It is NOT an established precedent for this use, and the
+    // claim is worth stating precisely. src/vt/cuda/ held 19 __trap() call
+    // sites when A2-1 landed, and the other 18 were all the same thing — the
+    // `#else` arm of an `#if __CUDA_ARCH__ >= 800` guard, saying "this path was
+    // not compiled for this arch and the host gate never launches it"
+    // (cuda_ops.cu:2740 and cuda_paged_attn.cu:1012 are both of that kind).
+    // This is the tree's FIRST data-dependent runtime contract trap: it fires
+    // on the arguments, not on the compile target, so unlike all 18 it is
+    // reachable on hardware the kernel was built for.
     //
     // Continuing silently is the failure this replaces. The guard used to read
     // `num_draft_tokens > 0 && draft_tokens != nullptr`, so a step that wired

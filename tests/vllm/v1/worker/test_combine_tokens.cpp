@@ -227,7 +227,7 @@ TEST_CASE("combine: num_new_sampled_tokens==0 writes no sampled id, empty logits
 // The instrument drives the draft-aware combine DIRECTLY rather than through the
 // runner, because the runner cannot reach it: `async_input_combine_` is vetoed
 // for every speculative engine at BOTH GPUModelRunner constructors
-// (src/vllm/v1/worker/gpu/runner.cpp:472 and :537 — the assignments themselves,
+// (src/vllm/v1/worker/gpu/runner.cpp:480 and :553 — the assignments themselves,
 // not the comments above them), and wave A2-5 owns that flip, which the spec
 // says is not a judgement call to make ahead of these waves. Driving the
 // function is therefore the only honest way to write G2 today; the price is that

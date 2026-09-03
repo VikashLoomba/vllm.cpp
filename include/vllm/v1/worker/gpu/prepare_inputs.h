@@ -254,8 +254,8 @@ StepInputs prepare_inputs(InputBatch& input_batch,
 // REACHABILITY, stated once: the draft lane below is UNREACHED on `main`. The
 // only production caller is GPUModelRunner::execute_model behind
 // `async_input_combine_`, and that flag is vetoed for every speculative engine at
-// BOTH GPUModelRunner constructors — src/vllm/v1/worker/gpu/runner.cpp:472 and
-// :537, which are the two `async_input_combine_ = ...` assignments and not the
+// BOTH GPUModelRunner constructors — src/vllm/v1/worker/gpu/runner.cpp:480 and
+// :553, which are the two `async_input_combine_ = ...` assignments and not the
 // comment blocks that precede them — so no production step reaches this function
 // with num_logits > 1. Row `SPEC-DFLASH2` owns the wiring (waves A2-2 and A2-3),
 // issue #2644 tracks it, and the row's spec lists it under `## Owed`.

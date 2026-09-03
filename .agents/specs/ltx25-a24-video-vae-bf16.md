@@ -819,6 +819,43 @@ are both about records a number agreed with and a tree did not.
   sentence where it edits that block and files the finding here.
 * **Whether the shipped bench geometries reach the multi-tile blend** (§4.14),
   which decides whether the tiled buffer's dtype is observable in a gated render.
+* **`Ltx2TrapezoidalMask1d` is correctly rounded and `torch.linspace` is not** --
+  [#2816](https://github.com/mudler/vllm.cpp/issues/2816). The port builds its
+  blend ramps with a double linspace and narrows once; torch's float32 CPU kernel
+  computes the head as `start + step*i` and the tail as `end - step*(n-1-i)`, with
+  the boundary set by the vectorization width, and the two disagree in the last
+  f32 bit for lengths 4, 7 and 13. At f32 the relative error is 6e-8 against a
+  5e-6 band and nothing sees it; at bf16 it is a whole word, and a 6-frame /
+  2-overlap temporal tile put 2 of 3888 blended outputs one bf16 ulp from
+  upstream. §8's fixture uses an 8/4 temporal tile, which does not reach a
+  disagreeing length, so the buffer gate measures the buffer. Deciding between
+  mirroring torch's vectorization boundary and accepting the divergence with the
+  mask case tightened from a band to bit-exactness needs its own row.
+* **The tiled decode's own residue at UNEQUAL tile shapes.** §8's latent is six
+  frames so that every tile decodes the same (4, 2, 2) latent. At five frames the
+  split is [0,4) and [2,5), and the port then sat one bf16 ulp from upstream on 1
+  of 3888 outputs -- the same blocked-association term the row records above for
+  the convolution, surfacing at a shape the untiled arm does not cover. It is
+  bounded by nothing here because §8 gates the equal-shape geometry; the unequal
+  one is unmeasured beyond that single reading.
+* **The video ENCODER refuses a bf16 bag by name** (`Ltx2ConvVideoEncode`), which
+  is a refusal and not an arm. Its bf16 port is owed above.
+* **`VaeStore::HostF32` hands a `float*` out of a `std::vector<uint8_t>`**, and
+  callers write through it. `-O3` with the default `-fstrict-aliasing` is in the
+  flags and `sanitize-cpu` does not catch this class. Alignment holds and every
+  access is whole-buffer or through that one accessor, so it works today;
+  `std::memcpy` cannot replace it without a write-back, because the encoder's
+  gathers mutate the volume in place. The repair is a refactor of the encoder's
+  host path, not a line, and it is not this row's.
+* **The bf16-on-a-non-CPU-queue refusal is UNGATED, and cannot be gated on this
+  build.** `ltx2_video_vae.cpp:1462-1472` refuses a bf16 bag on a device queue,
+  but an earlier check at `:177` refuses any queue whose device type has no
+  registered platform, and on a CPU-only build `cuda` has none -- measured, the
+  attempt throws "for which no platform is registered" and never reaches the
+  dtype refusal. Gating it needs a build with a non-CPU platform registered,
+  which is a CUDA build and a lease. The other two refusals this row adds
+  (`RequireVaeDType` and the encoder's) ARE gated, in "the three dtype refusals
+  this arm adds are REACHED".
 * **The shipped `timestep_scale_multiplier` value** (§4.12), which decides whether
   the bf16 timestep product differs on the real checkpoint. Needs the checkpoint;
   `CHECKPOINT_ROOT` is not mounted on this box.
@@ -923,8 +960,8 @@ what makes tier 1 load-bearing rather than duplicative.
 
 | mutation | result |
 |---|---|
-| delete the production `kBF16` argument (`ltx2_video.cpp`) | `vae_decode_not_bf16` 0 -> **27645 of 27648**; 1 of 4972 engine assertions red, every digest, absmax, frame byte and determinism check GREEN; `test_ltx2_vae` fully green, which is the unit suite measuring the class rather than the capability |
-| GroupNorm: round the normed value before the affine | reds "each kLtx2Vae kernel's BF16 rule" |
+| delete the production `kBF16` argument (`ltx2_video.cpp`) | `vae_decode_not_bf16` 0 -> **27645 of 27648**; **2** of 4972 engine assertions red (the second is the READER-ANCHORS case, `tests/vllm/multimodal/test_ltx2_video.cpp:1473`, because collapsing two lines to one moves the anchors), every digest, absmax, frame byte and determinism check GREEN; `test_ltx2_vae` fully green, which is the unit suite measuring the class rather than the capability |
+| GroupNorm: round the normed value before the affine | reds "each kLtx2Vae kernel's BF16 rule" **and the deep arm** |
 | `ada_ln`: one rounding instead of three | reds "each kLtx2Vae kernel's BF16 rule" |
 | `spatial_noise`: fuse the product and the add | reds "each kLtx2Vae kernel's BF16 rule" |
 | `linear_cn`: add the bias after the store rounding | reds "each kLtx2Vae kernel's BF16 rule" |
@@ -933,10 +970,18 @@ what makes tier 1 load-bearing rather than duplicative.
 | `_RMSNorm2D`: restore the old multiply order | reds the deep AND shallow bf16 arms |
 | `un_normalize`: fuse the multiply and the add | reds the deep AND shallow bf16 arms |
 | timestep embedding: drop the intermediate rounding | reds the deep AND shallow bf16 arms |
-| noise blend: narrow the Python-float scalars | reds the **shallow** arm; the deep arm's bound absorbs it |
+| noise blend: narrow the Python-float scalars | reds **both** arms; the deep arm's `max\|diff\|` is 0.0273438 against a bound of 0.0117188 |
 
 The last four red NOTHING before the shallow arm existed. That is recorded because
 it is the reason the shallow arm was built rather than a nicety.
+
+Three more, added by the fresh review's repairs and measured the same way:
+
+| mutation | result |
+|---|---|
+| `scaled_timestep`: restore the pre-row f64 product | before the repair, GREEN -- 52 cases and 3480 assertions of `test_ltx2_vae` passed. After it, reds the section 5i arm: `max\|diff\|` 0 -> **0.0117188**, landing exactly on the rejected wide-product tensor (its own distance goes 0.0117188 -> 0) |
+| tiled decode: force `buffer.Allocate` to `kF32` | before the repair, GREEN -- 10 cases and 915 assertions of `test_ltx2_tiling`, and 114 cases and 4972 assertions of `test_ltx2_video`. After it, `test_ltx2_tiling` is 10/11 with 5 of 971 assertions red: `max\|diff\|` 0 -> **0.00507808**, landing exactly on upstream's own f32-buffer tensor. `test_ltx2_video` stays green, which is the engine suite measuring the render rather than the blend |
+| tiled decode: fuse the three separable blend masks (the defect as found) | reds the section 8 arm at **0.001953125**, one bf16 ulp; every f32 tiling case stays green, which is why it survived to the bf16 arm (#2815) |
 
 ### One instrument lost its window and is repaired rather than deleted
 

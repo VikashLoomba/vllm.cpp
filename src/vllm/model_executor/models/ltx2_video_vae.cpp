@@ -364,6 +364,15 @@ class VaeStore {
   // dtype check is what makes a bf16 volume a REFUSAL here instead of a
   // reinterpretation that reads two elements as one and renders a plausible clip
   // no shape-valid gate can see.
+  //
+  // IT IS ALSO A STRICT-ALIASING QUESTION, and it is left open deliberately. The
+  // buffer is `unsigned char` and this hands out a `float*` that callers WRITE
+  // through -- `-O3 -fstrict-aliasing` is in the flags and `sanitize-cpu` does not
+  // catch this class. `std::memcpy` cannot replace it without a write-back,
+  // because the encoder's gathers mutate the volume in place, so the repair is a
+  // refactor of that path rather than a line. Alignment holds (`std::vector`'s
+  // allocator meets `max_align_t`) and every access is whole-buffer or through
+  // this one accessor. Recorded in the row's `## Owed`; not repaired here.
   float* HostF32() {
     VT_CHECK(!OnDevice(),
              "ltx2 video vae: a host loop asked for the bytes of a volume that is resident on a "

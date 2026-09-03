@@ -1599,6 +1599,65 @@ TEST_CASE("ltx2 vae: the scaled timestep NARROWS BOTH OPERANDS and rounds the pr
   CHECK(rej == vllm_test::kLtx2VideoDecTsScaleRejectWideProduct);
 }
 
+TEST_CASE("ltx2 vae: the dtype refusals this arm adds are REACHED, not merely written") {
+  // A24 wave 3 fresh review (#2786). The row adds three refusals and gated none
+  // of them; `grep -rn "the decode serves f32" tests/` returned nothing, while
+  // `vt::Conv3d`'s equivalent has been gated since tests/vt/test_ops_conv3d.cpp:738.
+  // A refusal nothing executes is a comment.
+  vllm::Ltx2ConvVideoDecoderConfig cfg = ReducedVideoDecoderConfig();
+  cfg.prefix = "ltx2.videodecshallow.";
+  cfg.decoder_blocks = {{"attn", 1, 0, false, false}};
+  ParamBag bag = BuildVideoDecoderParams(cfg);
+
+  const int64_t lc = vllm_test::kLtx2VideoDecLatentC;
+  const int64_t lt = vllm_test::kLtx2VideoDecLatentT;
+  const int64_t lh = vllm_test::kLtx2VideoDecLatentH;
+  const int64_t lw = vllm_test::kLtx2VideoDecLatentW;
+  const std::vector<float> latent =
+      Ltx2Input("ltx2.videodecshallow.input", lc * lt * lh * lw, 1.0);
+
+  SUBCASE("a third storage width is refused by name") {
+    // `RequireVaeDType`. FP8 and NVFP4 are A22; the point is that a bag carrying
+    // one arrives at a message naming this decode and the dtype, not at a
+    // kernel-level surprise three headers away.
+    vllm::Ltx2VaeWeights wrong = bag.weights;
+    wrong.dtype = vt::DType::kF16;
+    GoldenNoise noise("ltx2.videodecshallow.");
+    CHECK_THROWS_WITH_AS(
+        vllm::Ltx2ConvVideoDecode(cfg, wrong, latent, lc, lt, lh, lw, &noise),
+        doctest::Contains("the decode serves f32"), std::runtime_error);
+  }
+
+  // THE THIRD REFUSAL IS NOT GATED HERE, AND MEASURING WHY IS THE POINT.
+  // `Ltx2ConvVideoDecode` refuses a bf16 bag on a non-CPU queue
+  // (ltx2_video_vae.cpp:1462-1472), but on a CPU-only build it is UNREACHABLE: an
+  // earlier check at `:177` refuses any queue whose device type has no registered
+  // platform, and on this build `cuda` has none. Measured -- the attempt threw
+  // "for which no platform is registered", not "only the CPU arm serves it".
+  // Gating it needs a build where a non-CPU platform is registered, which is a
+  // CUDA build and a lease. Recorded in the row's `## Owed` rather than replaced
+  // by a case that asserts the wrong refusal.
+
+  SUBCASE("the ENCODER refuses a bf16 bag by name, and at its own entry") {
+    // Added by the review: the encoder allocates every volume `kF32` while
+    // `Param` returns whatever the bag stores, so a bf16 bag would have been read
+    // as f32 words. It did terminate before this refusal existed -- on a
+    // `weights.Get` several hundred lines downstream that reported a MISSING
+    // PARAMETER -- which is why the message is asserted and not only the throw.
+    vllm::Ltx2ConvVideoEncoderConfig enc;
+    enc.prefix = "ltx2.videoenc.";
+    enc.in_channels = 3;
+    enc.out_channels = 4;
+    enc.patch_size = 2;
+    const std::vector<float> frames(static_cast<size_t>(enc.in_channels * 1 * 8 * 8), 0.0f);
+    vllm::Ltx2VaeWeights bf16;
+    bf16.dtype = vt::DType::kBF16;
+    CHECK_THROWS_WITH_AS(
+        vllm::Ltx2ConvVideoEncode(enc, bf16, frames, enc.in_channels, 1, 8, 8, nullptr),
+        doctest::Contains("the encoder is still the f32 port"), std::runtime_error);
+  }
+}
+
 TEST_CASE("ltx2 vae: the PixelNorm epsilon is the BF16 one, at the scale where that BINDS") {
   // A24 wave 3 (#2786), and the reason it is a separate case from the decoder
   // golden above is the whole lesson of A24 wave 1.

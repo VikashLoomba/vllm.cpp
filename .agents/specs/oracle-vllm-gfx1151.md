@@ -14,8 +14,27 @@ vLLM-plus-GGUF-plugin question on `dgx:gpu0`, CUDA, a different device).
 
 ## Now
 
-`ACTIVE` — the prerequisite is MEASURED and it is positive. The remaining
-question is the build and the run.
+`DONE` — measured end to end on `strix:gpu0`, 2026-09-03. **The answer is yes,
+and the answer changes what the arm's gate is measuring.**
+
+The pinned vLLM `5559679229` builds for gfx1151, resolves `RocmPlatform` /
+`AMD_Radeon_8060S` / `on_gfx1151() == True`, loads the gated Q4_K_M GGUF through
+`vllm-gguf-plugin`, and generates 48 greedy tokens for all six gate prompts,
+reproducibly, twice per configuration. `AGENTS.md`'s gateability bar — the
+oracle demonstrably builds and runs the model — is met on this device.
+
+It then diverges from llama.cpp `b10451` on the same artifact at the same six
+prompts: **3 of 6 with `torch.compile` on, 4 of 6 eager**, against the vllm.cpp
+ROCm arm's 3 of 6. At prompt 3 step 45, the step the gate convicts our arm at,
+eager vLLM emits the same token our arm does and compiled vLLM emits llama.cpp's.
+
+The prerequisite that killed the `thor:gpu0` attempt does not reproduce:
+`torch 2.13.0+rocm7.2` carries 153 `gfx1151` offload bundles and
+`torch.cuda.get_arch_list()` names the arch, with no `HSA_OVERRIDE_GFX_VERSION`
+anywhere.
+
+Evidence:
+[`docs/bench-evidence/oracle-vllm-gfx1151-20260903.md`](../../docs/bench-evidence/oracle-vllm-gfx1151-20260903.md).
 
 ## The question
 
@@ -119,6 +138,60 @@ statement about gfx1151.
 | `llvm-objdump --offloading \| head -80` | `objdump_rc=141` | SIGPIPE, not a failure |
 | `@triton.jit` body on stdin | `ValueError: @jit functions should be defined in a Python file` | Triton needs a real file; the probe was mine, not the device's |
 | `python3-dev` absent | `CMake Error at cmake/utils.cmake:10: Unable to find python matching …`, and separately `fatal error: Python.h` inside Triton's AMD driver | one missing header stopped both the vLLM configure and every Triton kernel on the board. Neither was about gfx1151 |
+| `rocm-libs` absent | `LoadHIP.cmake:79 … Could not find a package configuration file provided by "rocrand"` | the image carries a RUNTIME ROCm, not a development one |
+| `libdrm-dev` absent | `Imported target "torch" includes non-existent path /usr/include/libdrm` | torch's own `INTERFACE_INCLUDE_DIRECTORIES` names it |
+| the default PyPI `torchvision` | `RuntimeError: operator torchvision::nms does not exist` | the package imports, only its operator library is built against another torch. `vllm.transformers_utils` imports it unconditionally |
+| `amdsmi` absent | `current_platform = UnspecifiedPlatform`, then `NotImplementedError` | `vllm/platforms/__init__.py:110-128` decides "am I ROCm?" by importing `amdsmi`. **Without it vLLM answers no on a fully working ROCm box, and a run in that state reads exactly like "vLLM cannot run here"** |
+| probe API drift | `TypeError: … missing 1 required positional argument: 'model_config'`, twice, and `module 'vllm._custom_ops' has no attribute 'silu_and_mul'` | my calls, not the pin. The engine's own `Resolved architecture: Qwen3_5ForConditionalGeneration` line is the better evidence and is what the record quotes |
+| editing a running script | `syntax error near unexpected token 'fi'` in a file that `bash -n` parses cleanly | bash reads a script by byte offset AS IT EXECUTES. Every generation leg had already finished; the postcondition section never ran. Phase 4 was written as a NEW file for this reason |
 
 Each was repaired and re-run rather than reasoned around, and every repaired
 probe carries a control.
+
+## Outcome
+
+**What was measured, and what it cost.** Four `rc` leases on `strix:gpu0`, one
+worker, one boot. The build failed three times and the run twice before either
+succeeded, and **every one of those five failures was an absent package in the
+worker image** — `python3-dev`, `rocm-libs`, `libdrm-dev`, the ROCm
+`torchvision`, `amdsmi`. Not one of them was a property of gfx1151. That ratio
+is the finding behind the finding: the belief that vLLM cannot run on this board
+is exactly what a provisioning gap looks like from the outside, and it survived
+here for months without anyone spending a lease to distinguish the two.
+
+**Why the prerequisite was measured alone and first.** The `thor:gpu0` attempt at
+this class of question died on torch arch coverage and was misdiagnosed three
+times. Here the same question was answered with two instruments that share no
+machinery — the offload bundle in `libtorch_hip.so` and
+`torch.cuda.get_arch_list()` — which agreed 15 targets for 15, plus a compute
+smoke test and a Triton JIT. Had it come back negative, that was the answer and
+the campaign stopped there.
+
+**Why `HSA_OVERRIDE_GFX_VERSION` was never set.** It is the standard workaround
+for an unsupported RDNA target and it makes the runtime report a different
+device. A pin taken under it is a pin on a fiction. Every job asserted its own
+inherited environment was free of it and printed the assertion.
+
+**Rejected: the bf16 route.** 53.8 GB against a 64 GiB carve, and
+quant-mismatched, so it could only have validated the model implementation and
+never the Q4_K arm. It was written as a fallback and never needed. The GGUF route
+loaded 16.08 GiB, which is what proves the quantized arm was the one that ran.
+
+**Rejected: reading `torch.cuda.get_arch_list()` alone.** It is one instrument
+reporting on itself. The offload bundle is the object.
+
+**Rejected: scoring on one leg.** Eager was run twice and compiled twice, and the
+two pairs are byte-identical *files*. Without that, the eager-versus-compiled
+difference at prompts 3 and 4 could not be distinguished from noise, and it is
+the single most consequential row in the result.
+
+**Defaults.** `enforce_eager` was run both ways rather than chosen, because the
+choice turned out to change tokens. `gpu_memory_utilization=0.60` was picked to
+leave the 17 GB arm a wide margin on a 64 GiB carve rather than to be
+representative; nothing timed was taken from it. `MAX_JOBS=4` because
+unconstrained parallelism has OOM-rebooted this fleet.
+
+**What is deliberately NOT done here.** The gate's verdict is not rescored, and
+#2497 and #2534 are untouched. Re-declaring a gate is a spec-and-fresh-review
+job, and this row's authority ends at "the primary oracle is available on this
+device, and here is what it emits".

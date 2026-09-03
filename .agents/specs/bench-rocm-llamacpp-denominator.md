@@ -25,17 +25,42 @@ the median, 6 of 6 legs `rc=0`, taken on 2026-09-02 in `rc` job
 three legs on a different lease. The executed path is pinned by the source
 content manifest and by the sha256 of every binary and shared object the run
 linked, because this oracle's greedy decode is not deterministic across its own
-kernel paths and the revision alone under-specifies it. The job checked that
-manifest only against a constant in its own script, which fixes the tree but not
-its provenance; the link to upstream was closed separately by reproducing the
-manifest from `git archive` of `10bf611e…aebd8` out of `ggml-org/llama.cpp`,
-where the tag `b10451` resolves to that commit and the file count matches at
-3,425. `build_commit` reading `unknown` is a consequence of staging from a
-tarball with no `.git`, not an unpinned build.
+kernel paths and the revision alone under-specifies it.
+
+**The custody chain has three links, two closed and one open, and the records
+say which is which.** Link 1, upstream commit to source content, is CLOSED:
+the job only compared the staged tree against a constant in its own script,
+which fixes the tree and not its provenance, so the link was closed separately
+by reproducing the manifest from `git archive` of `10bf611e…aebd8` out of
+`ggml-org/llama.cpp`, where the tag `b10451` resolves to that commit and the
+file count matches at 3,425 under `LC_ALL=C` on both sides. Link 3, compiled
+tree to executed bytes, is CLOSED by the sha256 of every binary and shared
+object the run linked. **Link 2, source content to those bytes, is OPEN.** No
+compiler ran in this lease — `job.log:44` reads
+`llamacpp_build=ALREADY PRESENT`, there is no `llamacpp_build_rc` and no build
+log, and the step 4 and step 5 headers are one second apart — so the binaries
+were carried from the 2026-09-01 lease, which records the identical `llama-bench`
+and `llama-cli` sha256s, and whose source reached the box as a `git archive`
+tarball whose only recorded identity is its own sha256. A tarball sha256 is not
+a pure function of a commit, so no committed artifact ties the verified source to
+the executed bytes. `build_commit` reading `unknown` is a consequence of staging
+from a tarball with no `.git`, not an unpinned build.
 
 The staged arm refuses on `STRIX_ARM_SPEED_RATIFIED_BY`, and the refusal is
-proven rather than asserted: **14 of 14 mutations of the guard are detected** by
-`tests/scripts/test_rocm_strix_ourarm_staged.py`. Three of those mutations read
+proven rather than asserted: **14 mutations of the guard were applied and 14
+were detected** by `tests/scripts/test_rocm_strix_ourarm_staged.py`. That is a
+count over a CHOSEN set and it is not a completeness claim, which the tree then
+demonstrated: a fifteenth mutation, weakening the issue-reference term
+`#[0-9]+` to `#?[0-9]+`, was **not** detected — the suite stayed green at 13
+passed while `STRIX_ARM_SPEED_RATIFIED_BY='ratified 2026-09-02 by the operator'`
+went from `rc=3` to `rc=0`, degrading "naming means an issue reference" to
+"contains any digit". The cause was the negative population: every long refused
+value carried no digit at all, because a date is the digit a real ratification
+always has. Five values that are long, carry digits and carry no `#` now kill
+that mutant. **Read the number as a lower bound on detection, never an upper
+one.**
+
+Three of the original fourteen read
 NOT DETECTED on the first pass and were repaired rather than recorded as passes
 — the length floor and the issue-reference term were being tested as one
 condition, and the reference-tier assertion was a substring test that
@@ -88,8 +113,10 @@ by accident is how #2497 got its retraction, so this one refuses to start.
 Two artifacts, one measured and one inert.
 
 1. **Measured — the oracle.** llama.cpp at the recorded pin `b10451` =
-   `10bf611e533d81f739128304991c5e133c6aebd8`, built for `gfx1151` in the lease,
-   decoding the plain `Qwen3.8-27B-Q4_K_M.gguf` on `strix:gpu0`. Repeated warm
+   `10bf611e533d81f739128304991c5e133c6aebd8`, `gfx1151` binaries **carried into
+   the lease from the 2026-09-01 one, not built in it** (`job.log:44` reads
+   `llamacpp_build=ALREADY PRESENT`), decoding the plain
+   `Qwen3.8-27B-Q4_K_M.gguf` on `strix:gpu0`. Repeated warm
    legs, order recorded, executed kernel path pinned, AMD clock state sampled per
    leg by an ad-hoc sampler that says it is ad-hoc.
 2. **Staged, not run — our arm.** `.agents/scripts/rocm-strix-ourarm-staged.sh`,
@@ -156,7 +183,12 @@ exit 127.
 - **6 legs**, each one `llama-bench -m … -p 0 -n 64 -ngl 99 -r 3 -o json`. A leg
   is one process: it loads the model, does `llama-bench`'s own warmup, and times
   3 generations of 64 tokens. `N = 6` comes from this design and not from
-  counting log lines; the job log tees and a grep tally would double it.
+  counting log lines. `grep -c 'avg_ts' job.log` reads 13 against six legs,
+  because the per-leg echo, the fold's `population` string and the whole
+  `RESULT.json` all land in the same log. Re-emission is the mechanism, not
+  `tee`, which writes each line once. `fold.py` refuses in BOTH directions
+  against the legs actually on disk, so the design cannot be lowered to drop
+  one.
 - Legs run in sequence 1..6 and the sequence index is recorded with each. There
   is one engine, so there is nothing to alternate; the order is recorded so a
   monotonic drift is visible as one.
@@ -186,9 +218,15 @@ so a reader can see which one a figure came from.
 `.agents/benchmarking.md`'s 5% within-run SM-clock spread ceiling is **not
 applied**. It was calibrated on a datacenter part with persistence mode and its
 own power budget; this APU shares one package power budget with 32 CPU cores and
-the predecessor measured 8.2–12.0% on both engines under sustained load. An AMD
-rule needs its own calibration and cannot inherit the NVIDIA number. That
-observation is recorded for #2381 and is not repaired here.
+**no compute window either run has ever sampled on it satisfies that ceiling**:
+8.3–11.0% across these six legs, and 8.2–12.0% across the predecessor's five
+(8.2 and 12.0 being our arm and a harness control, 9.5–10.7 the three llama.cpp
+legs). Those are two different ranges, and the evidence document said they were
+one until 2026-09-03. The argument is unchanged at the true numbers, and
+stronger: eleven of eleven windows, two engines, two leases, an idle box, all
+between 1.6x and 2.4x the ceiling. An AMD rule needs its own calibration and
+cannot inherit the NVIDIA number. That observation is recorded for #2381 and is
+not repaired here.
 
 The cross-arm clause of that section — that two arms' clock medians and means
 must agree, because the offset is the term that lands in the ratio — has no
@@ -234,23 +272,129 @@ status and a message naming the token gate; a well-formed value gets past the
 guard. The test is red before the script exists and each assertion is mutated to
 prove it detects the defect.
 
+**It runs on a lane and not only on a developer box.** The suite was registered
+in `scripts/agent-preflight.sh` alone, and CI enumerates its
+`tests/scripts/test_*.py` steps explicitly with no glob, so the row's one
+falsifiable behaviour was enforced by a locally-run preflight. It now has its
+own CI step. Nothing in it can skip: `bash` and the standard library over one
+committed script, no GPU, no lease, no toolchain, no network.
+
 The measured run's own assertions are inside the job — the artifact sha, the
 source manifest, the binary presence, the leg count — and each aborts rather than
 reporting.
+
+**`fold.py`'s leg-count refusal runs in BOTH directions**, and against what is
+on disk rather than against its own loop. It refused `--legs 7` and a forced
+`rc=1` leg, and reported `MEASURED` with `rc=0` on `--legs 5`, silently folding
+five and ignoring `leg6.*` entirely: a leg could be dropped by lowering the
+declared design, which is the one failure a leg-count guard exists to stop. It
+also carried an assertion (`if len(legs) != args.legs`) that no mutation could
+ever break, because `legs` was built by a loop of exactly `args.legs`
+iterations. The directory is now enumerated and compared against the design in
+both directions, and the unfalsifiable assertion is gone rather than kept for
+its comment value. Proven by execution, on a scratch copy so the committed
+`RESULT.json` was never the write target:
+
+| Input | before | after |
+|---|---|---|
+| `--legs 5`, six legs on disk | `MEASURED`, `rc=0` | `INCOMPLETE`, `rc=3`, names leg 6 |
+| `--legs 6` | `MEASURED`, `rc=0` | `MEASURED`, `rc=0` |
+| `--legs 7` | `INCOMPLETE`, `rc=3` | `INCOMPLETE`, `rc=3`, names leg 7 |
+| `--legs 6`, `leg3.*` deleted | — | `INCOMPLETE`, `rc=3`, names leg 3 |
+| `--legs 6`, `leg2.rc` forced to 1 | `INCOMPLETE`, `rc=3` | `INCOMPLETE`, `rc=3` |
+
+Re-folding the committed evidence at `--legs 6` with the repaired script
+reproduces the committed `RESULT.json` **byte for byte**, so no statistic moved.
+
+**`docs/bench-evidence/<run-id>/` artifact kinds now classify.** `fold.py`,
+`amd_clock_sample.py`, six `clock-leg*.jsonl` and six `leg*.rc` — all fourteen
+— had no class in `scripts/check-pr-size.py`, which fails closed. Its suite
+sweeps every TRACKED path, so this branch was red against the whole tree and
+landing it would have reddened `main` itself and refused every later change
+touching that checker through its own evidence contract. It went unseen because
+the checker is CI-only and `agent-preflight.sh` skips it. Repaired the way the
+checker's own comments prescribe: NAME the artifact kinds, keep the extension
+list a closed enumeration, do not relax the directory shape.
 
 ## Gates
 
 ```sh
 python3 -m pytest tests/scripts/test_rocm_strix_ourarm_staged.py -q
+python3 -m pytest tests/scripts/test_check_pr_size.py -q
+python3 scripts/check-pr-size.py --base origin/main --head HEAD
 scripts/agent-preflight.sh
 ```
 
-Neither gate measures the GPU. The measured figure is evidence, not a gate; a
+The two `check-pr-size` lines are listed because **preflight skips that
+checker**, which is how an unclassified path reached a fresh review. Run them by
+name or they do not run at all.
+
+No gate here measures the GPU. The measured figure is evidence, not a gate; a
 number this row produces about the oracle cannot be re-derived by CI.
 
 ## Evidence
 
 [`docs/bench-evidence/rocm-strix-llamacpp-denominator-20260902.md`](../../docs/bench-evidence/rocm-strix-llamacpp-denominator-20260902.md).
+
+**The checker change's red-before and green-after.** `check-pr-size.py` is a
+semantic checker change, so it carries both.
+
+```
+RED   (base checker, HEAD tree)
+  $ python3 scripts/check-pr-size.py --base origin/main --head HEAD
+  ERROR: PR size check could not classify the change: unclassified repository
+  path 'docs/bench-evidence/rocm-strix-llamacpp-denominator-20260902/amd_clock_sample.py'
+  rc=1
+  $ python3 -m pytest tests/scripts/test_check_pr_size.py -q
+  AssertionError: Lists differ: [...] != []   (14 additional elements)
+  1 failed, 6 passed, 39 subtests
+  origin/main: 5,631 tracked paths, 0 unclassified. This head: 5,660, 14 unclassified.
+
+GREEN (head checker, HEAD tree)
+  $ python3 scripts/check-pr-size.py --base origin/main --head HEAD
+  OK: every explicit path class is within its review budget.   rc=0
+  $ python3 -m pytest tests/scripts/test_check_pr_size.py -q
+  54 passed, 162 subtests
+```
+
+`test_a_measurement_runs_own_artifact_kinds_classify_as_evidence` is the paired
+evidence: every `evidence` assertion in it raises `ValueError` against the base
+checker, verified by loading `origin/main`'s `check-pr-size.py` directly. It
+also pins the two directions that must NOT move — an unargued sibling extension
+still fails closed, and `leg1.json` stays `public_document`, because the
+evidence arm is tested before `DOC` and admitting `.json` there would silently
+reclassify `docs/bench-evidence/mxfp4-qwen`'s golden.
+
+**The guard mutation the original set missed.** Weakening `#[0-9]+` to
+`#?[0-9]+` in the staged script left the suite green at `13 passed` while
+`STRIX_ARM_SPEED_RATIFIED_BY='ratified 2026-09-02 by the operator'` went
+`rc=3` → `rc=0`. With the five added negative values the same mutant is caught
+by `5 failed`. Both runs were taken with the mutation verified present on disk,
+and the tree was restored byte-for-byte after each (`git diff --stat` empty).
+
+**The count of machine-checked claims is not quoted, and that is the
+reconciliation.** The landing commit body of 2026-09-02 said "292 machine-checked
+claims, 0 mismatches"; the fresh review's own verification reported 331 over the
+same artifacts. Neither is wrong about the tree — they bucketed a table cell,
+a per-leg triple and a sub-field differently — and neither is reproducible from
+anything committed, so the difference is in the counting and not in the
+evidence. What IS reproducible is stated instead: every transcribed number is
+re-derived from `leg{1..6}.json` and the raw clock samples without running
+`fold.py`, with **0 mismatches**; two independent re-derivations agree exactly;
+and a clean re-fold of the committed directory reproduces `RESULT.json` byte for
+byte. A count nobody can redo is the shape `.agents/benchmarking.md` warns
+about, where a number quoted often gets treated as measured.
+
+**Evidence curation is now recorded.** `system-info-extract.txt` is a hand-made
+selection that no step of `job-as-run.sh` produces, and the `use_extra_bufts`
+and tensor-count arguments rest on it. The 348,370-byte source it derives from is
+committed as `system-info.err.gz`, and the evidence document carries the command
+that checks the derivative against it byte-for-byte. `CPU_REPACK` appears **0
+times** in all 4,952 lines of that source, so the argument no longer depends on
+the curation at all. `rc-devices-before.txt`, the fleet state at submission this
+spec requires, sat UNTRACKED in the worktree root while the document quoted it;
+it is committed beside the other artifacts — the same defect class as the
+`job.log` gitignore bug this row already repaired.
 
 ## Stop conditions
 
@@ -269,3 +413,18 @@ number this row produces about the oracle cannot be re-derived by CI.
 - An AMD clock helper with its own calibrated spread rule.
   [#2381](https://github.com/mudler/vllm.cpp/issues/2381) owns it; every clock
   figure this row produces is ad-hoc until then.
+- **Link 2 of the custody chain**, source content to executed bytes. Closing it
+  needs a lease that compiles and records its own compiler invocation, which
+  this row did not take and did not need for a single-engine figure.
+  [#2497](https://github.com/mudler/vllm.cpp/issues/2497) owns it and gets it
+  for free on the retake, which cannot reuse today's binaries.
+- **`scripts/check-agent-record.py:463`'s stale comment**, which still calls this
+  row "no spec of its own". Not repaired here, and the reason is a real trap
+  rather than a preference: `check-pr-size.py` requires every change to a
+  governance checker to carry semantic mutation evidence, and a comment has no
+  semantics to mutate, so any paired test written for it passes against the base
+  checker too and the contract reports it as not being evidence. Fabricating a
+  mutation for a comment is worse than the stale comment.
+  [#2631](https://github.com/mudler/vllm.cpp/issues/2631) owns it and proposes
+  the shape: exempt only when the two revisions are equal with comments and
+  docstrings stripped.

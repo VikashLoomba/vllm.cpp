@@ -41,8 +41,13 @@ which refuses to start until the gate is ratified.
 | Min / max repetition | 12.151 / 12.333 |
 
 `N = 6` is the **design**, handed to the fold as `--legs 6`. It is never derived
-by counting log lines: the job log is tee'd, and a grep tally reads every leg
-twice.
+by counting log lines, and the log says why: `grep -c 'avg_ts' job.log` reads
+**13** against six legs. Six of those are the per-leg lines step 7 echoes, six
+more are the same figures inside the `RESULT.json` that step 8 echoes back into
+the same log, and the thirteenth is the fold's own `population` string. So a
+tally over that log answers 13, or 7, or 6, depending only on which term is
+grepped, and it is never used as a leg count. (`tee -a` is not the mechanism:
+it writes each line once. Re-emission is.)
 
 ### Per leg, in the order they ran
 
@@ -61,10 +66,15 @@ then 3 timed generations of 64 tokens. The per-leg figure is that leg's own
 
 **6 of 6 legs completed, and none was discarded.** The declared discard policy
 allowed exactly one named cause — a cold page cache on leg 1 — and it was not
-reached for, because leg 1 is not the outlier: it is the *lowest* leg by 0.0063
-tok/s and it sits inside the other five. The order column carries no monotonic
-drift: ranked slowest to fastest the legs read 1, 6, 5, 3, 2, 4, so the slowest
-leg ran first, the fastest ran fourth and the second-slowest ran last.
+reached for. Leg 1 is the minimum, so the question is whether it is *separated*
+from the rest, and it is not. Ranked slowest to fastest the legs read 1, 6, 5,
+3, 2, 4, and the successive gaps are **0.0063, 0.0002, 0.0182, 0.0013,
+0.0110** tok/s: the largest gap in the population sits in the middle of it, not
+below leg 1. A cold-cache leg would stand off the bottom of the ranking, and
+this one does not.
+
+The order column also carries no monotonic drift: on that same ranking the
+slowest leg ran first, the fastest ran fourth and the second-slowest ran last.
 
 **This reproduces across leases.** The predecessor run of 2026-09-01 took the
 same oracle on the same board in a different lease and read 12.239 / 12.242 /
@@ -81,7 +91,7 @@ term below was captured by the job itself.
 | Term | Value |
 |---|---|
 | Revision | `10bf611e533d81f739128304991c5e133c6aebd8`, label `b10451` |
-| Source identity | content manifest `56c26d15c2acf11b8621ac26663b4316dc29719d765ba1d95231ffacaddf3cda`, `LC_ALL=C` collation, verified before AND after the build step |
+| Source identity | content manifest `56c26d15c2acf11b8621ac26663b4316dc29719d765ba1d95231ffacaddf3cda`, `LC_ALL=C` collation, of the source tree staged in the pod. Read twice, at `job.log:38` and `job.log:53` — **no build ran between those two reads**; see link 2 below |
 | `llama-bench` | `e2acbe26f4ef214ca5b3658a1062929242345a1205f9a13d6af841bfa6c3f2c1` |
 | `llama-cli` | `d563d9877adb49b4ae2c0a6c23e4019548ffc0c7e2d3a7c4339af3f636646a55` |
 | `libllama.so.0.1.0` | `c4b3e80215904fbe833a8ede82cd9357732088f36a2c4b29e27ebdfa8451ae56` |
@@ -102,9 +112,11 @@ term below was captured by the job itself.
 
 **`build_commit` reads `unknown` and `build_number` reads `0` in `llama-bench`'s
 own JSON.** The tree is staged from a pinned tarball, so it carries no `.git`,
-and llama.cpp's build stamp is written from `git describe`. What pins this run is
-therefore the **content manifest** of the 3,425 source files, and the chain from
-the upstream revision to the bytes that decoded has three links.
+and llama.cpp's build stamp is written from `git describe`. So the run is pinned
+by two artifacts and not by a stamp: the **content manifest** of the 3,425
+source files, and the **sha256 of every binary** the run linked. The chain from
+the upstream revision to the bytes that decoded has three links, **two of them
+closed and one open**, and the open one is named below rather than passed over.
 
 1. **Upstream commit to content.** `git archive` of
    `10bf611e533d81f739128304991c5e133c6aebd8` from a clone whose `origin` is
@@ -118,43 +130,78 @@ the upstream revision to the bytes that decoded has three links.
        | xargs -0 sha256sum | sha256sum )
    ```
 
-2. **Content to the compiled tree.** The job recomputed that manifest on the
-   worker before the build step and again after it. Both read `56c26d15…f3cda`.
+2. **Content to the compiled tree. THIS LINK IS OPEN, and nothing here closes
+   it.** No compiler ran in this lease. `job.log:44` reads
+   `llamacpp_build=ALREADY PRESENT`; there is no `llamacpp_build_rc`, no build
+   log, and the step 4 and step 5 headers are one second apart. The binaries
+   were carried from the **2026-09-01 lease**, which recorded the identical
+   `llama-bench` and `llama-cli` sha256s
+   ([`rocm-strix-qwen38-q4km-20260901.md`](rocm-strix-qwen38-q4km-20260901.md)),
+   and whose source reached the box as a `git archive` tarball with sha256
+   `9f92a61d…54fb72`. A tarball's sha256 is not a pure function of a commit —
+   it varies with the git version and the archive options — so it identifies
+   those bytes without deriving them from `10bf611e…aebd8`. **No committed
+   artifact ties the verified source of link 1 to the executed bytes of link
+   3.**
+
+   What the job did check, twice, is that the source tree sitting in the pod
+   still hashed to `56c26d15…f3cda` (`job.log:38` and `job.log:53`). That is a
+   true fact about that tree. It is not a fact about what any compiler consumed,
+   because in this lease no compiler consumed anything.
 
 3. **Compiled tree to the executed bytes.** Every binary and shared object the
-   run linked is sha256'd in the table above.
+   run linked is sha256'd in the table above, so what decoded is pinned as
+   bytes.
 
-**Link 1 was not checked by the job. It is checked here instead, and it was open
-until it was.** The job compared the staged tree against a constant written into
-`job-as-run.sh`, which proves the tree did not change between two points in the
-job and says nothing about which upstream revision that tree is; the revision
-itself came from a `.VERSION` text file staged beside the tarball on the share,
-which is an assertion rather than a check. Reproducing the manifest from upstream
-is what makes the difference, and it is why this document can say the executed
-path is pinned rather than only labelled. A stamp would have recorded what the
+**Link 1 was not checked by the job either. It is checked here instead, and it
+was open until it was.** The job compared the staged tree against a constant
+written into `job-as-run.sh`, which proves the tree did not change between two
+points in the job and says nothing about which upstream revision that tree is;
+the revision itself came from a `.VERSION` text file staged beside the tarball on
+the share, which is an assertion rather than a check. Reproducing the manifest
+from upstream is what makes the difference. A stamp would have recorded what the
 tree claimed to be; the manifest records what it was.
+
+**So the honest summary is three sentences.** The source is pinned to upstream
+and verified, by a manifest that is a pure function of the commit. The executed
+binaries are pinned as bytes, and carried from the named 2026-09-01 lease. The
+step between them is asserted and not checked, and closing it needs a build in a
+lease that records its own compiler invocation — which this row does not owe and
+[#2497](https://github.com/mudler/vllm.cpp/issues/2497) carries.
 
 ### `use_extra_bufts`, answered by observation
 
 `llama-bench` exposes no switch for it. `src/llama-model.cpp:2489` defaults it
 `true` and `tools/llama-bench/llama-bench.cpp:1218-1267` sets no override, so
 this run's value is `true`. Rather than assert that, the run printed where the
-tensors landed:
+tensors landed.
+
+**This is an ASSEMBLED EXCERPT, not one transcript, and the provenance is per
+line.** `llama-cli -v` allocates twice — a reserve pass and then the real load —
+so the six buffer lines below do not occur together anywhere. Each is quoted
+with its line in
+[`system-info-extract.txt`](rocm-strix-llamacpp-denominator-20260902/system-info-extract.txt):
 
 ```
-load_tensors:        ROCm0 model buffer size = 15345.66 MiB
-load_tensors:    ROCm_Host model buffer size =   682.03 MiB
-llama_kv_cache:      ROCm0 KV buffer size = 16384.00 MiB
-llama_memory_recurrent:      ROCm0 RS buffer size =   149.62 MiB
-sched_reserve:      ROCm0 compute buffer size =   122.00 MiB
-sched_reserve:  ROCm_Host compute buffer size =   266.02 MiB
+189  load_tensors:        ROCm0 model buffer size = 15345.66 MiB   <- real load
+190  load_tensors:    ROCm_Host model buffer size =   682.03 MiB   <- real load
+192  llama_kv_cache:      ROCm0 KV buffer size = 16384.00 MiB      <- real load
+174  llama_memory_recurrent:  ROCm0 RS buffer size =   149.62 MiB  <- reserve pass
+180  sched_reserve:      ROCm0 compute buffer size =   122.00 MiB  <- reserve pass
+181  sched_reserve:  ROCm_Host compute buffer size =   266.02 MiB  <- reserve pass
 ```
 
-**No `CPU_REPACK` buffer type appears at all.** With `-ngl 99` every loaded
-tensor sits in a ROCm buffer, so the CPU repack buffer types that
-`use_extra_bufts` admits hold nothing and the flag cannot move this measurement.
-`REPACK = 1` in `system_info` reports a compiled-in CPU capability, not a buffer
-this run used.
+The reserve pass's own `load_tensors:` lines read `0.00 MiB` at 87-88 and its
+`llama_kv_cache:` line reads `0.00 MiB` at 154, which is why the first three are
+taken from the second pass and not from beside the other three.
+
+**The conclusion does not depend on the assembly.** It is an absence over the
+whole file, so it is checked over the whole file rather than over this excerpt:
+**no `CPU_REPACK` buffer type appears anywhere in the run's stderr**, in either
+pass. With `-ngl 99` every loaded tensor sits in a ROCm buffer, so the CPU repack
+buffer types that `use_extra_bufts` admits hold nothing and the flag cannot move
+this measurement. `REPACK = 1` in `system_info` reports a compiled-in CPU
+capability, not a buffer this run used.
 
 ### The model as the oracle read it
 
@@ -191,7 +238,7 @@ this row's number.
 | ROCm | 7.2.4 |
 | `boot_id` | `a5bc8128-f6ad-4767-8614-6923f88032e1`, **one value across all 6 legs** — no reboot split this run |
 | Lease | `rc` job `ff18a029-cd10-42d1-a5f7-9129c1c8af09`, one lease, one job at a time |
-| Fleet at submission | `strix:gpu0` **ready** and taken by this job alone; `dgx:gpu0` and `thor:gpu0` busy with unrelated jobs on **different boxes**, `orin:gpu0` ready |
+| Fleet at submission | `strix:gpu0` **ready** and taken by this job alone; `dgx:gpu0` and `thor:gpu0` busy with unrelated jobs on **different boxes**, `orin:gpu0` ready. Recorded verbatim in [`rc-devices-before.txt`](rocm-strix-llamacpp-denominator-20260902/rc-devices-before.txt) |
 | Window | legs ran 22:58:20Z to 23:00:52Z, job 22:52:51Z to 23:00:53Z, 2026-09-02 |
 | `fold_rc` | `0`, and the fold's own `status` is `MEASURED` with an empty `reasons` list |
 | `JOB_VERDICT` | `OK` **by the script's own definition**, `fold_rc` being 0. The `JOB_VERDICT=` line itself appears in no artifact: `job-as-run.sh` copies the log out one line before it echoes the verdict, so what is captured is `fold_rc=0` and the verdict is derived from it |
@@ -235,8 +282,16 @@ throughput — the board held one clock state for all six legs.
 **`.agents/benchmarking.md`'s 5% within-run SM-clock spread ceiling is not
 applied here.** It was calibrated on a datacenter part with persistence mode and
 its own power budget. This APU shares one package power budget with 32 CPU
-cores, and both the predecessor run and this one measure 8.3–11.0% within a
-compute window on an otherwise idle box. An AMD rule needs its own calibration
+cores, and every compute window either run has ever sampled on it is above that
+ceiling: **8.3–11.0%** across these six legs, and **8.2–12.0%** across the
+predecessor's five (8.2, 9.5, 10.2, 10.7, 12.0 — its
+[own table](rocm-strix-qwen38-q4km-20260901.md), whose 9.5–10.7 band is the
+three llama.cpp legs and whose 8.2 and 12.0 are our arm and a harness control).
+The two ranges are not the same range, and the earlier draft of this line said
+they were. The argument is unchanged at the true numbers, and stronger: eleven
+of eleven compute windows, on two engines, in two leases, on an idle box, sit
+between 1.6x and 2.4x the ceiling. A rule no observation has ever satisfied is
+not a rule this board has failed. An AMD rule needs its own calibration
 and cannot inherit the NVIDIA number; that observation belongs to #2381 and is
 not repaired here. The cross-arm clause of that section — that two arms' clock
 medians and means must agree, because the offset lands in the ratio — has no
@@ -284,10 +339,26 @@ because `/workspace` is CIFS and is never a run surface, and stdin closed.
 | `leg{1..6}.json` | `llama-bench`'s own JSON per leg, unmodified |
 | `leg{1..6}.rc` | each leg's exit status |
 | `clock-leg{1..6}.jsonl` | the raw 4 Hz sysfs samples |
-| `job.log` | the tee'd job log: the artifact and manifest verification, the binary sha256 table above, the lease and boot ids, and `fold_rc`. It is the only artifact carrying them, and `.gitignore`'s repo-wide `*.log` matches it, so it is committed with `git add -f` as the other evidence logs under this directory are — an unforced `git add` drops it silently |
-| `system-info-extract.txt` | the de-duplicated identity, loader and buffer lines from the 348 KB `llama-cli -v` stderr |
+| `job.log` | the job log: the artifact and manifest verification, the binary sha256 table above, the lease id, `llamacpp_build=ALREADY PRESENT` and `fold_rc`. **Those five are what only this file carries** — the `boot_id` is not one of them; it is also in `worker.txt`, in `RESULT.json` and in all six clock files. `.gitignore`'s repo-wide `*.log` matches this path, so it is committed with `git add -f` as the other evidence logs under this directory are — an unforced `git add` drops it silently |
+| `system-info.err.gz` | the **complete** `llama-cli -v` stderr, 4,952 lines / 348,370 bytes uncompressed, sha256 `9c677901…08ca`. Committed so the file below can be checked against something |
+| `system-info-extract.txt` | a **hand-made** selection from it: 194 of its 2,522 unique lines. No step of `job-as-run.sh` writes this filename. What is machine-checkable is that it is a faithful selection — every line appears verbatim in the source, in source order, with the log's `<time> <level> ` prefix stripped and duplicates dropped keeping the first. The command below reproduces it byte-for-byte from `system-info.err.gz` |
+| `rc-devices-before.txt` | `rc devices` at submission: the fleet contention state the design requires, quoted in "Environment and contention" above |
 | `list-devices.txt`, `worker.txt` | device enumeration and worker identity |
 | `job-as-run.sh`, `fold.py`, `amd_clock_sample.py` | the recipe |
+
+```sh
+gunzip -c system-info.err.gz \
+  | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ [A-Z] //' \
+  | awk '!seen[$0]++' \
+  | grep -Fxf system-info-extract.txt \
+  | diff - system-info-extract.txt        # empty
+```
+
+That command verifies fidelity; it does not regenerate the selection, because
+the selection was made by a person. The two arguments that rest on this file —
+the absent `CPU_REPACK` buffer type and the tensor-type counts — are both
+re-checkable against `system-info.err.gz` directly, and `CPU_REPACK` appears
+**0 times** in all 4,952 lines of it.
 
 ## What this does not establish
 
@@ -297,3 +368,8 @@ because `/workspace` is CIFS and is never a run surface, and stdin closed.
   `BACKEND-GATE-ROCM-LLAMACPP` stays `INVENTORIED`.
 - **No gate.** This figure is evidence. CI cannot re-derive it, and no checker
   reads it.
+- **Not that these binaries were compiled from this source.** Link 2 above is
+  open. The source is pinned to upstream and the executed bytes are pinned as
+  bytes, and no committed artifact joins them.
+  [#2497](https://github.com/mudler/vllm.cpp/issues/2497) closes it on the
+  retake, which cannot reuse these binaries.

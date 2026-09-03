@@ -6,7 +6,15 @@ every derived number carries the population it came from, and the clock
 instrument names itself as ad-hoc rather than as the committed helper.
 
 N comes from --legs, which is the DESIGN. It is never derived by counting log
-lines: the job log is tee'd and a grep tally reads every leg twice.
+lines: `grep -c 'avg_ts' job.log` reads 13 against six legs, because the per-leg
+echo, this script's own `population` string and the whole RESULT.json all land in
+the same log. Re-emission is the mechanism; `tee -a` writes each line once.
+
+But a declared N is only half a guard, so --legs is checked in BOTH directions
+against the legs actually present in --evidence. Lowering it must not drop one.
+
+THIS SCRIPT WRITES RESULT.json INTO --evidence. Point it at a scratch copy when
+testing, or it overwrites the committed artifact.
 """
 
 from __future__ import annotations
@@ -14,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import statistics
 import sys
 
@@ -112,8 +121,39 @@ for l in usable:
     reps.extend(float(v) for v in (l.get("samples_ts") or []))
 
 reasons = []
-if len(legs) != args.legs:
-    reasons.append(f"design declares {args.legs} legs, folded {len(legs)}")
+# The refusal must run in BOTH directions, and against what is ON DISK.
+#
+# A `len(legs) != args.legs` test sat here and was structurally unreachable:
+# `legs` is built by a loop of exactly `args.legs` iterations, so no mutation
+# could ever break it. It also left the dangerous direction open. `--legs 7`
+# refused, because the seventh leg produced no usable figure -- but `--legs 5`
+# folded five legs, ignored `leg6.*` entirely and reported MEASURED with rc 0.
+# A leg could be DROPPED by lowering the declared design, which is the one
+# failure a leg-count guard exists to stop.
+#
+# So the directory is enumerated and compared against the design. This is a real
+# function of the tree: lowering `--legs` now names the legs it would have
+# dropped, and raising it names the legs it cannot find.
+found: set[int] = set()
+for pattern in ("leg*.json", "leg*.rc", "clock-leg*.jsonl"):
+    for p in E.glob(pattern):
+        m = re.fullmatch(r"(?:clock-)?leg(\d+)\.(?:json|rc|jsonl)", p.name)
+        if m:
+            found.add(int(m.group(1)))
+on_disk = sorted(found)
+declared = list(range(1, args.legs + 1))
+undeclared = [i for i in on_disk if i not in declared]
+absent = [i for i in declared if i not in on_disk]
+if undeclared:
+    reasons.append(
+        f"design declares {args.legs} legs, but the evidence directory also holds "
+        f"leg(s) {undeclared}; a leg may not be dropped by lowering --legs"
+    )
+if absent:
+    reasons.append(
+        f"design declares {args.legs} legs and the evidence directory holds "
+        f"nothing at all for leg(s) {absent}"
+    )
 if len(usable) != args.legs:
     reasons.append(f"{args.legs - len(usable)} of {args.legs} legs produced no usable figure")
 if len(usable) < 2:

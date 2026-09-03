@@ -246,9 +246,17 @@ produced.
 Two terms the reader must carry before dividing anything:
   - the clock offset between the arms, per leg, from the compute windows above;
     throughput is an integral over the window, so the MEANS are what transfer
-  - the residency difference: the oracle declines blk.64 (~290 MB, the drafter)
+  - the residency difference: the oracle declines blk.64, the drafter layer,
     while our loader holds it. Both arms run 64 trunk blocks per token, so that
-    belongs in the memory column and not in a throughput ratio
+    belongs in the memory column and not in a throughput ratio.
+
+    NO SIZE IS WRITTEN HERE, ON PURPOSE. This row's spec forbids it producing,
+    recording or quoting ANY throughput, latency or memory figure for vllm.cpp,
+    with no exception written, because this arm's declared token gate reads
+    TOKEN_GATE=FAIL at 3 of 6 -- and "how much our loader holds" is a memory
+    figure for vllm.cpp however casually it is phrased. A "~290 MB" attributed
+    to our loader stood on this line and is gone. The warning is what a future
+    reader needs. The number is what this row may not give them.
 CLOSING
 echo "JOB_VERDICT=$([ "$FOLD_RC" = 0 ] && echo OK || echo INCOMPLETE)"
 echo "=== PAIRED JOB DONE ==="

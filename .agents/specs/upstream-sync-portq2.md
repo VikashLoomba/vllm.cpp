@@ -164,12 +164,15 @@ printed again by this wave's operator before they are written down.
   [#2666](https://github.com/mudler/vllm.cpp/issues/2666) `KERNEL-ATTN-MLA-SPARSE`,
   [#2667](https://github.com/mudler/vllm.cpp/issues/2667) `MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm`,
   [#2668](https://github.com/mudler/vllm.cpp/issues/2668) `SPEC-ACCEPT-VARIANTS`.
-- **Three committed records that the PIN ADVANCE will falsify**, correct today and
+- **Two committed records that the PIN ADVANCE will falsify**, correct today and
   therefore not edited here: `.agents/porting.md:78` (ModelOpt fp8 `out_dtype`),
-  the two `config/cache.py:111` citations for `calculate_kv_scales`, and
-  `.agents/specs/dflash2-spec-decode.md`'s recorded draft-logits cache layout.
-  Report §9 carries them; the third also rides on
-  [#2668](https://github.com/mudler/vllm.cpp/issues/2668).
+  and `calculate_kv_scales`'s `config/cache.py:111` anchor in SIX places, one of
+  them inside a thrown message a user can read
+  (`include/vllm/model_executor/layers/quantization/kv_cache.h:108`). Report §9
+  enumerates all six. A third item claimed here in an earlier draft — the DFlash2
+  draft-logits layout — was **false and is retracted in report §9.1**: DFlash2
+  keeps `(torch.float32, -inf)` at the advance target, so that record is correct
+  and nothing is owed.
 
 ## Outcome
 
@@ -203,6 +206,28 @@ commit does not contain, guarded by an algorithm this tree does not implement, i
 `inert` under §2.2's own definition. The disagreement is recorded in the report
 rather than absorbed, because the reader's facts were right and only the
 label boundary was at issue.
+
+**What the fresh review corrected, and what it did not.** Twenty of twenty
+dispositions it re-derived held, and none of the six findings moved a label. Four
+were in the hand-off sections, where they would have misled the wave that acts on
+them: a false staleness claim about the DFlash2 draft-logits record that had
+already reached an issue body (report §9.1, retracted, and #2668 corrected in the
+same change); an undercount of the `config/cache.py:111` citations that omitted
+the instance in product output; a reversed precedence gloss in §6.1, where
+upstream reads `block_size` first and this tree reads `dspark_block_size` first;
+and an over-scoped `ALREADY_SATISFIED` on `[77]`, which holds for the
+index-range defect the commit fixes and not for its NaN-selection side effect.
+One cell, `[46]`, argued from a missing symbol where a positive citation was
+available and stronger — this spec's own §2.4 standard, unmet in exactly one
+place. Three zero-hit lists left their `include/`+`src/` scope unstated.
+
+**The instrument rule, promoted from an incident to a rule.** §2.4's guard is now
+stated as: pair every zero with a positive control run through the SAME probe
+form. This wave produced one malformed probe (`grep -rniE "a\|b"`, where ERE
+reads `\|` as a literal pipe); the review of it produced two more with a
+different mechanism (an unquoted `--include=*.h` eaten by zsh globbing, silent at
+rc 0) and caught both by the control. The incident recurs; the control is what
+does not.
 
 **The finding worth carrying to the next tranche.** Reading the commit is not
 enough; read the TARGET HEAD. `[55]`'s commit deletes a DSpark refusal, and

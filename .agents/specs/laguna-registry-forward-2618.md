@@ -110,9 +110,13 @@ scripts/agent-preflight.sh
 
 ## Evidence
 
-Recorded in the pull request body: RED (signal + `ctest` line), GREEN (both
-doctest counts), each mutation with its rebuild rc and the restore sha256, and
-the reachability mutation (deleting the new call site).
+Recorded in the pull request body: RED (both doctest counts and the process
+signal), GREEN (both counts), each mutation with its rebuild rc and the restore
+sha256, and the reachability mutation (deleting the new call site).
+
+Six mutations were run, each rebuilt and each restored to sha256
+`965db05a0a699065d597266d3ff90916a8a5617a50deb0b66367cdc6a24459c9`. Five were
+detected. One (M5, zeroing `positions`) SURVIVED, and O3 below is why.
 
 ## Stop conditions
 
@@ -128,3 +132,13 @@ paged cache the registry cannot supply, because that is a different row.
 - O2. A real-checkpoint registry step. This row gates on the synthetic NVFP4
   fixture only, because it is the only forward-runnable Laguna fixture in the
   tree.
+- O3. That fixture is CONSTANT, and the row measured it rather than assuming it.
+  `BuildFiniteTensors()` through `LagunaForwardGguf` returns `0.0444346` for all
+  24 logits, unchanged by position (`{0,1,2}` vs `{0,0,0}` vs `{0,2000,4000}`,
+  maxdiff 0), unchanged by token id (`{1,3,2}` vs `{5,5,5}`, maxdiff 0), and
+  identical across rows. So no gate on this fixture can see a RoPE, causal-mask,
+  position-plumbing or embedding-gather defect, and the pre-existing
+  `finite + deterministic` run-gate holds trivially. Tracked by
+  [#2834](https://github.com/mudler/vllm.cpp/issues/2834). This is why M5's
+  wrong-`positions` mutation SURVIVED and is recorded as survived rather than
+  quietly dropped: the fixture, not the route, is what fails to detect it.

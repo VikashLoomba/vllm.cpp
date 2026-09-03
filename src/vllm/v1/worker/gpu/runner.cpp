@@ -2371,6 +2371,20 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // embeds the spliced ids instead of the (deliberately stale) host vector.
   const int32_t* device_input_ids = nullptr;
   if (async_input_combine_ && num_reqs > 0) {
+    // SPEC-DFLASH2 A2-1 made combine_sampled_and_draft_tokens draft-aware, but
+    // the buffer it scatters FROM is still owed: `pending_drafts_` is host-
+    // resident and per-request, and wave A2-3 (row SPEC-DFLASH2, #2644) is what
+    // turns it into the [num_req_states, k] draft_tokens buffer these calls
+    // would pass. Today the veto below at the `async_input_combine_`
+    // construction site keeps every speculative engine off this path, so
+    // step.num_draft_tokens is always 0 here and every call passes an empty
+    // draft buffer with an arange cu_num_logits. Refuse loudly rather than
+    // combine a verify step against a draft buffer that is not there, if that
+    // veto ever moves before A2-3 lands.
+    VT_CHECK(step.num_draft_tokens == 0,
+             "async input combine: this step scheduled draft tokens, but the "
+             "draft buffer the combine scatters from is not wired yet "
+             "(SPEC-DFLASH2 A2-3, #2644)");
 #ifdef VLLM_CPP_CUDA
     // W4 device-resident sampled tokens. Preferred whenever engaged
     // (async_device_mirror(): CUDA + VT_ASYNC_DEVICE_MIRROR, INTEGRATED OR
@@ -2407,9 +2421,14 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       stage_upload(*dev, dev->seq_lens, step.seq_lens.data(), num_reqs);
       stage_upload(*dev, dev->prefill_len, input_batch_.prefill_len.data(),
                    num_reqs);
+      // draft_tokens / cu_num_logits null: no draft buffer on the device yet
+      // (A2-3), and a null cu_num_logits is the arange the non-speculative path
+      // produces, which the VT_CHECK above has already established.
       vt::cuda::LaunchCombineSampledAndDraftTokens(
           queue_, dev->input_ids, /*idx_mapping=*/nullptr, dev->last_sampled,
-          dev->query_start_loc, dev->seq_lens, dev->prefill_len, num_reqs,
+          dev->query_start_loc, dev->seq_lens, dev->prefill_len,
+          /*draft_tokens=*/nullptr, /*draft_tokens_stride=*/0,
+          /*cu_num_logits=*/nullptr, num_reqs,
           /*num_new_sampled_tokens=*/1);
       device_input_ids = dev->input_ids;
     } else if (vllm::platforms::GetPlatform(queue_.device.type)
@@ -2427,10 +2446,15 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       // is_integrated_gpu() decouples a future discrete GPU (answers false → host
       // combine below, the right path there since its host arrays are not
       // device-addressable).
+      // draft_tokens / cu_num_logits null for the same reason as the mirror arm
+      // above: A2-3 owns the draft buffer, and null cu_num_logits is the arange
+      // this non-speculative path produces.
       vt::cuda::LaunchCombineSampledAndDraftTokens(
           queue_, step.input_token_ids.data(), /*idx_mapping=*/nullptr,
           input_batch_.last_sampled_tokens.data(), step.query_start_loc.data(),
-          step.seq_lens.data(), input_batch_.prefill_len.data(), num_reqs,
+          step.seq_lens.data(), input_batch_.prefill_len.data(),
+          /*draft_tokens=*/nullptr, /*draft_tokens_stride=*/0,
+          /*cu_num_logits=*/nullptr, num_reqs,
           /*num_new_sampled_tokens=*/1);
     } else
 #endif
@@ -2440,6 +2464,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       combine_sampled_and_draft_tokens(
           step.input_token_ids, idx_mapping, input_batch_.last_sampled_tokens,
           step.query_start_loc, step.seq_lens, input_batch_.prefill_len,
+          /*draft_tokens=*/{}, /*draft_tokens_stride=*/0, step.cu_num_logits,
           /*num_new_sampled_tokens=*/1);
     }
   }

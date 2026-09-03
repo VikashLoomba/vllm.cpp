@@ -1302,7 +1302,7 @@ __device__ inline void dq8_regs_3bits(uint32_t a, uint32_t b, int s2, FragB& f0,
   asm("bfe.u32 %0, %1, " #imm ", 16;" : "=r"(dst) : "r"(src))
 
 // The register form of `dq8_aligned_4bits` (exl3_gemv_kernel.cuh:86-100), which
-// is itself `exl3_dq.cuh:164-186` reading from shared memory. Same eight
+// is itself `exl3_dq.cuh:163-184` reading from shared memory. Same eight
 // codewords, from two already-loaded words.
 //
 // WHY THE 4-BIT WINDOW READ IS A DIFFERENT FUNCTION AND NOT A PARAMETER. At

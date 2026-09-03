@@ -454,7 +454,7 @@ funnel offset (`x_src_a`, `x_src_b`, `x_s2`, `:206-216`), and eight lanes of the
 warp carry nothing.
 
 `dq8_regs_4bits` is the register form of `dq8_aligned_4bits`
-(`exl3_dq.cuh:164-186`), and it needs two immediate-operand PTX forms this tree
+(`exl3_dq.cuh:163-184`), and it needs two immediate-operand PTX forms this tree
 did not carry: `shf.r.wrap.b32` and `bfe.u32` with a literal field offset
 (`ptx.cuh:314-315`). They are macros upstream and macros here, because the
 operand is an ASSEMBLER IMMEDIATE and no runtime argument or template non-type

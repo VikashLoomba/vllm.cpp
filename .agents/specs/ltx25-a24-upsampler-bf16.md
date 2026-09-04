@@ -60,6 +60,26 @@ is a gate requirement had no spec for one commit. Written down because the
 mechanism is not specific to this row and the symptom is a diffstat entry nobody
 reads.
 
+### The recorded reader anchors went stale INSIDE this pull request
+
+`ltx2_video.cpp` carries a READER ANCHORS list that `test_ltx2_video` derives and
+compares. The counters and loader comments this row adds shifted every one of the
+fourteen by 11 to 18 lines, and the case failed with both lists printed. Updated
+to the derived values. This is the fifth recorded instance in this tree of a line
+anchor going stale within the change that moved it, and the reason the case exists
+is that it is the only thing that notices.
+
+### The two ltx2 suites that are red, and only one is this row's
+
+`ctest -R ltx2` after the fix: **13 of 13 targets built, 12 passed**, and the one
+failure is `test_ltx2_video_device_forward`, which is
+[#2853](https://github.com/mudler/vllm.cpp/issues/2853) — **open, pre-existing,
+and wave 3's**. Its refusal string ("a bf16 decode was requested on device
+'xpu'") is present at `origin/main`, this branch touches no
+`ltx2_video_vae` file, and wave 3's spec already lists it under `## Owed`.
+Checked rather than assumed, because "a red that was already red" is exactly the
+claim a row should not be trusted to make about itself.
+
 ### What the port turned out to be
 
 **Bit-exact on every arm**, which §3.1 predicted it could not be. That section

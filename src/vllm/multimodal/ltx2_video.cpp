@@ -475,7 +475,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 605 607 1239 1335 1431 1447 1582 1586 1719 1797 1915 1957 1999 2001
+// 616 618 1250 1346 1442 1458 1593 1597 1730 1813 1931 1973 2015 2017
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,

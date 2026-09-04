@@ -726,9 +726,21 @@ Each rides in the pull request whose change makes it stale, per AGENTS.md.
   was created from. This spec is its owner; the pull request body says so.
 - [#2845](https://github.com/mudler/vllm.cpp/issues/2845) — the implementation.
   **Closed by the CPU arm.** What remains after it is listed under `## Now`:
-  ROCm and Vulkan chunked arms, G7's bf16 cross-device re-baseline, a CUDA gate
-  run for D0's changed f32 default, and re-deriving the control token sequence.
-  This spec owns each of them.
+  ROCm and Vulkan chunked arms, G7's bf16 cross-device re-baseline, and a CUDA
+  gate run for D0's changed f32 default. This spec owns each of them.
+- [#2858](https://github.com/mudler/vllm.cpp/issues/2858) — re-deriving the
+  control token sequence. **Done and closed by wave ARMTOKENS**; the result is
+  under `## Now` and in
+  [the evidence file](../../docs/bench-evidence/qwen4exp-gdn-chunked-token-ids-20260904.md).
+- [#2861](https://github.com/mudler/vllm.cpp/issues/2861) — `main` not compiling
+  with `-DVLLM_CPP_CUDA=ON`, this row's own regression. **Found and fixed in the
+  ARMTOKENS flow and closed by its pull request.** Listed here because AGENTS.md
+  asks an issue a change cites to name its owner, and this spec is that owner.
+- **The MoE prefill residue is now the DOMINANT CPU-vs-CUDA divergence**, not
+  merely a second source. ARMTOKENS measured `moe` at `2.289e-04` from an input
+  differing by `4.324e-05`, against PREFILLDIV's `1.269e-04` from `2.1e-05`.
+  Still named, still undiagnosed, still not this row — but it is what any future
+  work on these ids has to attack, because the Gated DeltaNet term is spent.
 - **GDN decode on the non-CUDA arms.** Out of scope above. vLLM does run decode
   sequentially, so the arms already mirror it, but nobody has measured that claim
   the way prefill has now been measured. No issue yet; file one before this row
@@ -944,11 +956,39 @@ Not done, and each is a gate rather than a nicety:
   still isolates chunk-count, varlen and GQA. **None of the twins has run on a
   GPU**, so their `3e-2` tolerance is inherited from the one bf16 rung that
   already existed at these shapes and is not measured.
-- **The control token sequence has not been re-derived.** It needs the 67.564 GiB
-  UD-IQ1_S artifact and a lease. Every line that presented it as a CURRENT
-  expectation is annotated rather than replaced (`docs/USAGE.md`,
-  `qwen4_exp_registry.cpp`, `qwen4-exp-qsa-q-bf16.md`), and `VT_GDN_CHUNKED=0`
-  is named as the way to reproduce it. The evidence files keep their numbers.
+- ~~**The control token sequence has not been re-derived.**~~ **DONE, wave
+  ARMTOKENS, 2026-09-04**
+  ([evidence](../../docs/bench-evidence/qwen4exp-gdn-chunked-token-ids-20260904.md),
+  [#2858](https://github.com/mudler/vllm.cpp/issues/2858)). **Neither sequence
+  moved.** On the released UD-IQ1_S artifact, production configuration, greedy,
+  `thor:gpu0`: `--device cpu` emits `11751 13 15767 411 2029 11 1092 369` and
+  `--device cuda` emits `11751 13 15767 411 1928 11 628 567`, both byte-identical
+  to PREFILLDIV's, still **5 of 8**. `VT_GDN_CHUNKED=0` emits the same eight ids
+  as the default, so the annotations naming it as the way to reproduce the old
+  sequence were correct but no longer load-bearing.
+  **The arm is not inert, and it was NOT enough to read the ids to know that.**
+  All three CPU arms agreeing left T4's exact ambiguity — a flag whose two arms
+  coincide, or an arm that is not reached — and no log line names the arm. The
+  committed `VT_Q4EXP_LAYER_FP` fingerprint settled it: `VT_GDN_CHUNKED` moves
+  `L00 blk` by `3.702e-04` from a bit-identical input, 26 of 42 taps differ, and
+  the CPU arm lands `1.772e-05` from CUDA where the sequential arm sat
+  `3.525e-04` away — **19.9x**, with `s.attn` 24.1x and `mhc.mix` 11.6x. The
+  CPU-sequential and CUDA `L00 blk` readings reproduce PREFILLDIV's to the
+  printed digit on a different tree, which is what makes this a re-measurement.
+  **What the row bought is a 20x reduction at the block and no id.** `out`
+  improves 1.23x only, because the MoE residue moved the other way
+  (`moe` 1.269e-04 -> 2.289e-04 from an input 11.6x closer). With the Gated
+  DeltaNet source closed, that residue is the whole-model divergence. Scope's
+  refusal to promise token agreement is vindicated in both directions: agreement
+  did not improve, and it did not degrade either.
+
+- **`main` did not compile with CUDA, and that is how this wave found out**
+  ([#2861](https://github.com/mudler/vllm.cpp/issues/2861), fixed in the same
+  flow). `f2bda11e3` left `vt::cuda::<unnamed>::ChunkedPrefillEnabled` with no
+  caller and `-Werror=all-warnings` rejects it (nvcc 177-D), so the first lease
+  spent 920 s and produced no arm. The bullet above about no CUDA gate having run
+  understated it: the CUDA arm of this row was **unbuildable**, not merely
+  ungated, from `73db7a8a3` until the fix.
 - **T2/G3 is partial.** The two dtype properties a caller can observe are gated
   (the output is bf16-representable on bf16 input; the state is f32 and not
   bf16-rounded). The nine INTERIOR placement sites are gated only in aggregate,

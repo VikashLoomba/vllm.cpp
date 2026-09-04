@@ -411,16 +411,92 @@ python3 scripts/check-pr-size.py --base origin/main --head HEAD
 
 ---
 
-## 9. Evidence
+## 9. Evidence, as MEASURED
 
-* The four probes of §4, with their scripts, their `separating` counts and the
-  rejected hypothesis printed beside upstream's answer in every table.
+Every figure below was run at this row's head. The mutations were applied to the
+worktree and the tree was restored byte-for-byte after each
+(`git status --porcelain | wc -l` = 0).
+
+### 9.1 The value gate is BIT-EXACT, which is not wave 3's shape
+
+`./build/tests/test_ltx2_vae -tc='*ENCODER*BF16*'` — 1 passed, **43 of 43
+assertions**:
+
+```text
+BF16 video encoder: 0 of 64 words differ, max|diff| = 0;
+  one-ulp sensitivity 0.0078125; the two upstream arms are 0.00980377 apart;
+  defect distances: f32 statistics 0.00390625, unrounded group mean 0.00390625
+bf16 encode values wider than bf16: 0 of 64
+```
+
+**The band shape wave 3 uses would have been a mute switch here, and the numbers
+say so rather than the prose.** Both defect distances (0.00390625) are BELOW the
+chain's one-ulp sensitivity (0.0078125), so any band wide enough to admit an
+honest port admits both defects. The case asserts that relation
+(`DefectStats < UlpSensitivity`, `DefectGroupMean < UlpSensitivity`) so it cannot
+quietly stop being true, and holds the port bit-exact instead — which is
+available because this fixture is three convolutions deep rather than thirteen.
+
+### 9.2 The red, entering through a production entry point
+
+With the arm implemented and the loader NOT yet wired:
+
+```text
+tests/vllm/multimodal/test_ltx2_video.cpp:7108: ERROR:
+  CHECK( trace.vae_encode_not_bf16 == 0 ) is NOT correct!
+  values: CHECK( 20 == 0 )
+  logged: pixels into the encode, wider than bf16: 15352 of 15360
+          VAE encode output, wider than bf16: 20 of 20
+```
+
+The input floor is `> n / 2` and the measured value is **15352 of 15360
+(99.95%)**, printed beside it. After wiring the loader: 1 passed, 7 of 7.
+
+### 9.3 The three mutations, with their literal results
+
+| mutation | `test_ltx2_vae` | `test_ltx2_video` |
+|---|---|---|
+| **delete the production call site** (the `kBF16` argument at `ltx2_video.cpp:1657`) | **55/55, 3570/3570 GREEN** | **RED**, `CHECK( 20 == 0 )` |
+| **the group mean carried in f32 across the add** | **RED**, `CHECK( 39 == 0 )`, max\|diff\| 0.00390625 | 115/115 GREEN |
+| **the per-channel statistics taken off the bf16 grid** | **RED**, `CHECK( 1 == 0 )`, max\|diff\| 0.000244141 | 115/115 GREEN |
+
+**The first row is the reachability proof and its GREEN half is the point.** The
+whole value suite stays green with nothing reaching the arm — 3570 assertions
+that measure a class and not a capability — and only the render-path case moves.
+That is what `.agents/reachability.md` asks a mutation to show.
+
+**The second and third rows are the complement.** The render-path counter stays
+green under both, because a wrong VALUE computed at the right WIDTH is still
+bf16-representable. Neither case can replace the other.
+
+Two notes on the mutations rather than around them. The first mutation deletes a
+line, so the derived READER ANCHORS case reds with it; that is the mutation's
+shape and not a second finding. The third mutation perturbs each statistic by one
+f32 ulp because the stream's own f32 value is not reachable from inside the
+function — it is therefore a **lower bound**, and the real defect is 16x larger:
+the generator measures it end to end against upstream at 0.00390625 and refuses
+to emit a zero.
+
+### 9.4 The generator caught its own author in this repository's named trap
+
+The first form of the f32-statistics defect read the buffers AFTER
+`.to(torch.bfloat16)` had narrowed them in place. Both hypotheses became the same
+tensor and the probe measured a defect of exactly **0**, which the generator's own
+`assert defect_stats > 0` refused to emit. It is the trap wave 3's implementer and
+BOTH its reviewers hit. The repaired probe captures the f32 buffers before any
+cast and additionally asserts they are OFF the bf16 grid, so a later change to
+`param_values` cannot mute the defect in silence.
+
+### 9.5 The rest
+
+* The four probes of §4, with their `separating` counts and the rejected
+  hypothesis printed beside upstream's answer in every table.
 * The oracle identity assertion of §2, run before any anchor was trusted.
-* §0's five `grep -c` measurements, which are the shape verdict and are re-run in
-  `## Gates` rather than remembered.
-* The literal red of the production dtype case before the arm exists, and its
-  green after.
-* The three mutations of §6 with their literal results.
+* §0's five `grep -c` measurements, re-run in `## Gates`.
+* **The regenerated goldens are a pure addition**: `git diff --stat` on
+  `tests/vllm/models/ltx2_vae_goldens.inc` is `48 ++++`, **0 deletions**. Every
+  previously committed golden reproduced byte-for-byte from the pinned checkout.
+
 
 ---
 
@@ -485,4 +561,6 @@ python3 scripts/check-pr-size.py --base origin/main --head HEAD
 
 ## Now
 
-`ACTIVE`. Spec committed before implementation.
+`ACTIVE`, reviewed pull request open. Spec commit `55a98935b` precedes the two
+implementation commits `4913a313e` and `e3a669949`, which is the commit order
+that proves it came first.

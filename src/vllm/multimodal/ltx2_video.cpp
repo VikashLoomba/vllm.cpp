@@ -536,6 +536,17 @@ int64_t CountWiderThanBf16(const std::vector<float>& values) {
   return n;
 }
 
+// The A24 wave 5 instrument, in ONE place so all three upsampler call sites
+// report the same thing. `latent.dtype` is the width `Ltx2LatentUpsample` took
+// off the weight bag and actually computed at, and the value scan is the half
+// that a correctly-set field over a wide computation cannot fool.
+void RecordUpsampleWidth(Ltx2ConditioningTrace& trace, const Ltx2LatentVolume& latent) {
+  ++trace.upsample_calls;
+  if (latent.dtype != vt::DType::kBF16) ++trace.upsample_wide_calls;
+  trace.upsample_not_bf16 += CountWiderThanBf16(latent.data);
+  trace.upsample_values += static_cast<int64_t>(latent.data.size());
+}
+
 double AbsMax(const std::vector<float>& values) {
   double m = 0.0;
   for (const float v : values) m = std::max(m, std::abs(static_cast<double>(v)));
@@ -1722,7 +1733,12 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     const SafetensorsFile f = SafetensorsFile::Open(upsampler_path);
     const nlohmann::json config = Ltx2ReadCheckpointConfig(f);
     im.upsampler_cfg = Ltx2ParseUpsamplerConfig(config);
-    im.upsampler_weights = Ltx2LoadVaeWeights(f);
+    // A24 wave 5 (#2857). Upstream resolves ONE model dtype (distilled.py:109)
+    // and hands it to the latent upsampler at :138-141, so the checkpoint is
+    // loaded at the width it is stored and RUN at, not widened to f32. The
+    // shipped spatial upsampler is 512 mid-channels of Conv3d weight, so the
+    // widening this removes is the whole point rather than a tidy-up.
+    im.upsampler_weights = Ltx2LoadVaeWeights(f, {}, vt::DType::kBF16);
     im.has_upsampler = true;
   }
 
@@ -1774,7 +1790,7 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
            "it is handed a 4-D tensor. The frame axis is gone by then, which is why no 2-D arm "
            "can upsample it.");
     }
-    im.temporal_upsampler_weights = Ltx2LoadVaeWeights(f);
+    im.temporal_upsampler_weights = Ltx2LoadVaeWeights(f, {}, vt::DType::kBF16);
     im.has_temporal_upsampler = true;
   }
 
@@ -3782,6 +3798,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
           im.upsampler_cfg, im.upsampler_weights, in,
           VaeStatsAsF32(im.video_weights, "per_channel_statistics.std-of-means"),
           VaeStatsAsF32(im.video_weights, "per_channel_statistics.mean-of-means"));
+      RecordUpsampleWidth(im.trace, up);
       if (up.channels != vshape.channels || up.frames != vshape.frames ||
           up.height != vshape.height || up.width != vshape.width) {
         Fail("the upsampled latent is " + std::to_string(up.channels) + "x" +
@@ -3809,6 +3826,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
             im.upsampler_cfg, im.upsampler_weights, slot_keyframes,
             VaeStatsAsF32(im.video_weights, "per_channel_statistics.std-of-means"),
             VaeStatsAsF32(im.video_weights, "per_channel_statistics.mean-of-means"));
+        RecordUpsampleWidth(im.trace, up_slots);
         if (up_slots.height != vshape.height || up_slots.width != vshape.width ||
             up_slots.channels != vshape.channels ||
             up_slots.frames != static_cast<int64_t>(slot_positions.size())) {
@@ -5326,6 +5344,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
           im.temporal_upsampler_cfg, im.temporal_upsampler_weights, before_round,
           VaeStatsAsF32(im.video_weights, "per_channel_statistics.std-of-means"),
           VaeStatsAsF32(im.video_weights, "per_channel_statistics.mean-of-means"));
+      RecordUpsampleWidth(im.trace, upsampled);
       ++im.trace.temporal_upsample_calls;
 
       // (:408) The canvas doubles as `2 * (frames - 1) + 1`, not as `2 * frames`.

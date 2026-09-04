@@ -106,10 +106,29 @@
 //    says, so neither refusal can drift into one upstream would serve.
 //
 // ─── DTYPE ───────────────────────────────────────────────────────────────────
-// f32, because this is the CPU REFERENCE arm and the gate compares the ALGORITHM
-// against upstream run in torch float32. Upstream runs the upsampler in the
-// pipeline's bfloat16 (distilled.py:109, 219), so the bf16 arm is owed by phase
-// L6 exactly as the VAEs' is.
+// TWO ARMS since A24 wave 5 (row LTX25-A24-UPSAMPLER-BF16, #2857), and the arm
+// is the WEIGHT BAG'S, never a caller's choice: `Ltx2VaeWeights` populates one
+// of its two maps and its `dtype` says which (ltx2_audio_vae.h:71-85).
+//
+//   bf16  Upstream's own model dtype. `distilled.py:109` resolves ONE dtype for
+//         the pipeline and `:138-141` hands it to the latent upsampler, so this
+//         is what a shipped checkpoint runs at and it is the DEFAULT the engine
+//         loads (multimodal/ltx2_video.cpp).
+//   f32   The CPU parity arm every committed golden was measured against, kept
+//         because the algorithm gate compares against upstream run in float32.
+//
+// The storage really is the width: `Volume` holds bytes at `dtype`, not an f32
+// buffer of narrowed values. Six rounding rules separate the two arms and each
+// was measured against the executed module rather than read off it -- the
+// GroupNorm affine's single rounding, the f32 epsilon, SiLU's single rounding,
+// the residual add that rounds BEFORE the activation, the blur kernel's
+// registered buffer, and `PerChannelStatistics`' narrowed buffers and two
+// roundings. .agents/specs/ltx25-a24-upsampler-bf16.md section 3 tabulates them
+// with the alternative each rejects and a separating count.
+//
+// The FP8 and NVFP4 arms are A22 and are refused by name. There is no CUDA arm:
+// this file has no queue and no `vt::` kernel seam, so a device arm is a
+// residency row and not a dtype row. Both are owed in the row's spec.
 #pragma once
 
 #include <cstdint>
@@ -117,6 +136,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/ltx2_audio_vae.h"  // Ltx2VaeWeights
+#include "vt/dtype.h"
 
 namespace vllm {
 
@@ -193,6 +213,13 @@ std::vector<Ltx2UpsamplerTensorSpec> EnumerateLtx2UpsamplerTensors(
     const Ltx2UpsamplerConfig& config);
 
 // A [batch, channels, frames, height, width] latent, row-major.
+//
+// `data` stays f32 because a latent is an INTERFACE value -- the same split
+// `Ltx2ConvVideoEncode` makes on its own return. `dtype` reports the width the
+// stage that produced it actually COMPUTED at, and it is not decoration: A24's
+// deliverable is a dtype, a token gate cannot see one, and this field is what a
+// production path reads to assert it. It is set by `Ltx2LatentUpsample` from the
+// weight bag's own arm and defaults to f32 on a latent nobody has upsampled.
 struct Ltx2LatentVolume {
   int64_t batch = 1;
   int64_t channels = 0;
@@ -200,6 +227,7 @@ struct Ltx2LatentVolume {
   int64_t height = 0;
   int64_t width = 0;
   std::vector<float> data;
+  vt::DType dtype = vt::DType::kF32;
 
   int64_t elems() const { return batch * channels * frames * height * width; }
 };

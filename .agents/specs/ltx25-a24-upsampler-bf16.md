@@ -183,8 +183,54 @@ upstream's bf16 forward:
 Three of the five arms are bit-exact even through the chain. The two that are not
 are the two whose post-upsample convolution is fed a re-shaped tensor, and their
 worst is 0.0078 against a nearest rejected rule at 0.0098 — **1.25x**. That is
-thin and it is reported as thin. It is also why the rules do not depend on this
-band: each has its own bit-exact case above.
+thin and it is reported as thin.
+
+### 3.2 The band above was measured on the WRONG parameter draw, and the shipped one is different
+
+§3.1's table came from a `torch.manual_seed` draw. The committed generator draws
+every parameter from a deterministic FNV-1a stream keyed by NAME, and re-measured
+on THAT draw the same table is materially worse: the `PixelShuffle` arm's correct
+chain sits at 0.00390625 and its `gn_bf16_eps` alternative sits at **exactly
+0.00390625**, so the arm separates that rule not at all. The `Dims2` arm
+separates **none of the four**.
+
+**The generator refused to emit rather than ship that**, which is what its refusal
+is for, and the refusal is quoted here because it is the load-bearing event of
+this section:
+
+```text
+ValueError: upsampler bf16 arm PixelShuffle: the correct chain is 0.00390625 from
+upstream and the nearest REJECTED rule is 0.00390625. No band can separate them,
+so this arm cannot gate its own rules and must not be emitted.
+```
+
+Two things follow, and both are in the shipped design:
+
+1. **Coverage is per RULE across arms, not per arm.** No single arm sees all
+   four, and requiring that of each was the wrong assertion. What must hold is
+   that every rule is separated by at least one arm, and the generator refuses
+   when it is not. Emitted coverage at the committed fixture: R4 by 5 arms of 6,
+   R5 by 3, R2 by 5, R3 by **2**.
+2. **`SmallVar` exists for R3 and its scale was swept, not chosen.** R3 needs a
+   small GroupNorm variance, and that is exactly the regime where the chain's
+   amplification is chaotic. Measured on the committed draw:
+
+   | latent scale | correct chain | nearest rejected | all four separate |
+   |---|---:|---:|---|
+   | 1.0 | 0.00390625 | 0.00390625 | no (R5, R3 invisible) |
+   | 0.2 | 0.00390625 | 0.00390625 | no (R4 invisible) |
+   | 0.05 | 0.00390625 | 0.017578125 | yes |
+   | **0.02** | **0.0** | **0.015625** | **yes** |
+   | 0.01 | 0.01171875 | 0.01171875 | no (R4 invisible) |
+   | 0.002 | 0.0 | 0.0126953125 | yes |
+
+   0.02 is the largest scale at which the chain is **bit-exact** and all four
+   rules separate. Neighbouring scales failing is not a fragility that can ship:
+   the generator refuses an arm whose rules do not separate, so a pin that moved
+   this reds at generation instead of quietly widening a band.
+
+The rules do not, in the end, depend on a thin band anywhere: `SmallVar` gates all
+four from a bit-exact chain, and `Temporal` gates all four independently.
 
 **The first version of this table was a mute switch and the second is not.** Run
 with `LatentUpsampler`'s default GroupNorm initialisation — `weight = 1`,

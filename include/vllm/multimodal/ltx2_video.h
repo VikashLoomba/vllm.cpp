@@ -740,6 +740,29 @@ struct Ltx2ConditioningTrace {
   // the render's.
   int64_t vae_encode_not_bf16 = 0, vae_encode_values = 0;
   int64_t vae_encode_in_not_bf16 = 0, vae_encode_in_values = 0;
+  // ── the LATENT UPSAMPLER's width (A24 wave 5, row LTX25-A24-UPSAMPLER-BF16,
+  //    issue #2857) ────────────────────────────────────────────────────────
+  //
+  // A24's deliverable is a DTYPE, and no token gate can see one: the clip is
+  // identical whether the upsampler computed at bf16 or at twice the bytes.
+  // These are what a production path reads instead.
+  //
+  // TWO INSTRUMENTS, because either alone is a mute switch. `upsample_wide_calls`
+  // counts the calls whose returned latent REPORTS a width other than bf16 --
+  // the arm the weight bag selected, read back off the result. It answers "did
+  // the narrow path run" and it cannot answer "did anything run at all", which
+  // is why `upsample_calls` is beside it: a build that stops calling the
+  // upsampler drives the first counter to zero and looks perfect.
+  //
+  // `upsample_not_bf16` is the VALUE-level half: how many elements of the
+  // upsampled latent carry bits bf16 cannot hold. It is the one that survives a
+  // `dtype` field that is set correctly and computed wide, because the values
+  // would then still be f32-wide. Summed over all three production call sites --
+  // the video latent, the generated keyframe slots and DFR's temporal rounds --
+  // because a counter taken at one would report that site's width as the
+  // render's.
+  int64_t upsample_calls = 0, upsample_wide_calls = 0;
+  int64_t upsample_not_bf16 = 0, upsample_values = 0;
   // ── the IMAGE conditioning (row LTX25-IMAGE-COND, issue #644) ────────────
   //
   // Zero everywhere when the request carried no image. `image_tokens` is how

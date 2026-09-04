@@ -7197,6 +7197,14 @@ the tree was rebuilt and both binaries hashed again:
 `99485ce5ca1ceff1600f31029349fb9af7abd5125bc0a4b0233508c911e2d887`, identical to
 the green row, with both suites at 24 / 4014 and 28 / 16385.
 
+**RE-MEASURED AFTER MERGING `origin/main` `73db7a8a3`, because a merge can
+falsify prose the code still supports.** Both binaries moved — main brought other
+changes into `libvllm.a` — and both suites are green at the same counts:
+`test_dots3_note_audio` `e034b19f…` 24 / 4014, and
+`test_openai_api_server_dots3_mm_forward` `3fd8caced…` 28 / 16385. The mutation
+sweep above ran on the PRE-merge binaries, which is why its baseline row names
+`5c583c69…` / `99485ce5…` and not these.
+
 **`test_parakeet_audio_processor` is untouched and stays 6 / 41054.** Parakeet's
 rate refusal is upstream-faithful — `feature_extraction_parakeet.py` raises
 rather than resampling — and neither finding reaches it.

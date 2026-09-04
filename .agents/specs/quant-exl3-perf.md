@@ -39,14 +39,23 @@ Both are gated in `tests/vt/test_exl3_gemv.cpp` and derived in full under
 2. **What bits 4 buys is LOWER THRESHOLDS, not a second admitting branch.** Its
    270 modules spread over SIX values of `n` where the bits-3 137 have two, so
    the admission ladder is 32, 160, 192, 320, 384, 544 instead of 160 and 544.
-   At `narrow_coresident = 160` the arm set reaches **164 of 409** modules,
-   against 45 for slice A alone; at 32 it reaches 34, against 0.
+
+3. **AND THE OCCUPANCY IS NOW MEASURED, WHICH SETTLES BOTH.** GB10 reports
+   `SM_COUNT=48 MAX_THREADS_PER_SM=1536`, so the narrow config's 512-thread
+   blocks ceiling `narrow_coresident` at `floor(1536/512) * 48 = **144**`. Every
+   threshold above 144 declines. **34 of 409 modules are admitted — 0.75% of the
+   trellis BYTES** — and the measured decode A/B is a null at 1.3% spread with
+   `nsys` showing the arm never launches at the default. An earlier draft of
+   this section claimed "164 of 409 at `narrow_coresident = 160`"; 160 is not
+   reachable on this hardware and that claim is superseded by
+   `## THE REASSESSMENT`.
 
 So the row's open question is no longer "does an arm exist for these tensors" --
-after slice B one exists for 407 of 409, the same 407 upstream takes. It is
-"does the envelope admit them on GB10", and that is one unmeasured occupancy
-number. `docs/benchmarks/qwen38-27b-exl3-gb10.md` carries the same distinction
-on `main` as of `f8efa5761`.
+after slice B one exists for 407 of 409, the same 407 upstream takes -- nor even
+"does the envelope admit them", which is now measured as almost never on GB10.
+It is whether this arm set is worth its compile cost on a device whose
+`MAX_THREADS_PER_SM` ceilings it out. `docs/benchmarks/qwen38-27b-exl3-gb10.md`
+carries the same distinction on `main` as of `f8efa5761`.
 
 ### SLICE A, host arm, executed 2026-09-03 on `mudler-ubuntu-box`
 
@@ -190,7 +199,14 @@ narrow_coresident = blocks_per_sm * sm_count
 | GB10, if 1536 / 48 | 1536 | 48 | 144 | CANNOT | CANNOT |
 | GB10, if 2048 / 48 | 2048 | 48 | 192 | **CANNOT** | can |
 
-**This is a PREDICTION, recorded before the `dgx:gpu0` job runs**, so it can be
+**CONFIRMED 2026-09-03.** GB10 measured `SM_COUNT=48 MAX_THREADS_PER_SM=1536`,
+so the ceiling is `floor(1536/512) * 48 = 144`, and BOTH bits-3 shapes decline —
+including the `n = 5120` one this table guessed "can" at 192. The row of this
+table that was right is the mechanism; the row that was wrong is the guess about
+GB10's threads per SM, which turned out to be 1536 and not 2048. See
+`## Device throughput — SLICE A, MEASURED` and `## THE REASSESSMENT`.
+
+**This was a PREDICTION, recorded before the `dgx:gpu0` job ran**, so it could be
 falsified rather than fitted afterwards. The `n = 17408` shape — 92 of the 137
 bits-3 modules, every `mlp.gate_proj` and `mlp.up_proj` — needs 544, which needs
 roughly 136 SMs at 4 blocks each. No part in this fleet is close. So at mode 1
@@ -295,103 +311,217 @@ and `1` would have been attributed by assumed loop order, which is how three
 measured values were once rotated across three axes in this repository. The
 field is `std::string`, and the probe above is why rather than a precaution.
 
-### SLICE B, device arm — PENDING on `thor:gpu0`
+### SLICE B, device arm — `thor:gpu0`, executed 2026-09-03. GREEN.
 
-Submitted 2026-09-03 under an `rc` lease, queued behind two other jobs on that
-device. Pinned to `git bundle` sha256
-`b1cf294a2c563376a117ee28cecf1922291dc91c3b89be0e1121f5a454243bcb`, commit
-`b1bad1a5a`, and the job aborts unless `git rev-parse HEAD` inside the clone
-matches. Nothing is pushed to reach the box. The harness is
-`/workspace/exl342-thor/run.sh`.
+NVIDIA Thor, compute capability **11.0**, driver **595.78**, nvcc 13.0, built
+`sm_110` from the pinned bundle `c67a…`/`b1cf294a2…` at commit `b1bad1a5a`.
+`BUILD_RC=0`, so **the ported bits-4 kernel COMPILES** — its first build
+anywhere. `SM_COUNT=20 MAX_THREADS_PER_SM=1536 REGS_PER_SM=65536
+SMEM_PER_SM=233472`.
 
-**Which tree slice B's evidence is measured on, said before it drifts.** Slice A
-recorded a claim of this shape and a later `origin/main` merge falsified it, so
-this one is written narrowly on purpose: `b1bad1a5a` is the LAST commit of this
-branch that touches `src/`, `include/` or `tests/`. Anything after it edits this
-spec, this row's claim and the public documents, and nothing else. Re-derive
-that with
-`git diff --stat b1bad1a5a..HEAD -- src include tests CMakeLists.txt` before
-quoting any number below; a non-empty output means the evidence names a
-different tree than the head does, and the lease must be re-pinned and re-run
-rather than the sentence re-worded.
-
-**No claim about the ported kernel is made until it runs.** What it will
-produce, cheapest first: the tree facts, the sm_110 build, the four-leg tier-3c
-gate with its skip count, the same binary re-run with `VT_EXL3_GEMV_SMEM=1`
-because `Exl3GemvSmemMode()` caches its `getenv` in a function-local static,
-`SM_COUNT` and `MAX_THREADS_PER_SM`, then six mutations behind a clock:
-
-| Mutation | what it removes | expected |
-|---|---|---|
-| M1 `(4,2)` out of the predicate | the arm itself; the pre-slice-B product exactly | RED, and a THROW rather than a failed assertion, so only the rc sees it |
-| M2 `GemvKernelForArm<4, 2>` → `<4, 1>` | the confusable codebook, at the new width | RED on tier 3c and on the sibling-reference check |
-| M3 the 24-lane guard applied at bits 4 | a quarter of every bits-4 tile | RED on the bits-4 legs only |
-| M4 the bits-4 window pair reversed | the funnel order across the word boundary | RED on the bits-4 legs only |
-| M5 `LSTRIDE` back to the literal 24 | the stride the whole port turns on | a COMPILE error naming `LSTRIDE == TWORDS`; read the first error line, because a build failure is otherwise a VOID mutation and not a result |
-| M6 the `Exl3GemvTryLaunch` call site | the DEFAULT-mode route to the arm | the forced legs stay GREEN and the unforced one REDS; a green here would mean the suite measures a class and not a capability |
-
-### Device throughput — SLICE B, PENDING on `dgx:gpu0`
-
-Submitted 2026-09-03 at queue position 11 behind a job that had already run for
-ten hours. **It will not have run when this row is reported, and no throughput
-number is claimed for `(4, 2)` anywhere.** Pinned to tarball sha256
-`ca6c50419bec8c2af8e391d3010bde8c29f5062a37b90a0fc6ccc378eececd44`, commit
-`b1bad1a5a`; harness `/workspace/exl342-dgx/job.sh`, adapted from slice A's with
-the tree facts and the two `(4, 2)` mutations replaced.
-
-Read `SM_COUNT` and `MAX_THREADS_PER_SM` from section F BEFORE any tok/s number.
-If they put `narrow_coresident` below 32, no module of the checkpoint is
-admitted at either width and `G1 == G0` is the predicted reading rather than a
-result about the kernel. Between 32 and 160 it is 34 modules of 409. The
-nsys leg is what separates "the arm ran and did not help" from "the arm never
-ran", and a speed ratio taken without it is the 8%-from-nothing failure again.
-
-### Device throughput — SLICE A, PENDING, and how to collect it
-
-Queued on `dgx:gpu0`. **No throughput number is claimed anywhere until it runs**,
-and none appears in `docs/FEATURES.md` or `docs/USAGE.md` either.
-
-```sh
-rc ps                                     # find the exl3perf-2570 job id
-rc logs <job-id> | grep '^RESULT'         # the whole evidence stream
+```
+GATE[default] RC=0        test cases: 7 | 7 passed   assertions: 184 | 184 passed | 0 failed
+device case SKIPPED count: 0        <- the device arm RAN
+(3,1) narrow  rel RMS 5.16027e-04  worst 0.125    vs cb 2 reference: 1.29746
+(3,2) narrow  rel RMS 5.27980e-04  worst 0.125    vs cb 1 reference: 1.60119
+(4,2) narrow  rel RMS 5.09719e-04  worst 0.0625   vs cb 1 reference: 1.59095
+(4,2) wide    rel RMS 4.54155e-04  worst 0.0625   vs cb 1 reference: 1.60119
+(3,1) vs (3,2) differ in 4095 of 4096 outputs
+GATE[smem=1]  RC=0, identical numbers        <- the SMEM_STAGE arm too
 ```
 
-Results also land under `/workspace/exl3perf-2570/out/` (`/mnt/nas_share/rc/…`
-from the devbox), but that mount LAGS — `rc logs` is the authoritative read and
-the CIFS copy has been minutes behind it in this campaign. A flat `rc logs` tail
-is not evidence of a stalled job either: compare byte counts across two samples
-before concluding anything, because the endpoint serves cached content.
+**The new arm is the most accurate of the four**, at `4.5e-4`–`5.1e-4` against
+the tier-3c bound of `6.0e-3`, an order of magnitude inside it, and its worst
+elementwise error is HALF the bits-3 arms' — which is what a wider codeword
+should do. The bound was not touched. The two pre-existing arms report exactly
+the numbers slice A recorded, so the port disturbed neither.
 
-The job is pinned to tarball
-`sha256 c133a4cbba670dbef6c6daebf4c0e130824519f317af221eaff7ebb1e9e9c5dd`
-(commit `665167c4a`) and aborts rather than build anything else. The five files
-this row's measurements depend on are byte-identical between that commit and the
-merged head; other paths have moved under it since (see "Which tree the device
-evidence is measured on").
+`rel_sib` is the discrimination check: every arm sits ~1.3–1.6 relative RMS away
+from the SAME width decoded with the other codebook, against `> 0.6` required.
+That is the check that generalises to `(4, 2)`, whose confusable partner
+`(4, 1)` is deliberately not compiled.
 
-The harness itself is `/workspace/exl3perf-2570/job.sh`,
-`sha256 81e2de48268fd9e69cdc7144fcd0162149c1ca05bf6dff3d081d3afa195268ef` —
-named because a measurement is only reproducible if the script that took it is
-identifiable, and this one runs unattended. It carries one class of repair worth
-knowing about when reading or reusing it. The script sets only `set -u`, but its
-first `set +e` / `set -e` pair leaves **errexit ON** for everything after it, and
-`hb` is a shell FUNCTION: `hb ...; RC=$?` therefore kills the job on a non-zero
-return before `$?` can be read. A failed build, a failed model stage or a
-mutation that does not compile would have ended the run silently instead of
-reporting the abort it was written to report. Every rc is now taken with
-`|| RC=$?` or inside an explicit `set +e` block.
+**REACHED UNFORCED, all three narrow arms**: `4096 of 4096 outputs byte-equal to
+the forced launch`, with `force_gemv` left at its `-1` default. The arm is on the
+production path, not only on the test's.
 
-What it produces, in order, cheapest evidence first so a crash on this box costs
-the least: the tree facts, the build, the device numeric gate, `SM_COUNT` and
-`MAX_THREADS_PER_SM` (which settle the prediction above), the interleaved A/B,
-an `nsys --cuda-graph-trace=node` check of whether `exl3_gemv_kernel` actually
-appears, and finally the M1/M2/M3 mutations behind a 180-minute deadline.
+### Mutation table — slice B, device arm, `thor:gpu0`
 
-**Read the envelope verdict BEFORE any tok/s number.** If `SM_COUNT` and
-`MAX_THREADS_PER_SM` put `narrow_coresident` below 544 and 160, then `G1 == G0`
-is the predicted result and the A/B has measured an envelope decline rather than
-a kernel. Quoting a speed ratio from those legs would be measuring the same path
-twice, which is the mistake this row was written to avoid.
+| Mutation | sha256 | built | mtime moved | `TEST_RC` | verdict | restored |
+|---|---|---|---|---|---|---|
+| baseline | — | OK | — | 0 | 184/184, 0 skipped | — |
+| M1 `(4,2)` out of the predicate | `02f7154bd7c3…` | OK | YES | 1 | **RED** — and it THREW | YES |
+| M2 `GemvKernelForArm<4, 2>` → `<4, 1>` | `c599b7883aa4…` | OK | YES | 1 | **RED**, 6 failed | YES |
+| M3 24-lane guard applied at bits 4 | `5417211c13ea…` | OK | YES | 1 | **RED**, 4 failed | YES |
+| M4 bits-4 window pair reversed | `96792eff7ff1…` | OK | YES | 1 | **RED**, 4 failed | YES |
+| M5 `LSTRIDE` back to literal 24 | `8674798a3bec…` | **compile error** | — | — | **CAUGHT BY `static_assert`** | YES |
+| M6 production call site deleted | `69d81746e773…` | OK | YES | 1 | **RED**, exactly 3 failed | YES |
+| after restore | matches baseline | OK | — | 0 | 184/184, 0 failed | — |
+
+Every expectation in this table was WRITTEN DOWN BEFORE THE RUN, in this file,
+and each is what happened.
+
+**M1 is the doctest trap caught again.** Its summary reads
+`assertions: 171 | 171 passed | 0 failed` — a clean sweep — while `TEST_RC=1`,
+because the case did not fail an assertion, it THREW:
+`exl3_gemm was asked to force the m<=8 GEMV arm (force_gemv=1) but the call is
+not hard-eligible for it: m=1 k=2048 n=4096 bits=4`. Reading the assertions line
+would have recorded M1 as green.
+
+**M5 failed to COMPILE, and that is the stronger result, not a void mutation.**
+The first error is
+`cuda_exl3.cu(1385): error: static assertion failed with "exl3 gemv: one warp
+load must cover one tile"` — the invariant slice B added, naming itself. A wrong
+`LSTRIDE` cannot reach a test run.
+
+**M6 IS THE REACHABILITY PROOF, and its shape is the evidence.** Deleting the
+`Exl3GemvTryLaunch` call site reds **exactly three** assertions, and all three
+are `CHECK( same == got.size() )` — the unforced legs, one per narrow arm. Every
+forced assertion stayed GREEN. So the suite distinguishes "the kernel works"
+from "anything reaches it", which is what a gate that only forced the arm could
+never do.
+
+### Device throughput — SLICE A, MEASURED on `dgx:gpu0` 2026-09-03: a NULL, with the envelope declining rather than the kernel failing to help
+
+NVIDIA **GB10**, cc **12.1**, driver **580.173.02**, `sm_121a`, commit
+`665167c4a`. Real HumanEval, ShareGPT-shaped, `num_prompts=32 output_len=128
+temperature=0.6 seed=0 concurrency=1`, `VT_DFLASH_PAGED=0` on every leg alike.
+Axis is `Mean per-stream decode rate`, decode only. Three rounds INTERLEAVED on
+ONE binary.
+
+| leg | round 1 | round 2 | round 3 | mean |
+|---|---|---|---|---|
+| `VT_EXL3_GEMV=0` (arm off) | 17.20 | 17.18 | 17.09 | 17.157 |
+| `VT_EXL3_GEMV=1` (default, the only production claim) | 17.22 | 17.12 | 17.09 | 17.143 |
+| `VT_EXL3_GEMV=2` (diagnostic, never a production number) | 17.02 | 17.05 | 16.99 | 17.020 |
+
+**G1 == G0 to 0.08%.** Total spread across all nine legs is 1.3%. There is no
+separation between the arms.
+
+**THE PREDICTION THIS ROW REGISTERED BEFORE THE RUN IS CONFIRMED.**
+`## THE OCCUPANCY TERM HAS A CEILING` predicted
+`narrow_coresident <= floor(max_threads_per_sm / 512) * sm_count` and said the
+dgx job's `SM_COUNT` and `MAX_THREADS_PER_SM` would settle it. Measured:
+`SM_COUNT=48 MAX_THREADS_PER_SM=1536`, so the ceiling is
+`floor(1536/512) * 48 = 3 * 48 = **144**`. Against the **160** and **544** this
+checkpoint's two bits-3 shapes need, **both decline** — including the
+`down_proj` shape at 160 that the prediction table listed as the one that might
+be admitted. It is not. **No bits-3 module of this artifact takes the arm on
+GB10.**
+
+**nsys separates a decline from an ineffective kernel, which is the whole reason
+that leg exists:**
+
+```
+mode=0   exl3_gemv_kernel rows = 0    exl3_gemm_kernel rows = 7
+mode=1   exl3_gemv_kernel rows = 0    exl3_gemm_kernel rows = 7
+mode=2   exl3_gemv_kernel rows = 4    exl3_gemm_kernel rows = 5
+         exl3_gemv_kernel<(int)3, (bool)1, (int)2, (int)0, (int)1, (bool)0>
+```
+
+At the default the GEMV **never launches**. Forced, it launches and decodes
+correctly — the template arguments read `bits=3, c_fp32=true, cb=2, MMODE=0,
+CFG=1, SMEM_STAGE=false`, so it is the `(3, 2)` arm, in the WIDE config, which
+is what mode 2 selects for the `n = 17408` shape. So `G1 == G0` is this row's
+table and not a mystery, and the arm is DECLINED rather than ineffective. Those
+are different findings and only the trace separates them.
+
+**A NULL IS THE RESULT, AND IT IS NOT A CEILING.** The instantiation is correct,
+upstream-faithful, device-gated at tier 3c on two boxes, and worth zero end to
+end on GB10 — because upstream's own envelope, ported verbatim, declines every
+shape this checkpoint has at this occupancy.
+
+Read `G2` with care and do not quote it as a production number: it is
+consistently the slowest leg, in all three rounds (17.02 < 17.20, 17.05 < 17.18,
+16.99 < 17.09). Three of three in one direction is `p = 0.125` under a sign
+test, so it is NOT evidence, and the effect is inside the 1.3% spread. It is at
+most a weak hint that the GEMV would not have won on these shapes anyway, which
+is exactly what upstream's envelope asserts by declining them.
+
+**ONE LEG IS UNMEASURED AND IS NOT REPORTED AS A NULL.** The job printed
+`DRAFT LEGS SKIPPED: draft absent at /tmp/q38bench/draft or past the time guard.
+The m == 8 end of the envelope is therefore UNMEASURED, not measured-as-null.`
+Every number above is `m == 1`, `MMODE == 0`. The speculative-decode arm drives
+`m` up to 8 and takes `MMODE == 1` with row-guarded fragment loads — a different
+compiled kernel and a different point on the envelope. Nothing here measures it.
+
+### Device throughput for `(4, 2)` — NOT MEASURED, and see the reassessment
+
+Queued on `dgx:gpu0` behind other work and did not run. **No throughput number
+is claimed for `(4, 2)`.** The reassessment below says what the slice A
+measurement already implies about it, which is a different thing from a
+measurement of it.
+
+
+## THE REASSESSMENT: what `narrow_coresident = 144` does to `(4, 2)`
+
+**This section restates a number this row previously published, because the
+measurement moved it by a factor of forty.** `## THE WIDE CONFIG IS NOT THE
+ESCAPE` said the bits-4 ladder reaches "164 of 409 modules at
+`narrow_coresident = 160`". **160 IS NOT REACHABLE ON GB10.** The measured
+ceiling is 144, so that sentence describes a device this fleet does not have.
+
+The admission rule is `size_n / 32 <= narrow_coresident`, and on GB10
+`narrow_coresident = blocks_per_sm * 48` with `blocks_per_sm <= 3`:
+
+| `blocks_per_sm` | `narrow_coresident` | largest admitted `n` |
+|---:|---:|---:|
+| 1 | 48 | 1536 |
+| 2 | 96 | 3072 |
+| 3 (the ceiling) | 144 | 4608 |
+
+**The verdict is the same across that whole range**, which is what makes it
+robust rather than a knife edge: the only shape in the checkpoint with
+`n <= 4608` is `n = 1024`, and it is admitted even at one block per SM
+(`48 >= 32`); the next rung up is `n = 5120` at 160, which even three blocks per
+SM cannot reach. So `blocks_per_sm` need not be measured directly to settle
+this, and the empty `GEMV RES-USAGE` line in the dgx log costs nothing.
+
+| | modules | share of modules | share of trellis BYTES |
+|---|---:|---:|---:|
+| admitted at `nc = 144` (MEASURED) | **34 of 409** | 8.3% | **0.75%** |
+| admitted at `nc = 160` (this row's earlier claim) | 164 of 409 | 40.1% | 29.8% |
+
+The byte column is the one that decides it, because decode at `m == 1` is
+weight-bandwidth-bound and the 34 admitted modules are the SMALLEST in the
+artifact: `k = 5120, n = 1024`, 2.6 MB each against 33–45 MB for the projections
+that dominate. 34 of them is 89 MB of an 11.0 GiB trellis.
+
+**So on GB10, `(4, 2)` moves 0.75% of the weight traffic to a different kernel,
+and the measurement that would detect it has a 1.3% spread.** It cannot show. A
+throughput case for landing `(4, 2)` on this hardware does not exist, and this
+row will not manufacture one by running the A/B until a favourable draw appears.
+
+**What that does and does not mean:**
+
+- It is NOT a reason to call the port wrong. It is device-gated GREEN on Thor at
+  `4.5e-4`–`5.1e-4` against a `6.0e-3` bound in both configs and both smem
+  modes, it is upstream-faithful line for line, its production route is proven
+  by M6, and six mutations red exactly as pre-registered.
+- It is NOT a ceiling claim. The binding term is `MAX_THREADS_PER_SM = 1536`
+  against a 512-thread block. A Blackwell part at 2048 threads/SM reaches
+  `4 * 48 = 192`, which admits `n <= 6144` — 167 bits-4 modules and 45 bits-3
+  ones, 212 of 409. The arm set is not useless; GB10 is the wrong device for it.
+- The next traceable hypothesis is therefore the BLOCK SIZE, not the kernel and
+  not the width. `narrow_coresident` is ceilinged by `floor(1536/512) = 3`
+  purely because CFG 0 launches 512 threads. Upstream's CFG 1 launches 256 and
+  would ceiling at 6, but its admission band needs `size_k <= 4096` and this
+  checkpoint's smallest 4-bit `k` is 5120, so it is unreachable here — that is
+  slice B's first finding, and it is what closes the easy escape. Whether a
+  256-thread NARROW variant is admissible is an upstream question this row has
+  not asked, and inventing one would be a structure upstream does not have.
+- **`m == 8` is still unmeasured.** The draft legs did not run. Everything above
+  is `m == 1` / `MMODE == 0`, and the speculative arm compiles a different
+  kernel at a different point on the envelope.
+
+**RECOMMENDATION, stated plainly because the coordinator has to decide it.**
+Land `(4, 2)` for coverage and correctness, or do not land it, on the cost of 16
+more kernels in a fat build for ten architectures — but do not land it for
+throughput on GB10, and do not let any record imply that it buys any. The
+measured position is 0.75% of weight bytes under a 1.3% spread. If the answer
+is "not worth the compile cost today", that is a defensible reading of this
+table and the arm should be recorded as ported-and-parked with this section as
+the reason, not quietly dropped.
 
 ## Owed`, itemised, with the reason it is not closed here.
 
@@ -994,17 +1124,27 @@ A CPU-only green is not a device result and is never reported as one. A doctest
   either codebook, and 16 unreachable kernels each in a translation unit the fat
   build compiles for ten architectures is the `(3, 0)` mistake this row's own
   comment block records. Owed with the artifact that needs them.
-- **The envelope may decline most of this checkpoint's shapes at mode 1 on
-  GB10, at BOTH widths.** Slice B's finding is that the wide config is not the
-  escape it was predicted to be: its band needs `size_k <= 4096` and this
-  artifact's smallest 4-bit `k` is 5120, so every one of the 409 modules rests
-  on the same `size_n / 32 <= narrow_coresident` test. What bits 4 changes is
-  the thresholds — 32, 160, 192, 320, 384, 544 across six values of `n`, against
-  the bits-3 shapes' 160 and 544. If the measurement then reads zero, the
-  instantiation is still correct and upstream-faithful and worth nothing on this
-  device, and the next traceable hypothesis is the occupancy of the narrow
-  config itself, which is the only device-supplied term in the admission test.
-  That is a measurement, not a ceiling.
+- **MEASURED, and no longer owed: the envelope DOES decline almost every shape
+  on GB10, at both widths.** `narrow_coresident` ceilings at 144
+  (`SM_COUNT=48`, `MAX_THREADS_PER_SM=1536`, 512-thread blocks), so 34 of 409
+  modules are admitted — 0.75% of the trellis bytes — and the decode A/B is a
+  null at 1.3% spread with `nsys` confirming the arm never launches at the
+  default. What remains owed is the DECISION this creates, not the measurement:
+  see `## THE REASSESSMENT`.
+
+- **`(4, 2)`'s own throughput leg on `dgx:gpu0`.** Queued and did not run. It is
+  owed, and the reassessment says what to expect from it rather than standing in
+  for it: at 0.75% of weight bytes under a 1.3% spread it cannot resolve, so
+  running it would produce a null that means nothing new. The measurement that
+  WOULD be worth taking is on a part with `MAX_THREADS_PER_SM >= 2048`, where
+  the same arm set admits 212 of 409 modules.
+
+- **`m == 8` / `MMODE == 1` is UNMEASURED at every width.** The dgx job's draft
+  legs were skipped and said so rather than reporting a null. Every throughput
+  number this row holds is `m == 1`. The speculative-decode arm compiles a
+  different kernel with row-guarded fragment loads and sits at a different point
+  on the envelope; nothing here touches it.
+
 - **The fused MoE arm is `(3, 1)` only** (`kMoeBits`/`kMoeCb` in
   `cuda_exl3.cu`), and it is CUDA-only. The #2495 checkpoint is dense so nothing
   here reaches it, and it is named so the next MoE EXL3 artifact does not

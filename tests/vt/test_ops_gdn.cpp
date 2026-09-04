@@ -2268,6 +2268,24 @@ GdnDiffStats RunGdnChunkedVsSequentialOnQueue(Backend& gpu, Queue& queue,
   CheckClose(st_chunk, st_seq, atol, rtol);
   const auto [output_max, output_mean] = AbsoluteDiffStats(out_chunk_f, out_seq_f);
   const auto [state_max, state_mean] = AbsoluteDiffStats(st_chunk, st_seq);
+  // KERNEL-GDN-CHUNKED-MIRROR: THIS A/B MUST ACTUALLY BE AN A/B.
+  //
+  // `run("0")` and `run("1")` differ only through VT_GDN_CHUNKED, so if the two
+  // legs come back identical the case has compared one arm with itself and
+  // every tolerance above passes vacuously. That is not hypothetical: D0 added
+  // a dtype term to the predicate, and at f32 BOTH toggles now take the
+  // sequential recurrence, because vLLM has no f32 chunked kernel on either of
+  // its implementations. The same guard is asserted on the CPU A/B (T4), and it
+  // belongs here for the same reason.
+  //
+  // So the assertion is conditional on the arms being ABLE to differ, and it is
+  // the predicate itself that decides -- not a hardcoded dtype list that could
+  // drift away from it.
+  if (vt::GdnUseChunkedPrefill(cb.in)) {
+    INFO("VT_GDN_CHUNKED=0 and =1 produced identical output: the flag is being "
+         "read and ignored, or both legs took the same arm");
+    CHECK(output_max > 0.0);
+  }
   return GdnDiffStats{output_max, output_mean, state_max, state_mean};
 }
 
@@ -3822,16 +3840,35 @@ TEST_CASE("CUDA gdn prefill chunked matches sequential (2+ chunks, partial tail)
   const Combo bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
   // Isolation ladder: single partial chunk (intra only), one exact chunk, two
   // chunks (first cross-chunk state pass), then the partial-tail cases.
+  // KERNEL-GDN-CHUNKED-MIRROR: THESE f32 RUNGS NO LONGER COMPARE TWO ARMS.
+  // D0's dtype term means an f32 request takes the SEQUENTIAL recurrence on
+  // both toggles, so each f32 call below is now a self-comparison that passes
+  // whatever the chunked kernel does. They are kept because "f32 routes
+  // sequential on every toggle" is worth pinning and is what they now assert
+  // (the must-differ guard inside the helper is correctly skipped for them),
+  // but three of this ladder's four rungs stopped isolating anything about the
+  // chunked arm the moment the default became dtype-conditioned.
+  //
+  // So each rung gains a BF16 TWIN at the tolerance this file already uses for
+  // bf16 at these shapes. The twins are what carry the isolation now:
+  // chunk-count (40 / 64 / 128 = partial, exact, two whole chunks), varlen with
+  // differing chunk counts, and GQA ratio 2. NOT YET RUN ON A GPU -- this wave
+  // had none; #2845's `## Now` owns that.
   RunGdnChunkedVsSequential({0, 40}, 1, 1, 128, 128, f32, 6900, 5e-3f, 5e-3f);
+  RunGdnChunkedVsSequential({0, 40}, 1, 1, 128, 128, bf16, 6901, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 64}, 1, 1, 128, 128, f32, 6910, 5e-3f, 5e-3f);
+  RunGdnChunkedVsSequential({0, 64}, 1, 1, 128, 128, bf16, 6911, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 128}, 1, 1, 128, 128, f32, 6920, 5e-3f, 5e-3f);
+  RunGdnChunkedVsSequential({0, 128}, 1, 1, 128, 128, bf16, 6921, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 150}, 2, 4, 128, 128, f32, 7000, 5e-3f, 5e-3f);
   RunGdnChunkedVsSequential({0, 150}, 2, 4, 128, 128, bf16, 7010, 3e-2f, 3e-2f);
   // Multi-sequence varlen: two sequences of differing chunk counts packed
   // together (chunk-offset / per-seq state layout).
   RunGdnChunkedVsSequential({0, 150, 200}, 2, 4, 128, 128, f32, 7020, 5e-3f, 5e-3f);
+  RunGdnChunkedVsSequential({0, 150, 200}, 2, 4, 128, 128, bf16, 7021, 3e-2f, 3e-2f);
   // GQA ratio 2 at the real gate shape (Hk=16/Hv=32 sliced to Hk=4/Hv=8).
   RunGdnChunkedVsSequential({0, 130}, 4, 8, 128, 128, f32, 7030, 5e-3f, 5e-3f);
+  RunGdnChunkedVsSequential({0, 130}, 4, 8, 128, 128, bf16, 7031, 3e-2f, 3e-2f);
   (void)f32;
   (void)bf16;
 }
@@ -4977,12 +5014,20 @@ GdnRun RunGdnCpuPrefill(const std::vector<int32_t>& qsl, int64_t hk, int64_t hv,
   // q and k reach GdnPrefill L2-NORMALISED, on every production path and in
   // every committed golden (`q_k_prenormalized: true`): the Qwen GDN layer
   // normalises in fused_post_conv_prep, and upstream's own CPU chunked test
-  // runs the kernel with use_qk_l2norm_in_kernel=True. It is not cosmetic here.
-  // The chunked arm materialises (I+A)^-1 over a 64x64 unit lower triangular
-  // matrix whose entries are beta_i (k_i.k_j) exp(G_i-G_j); with unnormalised
-  // k of Dk=128 those dots run to ~6 and the inverse diverges, while the
-  // sequential arm -- which inverts nothing -- absorbs it. That is spec R5's
-  // conditioning risk, and the production contract is what bounds it.
+  // runs the kernel with use_qk_l2norm_in_kernel=True. It is a PRECONDITION of
+  // the op, not decoration, and un-normalised inputs make this suite useless
+  // rather than merely noisy.
+  //
+  // THE MECHANISM IS THE GATED DELTA RULE ITSELF, NOT THE CHUNKED ARM. An
+  // earlier draft of this comment blamed the materialised `(I+A)^-1`, on the
+  // strength of seeing a 2.8e7 DIFFERENCE between the arms and assuming the
+  // sequential one was well behaved. It is not: measured over 12 seeds at
+  // T=70, Dk=Dv=128 with un-normalised q/k, the SEQUENTIAL recurrence reaches
+  // max|out| of 1e23 to 1e31 and the chunked arm is SMALLER in every one of
+  // them. With |k|^2 ~ Dk, the update S <- S(I - beta k k^T) + beta v k^T has a
+  // per-token factor of order (1 - beta|k|^2), so |S| grows geometrically for
+  // both arms. Normalisation is what makes |k|^2 = 1 and the recurrence a
+  // contraction. There is no asymmetry between the arms to attribute here.
   auto l2 = [](std::vector<float>& x, int64_t rows, int64_t d) {
     for (int64_t r = 0; r < rows; ++r) {
       double ss = 0.0;
@@ -5015,6 +5060,22 @@ GdnRun RunGdnCpuPrefill(const std::vector<int32_t>& qsl, int64_t hk, int64_t hv,
   const GdnArgs args{1.0f / std::sqrt(static_cast<float>(dk))};
   vt::GdnPrefill(q, tout, tq, tk, tv, tg, tbeta, tst, tqsl, args);
   return GdnRun{Unpack(ob, out_dtype), stf};
+}
+
+// torch.testing.assert_close's criterion, which is what upstream's tolerances
+// mean: |a - b| <= atol + rtol * |b|, elementwise against the REFERENCE. Porting
+// one of its numbers as a bare max-abs bound is stricter than upstream and is
+// not the tolerance upstream stated.
+double MaxAssertCloseViolation(const std::vector<float>& got, const std::vector<float>& ref,
+                               double atol, double rtol) {
+  REQUIRE(got.size() == ref.size());
+  double worst = 0.0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    const double d = std::abs(static_cast<double>(got[i]) - ref[i]);
+    const double allowed = atol + rtol * std::abs(static_cast<double>(ref[i]));
+    worst = std::max(worst, d / allowed);  // <= 1.0 means upstream would pass it
+  }
+  return worst;
 }
 
 double MaxAbs(const std::vector<float>& a, const std::vector<float>& b) {
@@ -5050,7 +5111,13 @@ TEST_CASE("gdn prefill algorithm predicate routes on dtype and on VT_GDN_CHUNKED
     ScopedEnv on("VT_GDN_CHUNKED", "1");
     CHECK(vt::GdnChunkedPrefillEnabled());
     CHECK(vt::GdnUseChunkedPrefill(DType::kBF16));
-    CHECK(vt::GdnUseChunkedPrefill(DType::kF16));
+    // f16 is NOT chunked either, and "not f32" would have been the wrong
+    // predicate: upstream's chunked kernels take exactly one input dtype
+    // (chunk.py:213-215 asserts, fla.cpp:2205-2207 type-checks bf16), so there
+    // is no f16 chunked gated delta rule to mirror. Before this was narrowed,
+    // an f16 request took the chunked arm and was silently rounded to bf16 at
+    // all nine placement sites.
+    CHECK_FALSE(vt::GdnUseChunkedPrefill(DType::kF16));
     // f32 is NOT chunked even with the flag on: vLLM has no f32 chunked kernel
     // to mirror on EITHER of its implementations (chunk.py:213-215 asserts;
     // csrc/cpu/sgl-kernels/fla.cpp:2205-2207 type-checks bf16).
@@ -5120,23 +5187,33 @@ TEST_CASE("gdn chunked CPU arm stores the input dtype and keeps the state f32") 
   (void)ProcessStartChunkedFlag();
   ScopedEnv on("VT_GDN_CHUNKED", "1");
   const std::vector<int32_t> qsl{0, 70};
-  auto r = RunGdnCpuPrefill(qsl, 2, 4, 128, 128, DType::kBF16, 4200);
-  // Upstream allocates `o` with the INPUT's dtype (fla.cpp:2158; chunk_o.py:138
-  // stores into a bf16 tensor), so on bf16 input every output element is
-  // bf16-representable EVEN THOUGH this caller's buffer is f32. Storing the f32
-  // accumulator instead misses the committed golden by 1.911595e-04 against
-  // G1's 1.5e-04 bar -- and no value gate in this file would have seen it.
-  size_t nonbf16 = 0;
-  for (float x : r.out) nonbf16 += IsBf16Exact(x) ? 0 : 1;
-  CHECK(nonbf16 == 0);
-  CHECK(r.out.size() == static_cast<size_t>(70 * 4 * 128));
+  // THE DESTINATION DTYPE DECIDES THE STORE, which is upstream's own rule (`o`
+  // is allocated `q.options()`, fla.cpp:2158) and is also what keeps
+  // VT_GDN_OUT_BF16=0 meaningful: that switch's documented job is to restore
+  // f32 for this exact tensor (docs/ENVIRONMENT.md), and it can only do that if
+  // the kernel writes f32 when handed an f32 buffer. An earlier draft rounded
+  // to the INPUT dtype instead, which reproduced the golden and silently made
+  // that rollback a no-op on CPU.
+  auto r_bf16 = RunGdnCpuPrefill(qsl, 2, 4, 128, 128, DType::kBF16, 4200, DType::kBF16);
+  auto r_f32 = RunGdnCpuPrefill(qsl, 2, 4, 128, 128, DType::kBF16, 4200, DType::kF32);
+  size_t nonbf16_in_bf16 = 0, nonbf16_in_f32 = 0;
+  for (float x : r_bf16.out) nonbf16_in_bf16 += IsBf16Exact(x) ? 0 : 1;
+  for (float x : r_f32.out) nonbf16_in_f32 += IsBf16Exact(x) ? 0 : 1;
+  MESSAGE("out elements not bf16-representable: bf16 buffer " << nonbf16_in_bf16
+          << ", f32 buffer " << nonbf16_in_f32 << " / " << r_f32.out.size());
+  // The production store: a bf16 destination carries only bf16 values.
+  CHECK(nonbf16_in_bf16 == 0);
+  // The rollback: an f32 destination keeps the f32 accumulator. If this ever
+  // reads 0, VT_GDN_OUT_BF16=0 has stopped rolling anything back on CPU.
+  CHECK(nonbf16_in_f32 > 0);
+  CHECK(r_f32.out.size() == static_cast<size_t>(70 * 4 * 128));
   // The state is f32 and is NOT rounded (chunk_delta_h.py:353-355). If it were
   // carried or stored bf16, essentially every element would be bf16-exact.
   size_t st_nonbf16 = 0;
-  for (float x : r.state) st_nonbf16 += IsBf16Exact(x) ? 0 : 1;
+  for (float x : r_bf16.state) st_nonbf16 += IsBf16Exact(x) ? 0 : 1;
   MESSAGE("state elements that are not bf16-representable: " << st_nonbf16 << " / "
-          << r.state.size());
-  CHECK(st_nonbf16 > r.state.size() / 2);
+          << r_bf16.state.size());
+  CHECK(st_nonbf16 > r_bf16.state.size() / 2);
 }
 
 // --- T5/T8: upstream's own prefill breadth, ported --------------------------
@@ -5222,39 +5299,134 @@ TEST_CASE("gdn chunked CPU arm splits a sequence across two calls without drift"
   (void)ProcessStartChunkedFlag();
   ScopedEnv on("VT_GDN_CHUNKED", "1");
   constexpr int64_t kC = 64;
+  // upstream TWO_CALL_SPLITS (test_cpu_gdn_ops.py:332-336), unchanged
   const std::vector<std::pair<int64_t, int64_t>> splits = {
       {2 * kC, kC}, {2 * kC + 17, kC}, {2 * kC + 17, kC + 9},
       {4 * kC + 17, 2 * kC}, {3 * kC, kC + 1}};
   const int64_t hk = 2, hv = 4, d = 128;
   uint32_t seed = 4400;
+  double worst_out = 0.0, worst_state = 0.0;
+  double worst_ratio_out = 0.0, worst_ratio_state = 0.0;
+  int cases = 0;
   for (auto [total, split] : splits) {
-    auto st0 = RandomF32(static_cast<size_t>(hv * d * d), seed + 5, -0.2f, 0.2f);
-    auto st_full = st0;
-    auto full = RunGdnCpuPrefill({0, static_cast<int32_t>(total)}, hk, hv, d, d, DType::kBF16,
-                                 seed, DType::kF32, &st_full);
-    // The split legs re-draw the SAME random inputs (same seed), so leg 2 sees
-    // the tail of the identical token stream only if it is fed one. The seam
-    // has no offset argument, so this asserts the weaker but still real
-    // property upstream's split test asserts about the STATE: prefilling
-    // `total` tokens in one call and re-running the first `split` of them from
-    // the same initial state agrees on that prefix's output.
-    auto st_part = st0;
-    auto part = RunGdnCpuPrefill({0, static_cast<int32_t>(split)}, hk, hv, d, d, DType::kBF16,
-                                 seed, DType::kF32, &st_part);
-    const size_t prefix = static_cast<size_t>(split * hv * d);
-    std::vector<float> a(full.out.begin(), full.out.begin() + prefix);
-    std::vector<float> b(part.out.begin(), part.out.begin() + prefix);
-    const double e = MaxAbs(a, b);
-    // Chunk-aligned splits are byte-identical (the chunk decomposition is the
-    // same); a non-aligned split changes which tokens share a chunk, so the
-    // last partial chunk is reassociated and only agrees to the recorded
-    // chunk-vs-sequential scale.
-    if (split % kC == 0) {
-      CHECK(e == 0.0);
-    } else {
-      CHECK(e <= 1e-2);  // upstream's tolerance (:414)
-    }
+    // ONE token stream, sliced. An earlier draft ran both legs from the same
+    // initial state and compared a PREFIX, which cannot see this property at
+    // all: nothing resumed from a carried state, so the test asserted only that
+    // a shorter prefill agrees with the head of a longer one. That is the half
+    // upstream's test is actually about, and the half a scheduler-split prefill
+    // depends on.
+    const int64_t T = total;
+    auto qf = RandomF32(static_cast<size_t>(T * hk * d), seed, -1.0f, 1.0f);
+    auto kf = RandomF32(static_cast<size_t>(T * hk * d), seed + 1, -1.0f, 1.0f);
+    auto vf = RandomF32(static_cast<size_t>(T * hv * d), seed + 2, -1.0f, 1.0f);
+    auto gf = RandomF32(static_cast<size_t>(T * hv), seed + 3, -0.5f, 0.0f);
+    auto bf = RandomF32(static_cast<size_t>(T * hv), seed + 4, 0.1f, 0.9f);
+    auto l2 = [](std::vector<float>& x, int64_t rows, int64_t dd) {
+      for (int64_t r = 0; r < rows; ++r) {
+        double ss = 0.0;
+        for (int64_t c = 0; c < dd; ++c) ss += static_cast<double>(x[r * dd + c]) * x[r * dd + c];
+        const float inv = 1.0f / std::sqrt(static_cast<float>(ss) + 1e-6f);
+        for (int64_t c = 0; c < dd; ++c) x[r * dd + c] *= inv;
+      }
+    };
+    l2(qf, T * hk, d);
+    l2(kf, T * hk, d);
+    const auto qb = Pack(qf, DType::kBF16), kb = Pack(kf, DType::kBF16),
+               vb = Pack(vf, DType::kBF16);
+    const auto st0 = RandomF32(static_cast<size_t>(hv * d * d), seed + 5, -0.2f, 0.2f);
+
+    // Runs GdnPrefill over tokens [t0, t0+n) of the stream above, in place on
+    // `state`, writing bf16 out rows into `out_bf16` at the same offset.
+    auto leg = [&](int64_t t0, int64_t n, std::vector<float>& state,
+                   std::vector<uint16_t>& out_bf16) {
+      std::vector<int32_t> qsl{0, static_cast<int32_t>(n)};
+      const size_t es = sizeof(uint16_t);
+      Tensor tq = Tensor::Contiguous(
+          const_cast<uint8_t*>(qb.data()) + static_cast<size_t>(t0 * hk * d) * es,
+          DType::kBF16, Cpu(), {n, hk, d});
+      Tensor tk = Tensor::Contiguous(
+          const_cast<uint8_t*>(kb.data()) + static_cast<size_t>(t0 * hk * d) * es,
+          DType::kBF16, Cpu(), {n, hk, d});
+      Tensor tv = Tensor::Contiguous(
+          const_cast<uint8_t*>(vb.data()) + static_cast<size_t>(t0 * hv * d) * es,
+          DType::kBF16, Cpu(), {n, hv, d});
+      Tensor tg = Tensor::Contiguous(const_cast<float*>(gf.data()) + t0 * hv, DType::kF32,
+                                     Cpu(), {n, hv});
+      Tensor tb = Tensor::Contiguous(const_cast<float*>(bf.data()) + t0 * hv, DType::kF32,
+                                     Cpu(), {n, hv});
+      Tensor ts = Tensor::Contiguous(state.data(), DType::kF32, Cpu(), {1, hv, d, d});
+      Tensor to = Tensor::Contiguous(out_bf16.data() + static_cast<size_t>(t0 * hv * d),
+                                     DType::kBF16, Cpu(), {n, hv, d});
+      Tensor tqsl = Ti(qsl);
+      auto qq = Q();
+      vt::GdnPrefill(qq, to, tq, tk, tv, tg, tb, ts, tqsl,
+                     GdnArgs{1.0f / std::sqrt(static_cast<float>(d))});
+    };
+
+    std::vector<uint16_t> out_full(static_cast<size_t>(T * hv * d), 0),
+        out_split(static_cast<size_t>(T * hv * d), 0);
+    std::vector<float> st_full = st0, st_split = st0;
+    leg(0, T, st_full, out_full);
+    // THE SPLIT: leg 2 is seeded with leg 1's final state, exactly as
+    // cpu_gdn_attention_core continues a prefill across a scheduler step.
+    leg(0, split, st_split, out_split);
+    leg(split, T - split, st_split, out_split);
+
+    const auto of = Unpack(std::vector<uint8_t>(
+        reinterpret_cast<const uint8_t*>(out_full.data()),
+        reinterpret_cast<const uint8_t*>(out_full.data() + out_full.size())), DType::kBF16);
+    const auto os = Unpack(std::vector<uint8_t>(
+        reinterpret_cast<const uint8_t*>(out_split.data()),
+        reinterpret_cast<const uint8_t*>(out_split.data() + out_split.size())), DType::kBF16);
+    const double eo = MaxAbs(of, os), es2 = MaxAbs(st_full, st_split);
+    worst_out = std::max(worst_out, eo);
+    worst_state = std::max(worst_state, es2);
+    // Upstream's own bars for this exact property on its own chunked CPU kernel
+    // (test_cpu_gdn_ops.py:417-423): state atol/rtol 1e-3, output 2e-2, with the
+    // comment "State must be near-exact; output allows a looser bound for the
+    // bf16 round-trip". It does NOT claim bit-exactness, and neither can a
+    // mirror of it -- each extra chunk boundary sends the interactions across it
+    // through the bf16 state snapshot (chunk_delta_h.py:178,352) instead of the
+    // intra-chunk f32 path. That is the same mechanism
+    // tests/vllm/models/test_qwen27_paged_forward.cpp's continuity case had to
+    // be reconciled with.
+    // Upstream's criterion, not a rounded-off version of it: assert_close is
+    // |a-b| <= atol + rtol*|ref|, so a bare max-abs bound of 1e-3 is STRICTER
+    // than the 1e-3/1e-3 upstream actually asserts. Reported as a RATIO of the
+    // allowed bound, so <= 1.0 is exactly "upstream's test would pass this".
+    const double vs = MaxAssertCloseViolation(st_split, st_full, 1e-3, 1e-3);
+    const double vo = MaxAssertCloseViolation(os, of, 2e-2, 2e-2);
+    worst_ratio_state = std::max(worst_ratio_state, vs);
+    worst_ratio_out = std::max(worst_ratio_out, vo);
+    // OUT: upstream's own bar, unchanged, and it holds with ~165x headroom.
+    CHECK(vo <= 1.0);
+    // STATE: upstream's 1e-3/1e-3 DOES NOT TRANSFER TO THIS WORKLOAD, and
+    // carrying it across unchanged would have been the mis-port, not the
+    // discipline. Upstream's gating (`ref_gdn_gating` from A_log/softplus) makes
+    // g roughly -0.7 to -11 PER TOKEN, so its state is almost fully decayed
+    // within one chunk and where the prefill is split cannot matter: the
+    // committed replica reproduces that at a state ratio of exactly 0.00000 on
+    // upstream's own input distribution. This suite deliberately uses the
+    // gentler g ~ U(-0.5, 0), where the state genuinely carries across the
+    // boundary and the bf16 snapshot at it is exercised.
+    //
+    // On THAT workload, upstream's own placement in the committed replica
+    // (docs/bench-evidence/gdn-chunked-decomposition-20260902/, UPSTREAM map)
+    // reads **1.77** of its own bound, while this port reads **1.10**. So the
+    // bar here is 2.0 -- above the algorithm being mirrored, not merely above
+    // this implementation -- and its meaning is "no worse than vLLM's own
+    // placement on an input distribution vLLM's test never runs". It is a
+    // DERIVED bar with its derivation stated, not upstream's number widened
+    // until the port fit inside it.
+    CHECK(vs <= 2.0);
+    ++cases;
+    seed += 11;
   }
+  MESSAGE("two-call split: " << cases << " cases; worst max|d| out=" << worst_out
+          << " state=" << worst_state
+          << "; worst fraction of upstream's assert_close bound: out=" << worst_ratio_out
+          << " state=" << worst_ratio_state << " (1.0 == exactly upstream's bar)");
+  CHECK(cases == 5);
 }
 
 // --- T9 red-before, half 2: no setter in this file leaks ---------------------

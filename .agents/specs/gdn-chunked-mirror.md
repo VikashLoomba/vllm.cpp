@@ -664,6 +664,18 @@ and `cond = 1.13` on the golden; a dense inverse is safe there and not in
 general. Assert unit-diagonal forward substitution rather than a general solver,
 and add a case with `beta -> 1` and near-parallel `k`.
 
+**R5 MEASURED, and one implication in it is wrong.** The port takes unit-diagonal
+forward substitution as asked. But the un-normalised-`k` blow-up is NOT the
+inverse's: over 12 seeds at `T=70`, `Dk=Dv=128` with un-normalised `q`/`k`, the
+SEQUENTIAL recurrence reaches `max|out|` of `1e23` to `1e31` and the chunked arm
+is SMALLER in every one of them. With `|k|^2 ~ Dk` the update
+`S <- S(I - beta k k^T) + beta v k^T` has a per-token factor of order
+`(1 - beta|k|^2)`, so both arms diverge geometrically and L2 normalisation is
+what makes the recurrence a contraction. The precondition R5 names is real; the
+mechanism it attributes it to is not, and an earlier draft of this row's test
+comments carried that misattribution. The `beta -> 1` / near-parallel-`k` case
+R5 asks for is still OWED.
+
 **R6. The re-baselined cross-device gates go green for the wrong reason.**
 Covered by the G7 note.
 
@@ -827,6 +839,81 @@ alone moves `out` from `6.103516e-05` to `2.441406e-04` against a `1.5e-04` bar.
 The port follows Triton and records why; the measurement is in
 `.agents/specs/gdn-semantics.md` §7.
 
+**G8 FAILS, AND IT IS THIS ROW'S OWN REACHABILITY GATE.** With all four
+production `vt::GdnPrefill` call sites in `qwen3_5.cpp` disabled in a scratch
+copy (4 markers counted, build rc read separately from test rc), G1-G6 come back
+BYTE-IDENTICAL: 68/2264, 14/161, 9/19606, 4/9. The mutation bit — the positive
+control is that `test_qwen35_paged_forward` and `test_qwen3_5_gdn_spec_routing`
+flip green to red — so the op IS reached from `ModelRegistry::Forward`. What no
+gate in this row measures is the REACH: every test here enters through
+`vt::GdnPrefill` directly. Per `.agents/reachability.md` that measures a class,
+not a capability, and it is recorded here rather than left for a reader to
+rediscover. Two model-level tests now do discriminate the arms after the
+reconciliations below, which is a partial repair and not the gate G8 asks for.
+
+**THREE production-path tests went red and are reconciled here. The third was
+found by the full `ctest` sweep, not by the review** — which is the argument for
+running the whole suite rather than the row's own targets, and the reason
+`## Gates` G9 says what it says. All three are ONE failure mode wearing three
+faces: a scheduler-split prefill is bit-identical under the sequential
+recurrence and is not under vLLM's chunked one.
+
+- `tests/vllm/v1/test_llm_engine.cpp`'s
+  "chunked prefill accumulates the identical prompt logprobs" runs a
+  `linear_attention` config at `max_num_batched_tokens=1`, i.e. a chunk boundary
+  between EVERY pair of prompt tokens — the maximum discontinuity the algorithm
+  admits — and asserted `Approx(...).epsilon(1e-5)`. Sequential arm: exactly 0.
+  Chunked arm: max|d| `3.28e-03`, max relative `1.2e-03`. Its subject is the
+  ACCUMULATION MACHINERY (`gpu_model_runner.py:5646-5706`), which is
+  arm-independent, so the row/position/token-id assertions stay exact on both
+  arms and only the logprob VALUE splits: `== ` on the sequential arm, `5e-3`
+  relative on the chunked one.
+**The two the review found:**
+
+- `test_qwen27_paged_forward.cpp`'s state-continuity case read `0.00277987` and
+  `0.00376107` against a `< 1e-4` bar. **The port is right and the bar was
+  wrong**, and the bar was wrong in a way that only a chunked arm can expose:
+  one-shot == split is EXACT for the sequential recurrence and is not a property
+  of vLLM's algorithm at all. Each extra chunk boundary sends the interactions
+  across it through the bf16 state snapshot (`chunk_delta_h.py:178,352`) instead
+  of the intra-chunk f32 path. The committed replica reproduces it independently
+  of our C++ at this case's own T=6 split {3,3} — sequential `0.0`, chunked
+  upstream-bf16 `2.009496e-03`, chunked with f32 intermediates `5.960464e-08` —
+  so the discontinuity is the bf16 PLACEMENT, not the reassociation, and cannot
+  be engineered away without giving up the mirror. Upstream says the same thing
+  in its own words: `test_chunk_gated_delta_rule_cpu_two_call_split` gates this
+  exact property at `1e-3` state / `2e-2` output with the comment "State must be
+  near-exact; output allows a looser bound for the bf16 round-trip".
+  **Reconciled, not loosened**: the exactness claim moves onto the sequential arm
+  and is TIGHTENED there from `< 1e-4` to `== 0`, and the chunked arm gets a
+  `1e-2` bar with an IN-TEST POSITIVE CONTROL that drops the carried state and
+  asserts it exceeds that bar. **State the cost honestly: on the sequential arm
+  the ratio between a correct and a dropped state is infinite; on the chunked
+  arm it is ~7x (0.0038 against 0.0255).** Mirroring vLLM buys that
+  discriminating power down and no bar in that window buys it back.
+
+- `test_qwen4_exp_layer_loop.cpp`'s `CHECK(moved > 0.0)` read exactly `0`.
+  **The gate is a mute switch and always was** ([#2851](https://github.com/mudler/vllm.cpp/issues/2851)).
+  `logits_indices` is `{T-1}` and both prompts are EOS-terminated, so the one
+  compared row is the SAME final token's logits. Varying only `ids2`, the
+  sequential arm — byte-identical to `origin/main` on CPU — reads exactly `0`
+  for two of six valid prompts and the SAME `0.0546875` for four others, which
+  is a fixed `7/128` artifact rather than prompt response (`max|logit|` is
+  `95090.7`). The forward is not prompt-blind on either arm: with `ids2 = t + 2`
+  the chunked arm moves `31.8438`. Repaired by comparing ALL `T` rows, of which
+  `0..T-2` carry a different token, plus a same-prompt rerun control that makes
+  `> 0.0` mean something. The repaired form passes for all six prompts on both
+  arms where the old one failed two of six on `main`.
+
+**Three kernel defects the review found, fixed here.** The predicate was
+`dtype != f32`, so an f16 request took the chunked arm and was silently
+bf16-rounded at all nine sites; it is now `dtype == bf16`, which is what both
+upstream implementations accept. The output was rounded to the INPUT dtype,
+which silently made `VT_GDN_OUT_BF16=0` a no-op on CPU; the store now rounds to
+the DESTINATION dtype (upstream's own `o = q.options()` rule), the golden runner
+hands it a bf16 buffer as upstream does, and T2 gates both halves. And
+`chunk.py:212`'s `q.dtype == k.dtype == v.dtype` is now carried.
+
 Not done, and each is a gate rather than a nicety:
 
 - **ROCm and Vulkan have no chunked arm.** The shared predicate reaches them;
@@ -841,6 +928,16 @@ Not done, and each is a gate rather than a nicety:
 - **No CUDA gate was run.** D0 changed CUDA's f32 default and nothing on a GPU
   has executed since. `tests/vt/test_ops_gdn.cpp:3452`'s CUDA-vs-CPU case is the
   one the `ScopedEnv` conversion was supposed to unbreak, and it has not run.
+- **D0 DEFANGED SIX CUDA A/B CALLS AND THE REPAIR IS UNRUN.**
+  `RunGdnChunkedVsSequentialOnQueue` had no must-differ assertion, so the six
+  f32 calls in the chunked-vs-sequential ladder became self-comparisons the
+  moment both toggles routed f32 sequential — passing trivially and retiring
+  three of four rungs. The same guard this row applied to the CPU A/B (T4) is
+  now inside the helper, armed by `vt::GdnUseChunkedPrefill` itself rather than
+  a hardcoded dtype list, and each f32 rung has gained a bf16 twin so the ladder
+  still isolates chunk-count, varlen and GQA. **None of the twins has run on a
+  GPU**, so their `3e-2` tolerance is inherited from the one bf16 rung that
+  already existed at these shapes and is not measured.
 - **The control token sequence has not been re-derived.** It needs the 67.564 GiB
   UD-IQ1_S artifact and a lease. Every line that presented it as a CURRENT
   expectation is annotated rather than replaced (`docs/USAGE.md`,

@@ -857,8 +857,99 @@ TEST_CASE(
   // `MaxAbsDiff` RAISES on a non-finite operand rather than folding it away, so
   // this is also the second row's finiteness check.
   const double moved = vllm_test::MaxAbsDiff(host, host2);
-  MESSAGE("qwen4_exp second-prompt logit movement: " << moved);
-  CHECK(moved > 0.0);
+  MESSAGE("qwen4_exp second-prompt logit movement (row T-1 only, DIAGNOSTIC): " << moved);
+
+  // ─── #2851: THE ROW ABOVE CANNOT CARRY THIS CLAIM, AND NEVER COULD ────────
+  //
+  // `logits_indices` is `{T - 1}`, so `moved` compares exactly ONE row — and
+  // both prompts are deliberately EOS-terminated, so it is the row for the SAME
+  // final token. Only 3 tokens of context can move it, and in this synthetic
+  // fixture that is below the arithmetic noise floor. `CHECK(moved > 0.0)` was
+  // therefore satisfied by rounding, not by prompt dependence, and it is a mute
+  // switch in both directions. Measured on `origin/main`'s own arithmetic,
+  // varying only `ids2`'s formula:
+  //
+  //   (t + 1) * 4 + 1  (committed)  0.0546875     kVocab - 2 - t        0
+  //   t + 2                         0.0546875     (t + 1) * 3           0.0546875
+  //   (t * 5 + 2) % (kVocab - 1)    0.0546875     kVocab - 4 + t        0
+  //
+  // Two of six valid prompts make `origin/main` itself read exactly 0, so the
+  // committed prompt is a winning ticket rather than a demonstration; and the
+  // SAME 0.0546875 (= 7/128) for four different prompts is a fixed rounding
+  // artifact, because a quantity that does not move when the prompt moves is
+  // not measuring the prompt. `max|logit|` is 95090.7, so it is ~5.7e-7 of the
+  // compared magnitude, against sibling movement gates in this same file that
+  // read 31.8438 (:1349) and 129102 (:2158) on rows whose token differs.
+  //
+  // So the claim is re-asserted where it is unambiguous: over ALL T rows, of
+  // which rows 0..T-2 carry a DIFFERENT TOKEN in the two prompts. That is the
+  // "a token came out of THIS prompt" the comment above asks for, and it does
+  // not depend on which arithmetic the GDN prefill takes.
+  auto run_fresh_all_rows = [&](const std::vector<int32_t>& prompt) {
+    std::vector<std::vector<float>> fs(3), fc(3);
+    std::vector<vllm::dense_attn::DBuf> fs_b, fc_b;
+    std::vector<vllm::GdnStateCache> fg(3);
+    fs_b.reserve(3);
+    fc_b.reserve(3);
+    for (int i = 0; i < 3; ++i) {
+      fs[i].assign(static_cast<size_t>(ssm_row), 0.0F);
+      fc[i].assign(static_cast<size_t>(conv_dim * conv_len), 0.0F);
+      fs_b.emplace_back(
+          d, DType::kF32,
+          std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+          fs[i].data());
+      fc_b.emplace_back(d, DType::kF32,
+                        std::vector<int64_t>{1, conv_dim, conv_len}, fc[i].data());
+      fg[static_cast<size_t>(i)].ssm_state = fs_b.back().t();
+      fg[static_cast<size_t>(i)].conv_state = fc_b.back().t();
+    }
+    std::vector<uint16_t> fkv(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
+    vllm::dense_attn::DBuf fkv_b(d, DType::kBF16, {2, T, kKvHeads, kHeadDim},
+                                 fkv.data());
+    std::vector<vllm::PagedKvCache> fattn(1);
+    fattn[0] = attn_kv[0];
+    fattn[0].data = fkv_b.t().data;
+    std::vector<int32_t> all_rows(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t) all_rows[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+    vllm::ModelForwardInput fin{prompt, pos,    am, gm, fattn,
+                                fg,     config, q,  all_rows};
+    fin.num_reqs = 1;
+    fin.gdn_state_slots = 1;
+    vllm::ForwardLogits ffl;
+    REQUIRE_NOTHROW(ffl = vllm::ModelRegistry::Forward(*model, fin));
+    REQUIRE(ffl.on_device());
+    REQUIRE(ffl.rows == T);
+    std::vector<float> h(static_cast<size_t>(ffl.rows * ffl.vocab), 0.0F);
+    d.b.Copy(q, h.data(), ffl.device_tensor.data, h.size() * sizeof(float));
+    d.b.Synchronize(q);
+    return h;
+  };
+  const std::vector<float> all1 = run_fresh_all_rows(ids);
+  const std::vector<float> all2 = run_fresh_all_rows(ids2);
+  REQUIRE(all1.size() == all2.size());
+  const double moved_all = vllm_test::MaxAbsDiff(all1, all2);
+  // Rerunning the SAME prompt must be bit-identical, or `moved_all` is measuring
+  // run-to-run noise rather than the prompt. This is the control that stops the
+  // floor below from being a second mute switch.
+  const std::vector<float> all1_again = run_fresh_all_rows(ids);
+  const double self = vllm_test::MaxAbsDiff(all1, all1_again);
+  MESSAGE("qwen4_exp second-prompt logit movement over ALL " << T
+          << " rows: " << moved_all << " (same-prompt rerun control: " << self << ")");
+  // THE DETERMINISM CONTROL IS WHAT MAKES `> 0.0` A GATE RATHER THAN A MUTE
+  // SWITCH, and it is the half the one-row form never had. With the same prompt
+  // reproducing bit-for-bit, a nonzero difference between two prompts can only
+  // have come from the prompt. Without it, `> 0.0` is satisfied by any noise —
+  // which is exactly how the row-T-1 form passed on a 7/128 rounding artifact.
+  CHECK(self == 0.0);
+  CHECK(moved_all > 0.0);
+  // NO MAGNITUDE FLOOR IS ASSERTED, and that is deliberate rather than lazy.
+  // This fixture's logits are dominated by a prompt-INVARIANT common mode
+  // (`max|logit|` 95090.7 against a prompt-driven movement of 0.32 on the
+  // sequential arm and 31.84 on the chunked one), so max-abs-diff has no
+  // meaningful scale here and any constant would be picked to fit rather than
+  // derived. Whether this fixture SHOULD have that common mode is #2851's
+  // remaining half and belongs to the qwen4_exp row, not to a GDN kernel row.
+  // What is gated here is the claim the comment above actually makes.
 
   // ─── THE TWO REFUSALS THIS HOOK ADVERTISES, GATED BY THEIR MESSAGE ────────
   //

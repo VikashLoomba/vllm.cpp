@@ -2204,7 +2204,14 @@ bool GdnChunkedPrefillEnabled() {
 // two implementations of the kernel, so f32 routes to the sequential recurrence
 // that upstream's own f32-capable kernel computes.
 bool GdnUseChunkedPrefill(DType q_dtype) {
-  return q_dtype != DType::kF32 && GdnChunkedPrefillEnabled();
+  // BF16 ONLY, not merely "not f32". Upstream's chunked kernels accept exactly
+  // one input dtype on BOTH implementations: the Triton wrapper asserts
+  // `q.dtype != torch.float32` (chunk.py:213-215) and every FLA store is
+  // `k.dtype`, while the CPU kernel type-checks `at::kBFloat16` outright
+  // (csrc/cpu/sgl-kernels/fla.cpp:2205-2207). There is no f16 chunked gated
+  // delta rule upstream to mirror, so f16 takes the sequential recurrence for
+  // the same reason f32 does.
+  return q_dtype == DType::kBF16 && GdnChunkedPrefillEnabled();
 }
 
 void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,

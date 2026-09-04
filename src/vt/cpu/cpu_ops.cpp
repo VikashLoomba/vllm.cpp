@@ -1898,20 +1898,45 @@ struct GdnChunkScratch {
 // :2213-2214) — and it type-checks bf16 only (:2205-2207), which is D0's
 // dtype term stated a second time by a second upstream implementation.
 //
-// It differs from the Triton path in three SECONDARY sites, and this port
-// follows Triton at all three, because the only oracle dump this tree owns
-// (tests/parity/goldens/gdn_prefill_bf16_realdims) is a Triton dump and G1's
-// bar was derived from it. Measured on that golden (max|d| vs the dump):
+// WHICH UPSTREAM BEHAVIOUR THIS MIRRORS, SAID PLAINLY: the TRITON kernel, which
+// is what vLLM runs on a GPU. A `vllm --device cpu` run executes
+// `chunk_gated_delta_rule_cpu` instead, so a CPU-vs-CPU oracle comparison would
+// show this arm differing from vLLM-on-CPU by about the 2.44e-04 the table
+// below prices, NOT agreeing with it. That is a deliberate choice and it is the
+// one the evidence supports: the only oracle dump this tree owns
+// (tests/parity/goldens/gdn_prefill_bf16_realdims) is a Triton dump, and G1's
+// bar was derived from it.
+//
+// It differs from the Triton path in three SECONDARY sites. Measured on that
+// golden (max|d| vs the dump), each applied to the Triton placement alone:
 //
 //   placement                                        out          state
 //   Triton (this port)                          6.103516e-05  5.059987e-04
 //   + q pre-scaled into bf16 (fla.cpp:2231)     2.441406e-04  5.059987e-04
 //   + decay folded into k (fla.cpp:1519)        6.103516e-05  1.281053e-03
-//   + row-wise bf16 solve_tril (fla.cpp:524)    6.103516e-05  8.501429e-04
+//   + row-wise bf16 solve_tril (fla.cpp:524)    6.103516e-05  5.059987e-04
+//   + bf16 `attn2` buffer (fla.cpp:1060)        6.103516e-05  8.501429e-04
 //   full CPU-kernel placement                   2.441406e-04  1.281053e-03
 //
-// G1's bar is 1.5e-04 out / 1.5e-03 state, so pre-scaling q into bf16 alone
-// costs the port that gate. The measurement harness is
+// The fourth row is INERT on this golden -- rounding each substitution row
+// changes nothing, because `A` is f32 going in and the result is rounded once
+// either way. An earlier version of this table attributed 8.501429e-04 to it;
+// that number belongs to the FIFTH row, the CPU kernel's bf16 `attn2` buffer,
+// which the fourth row's variant had silently bundled in.
+//
+// G1's bar is 1.5e-04 out / 1.5e-03 state, so the q pre-scale is the one site
+// that decides the gate.
+//
+// AND THE q PRE-SCALE IS NOT EVEN THE CPU KERNEL'S PRODUCTION BEHAVIOUR.
+// `fla.cpp:2231`'s `query.mul(scale)` sits on the `use_qk_l2norm_in_kernel ==
+// false` branch; on the TRUE branch -- which is production, and which upstream's
+// own CPU test uses -- `l2norm_fwd` applies the same Dk^-0.5 inside the kernel
+// and stores bf16 once. Upstream rounds `q` ONCE either way, and our seam has
+// already spent that rounding upstream of GdnPrefill (`dql2` arrives bf16 and
+// L2-normalised, with `scale` carried separately in GdnArgs). Applying it again
+// here would be a DOUBLE rounding neither upstream implementation performs. So
+// following Triton on this site is right structurally, and the measurement
+// above is the confirmation rather than the reason. The measurement harness is
 // docs/bench-evidence/gdn-chunked-decomposition-20260902/ (gdn_decomp.py's
 // UPSTREAM map is the site-by-site placement this code implements).
 //
@@ -1939,7 +1964,7 @@ void GdnChunkedHeadPrefill(Tensor& out, const Tensor& q_in, const Tensor& k_in,
                            const Tensor& v_in, const Tensor& g, const Tensor& beta,
                            float* h, int64_t t0, int64_t t1, int64_t hv, int64_t hk,
                            int64_t hk_n, int64_t hv_n, int64_t dk, int64_t dv, float scale,
-                           bool round_out, GdnChunkScratch& s) {
+                           GdnChunkScratch& s) {
   const int64_t bt = kGdnChunk;
   for (int64_t c0 = t0; c0 < t1; c0 += bt) {
     const int64_t n = std::min(bt, t1 - c0);
@@ -2068,7 +2093,14 @@ void GdnChunkedHeadPrefill(Tensor& out, const Tensor& q_in, const Tensor& k_in,
         for (int64_t j = 0; j <= i; ++j)
           intra += s.Ao[static_cast<size_t>(i * bt + j)] * s.vnew[static_cast<size_t>(j * dv + vi)];
         const float o = cross * s.eG[static_cast<size_t>(i)] * scale + intra * scale;
-        StoreF32(out, ((c0 + i) * hv_n + hv) * dv + vi, round_out ? Bf16(o) : o);
+        // The store rounds to the DESTINATION dtype, which is upstream's own
+        // rule: `o` is allocated `q.options()` (fla.cpp:2158) and chunk_o.py:138
+        // stores into it, so on the production path (a bf16 `dcore`) StoreF32's
+        // F32ToBF16 performs exactly the rounding the oracle performed. An
+        // explicit round-to-input-dtype here instead would silently defeat
+        // `VT_GDN_OUT_BF16=0`, whose documented job is to restore f32 for this
+        // very tensor, and would be wrong for any dtype but bf16.
+        StoreF32(out, ((c0 + i) * hv_n + hv) * dv + vi, o);
       }
     }
   }
@@ -2102,11 +2134,12 @@ void GdnPrefillKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, 
   // this is false and the sequential recurrence below runs, because that is the
   // only gated delta rule vLLM itself will execute at that dtype.
   if (GdnUseChunkedPrefill(q_in.dtype)) {
-    // Upstream's `o` is allocated with the INPUT's dtype (fla.cpp:2158,
-    // chunk_o.py:138), so the result is rounded there whatever the caller's
-    // buffer holds. Storing f32 instead misses the golden by 1.911595e-04
-    // against G1's 1.5e-04 bar.
-    const bool round_out = q_in.dtype != DType::kF32;
+    // Upstream requires q, k and v to share one dtype (chunk.py:212) and its CPU
+    // kernel type-checks all three as bf16 (fla.cpp:2205-2207). Carry that
+    // rather than silently reading a mixed set through LoadF32.
+    VT_CHECK(k.dtype == q_in.dtype && v.dtype == q_in.dtype,
+             "gdn_prefill: the chunked arm needs q/k/v in one dtype (bf16); "
+             "set VT_GDN_CHUNKED=0 for the sequential recurrence");
     ForRows(nitems, [&](int64_t r0, int64_t r1) {
       GdnChunkScratch sc(kGdnChunk, dk, dv);
       for (int64_t item = r0; item < r1; ++item) {
@@ -2115,7 +2148,7 @@ void GdnPrefillKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, 
         const int64_t hk = hv / ratio;
         float* s_head = state.Ptr<float>() + (s * hv_n + hv) * dv * dk;
         GdnChunkedHeadPrefill(out, q_in, k, v, g, beta, s_head, qslp[s], qslp[s + 1], hv, hk,
-                              hk_n, hv_n, dk, dv, args.scale, round_out, sc);
+                              hk_n, hv_n, dk, dv, args.scale, sc);
       }
     });
     return;

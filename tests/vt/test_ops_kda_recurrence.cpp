@@ -21,6 +21,8 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <string>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -38,6 +40,28 @@ using vt::Queue;
 using vt::Tensor;
 
 namespace {
+// Restores the previous value at scope exit, so a pinned flag cannot leak into
+// a later case in the same binary (KERNEL-GDN-CHUNKED-MIRROR T9/R10).
+class ScopedEnv {
+ public:
+  ScopedEnv(const char* name, const char* value) : name_(name) {
+    const char* old = std::getenv(name);
+    if (old != nullptr) { had_old_ = true; old_ = old; }
+    setenv(name, value, 1);
+  }
+  ~ScopedEnv() {
+    if (had_old_) setenv(name_.c_str(), old_.c_str(), 1);
+    else unsetenv(name_.c_str());
+  }
+  ScopedEnv(const ScopedEnv&) = delete;
+  ScopedEnv& operator=(const ScopedEnv&) = delete;
+
+ private:
+  std::string name_;
+  std::string old_;
+  bool had_old_ = false;
+};
+
 
 Device Cpu() { return Device{DeviceType::kCPU, 0}; }
 Queue CpuQ() { return Queue{Cpu(), nullptr}; }
@@ -219,6 +243,9 @@ TEST_CASE("kda recurrence: g broadcast from per-head scalar == vt::GdnPrefill (b
 // from being silent. The `== 0` above is NOT weakened to a tolerance
 // (stop condition 6); it is scoped, and this is the scope.
 TEST_CASE("kda recurrence: at bf16 vt::GdnPrefill takes the chunked arm and KDA does not") {
+  // PINNED ON: this case is about what the CHUNKED arm does, so it must not
+  // depend on the ambient VT_GDN_CHUNKED.
+  ScopedEnv chunked_on("VT_GDN_CHUNKED", "1");
   const int64_t T = 70, H = 2, D = 64;  // > one chunk, so the state carry runs
   const int64_t proj = H * D;
   auto q = L2NormRows(RandF32(static_cast<size_t>(T) * proj, 31), static_cast<size_t>(T) * H,

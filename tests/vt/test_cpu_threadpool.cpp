@@ -401,8 +401,23 @@ std::vector<std::vector<uint8_t>> RunBattery(Threadpool& pool) {
     FillF32(vf, 43);
     FillF32(g, 44);
     FillF32(beta, 45);
-    // q/k reach GdnPrefill L2-normalised on every production path; the chunked
-    // arm materialises (I+A)^-1 and that is what bounds its conditioning (R5).
+    // q and k reach GdnPrefill L2-NORMALISED, on every production path and in
+    // every committed golden (`q_k_prenormalized: true`): the Qwen GDN layer
+    // normalises in fused_post_conv_prep, and upstream's own CPU chunked test
+    // runs the kernel with use_qk_l2norm_in_kernel=True. It is a PRECONDITION of
+    // the op, not decoration, and un-normalised inputs make this suite useless
+    // rather than merely noisy.
+    //
+    // THE MECHANISM IS THE GATED DELTA RULE ITSELF, NOT THE CHUNKED ARM. An
+    // earlier draft of this comment blamed the materialised `(I+A)^-1`, on the
+    // strength of seeing a 2.8e7 DIFFERENCE between the arms and assuming the
+    // sequential one was well behaved. It is not: measured over 12 seeds at
+    // T=70, Dk=Dv=128 with un-normalised q/k, the SEQUENTIAL recurrence reaches
+    // max|out| of 1e23 to 1e31 and the chunked arm is SMALLER in every one of
+    // them. With |k|^2 ~ Dk, the update S <- S(I - beta k k^T) + beta v k^T has a
+    // per-token factor of order (1 - beta|k|^2), so |S| grows geometrically for
+    // both arms. Normalisation is what makes |k|^2 = 1 and the recurrence a
+    // contraction. There is no asymmetry between the arms to attribute here.
     auto l2 = [](std::vector<float>& x, int64_t rows, int64_t d) {
       for (int64_t r = 0; r < rows; ++r) {
         double ss = 0.0;

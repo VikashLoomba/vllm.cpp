@@ -2397,7 +2397,13 @@ TEST_CASE("gdn chunked CPU prefill meets the tight bar on the real Triton golden
     DeviceBuf dbeta(b, q, beta.dtype, ShapeOf(beta.tensor), beta.raw.data.data());
     DeviceBuf dst(b, q, st.dtype, ShapeOf(st.tensor), st.raw.data.data());
     DeviceBuf dqsl(b, q, qsl.dtype, ShapeOf(qsl.tensor), qsl.raw.data.data());
-    DeviceBuf dout(b, q, DType::kF32, ShapeOf(v.tensor));
+    // BF16 OUT, matching the oracle. Upstream allocates `o` with the input's
+    // options (fla.cpp:2158; chunk_o.py:138 stores into a bf16 tensor), and
+    // out.npy is that bf16 result widened to f32 for storage. Handing the
+    // kernel an f32 destination asks it for a value upstream never produces and
+    // costs 1.911595e-04 against this bar purely in the un-taken rounding — so
+    // the buffer dtype is part of what is being replayed, not a detail.
+    DeviceBuf dout(b, q, qi.dtype, ShapeOf(v.tensor));
     vt::GdnArgs args{m["args"]["scale"].get<float>()};
     vt::GdnPrefill(q, dout.tensor(), dq.tensor(), dk.tensor(), dv.tensor(), dg.tensor(),
                    dbeta.tensor(), dst.tensor(), dqsl.tensor(), args);
@@ -2416,8 +2422,12 @@ TEST_CASE("gdn chunked CPU prefill meets the tight bar on the real Triton golden
   constexpr double kOutBar = 1.5e-4;
   constexpr double kStateBar = 1.5e-3;
 
+  // PINNED ON, not left to the ambient environment. This case is named for the
+  // chunked arm and must measure it even when the suite is run with
+  // VT_GDN_CHUNKED=0 exported; that the UNSET default also selects it is
+  // asserted separately, by the predicate case in tests/vt/test_ops_gdn.cpp.
   double chunked_out = 0.0, chunked_state = 0.0;
-  run(nullptr, &chunked_out, &chunked_state);  // the DEFAULT, no flag set
+  run("1", &chunked_out, &chunked_state);
   MESSAGE("chunked CPU arm vs the Triton golden: max|d| out=" << chunked_out
           << " state=" << chunked_state << " (bar " << kOutBar << " / " << kStateBar << ")");
   CHECK(chunked_out <= kOutBar);

@@ -308,8 +308,26 @@ stopped being true, and the third has a second half.**
    is a Triton dump. Measured against it (max|d| out / state): Triton placement
    `6.103516e-05` / `5.059987e-04`; pre-scaled q `2.441406e-04` / `5.059987e-04`;
    decay-on-k `6.103516e-05` / `1.281053e-03`; row-wise solve `6.103516e-05` /
-   `8.501429e-04`. The gate bar is `1.5e-04` / `1.5e-03`, so the pre-scale
-   difference alone decides it.
+   `5.059987e-04`, i.e. INERT on this golden; and the CPU kernel's bf16 `attn2`
+   buffer `6.103516e-05` / `8.501429e-04`. The gate bar is `1.5e-04` / `1.5e-03`,
+   so the pre-scale difference alone decides it. (An earlier version of this
+   list credited `8.501429e-04` to the row-wise solve; that variant had bundled
+   the bf16 `attn2` buffer in with it, and the two are separated above.)
+
+   **Say which upstream this mirrors.** The CPU arm mirrors vLLM's **Triton**
+   kernel — what vLLM runs on a GPU. A `vllm --device cpu` run executes
+   `chunk_gated_delta_rule_cpu`, so a CPU-vs-CPU oracle comparison would show
+   our CPU arm about `2.44e-04` from vLLM-on-CPU rather than agreeing with it.
+
+   **The q pre-scale is not the CPU kernel's production behaviour either.**
+   `fla.cpp:2231`'s `query.mul(scale)` is the `use_qk_l2norm_in_kernel == false`
+   branch; on the true branch — production, and what upstream's own CPU test
+   uses — `l2norm_fwd` applies the same `Dk^-0.5` in-kernel and stores bf16
+   once. Upstream rounds `q` once either way, and our seam already spent that
+   rounding before `GdnPrefill` (`dql2` is bf16 and L2-normalised; `scale`
+   travels in `GdnArgs`). Applying it again would be a double rounding no
+   upstream implementation performs, so Triton is right here structurally and
+   the measurement only confirms it.
 
 **Decode**: the default `VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=1`
 (`envs.py:117,1123-1125`) selects

@@ -328,8 +328,16 @@ class Dots3NoteAudioProcessor {
   //     either way, because a one-segment sum is `ceil(n / stride)` on both
   //     sides — which is why this is a per-request refusal and not an
   //     install-time one.
+  //
+  // HANDS BACK THE RESAMPLED BUFFER when `resampled_out` is not null, so that a
+  // caller which also needs the encoder-cache key does not pay for the resample
+  // a second time (#2842 F2). It is left EMPTY when no resample happened, which
+  // is exactly the case in which the caller's own pointer is already the
+  // waveform the tower consumed. Nothing about the returned `AudioKwargs`
+  // depends on the argument.
   AudioKwargs ProcessWaveform(const float* samples, int64_t num_samples,
-                              int sample_rate) const;
+                              int sample_rate,
+                              std::vector<float>* resampled_out = nullptr) const;
 
   // `ceil(num_samples / token_stride)`, exposed because the chat seam needs the
   // placeholder count and the encoder needs the row count and they must be the
@@ -361,8 +369,18 @@ class Dots3NoteAudioProcessor {
   // audio. Every caller that has a request rate in hand must use this overload;
   // the two-argument one stays for the callers that are single-rate by
   // construction.
+  //
+  // `resampled` IS AN ANSWER, NOT A HINT: when it is not null it must be the
+  // buffer `ProcessWaveform` filled for THIS waveform and THIS rate, and it is
+  // hashed as-is. `RouteDots3NoteAudioWav` passes it because it has just called
+  // `ProcessWaveform`, and that is what makes the served path resample ONCE
+  // rather than twice — the second resample was a 1220.7 MB allocation on the
+  // request measured in §4.17.10. A caller that does not hold the buffer passes
+  // nothing and this resamples for itself, which is the only behaviour that
+  // ever existed and is what the unit suite drives.
   std::string HashAudio(const float* samples, int64_t num_samples,
-                        int sample_rate) const;
+                        int sample_rate,
+                        const std::vector<float>* resampled = nullptr) const;
 
  private:
   Dots3NoteAudioProcessorConfig cfg_;

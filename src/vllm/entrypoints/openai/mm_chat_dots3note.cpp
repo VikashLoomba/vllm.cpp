@@ -275,9 +275,18 @@ multimodal::MultiModalInputs RouteDots3NoteAudioWav(
   // refusing here: `InputValidationError` becomes HTTP 400 for THIS request,
   // where the same throw from inside `encode_mm` would set `AsyncLLM`'s errored
   // latch and 500 every later request, text ones included.
+  //
+  // ONE RESAMPLE PER REQUEST, NOT TWO (#2842 F2). The mm-hash below needs the
+  // SAME resampled waveform, and before this it got it by calling
+  // `ResampleAudioScipy` a second time over the same input: on the 1 Hz request
+  // measured in spec §4.17.10 that was 1220.7 MB twice for a 40 KB upload.
+  // `ProcessWaveform` fills `resampled` when it resamples and leaves it empty
+  // when it does not, and the hash below is handed the buffer rather than the
+  // rate to redo it from.
+  std::vector<float> resampled;
   multimodal::AudioKwargs kw = proc.ProcessWaveform(
       decoded.samples.data(), static_cast<int64_t>(decoded.samples.size()),
-      decoded.sampling_rate);
+      decoded.sampling_rate, &resampled);
 
   std::vector<std::array<int, 2>> placeholders;
   std::vector<int32_t> expanded = multimodal::ExpandAudioPlaceholders(
@@ -305,7 +314,8 @@ multimodal::MultiModalInputs RouteDots3NoteAudioWav(
     // same audio share one entry.
     spec.mm_hash = proc.HashAudio(decoded.samples.data(),
                                   static_cast<int64_t>(decoded.samples.size()),
-                                  decoded.sampling_rate);
+                                  decoded.sampling_rate,
+                                  resampled.empty() ? nullptr : &resampled);
     spec.audio_data = std::make_shared<multimodal::AudioKwargs>(std::move(kw));
     out.mm_features.push_back(std::move(spec));
   }

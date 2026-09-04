@@ -1085,6 +1085,48 @@ TEST_CASE("dots3-note W7c-2: the front end RESAMPLES a wrong rate, and W7b MOVED
     CHECK(a.num_tokens != b.num_tokens);
   }
 
+  SUBCASE("...and the served path builds that key from ONE resample, not two") {
+    // #2842 F2. `RouteDots3NoteAudioWav` drove `ProcessWaveform` and then the
+    // three-argument `HashAudio`, and each of them resampled: the 1 Hz request
+    // in spec §4.17.10 allocated 1220.7 MB TWICE for a 40 KB upload. The route
+    // now hands the buffer over. What has to hold is that handing it over and
+    // rebuilding it produce the SAME key, because a caller passing the wrong
+    // buffer would be a silent cross-request cache defect and not a crash.
+    const std::vector<float>& x = wav;
+    const auto n = static_cast<std::int64_t>(x.size());
+
+    std::vector<float> shared;
+    const vllm::multimodal::AudioKwargs kw =
+        proc.ProcessWaveform(x.data(), n, 44100, &shared);
+
+    // (a) The out-parameter is FILLED, and with the waveform the tower
+    // consumed rather than with anything else: same length as `num_samples`,
+    // and bit-identical to the seam's own answer for the same conversion.
+    CHECK(shared.size() == static_cast<std::size_t>(kw.num_samples));
+    REQUIRE(shared.size() == 2903u);
+    const std::vector<float> off =
+        vllm::multimodal::ResampleAudioScipy(x.data(), n, 44100, 16000);
+    REQUIRE(off.size() == shared.size());
+    std::size_t moved = 0;
+    for (std::size_t i = 0; i < off.size(); ++i)
+      if (off[i] != shared[i]) ++moved;
+    MESSAGE("handed back vs resampled again: " << moved << " of "
+            << off.size() << " samples differ");
+    CHECK(moved == 0u);
+
+    // (b) ...so the key is the same whichever way it is built. This is the
+    // assertion a wrong buffer at the call site fails.
+    CHECK(proc.HashAudio(x.data(), n, 44100, &shared) ==
+          proc.HashAudio(x.data(), n, 44100));
+
+    // (c) At the target rate nothing is handed back, because then the caller's
+    // own pointer already IS the consumed waveform. The vector is pre-filled so
+    // that "left empty" is distinguishable from "never written".
+    std::vector<float> none(3, 1.0f);
+    proc.ProcessWaveform(x.data(), n, 16000, &none);
+    CHECK(none.empty());
+  }
+
   SUBCASE("a clip over `chunk_seconds` no longer names W7b, because W7b LIFTED it") {
     // This subcase used to assert "SEGMENTATION IS NOT PORTED" and W7b. It is
     // kept rather than deleted because it is the RED-BEFORE of #2797 written

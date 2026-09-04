@@ -6708,6 +6708,35 @@ a measured tolerance.** It does NOT claim bit-identity with scipy's own
 `float32` arm, and it does not claim anything at all about libswresample beyond
 the probe-qualified distances recorded in §4.17.2.
 
+**SAY HOW BIG THAT GAP IS, because it is LARGER THAN THE GATE'S OWN TOLERANCE.**
+A reader who is told only that bit-identity is not claimed will infer the
+difference sits inside `kResampleTol`. It does not.
+`|scipy's real float32 arm − the committed float64 golden|`, both narrowed to
+`float32`, measured on scipy 1.17.1 / numpy 2.3.5:
+
+| Case | \|f32 arm − golden\| | against `kResampleTol` = 1.2e-7 |
+|---|---|---|
+| `Wav44100` | 2.384e-07 | **over** |
+| `Wav48000` | 2.384e-07 | **over** |
+| `Wav22050` | 1.788e-07 | **over** |
+| `Wav8000` | 1.192e-07 | under, by 0.7% |
+| `Alias44100` | 1.788e-07 | **over** |
+
+So "just mirror the cast" is not a free repair: narrowing the arithmetic to
+`float32` the way `resample_poly` does REDS this gate on four of the five
+goldens, and it would red it for the reason §4.17.4 gives rather than for a
+defect. Anyone who reaches for that change has to regenerate the goldens from
+the `float32` arm in the same commit.
+
+**A PARTIAL mirror is worse than either, and it stays green.** Narrowing only
+the taps to `float` and leaving the accumulation in `double` moves the answer
+5.96e-08 on four cases and 2.98e-08 on `Alias44100` — under the tolerance
+everywhere, so the gate would accept it silently. That is not an argument for
+the tolerance being loose. It is what "the gate is a BOUND, not an equality"
+means: 1.2e-7 is two `float` ulps at the fixtures' peak, and every arithmetic
+that lands inside it is a legitimate one. The defects the gate exists to catch
+are orders above it, and §4.17.11's difference table is what says so.
+
 #### 4.17.5 The seam, and why it is opted into PER MODEL
 
 `vllm::multimodal::ResampleAudioScipy` is a shared seam in new files
@@ -6843,6 +6872,11 @@ failed build has twice read as a pass:
 | M4 | off-by-one the `n_pre_remove` centring | the gate cannot see a one-sample phase shift |
 | M5 | delete the production call site — the resample in `ProcessWaveform` back to the throw | the served suite measures a function, not a capability |
 | M6 | hash the RAW waveform in the three-argument `HashAudio` | §4.17.6's cache collision is back and nothing sees it |
+| M7 | the ROUTE reverts to the two-argument `HashAudio` | the overload computes the right key and nothing asks for it |
+| M8 | the route hands the RAW buffer over as the resample "answer" (#2842) | the shared-buffer argument is trusted and never checked |
+| M9 | `kMaxUpsampleRatio` is widened past the attack (#2842) | the output bound is decorative |
+| M10 | delete the production call site — the resample in `ProcessWaveform` | the served suite measures a function, not a capability |
+| M11 | the route stops handing the buffer over, so it resamples TWICE (#2842) | *expected GREEN* — see §4.17.14 |
 
 The measured table is §4.17.11, written by the implementation commit. It is not
 in this spec commit, because a result written before it is measured is the
@@ -6921,6 +6955,10 @@ after allocating 16000000 samples" — that is precisely what the RED-before did
 
 
 #### 4.17.11 The gate, measured
+
+**These are W7c-2's LANDING numbers, at `0c440b6c3`.** §4.17.14 carries the ones
+after #2842's repair; both are kept, because a mutation table whose arms were
+measured against a different binary from its baseline is not a mutation table.
 
 Built in `/dev/shm` at `-DVLLM_CPP_SERVER=ON -DVLLM_CPP_BUILD_TESTS=ON
 -DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`, GCC, `-j 2`. Two suites, by
@@ -7105,6 +7143,63 @@ not a hypothetical.
 the tree was rebuilt and both binaries hashed again: `db03ea5e…` and
 `e0158068…`, identical to the baseline row, with both suites green at 24 / 3992
 and 28 / 16374.
+
+
+#### 4.17.14 The #2842 repair, measured
+
+Two fresh-review findings, repaired on `row/MODEL-MM-DOTS3-NOTE-W7C2` on top of
+`0c440b6c3`. Same recipe as §4.17.11 — `/dev/shm`, `-DVLLM_CPP_SERVER=ON
+-DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`, GCC,
+`-j 2` — on a DIFFERENT host and build directory, so the baseline shas below are
+not §4.17.11's even though the source is byte-identical. This build is not
+byte-reproducible across checkouts and never claimed to be; what a sha proves
+here is that two arms of THIS sweep are different binaries.
+
+| Arm | `test_dots3_note_audio` | `test_openai_api_server_dots3_mm_forward` |
+|---|---|---|
+| baseline, `0c440b6c3` | `b181a5dd…` 24 / 3992 pass | `8c117844…` 28 / 16374 pass |
+| **RED**, the new cases only | `356e5b48…` **23 / 24 cases, 13 of 4008 FAILED** | `213f7c9e…` **27 / 28 cases, 6 of 16385 FAILED** |
+| **GREEN**, repaired | `5c583c69…` 24 / 4014 pass | `99485ce5…` 28 / 16385 pass |
+
+**What the RED said, which is the whole finding.** The served 1 Hz request DID
+answer 400 — for the wrong reason and far too late. Its body was §4.15.3's
+`this request's 16000000 samples need 1000 chunks`, which is thrown AFTER the
+resample: the process had already built the sixteen-million-sample buffer that
+the finding is about. The subcase's `r.body.find("chunks") == npos` assertion is
+the one that separates "refused" from "refused after allocating", and it is the
+assertion the fix turns.
+
+| # | Mutation | `test_dots3_note_audio` | `test_openai_api_server_dots3_mm_forward` |
+|---|---|---|---|
+| M6 | hash the RAW waveform in the 3-argument `HashAudio` | `64adbaf0…` **1 case / 1 FAILED** | `1664dcff…` **1 case / 1 FAILED** |
+| M7 | the ROUTE reverts to the 2-argument `HashAudio` | `19be9058…` 24 / 4014 pass | `8725ae62…` **1 case / 1 FAILED** |
+| M8 | the route hands the RAW buffer over as the "answer" | `d6fdd6d5…` 24 / 4014 pass | `76fc721f…` **1 case / 1 FAILED** |
+| M9 | `kMaxUpsampleRatio` widened to 100000 | `4793b85a…` **1 case / 13 FAILED** | `957f3d2e…` **1 case / 6 FAILED** |
+| M10 | delete the production resample call site | `843fb58d…` **1 case FAILED** (it THREW) | `3fd981db…` **2 cases / 2 FAILED** |
+| M11 | the route stops handing the buffer over | `fb5b254c…` 24 / 4014 pass | `b0dc8199…` 28 / 16385 pass |
+
+Twelve distinct shas, none equal to the green row's `5c583c69…` / `99485ce5…`.
+M10's unit arm is the doctest shape where a THROWN case reports zero failed
+assertions and one failed case, so the case count is what reads it; `rc` was 1.
+
+**M11 IS GREEN ON PURPOSE, and saying so is the point.** Resampling once instead
+of twice is behaviour-preserving: the same key, the same features, the same
+answer. No test can see it, and inventing an instrument that counts resamples
+would be another `ResampleAudioScipyOutputLength` — a symbol reachable only from
+a test. What IS gated is the hazard the shared buffer introduces, which is a
+caller handing over the WRONG buffer: M8 covers that, and the unit subcase
+asserts that handing the buffer over and rebuilding it produce the same key.
+M6 and M7 confirm §4.17.6's contract survived the change.
+
+**Restored byte-for-byte, and verified at the BINARY.** After the last mutation
+the tree was rebuilt and both binaries hashed again:
+`5c583c698f9a54f09fd40b66300bad6129ed96b50e8f10097089e5d7aa6d2e7d` and
+`99485ce5ca1ceff1600f31029349fb9af7abd5125bc0a4b0233508c911e2d887`, identical to
+the green row, with both suites at 24 / 4014 and 28 / 16385.
+
+**`test_parakeet_audio_processor` is untouched and stays 6 / 41054.** Parakeet's
+rate refusal is upstream-faithful — `feature_extraction_parakeet.py` raises
+rather than resampling — and neither finding reaches it.
 
 
 ## 5. Gates

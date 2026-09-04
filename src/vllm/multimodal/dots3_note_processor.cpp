@@ -515,7 +515,8 @@ Dots3NoteAudioProcessor::SegmentWaveform(int64_t num_samples) const {
 }
 
 AudioKwargs Dots3NoteAudioProcessor::ProcessWaveform(
-    const float* samples, int64_t num_samples, int sample_rate) const {
+    const float* samples, int64_t num_samples, int sample_rate,
+    std::vector<float>* resampled_out) const {
   // W7c-2 (#2828): a rate that is not `audio_config.sampling_rate` is
   // RESAMPLED, not refused. Upstream resamples in its data parser
   // (`MultiModalDataParser(target_sr=..., target_channels=1)`,
@@ -546,7 +547,16 @@ AudioKwargs Dots3NoteAudioProcessor::ProcessWaveform(
   // HTTP 500, not 400: the served suite read `500 == 400` before this line was
   // written. Before W7c-2 the assignment was unreachable, because the refusal
   // above it guaranteed the two rates were already equal.
-  std::vector<float> resampled;
+  //
+  // THE BUFFER IS HANDED BACK when the caller asked for it (#2842 F2). The
+  // route needs the SAME resampled waveform for the encoder-cache key, and
+  // before this it got it by resampling a second time — 1220.7 MB twice on the
+  // request measured in spec §4.17.10. `resampled_out` is used as the local,
+  // so there is one buffer and no copy, and it stays empty at the target rate
+  // because then the caller's own pointer already is the consumed waveform.
+  std::vector<float> owned;
+  std::vector<float>& resampled = resampled_out != nullptr ? *resampled_out : owned;
+  resampled.clear();
   if (sample_rate != cfg_.sampling_rate) {
     resampled = ResampleAudioScipy(samples, num_samples, sample_rate,
                                    cfg_.sampling_rate);
@@ -644,9 +654,9 @@ std::string Dots3NoteAudioProcessor::HashAudio(const float* samples,
   return front_end_->HashAudio(samples, num_samples);
 }
 
-std::string Dots3NoteAudioProcessor::HashAudio(const float* samples,
-                                               int64_t num_samples,
-                                               int sample_rate) const {
+std::string Dots3NoteAudioProcessor::HashAudio(
+    const float* samples, int64_t num_samples, int sample_rate,
+    const std::vector<float>* resampled) const {
   // W7c-2 (#2828) CREATED the defect this closes, and closes it in the same
   // change. While every served rate was `audio_config.sampling_rate` the raw
   // waveform was an unambiguous encoder-cache key. It stops being one the
@@ -672,10 +682,20 @@ std::string Dots3NoteAudioProcessor::HashAudio(const float* samples,
   if (sample_rate == cfg_.sampling_rate) {
     return front_end_->HashAudio(samples, num_samples);
   }
-  const std::vector<float> resampled =
+  // RESAMPLE ONCE (#2842 F2). `RouteDots3NoteAudioWav` has just driven
+  // `ProcessWaveform` over this same waveform and this same rate, so it already
+  // holds the buffer this would otherwise rebuild; on the request measured in
+  // spec §4.17.10 that rebuild was a second 1220.7 MB allocation, doubling the
+  // cost of a 40 KB upload. The argument is the answer and not a hint: it is
+  // hashed as-is. A caller that does not hold it passes nothing and this
+  // resamples for itself, which is the only behaviour that ever existed.
+  if (resampled != nullptr) {
+    return front_end_->HashAudio(resampled->data(),
+                                 static_cast<int64_t>(resampled->size()));
+  }
+  const std::vector<float> own =
       ResampleAudioScipy(samples, num_samples, sample_rate, cfg_.sampling_rate);
-  return front_end_->HashAudio(resampled.data(),
-                               static_cast<int64_t>(resampled.size()));
+  return front_end_->HashAudio(own.data(), static_cast<int64_t>(own.size()));
 }
 
 }  // namespace vllm::multimodal

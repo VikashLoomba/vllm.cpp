@@ -55,6 +55,8 @@
 #include "vllm/multimodal/audio_processor.h"
 #include "vllm/multimodal/audio_resample.h"
 #include "vllm/multimodal/mel_filter_bank.h"
+#include "vllm/multimodal/processing/processor.h"
+#include "vllm/multimodal/qwen3vl_processor.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -665,6 +667,125 @@ std::vector<double> NearestSample(const std::vector<double>& x,
 }  // namespace ref_resample
 
 // ═══════════════════════════════════════════════════════════════════════════
+// A FIFTH REFERENCE (W8a, #2860): the ONE-PASS prompt-update planner.
+//
+// A second, independent implementation of `apply_token_matches`
+// (`vllm/multimodal/processing/processor.py:944-957` @ `9035151d6`) and the
+// planner it calls (`:799-857`, `:906-941`), written from the Python and not
+// from `src/vllm/multimodal/processing/processor.cpp`. It shares NO helper with
+// the implementation; every qualified name is `std::`, measured by the case
+// below, which is why this namespace joins the EXISTING instrument rather than
+// getting a second one of its own.
+//
+// It is INTEGER work, so "double precision" does not apply and this file does
+// not claim it. What the reference buys is that two independently written
+// planners agree on the whole output id stream and on every span, which is the
+// property a transcription slip in either one breaks.
+//
+// The style is deliberately not the implementation's: this one PRE-SCANS every
+// target occurrence in the prompt once, then walks the occurrence lists with a
+// cursor, where `src/` re-searches from the previous match's end on each step.
+// Two shapes of the same rule, so a shared off-by-one has to be made twice.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace ref_apply {
+
+// MEASURED by the enumeration case below, as the other four are.
+//
+//  1 std::size_t (12)   2 std::string (2)   3 std::vector (14)
+inline constexpr int kDistinctQualifiedNames = 3;
+inline constexpr int kQualifiedNameOccurrences = 28;
+
+struct Rule {
+  std::string modality;
+  std::vector<int> target;
+  std::vector<int> pads;  // one placeholder-run length per item
+};
+
+struct Span {
+  std::string modality;
+  int item = 0;
+  int offset = 0;
+  int length = 0;
+};
+
+struct Applied {
+  std::vector<int> ids;
+  std::vector<Span> spans;
+};
+
+// Every position at which `target` occurs in `ids`, overlaps included. The
+// EXCLUSION of overlapping matches is upstream's `start_idx = end_idx` advance
+// (`processor.py:652-655`) and it is applied by the cursor walk below, not
+// here.
+inline std::vector<int> AllOccurrences(const std::vector<int>& ids,
+                                       const std::vector<int>& target) {
+  std::vector<int> at;
+  if (target.empty()) return at;
+  const std::size_t n = ids.size();
+  const std::size_t m = target.size();
+  if (n < m) return at;
+  for (std::size_t i = 0; i + m <= n; ++i) {
+    std::size_t j = 0;
+    while (j < m && ids[i + j] == target[j]) ++j;
+    if (j == m) at.push_back(static_cast<int>(i));
+  }
+  return at;
+}
+
+inline Applied Apply(const std::vector<int>& ids,
+                     const std::vector<Rule>& rules) {
+  const std::size_t r_count = rules.size();
+  std::vector<std::vector<int>> occ(r_count);
+  for (std::size_t r = 0; r < r_count; ++r)
+    occ[r] = AllOccurrences(ids, rules[r].target);
+
+  std::vector<std::size_t> cursor(r_count, 0);  // into occ[r]
+  std::vector<std::size_t> taken(r_count, 0);   // items consumed
+
+  Applied out;
+  int copied = 0;  // how much of `ids` has been emitted
+  for (;;) {
+    std::size_t pick = r_count;
+    int pick_at = 0;
+    for (std::size_t r = 0; r < r_count; ++r) {
+      if (taken[r] >= rules[r].pads.size()) continue;
+      while (cursor[r] < occ[r].size() && occ[r][cursor[r]] < copied)
+        ++cursor[r];
+      if (cursor[r] >= occ[r].size()) continue;
+      const int here = occ[r][cursor[r]];
+      if (pick == r_count || here < pick_at) {
+        pick = r;
+        pick_at = here;
+      }
+    }
+    if (pick == r_count) break;
+
+    const Rule& rule = rules[pick];
+    for (int i = copied; i < pick_at; ++i)
+      out.ids.push_back(ids[static_cast<std::size_t>(i)]);
+
+    const int pads = rule.pads[taken[pick]];
+    Span span;
+    span.modality = rule.modality;
+    span.item = static_cast<int>(taken[pick]);
+    out.ids.push_back(rule.target[0]);
+    span.offset = static_cast<int>(out.ids.size());
+    span.length = pads;
+    for (int i = 0; i < pads; ++i) out.ids.push_back(rule.target[1]);
+    out.ids.push_back(rule.target[2]);
+    out.spans.push_back(span);
+
+    copied = pick_at + static_cast<int>(rule.target.size());
+    ++taken[pick];
+  }
+  for (int i = copied; i < static_cast<int>(ids.size()); ++i)
+    out.ids.push_back(ids[static_cast<std::size_t>(i)]);
+  return out;
+}
+
+}  // namespace ref_apply
+
+// ═══════════════════════════════════════════════════════════════════════════
 // THE ENUMERATION INSTRUMENT.
 //
 // Reads THIS source file at `DOTS3_AUDIO_TEST_SOURCE` (the same arrangement
@@ -866,6 +987,10 @@ TEST_CASE("dots3-note W7a+W7b+W7c-2: the FOUR references share no helper with sr
   // W7c-2 (#2828) extends it AGAIN, to a fourth namespace, for the same reason
   // W7b did rather than writing a second instrument.
   const RefNames resample = QualifiedNamesIn("ref_resample");
+  // W8a (#2860) extends it to a FIFTH, for the same reason again: `ref_apply`
+  // is new reference code, and reference code the instrument does not read is
+  // reference code whose independence nothing measures.
+  const RefNames apply = QualifiedNamesIn("ref_apply");
 
   // The instrument must be shown to have READ something. A parse that found an
   // empty span would otherwise report "zero non-std:: names" and pass.
@@ -873,6 +998,7 @@ TEST_CASE("dots3-note W7a+W7b+W7c-2: the FOUR references share no helper with sr
   REQUIRE(tower.occurrences > 0);
   REQUIRE(chunks.occurrences > 0);
   REQUIRE(resample.occurrences > 0);
+  REQUIRE(apply.occurrences > 0);
 
   MESSAGE("ref_front: " << front.distinct << " distinct, " << front.occurrences
                         << " occurrences, scopes=" << Join(front.scopes));
@@ -884,12 +1010,15 @@ TEST_CASE("dots3-note W7a+W7b+W7c-2: the FOUR references share no helper with sr
   MESSAGE("ref_resample: " << resample.distinct << " distinct, "
                            << resample.occurrences
                            << " occurrences, scopes=" << Join(resample.scopes));
+  MESSAGE("ref_apply: " << apply.distinct << " distinct, " << apply.occurrences
+                        << " occurrences, scopes=" << Join(apply.scopes));
 
   // The independence property itself.
   CHECK(Join(front.scopes) == "std");
   CHECK(Join(tower.scopes) == "std");
   CHECK(Join(chunks.scopes) == "std");
   CHECK(Join(resample.scopes) == "std");
+  CHECK(Join(apply.scopes) == "std");
 
   // And the enumerated lists, now that they are the measurement's own output.
   CHECK(front.distinct == ref_front::kDistinctQualifiedNames);
@@ -900,6 +1029,8 @@ TEST_CASE("dots3-note W7a+W7b+W7c-2: the FOUR references share no helper with sr
   CHECK(chunks.occurrences == ref_chunks::kQualifiedNameOccurrences);
   CHECK(resample.distinct == ref_resample::kDistinctQualifiedNames);
   CHECK(resample.occurrences == ref_resample::kQualifiedNameOccurrences);
+  CHECK(apply.distinct == ref_apply::kDistinctQualifiedNames);
+  CHECK(apply.occurrences == ref_apply::kQualifiedNameOccurrences);
 
   // AND THE STRIPPER ITSELF, because the property above is only as true as the
   // scan that measures it. `StripCommentsAndLiterals` used to treat every `'`
@@ -2975,4 +3106,234 @@ TEST_CASE("dots3-note W7c-2: the seam REFUSES a rate it will not design a filter
     CHECK(resample(2000, 16000).empty());
     CHECK(!resample(1999, 16000).empty());
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 8. W8a (#2860): THE ONE-PASS APPLIER against `ref_apply`.
+//
+//    `ApplyPromptReplacements` is what replaces the two sequential expanders.
+//    Spec §4.18.1 records why chaining them cannot work: each rebuilds the
+//    whole id vector, so the second one's offsets are measured against the
+//    first one's UN-expanded input and every span after the first is short by
+//    the earlier expansions.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+// The two dots3-note rules, at the fixture's own ids, built through the
+// PRODUCTION helper. `ref_apply` is handed the same three ids per modality and
+// builds its own target and content.
+std::vector<vllm::multimodal::PromptReplacement> ProdRules(
+    const std::vector<int>& image_counts,
+    const std::vector<int>& audio_counts) {
+  std::vector<vllm::multimodal::PromptReplacement> rules;
+  if (!image_counts.empty()) {
+    rules.push_back(vllm::multimodal::MakeTokenTripleReplacement(
+        "image", dots3_tiny::kImgStartId, dots3_tiny::kImgPadId,
+        dots3_tiny::kImgEndId, image_counts));
+  }
+  if (!audio_counts.empty()) {
+    rules.push_back(vllm::multimodal::MakeTokenTripleReplacement(
+        "audio", dots3_tiny::kAudStartId, dots3_tiny::kAudPadId,
+        dots3_tiny::kAudEndId, audio_counts));
+  }
+  return rules;
+}
+
+std::vector<ref_apply::Rule> RefRules(const std::vector<int>& image_counts,
+                                      const std::vector<int>& audio_counts) {
+  std::vector<ref_apply::Rule> rules;
+  if (!image_counts.empty()) {
+    rules.push_back(ref_apply::Rule{
+        "image",
+        {dots3_tiny::kImgStartId, dots3_tiny::kImgPadId, dots3_tiny::kImgEndId},
+        image_counts});
+  }
+  if (!audio_counts.empty()) {
+    rules.push_back(ref_apply::Rule{
+        "audio",
+        {dots3_tiny::kAudStartId, dots3_tiny::kAudPadId, dots3_tiny::kAudEndId},
+        audio_counts});
+  }
+  return rules;
+}
+
+std::vector<int> ToInt(const std::vector<std::int32_t>& v) {
+  return std::vector<int>(v.begin(), v.end());
+}
+
+std::vector<std::int32_t> ToI32(const std::vector<int>& v) {
+  return std::vector<std::int32_t>(v.begin(), v.end());
+}
+
+// Every case's assertion, so a new prompt shape costs one line.
+void AgreesWithReference(const std::vector<int>& prompt,
+                         const std::vector<int>& image_counts,
+                         const std::vector<int>& audio_counts) {
+  std::vector<vllm::multimodal::AppliedPromptUpdate> got;
+  const std::vector<std::int32_t> ours =
+      vllm::multimodal::ApplyPromptReplacements(
+          ToI32(prompt), ProdRules(image_counts, audio_counts), &got);
+  const ref_apply::Applied want =
+      ref_apply::Apply(prompt, RefRules(image_counts, audio_counts));
+
+  REQUIRE(ToInt(ours) == want.ids);
+  REQUIRE(got.size() == want.spans.size());
+  for (std::size_t i = 0; i < got.size(); ++i) {
+    INFO("span ", i);
+    CHECK(got[i].modality == want.spans[i].modality);
+    CHECK(got[i].item_index == want.spans[i].item);
+    CHECK(got[i].offset == want.spans[i].offset);
+    CHECK(got[i].length == want.spans[i].length);
+    // The span holds only pad ids, and it lies inside the output.
+    REQUIRE(got[i].offset >= 0);
+    REQUIRE(got[i].offset + got[i].length <= static_cast<int>(ours.size()));
+    const std::int32_t pad = got[i].modality == "image"
+                                 ? dots3_tiny::kImgPadId
+                                 : dots3_tiny::kAudPadId;
+    for (int t = got[i].offset; t < got[i].offset + got[i].length; ++t)
+      CHECK(ours[static_cast<std::size_t>(t)] == pad);
+  }
+  // ASCENDING and DISJOINT, which `GetMmFeaturesInWindow`'s two binary searches
+  // (`utils.cpp:9-50`) are a precondition of.
+  for (std::size_t i = 1; i < got.size(); ++i) {
+    CHECK(got[i - 1].offset + got[i - 1].length <= got[i].offset);
+  }
+}
+
+}  // namespace
+
+TEST_CASE("dots3-note W8a: the ONE-PASS applier agrees with an INDEPENDENT reference") {
+  const int kImg = dots3_tiny::kImgStartId, kImgP = dots3_tiny::kImgPadId,
+            kImgE = dots3_tiny::kImgEndId;
+  const int kAud = dots3_tiny::kAudStartId, kAudP = dots3_tiny::kAudPadId,
+            kAudE = dots3_tiny::kAudEndId;
+  const int kText = 13;  // "hello" in the row's BPE fixture
+
+  SUBCASE("one image alone") {
+    AgreesWithReference({kImg, kImgP, kImgE, kText}, {4}, {});
+  }
+  SUBCASE("one audio alone") {
+    AgreesWithReference({kAud, kAudP, kAudE, kText}, {}, {7});
+  }
+  SUBCASE("audio then text then image — the mixed request the seam builds") {
+    AgreesWithReference({kAud, kAudP, kAudE, kText, kImg, kImgP, kImgE}, {4},
+                        {7});
+  }
+  SUBCASE("image FIRST, so the rule order and the stream order disagree") {
+    AgreesWithReference({kImg, kImgP, kImgE, kAud, kAudP, kAudE}, {4}, {7});
+  }
+  SUBCASE("two images and two audios, INTERLEAVED") {
+    AgreesWithReference({kImg, kImgP, kImgE, kAud, kAudP, kAudE, kText, kImg,
+                         kImgP, kImgE, kAud, kAudP, kAudE},
+                        {4, 8}, {7, 3});
+  }
+  SUBCASE("ADJACENT targets with no text between them") {
+    AgreesWithReference({kImg, kImgP, kImgE, kImg, kImgP, kImgE}, {4, 4}, {});
+  }
+  SUBCASE("a ZERO-length run, which a 1x1 grid under a 2x2 merge cannot make "
+          "but the applier must still place") {
+    AgreesWithReference({kAud, kAudP, kAudE, kText}, {}, {0});
+  }
+  SUBCASE("no rules at all leaves the stream byte-identical") {
+    AgreesWithReference({kText, kText, kImgP, kAudP}, {}, {});
+  }
+}
+
+TEST_CASE("dots3-note W8a: the applier keys on the TARGET TRIPLE, not on the pad id") {
+  // Upstream's target is `[start, pad, end]` (`common/processor.py:749-756`,
+  // `:777-783` @ `9035151d6`), so a BARE pad id in the user's own text is NOT a
+  // placeholder. The pre-W8a `ExpandImagePlaceholders` keyed on the pad alone
+  // and threw "more image placeholders than grids" at it, which reached the
+  // client as a 400 naming an internal helper.
+  const std::vector<std::int32_t> prompt{
+      dots3_tiny::kImgPadId,   // a bare pad the user typed
+      13,
+      dots3_tiny::kImgStartId, dots3_tiny::kImgPadId, dots3_tiny::kImgEndId};
+  std::vector<vllm::multimodal::AppliedPromptUpdate> got;
+  const std::vector<std::int32_t> out =
+      vllm::multimodal::ApplyPromptReplacements(prompt, ProdRules({4}, {}),
+                                                &got);
+  REQUIRE(got.size() == 1u);
+  // The REAL placeholder, not the bare one at index 0.
+  CHECK(got[0].offset == 3);
+  CHECK(got[0].length == 4);
+  // Two untouched ids (the bare pad and the text token) plus the replaced
+  // triple, which is `[start] + 4 pads + [end]`.
+  CHECK(out.size() == 2u + 6u);
+  CHECK(out[0] == dots3_tiny::kImgPadId);  // left exactly where the user put it
+}
+
+TEST_CASE("dots3-note W8a: an item the prompt has no target for is REFUSED BY NAME") {
+  // The one outcome that produces a fluent WRONG answer: the encoder never runs
+  // for the dropped item, the placeholder run is never written, and the prompt
+  // reads as if the user had not sent that media. Upstream reaches the same
+  // conclusion through `_all_items_found` (`processor.py:896-903` @
+  // `9035151d6`).
+  const std::vector<std::int32_t> one_target{
+      dots3_tiny::kImgStartId, dots3_tiny::kImgPadId, dots3_tiny::kImgEndId};
+  CHECK_THROWS_WITH_AS(
+      vllm::multimodal::ApplyPromptReplacements(one_target, ProdRules({4, 4}, {}),
+                                                nullptr),
+      doctest::Contains("1 'image' placeholder target(s) but the request "
+                        "carries 2 item(s)"),
+      std::runtime_error);
+
+  // An EMPTY target is upstream's other planner arm and this port does not
+  // represent it, so it is refused rather than treated as a no-op.
+  std::vector<vllm::multimodal::PromptReplacement> empty_target;
+  empty_target.push_back(vllm::multimodal::PromptReplacement{"image", {}, {}});
+  CHECK_THROWS_WITH_AS(
+      vllm::multimodal::ApplyPromptReplacements(one_target, empty_target,
+                                                nullptr),
+      doctest::Contains("EMPTY target"), std::runtime_error);
+}
+
+TEST_CASE("dots3-note W8a: the SEQUENTIAL two-pass expansion this replaces gets the second span WRONG") {
+  // THE MEASUREMENT BEHIND SPEC §4.18.1, executed rather than argued. The two
+  // shipped expanders each rebuild the whole id vector, so chaining them over
+  // one prompt reports the image span at an offset that is short by exactly the
+  // audio expansion — and it lands INSIDE the audio span, where the runner
+  // would splice vision rows over audio rows.
+  const std::vector<std::int32_t> prompt{
+      dots3_tiny::kAudStartId, dots3_tiny::kAudPadId, dots3_tiny::kAudEndId,
+      13,
+      dots3_tiny::kImgStartId, dots3_tiny::kImgPadId, dots3_tiny::kImgEndId};
+
+  std::vector<std::array<int, 2>> audio_spans;
+  const std::vector<std::int32_t> after_audio =
+      vllm::multimodal::ExpandAudioPlaceholders(prompt, dots3_tiny::kAudPadId,
+                                                {7}, &audio_spans);
+  REQUIRE(audio_spans.size() == 1u);
+  CHECK(audio_spans[0][0] == 1);
+  CHECK(audio_spans[0][1] == 7);
+
+  // The chained pass, measured against the ORIGINAL ids, which is what makes it
+  // wrong. `grid` (1, 4, 4) over merge 2 is FOUR placeholder rows.
+  std::vector<std::array<int, 2>> chained_image;
+  vllm::multimodal::ExpandImagePlaceholders(
+      prompt, dots3_tiny::kImgPadId, /*merge_size=*/2,
+      {std::array<std::int64_t, 3>{1, 4, 4}}, &chained_image);
+  REQUIRE(chained_image.size() == 1u);
+  MESSAGE("chained two-pass reports the image at offset "
+          << chained_image[0][0] << "; the audio span is ["
+          << audio_spans[0][0] << ", "
+          << audio_spans[0][1] + audio_spans[0][0] << ")");
+  CHECK(chained_image[0][0] == 5);
+  // INSIDE the audio span, which is the defect in one line.
+  CHECK(chained_image[0][0] < audio_spans[0][0] + audio_spans[0][1]);
+
+  // The one-pass applier puts it where it belongs.
+  std::vector<vllm::multimodal::AppliedPromptUpdate> got;
+  const std::vector<std::int32_t> ours =
+      vllm::multimodal::ApplyPromptReplacements(prompt, ProdRules({4}, {7}),
+                                                &got);
+  REQUIRE(got.size() == 2u);
+  CHECK(got[0].modality == "audio");
+  CHECK(got[0].offset == 1);
+  CHECK(got[1].modality == "image");
+  CHECK(got[1].offset == 11);
+  CHECK(got[1].offset >= got[0].offset + got[0].length);
+  CHECK(ours.size() == 16u);
+  // And the chained arm's own OUTPUT stream is not this one either.
+  CHECK(after_audio.size() != ours.size());
 }

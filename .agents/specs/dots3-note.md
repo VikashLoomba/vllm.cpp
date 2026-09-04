@@ -4113,7 +4113,7 @@ having no oracle to catch it.
 | `adapter_type == "pixel_shuffle_mlp"` | W6b | `ParseDots3NoteVisionParams` |
 | `post_norm == false` | W6b | `ParseDots3NoteVisionParams` |
 | `use_bias == true` | W6b | `ParseDots3NoteVisionParams` |
-| `temporal_patch_size != 1` | W7 (video) | `ParseDots3NoteVisionParams` |
+| `temporal_patch_size != 1` | **W8** (video) — this row read `W7 (video)` until W8a, two lines above the correction paragraph that is about exactly this | `ParseDots3NoteVisionParams` |
 | `adapter_out_dim != config.hidden_size` | none — unservable | `Dots3NoteVisionRefusal` |
 | `adapter_merge_size != spatial_merge_size` | none — unservable | `Dots3NoteVisionRefusal` |
 
@@ -7210,6 +7210,346 @@ rate refusal is upstream-faithful — `feature_extraction_parakeet.py` raises
 rather than resampling — and neither finding reaches it.
 
 
+### 4.18 W8a applies EVERY modality in ONE pass, so one request carries TWO features
+
+**Issue: [#2860](https://github.com/mudler/vllm.cpp/issues/2860). Brick: W8a,
+the multi-item, multi-modality half of W8.** Before this slice the dots3-note
+chat seam located exactly ONE image part and exactly ONE audio part, declared
+`{"image": 1, "audio": 1}`, and refused a request carrying both BY NAME with
+HTTP 400. After it the seam serves any mix, declares `{"image": 512,
+"audio": 128}`, and a single request carries as many `mm_features` as it has
+media parts.
+
+**This is the first request in this repository to carry more than one
+`mm_feature`.** Every production seam emitted exactly one — `chat_mm.cpp:157`
+and `:184` for Qwen3-VL and Whisper, `mm_chat_dots3note.cpp:185` and `:320`
+here — and every served test asserted one. The machinery below the seam is
+N-generic in SHAPE and had never been exercised:
+`MultiModalInputs::mm_features` is a vector documented "one per placeholder
+item" (`include/vllm/multimodal/inputs.h:133`); `try_schedule_encoder_inputs`
+walks `GetMmFeaturesInWindow` over the request's item list
+(`scheduler.cpp:495-563`); `execute_mm_encoder` loops the scheduler's per-request
+input ids and dispatches `EncodeMm` per item (`runner.cpp:1955-1978`);
+`gather_mm_embeddings` slices one encoder output per overlapping item and marks
+each span in `is_mm_embed` (`runner.cpp:1999-2089`); and
+`EmbedMmDots3NoteForCausalLM` scatters `*inputs.mm_embeds` "concatenated in mask
+order" (`dots3_note_registry.cpp:358-470`, the mask-order loop at `:408-413`). **Proving it carries N is the
+work, and §4.18.7 records that it did on the first try.**
+
+#### 4.18.1 Why the two expanders could not simply both run
+
+`ExpandImagePlaceholders` (`qwen3vl_processor.cpp:175-206`) and
+`ExpandAudioPlaceholders` (`audio_processor.cpp:326-345`) each REBUILD the whole
+id vector and report offsets into the vector THEY built. Running them in
+sequence over one prompt therefore measures the second one's offsets against the
+first one's UN-expanded input: on the fixture prompt
+`[<|audio_comp_start|>, <|audio_comp_pad|>, <|audio_comp_end|>, "hello",
+<|img|>, <|imgpad|>, <|endofimg|>]` the audio pass expands its pad to seven and
+reports `[1, 7]`, and an image pass over that OUTPUT is correct — but an image
+pass over the ORIGINAL reports `[5, 4]` where the true position is `[11, 4]`,
+six rows early, straddling the audio span. Nothing downstream can detect that:
+the counts still balance, `n_rows == n_masked` still holds, and the answer is
+confidently wrong. That is why the pre-W8a seam refused instead of chaining, and
+why the mutation in §4.18.8 that restores the chaining has to be caught by a
+LOGPROB assertion rather than a status or a token count.
+
+#### 4.18.2 Upstream's shape, and what this port mirrors
+
+Read in `~/_git/vllm`, `git rev-parse HEAD` = `5559679229bc961848b121ccdeaa8fa5d79bec98`
+— the parity pin, which carries no `dots3_note` at all — with the sources at
+`git rev-parse 9035151d6` = `9035151d6c9fb726181469f9e6aa9ccbf9a5dacb`.
+
+| What | Upstream | `file:line@9035151d6` |
+|---|---|---|
+| the per-modality rule | `PromptReplacement(modality, target, replacement)` | `vllm/multimodal/processing/processor.py:423-519` |
+| the image rule's target | `[image_start_id, image_pad_id, image_end_id]` | `vllm/models/dots3_note/common/processor.py:735-756` |
+| the audio rule's target | `[audio_start_id, audio_pad_id, audio_end_id]` | `common/processor.py:757-783` |
+| the replacement content | `PromptUpdateDetails.select_token_id(full, pad_id)` | `processing/processor.py:206-256` |
+| the LIST of rules, built per request | `updates: list[PromptUpdate]` | `common/processor.py:725-812` |
+| ONE pass over the id stream | `apply_token_matches` -> `_apply_matches` -> `_plan_prompt_updates` | `processing/processor.py:944-957`, `:906-941`, `:799-857` |
+| target matching | `iter_token_matches`, non-overlapping | `processing/processor.py:619-657` |
+| the declared limits | `{"image": 512, "video": 1, "audio": 128}` | `common/processor.py:527-534` |
+
+`_plan_prompt_updates` is general over INSERT and REPLACE modes and over empty
+targets. Both dots3-note rules are REPLACE with a non-empty three-id target, and
+on that subset the planner reduces exactly to: repeatedly find, for each
+modality queue that still has items, the FIRST occurrence of its target at or
+after `prev_end_idx`; apply the earliest match, breaking a tie by the modality's
+position in the list (`min(..., key=lambda item: (item[1], _next_priority(item[0])))`
+at `:871-874`, over the queue priority `_next_priority` returns at `:794-797`);
+set `prev_end_idx` to that match's end. `ApplyPromptReplacements`
+(`src/vllm/multimodal/processing/processor.cpp`) is that reduction, and the
+narrowing is recorded in the header rather than implied: an INSERT-mode rule and
+an empty target are refused BY NAME, because a port that silently treated them
+as REPLACE would answer 200 with the wrong id stream.
+
+#### 4.18.3 The triple is the key, and that is a behaviour change
+
+The old expanders key on the PAD id ALONE. The new applier keys on the whole
+`[start, pad, end]` target, which is upstream's own key. Two consequences, both
+upstream's:
+
+- A bare `<|imgpad|>` typed into a user's TEXT is no longer expanded. The old
+  `ExpandImagePlaceholders` matched it and then threw
+  `"more image placeholders than grids"`, which reached the client as a 400
+  naming an internal helper. It is now an ordinary token the embedding table
+  looks up, exactly as upstream leaves it.
+- A user who types the WHOLE triple before their real image part takes that
+  item's grid. Upstream does the same thing, for the same reason: the target is
+  the only thing either side has to go on. Mirrored rather than guarded.
+
+What is NOT relaxed is the item count. If a rule's items are not all consumed by
+the end of the pass, `ApplyPromptReplacements` throws BY NAME with the modality,
+the count found and the count expected. Upstream reaches the same conclusion
+through `_all_items_found` (`processing/processor.py:896-903`); dropping an item
+silently is the one outcome that produces a fluent wrong answer.
+
+#### 4.18.4 The ORDER of `mm_features` is load-bearing, and it is the stream's
+
+`GetMmFeaturesInWindow` (`utils.cpp:9-50`) is a pair of BINARY SEARCHES over
+`offset` and over `offset + length`. Both the scheduler and the runner call it.
+A feature list that is not sorted ascending by `offset` makes both searches
+return a window that silently omits an item, and the runner then reports an
+encoder-cache miss or scatters the wrong rows. The one-pass walk emits spans in
+ID-STREAM order by construction, which is the sorted order, and the seam pushes
+`mm_features` in exactly that order — modality is a FIELD of the span, never the
+loop that produces it. A per-modality outer loop would be the natural way to
+write this and would be wrong; §4.18.8's M2 is that mistake, and it reds.
+
+#### 4.18.5 The declared limits, and why `video` stays ABSENT
+
+`Dots3NoteChatSupportedMmLimits` now returns `{"image": 512}` and, when the
+install built an audio tower, `{"audio": 128}`. Those are upstream's own numbers
+(`common/processor.py:530`, `:533`). `video` is NOT declared, although upstream
+declares `{"video": 1}` beside them, and the omission is the point:
+`BaseProcessingInfo` reads an ABSENT modality as limit 0
+(`context.py:414-415`), so the entrypoint refuses a video part with upstream's
+own `"At most 0 video(s) may be provided in one prompt."` — byte for byte the
+refusal this seam already produced. Declaring `{"video": 1}` here would promise
+a capability §4.18 does not build and the tower cannot serve; the seam's ceiling
+has to be what it can actually build, which is the rule the `has_audio`
+parameter has encoded since W7a.
+
+The limits are the OTHER operand of a `min()` fold with the engine's
+`--limit-mm-per-prompt` (`context.py:392-405`), so a user limit can still only
+LOWER them. What changed is that lowering is now the only way to get the old
+`{"image": 1, "audio": 1}` behaviour back.
+
+#### 4.18.6 Gate form: §6.4 option B, and the instrument is EXTENDED not copied
+
+No oracle. ~290 GB fp8 against a 119-122 GiB ceiling on every host this project
+reaches, and the pin carries no `dots3_note` at all, so there is nothing to run
+the same workload on. Correctness is argued by an **independent in-test
+reference sharing no helper with the implementation**, and its independence is
+MEASURED rather than asserted: `test_dots3_note_audio.cpp` already carries an
+enumeration instrument that re-reads its own source, strips comments and
+literals, takes the span of one reference namespace and counts every
+`scope::name` in it. W8a adds a FIFTH namespace, `ref_apply`, to that instrument
+rather than writing a second one — reference code the instrument does not read
+is reference code whose independence nothing measures, which is the reason W7b
+and W7c-2 extended it too.
+
+`ref_apply` is a from-scratch second implementation of the one-pass planner
+written only from upstream's Python. The reference is INTEGER work, so "double
+precision" does not apply to it and this section does not claim it: what the
+reference buys is that two independently written planners agree on the id stream
+and on every span, and the LOGPROB assertions in the served suite are what carry
+the numeric claim.
+
+No performance number is claimable on any axis, on this brick as on every other
+one on this row.
+
+#### 4.18.7 The plumbing below the seam carried TWO features on the first try
+
+Recorded because #2860 asked for a `NEEDS_DECISION` if it did not, and because a
+"generic in shape" claim that nobody executed is worth nothing.
+
+It did. The only product change in this brick is the new
+`src/vllm/multimodal/processing/processor.cpp` and the seam that calls it; the
+scheduler, the encoder loop, the embedding gather, the prefix-cache key builder
+and the model's masked scatter are untouched, and the first build with the seam
+wired ran `test_openai_api_server_dots3_mm_forward` green at 28 / 16467. No
+`NEEDS_DECISION` was raised and W8a was not split.
+
+#### 4.18.8 Mutations
+
+Each is applied to a scratch copy, built, run RED, and the tree restored
+byte-for-byte with both binaries re-hashed. Numbers are in §4.18.9.
+
+| ID | Mutation | Must red |
+|---|---|---|
+| M1 | keep only the FIRST feature in the seam's span loop | the three W8a served cases |
+| M2 | restore the sequential two-pass expansion (each rule applied on its own, against the ORIGINAL ids) | the mixed served case |
+| M3 | delete the entry-point route, so `MakeDots3NoteChatSeam` is never reached | every served case in the suite |
+| M4 | make `MakeTokenTripleReplacement` key on the PAD id alone instead of the target triple, in its COHERENT form: `target = {pad_id}` **together with** `full = n pads` and `embed_offset = 0`, so the rule still describes one self-consistent replacement | the unit case that types a bare pad id into the text |
+| M5 | emit spans per MODALITY instead of in stream order, in the CHAT SEAM's span loop | the mixed served case's span assertions |
+
+Two of those rows name a PLACEMENT or a FORM, and both do so because the row
+does not reproduce without it. M4's half-form — retarget to `{pad_id}` while
+LEAVING the `[start] + pads + [end]` content — is a different and far more
+destructive mutation, because the replacement then no longer describes what it
+replaces; it is not what the recorded row measured. M5's placement is the
+subject of §4.18.9's correction below.
+
+#### 4.18.9 Evidence
+
+Measured on this worktree at `f2930e918` + this branch, CPU only, in a
+`/dev/shm` build tree configured `-DVLLM_CPP_SERVER=ON
+-DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`.
+
+**Oracle identity.** `~/_git/vllm` `git rev-parse HEAD` =
+`5559679229bc961848b121ccdeaa8fa5d79bec98`, the parity pin, whose tree contains
+no `dots3_note` path at all (`git ls-tree -r --name-only 5559679229 | grep -i
+dots` returns `dots_ocr.py` and `dotsocr.py` only). Every anchor in this section
+names `9035151d6` =
+`9035151d6c9fb726181469f9e6aa9ccbf9a5dacb`, where
+`vllm/models/dots3_note/common/processor.py` and
+`vllm/multimodal/processing/processor.py` both exist.
+
+**RED-before, on the tree with the three cases inverted and no implementation
+present.** `test_openai_api_server_dots3_mm_forward`
+`907994b6a24425ec44680763623cc78cd5635ad63b6ea6aaa2b7b33035f834a9`, **28 cases,
+25 passed, 3 failed / 16377 assertions, 3 failed**. The three are exactly the
+inversions, and each names the refusal that had to go:
+
+```text
+TEST CASE:  dots3-note W8a: TWO images in one request are both served, ...
+  FATAL ERROR: REQUIRE( r.status == 200 ) is NOT correct!
+  values: REQUIRE( 400 == 200 )
+  logged: body: {"error":{"code":400,"message":"At most 1 image(s) may be provided in one prompt.",...}}
+
+TEST CASE:  dots3-note W8a: TWO audio parts in one request are both served, ...
+  FATAL ERROR: REQUIRE( r.status == 200 ) is NOT correct!
+  values: REQUIRE( 400 == 200 )
+  logged: body: {"error":{"code":400,"message":"At most 1 audio(s) may be provided in one prompt.",...}}
+
+TEST CASE:  dots3-note W8a: an image and an audio part in ONE request are BOTH served, ...
+  FATAL ERROR: REQUIRE( r.status == 200 ) is NOT correct!
+  values: REQUIRE( 400 == 200 )
+  logged: body: {"error":{"code":400,"message":"dots3-note multimodal chat seam: this request
+    carries BOTH an image and an audio part. ... that is owed to W8. ..."}}
+```
+
+`test_dots3_note_audio` at that point was untouched and green at **24 / 4014**.
+
+**GREEN-after.** `test_dots3_note_audio`
+`ea48d56ce241f5b2209a8fe61bbc676b4eaa4bd624ed45079e9f292800aae816` **28 / 4206**,
+`test_openai_api_server_dots3_mm_forward`
+`751f6c9752fb1f7efea3088e17111e93581750c125b475c30539ba118eb1a4bb` **28 / 16467**.
+Measured on the mixed request: `spans: audio [1, 8) image [11, 15)`,
+`mixed vs audio-only: 0.461567, mixed vs image-only: 0.83363`. The second image
+moves the first token's logprobs by up to `0.172768` and the second waveform by
+up to `0.668705`.
+
+**Mutations.** Every one built (`BUILD_RC=0` recorded for each, because a build
+failure reads as a passing test), and the tree was restored with `git checkout
+-- .` and rebuilt after each; the final rebuild reproduced BOTH green hashes
+byte-for-byte, which is the restoration proof.
+
+| ID | audio suite | mm-forward suite | binary sha (mm-forward) |
+|---|---|---|---|
+| green | 28 / 4206 | 28 / 16467 | `751f6c97…` |
+| M1 | 28 / 4206 | **25 / 16397, 3 cases failed** | `d7137d8d…` |
+| M2 | 28 / 4206 | **27 / 16423, 1 case failed** | `1fd5af9c…` |
+| M3 | 28 / 4206 | **2 / 16353, 26 cases and 58 assertions failed** | `6469a002…` |
+| M4 | **27 / 4205, 1 case failed** | 28 / 16467 | `58b9d389…` |
+| M5 (as first written) | 28 / 4206 | 28 / 16467 | `71f1fc9c…` |
+| M5b | 28 / 4206 | **27 / 16457, 10 assertions failed** | `4c407724…` |
+
+Three of those rows say something the table alone does not.
+
+**M2 is engine-FATAL, not a logprob drift.** The chained expansion puts the
+image span inside the audio span, so the runner gathers 11 encoder rows for 8
+masked positions and `EmbedMmDots3NoteForCausalLM`'s own balance check throws
+inside the busy loop:
+
+```text
+engine-fatal: EngineCore busy loop threw: vt: Dots3NoteForCausalLM embed:
+  11 gathered encoder rows for 8 masked placeholder positions. A masked scatter
+  that does not balance splices vision features onto text rows.
+  at src/vllm/model_executor/models/dots3_note_registry.cpp:423
+api-server: 500 endpoint=/v1/chat/completions ...
+```
+
+That is a stronger red than the one #2860 predicted, and it also shows the
+single-modality cases survive M2 (27 of 28 pass): chaining is only wrong when
+more than ONE rule runs, which is exactly §4.18.1's claim.
+
+**The M5 correction below and the MN1 paragraph at the end carry a SECOND
+measurement, taken while repairing this slice's fresh review and not by the wave
+itself.** It ran in its own `/dev/shm` build tree configured
+`-DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_BUILD_EXAMPLES=OFF -DVLLM_CPP_SERVER=OFF
+-DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`, which is why its green
+`test_dots3_note_audio` hashes `54fc6dc7…` where the wave's, built with the
+server on, hashes `ea48d56c…`. The CASE and ASSERTION counts agree on both — 28
+/ 4206 — and that is the axis the mutations are read on; the hashes are there
+only to prove that each mutated binary really differed and that the tree came
+back. The served suite needs the server and was not rebuilt for these two, so
+every served-suite number in this section stays the wave's.
+
+**M5 AS FIRST WRITTEN DID NOT RED, and the inertness is a property of WHERE it
+was placed, not of the fixture data.** It sorted the spans ASCENDING by modality
+name inside the CHAT SEAM's span loop. The reason first recorded here — that
+`"audio" < "image"` is already the stream order on every case in the suite, so
+the sort was a no-op — **is false. The fresh review of this slice found it
+false, and the numbers below are the repair's own re-measurement.** Place the
+identical ascending sort one level down, on the `applied` vector inside
+`ApplyPromptReplacements` itself, and the applier suite goes RED:
+`test_dots3_note_audio` **27 / 4186 passed, 1 case and 20 assertions failed**,
+against the green `28 / 4206`, with the binary changed (`2d6a1709…` against the
+green `54fc6dc7…`) and restored to `54fc6dc7…` byte for byte afterwards. The 20
+split across the two subcases the old sentence overlooks, both of which put a
+modality out of stream order on purpose:
+
+| Subcase | assertions | failed | what it reads |
+|---|---|---|---|
+| "image FIRST, so the rule order and the stream order disagree" | 26 | **7** | the image span is at offset 1 and the audio span at 7, so the sort inverts them: `CHECK( 7 == 1 )` on the first offset, and `CHECK( 14 <= 1 )` on the ascending-and-disjoint check |
+| "two images and two audios, INTERLEAVED" | 51 | **13** | the same inversion, and it crosses the item indices too: `CHECK( item_index 1 == 0 )`, plus `CHECK( 30 <= 1 )` |
+
+Both subcases call `ApplyPromptReplacements` DIRECTLY, so the seam-level loop M5
+mutated is downstream of them and neither can reach it. What M5 as first written
+measured was therefore its own placement and not the suite's coverage, and the
+distinction is the whole point of recording an inert mutation: a mutation that
+never applies reads exactly like a mutation the tests survived, and the reason
+given for the reading is what the next reader uses to decide whether a similar
+mutation is worth running. A reason that says "the data cannot discriminate"
+retires the question; the true reason — "this instrument was placed downstream
+of the cases that discriminate" — does not. M5b sorts DESCENDING at the seam and
+reorders for real.
+
+**M5b reds only the DIRECT span assertions; the served request still answers
+200.** At two items in one step the window `[0, 16)` covers the whole prompt, so
+`GetMmFeaturesInWindow`'s two binary searches over the unsorted pair still
+return `[0, 2)` and the runner recovers. The ordering requirement is therefore
+LATENT at this size and the only thing gating it is the explicit
+`mm_features[0].offset < mm_features[1].offset` assertion in the mixed case.
+Said plainly because the alternative is a reader assuming the served path
+proves it: it does not, and a chunked-prefill step or a third item is where it
+would start to.
+
+**ONE PORTED GUARANTEE IN THIS SLICE IS UNMEASURED, AND IT IS THE TIE-BREAK.**
+`processor.h`'s "a tie goes to the rule that appears EARLIER in `updates`" is a
+faithful port — upstream keys the choice on `(match, _next_priority(queue))`
+(`processing/processor.py:871-874` @ `9035151d6`) — but nothing here detects its
+inversion. MN1, from the fresh review of this slice and re-run by the repair:
+turn `at < best_start` into `at <= best_start` at
+`src/vllm/multimodal/processing/processor.cpp:101`, so the LAST rule wins a tie
+instead of the first. The build succeeds, the binary changes (`29f9d378…`
+against the green `54fc6dc7…`, restored byte for byte after), and
+`test_dots3_note_audio` stays **28 / 4206 fully green**; the review measured the
+served suite green under it too. **No gate is manufactured for it, because the
+case is unreachable rather than untested**: dots3-note's two rules have DISTINCT
+`[start, pad, end]` targets, and one id cannot be both start ids, so
+`at == best_start` cannot occur at this modality set. The independence reference
+cannot close it either — it shares the tie-break polarity by construction, which
+is the shared-helper failure mode this row keeps naming. What is recorded is the
+obligation this transfers: a THIRD modality whose target shares a first id with
+another's, or any rule set with two rules on the same target, makes the tie
+reachable and would otherwise inherit an unmeasured guarantee. The change that
+adds one owes the first case that can reach the tie.
+
+---
+
 ## 5. Gates
 
 **Correctness first, and the gate form is chosen by measurement, not in advance**
@@ -7731,9 +8071,35 @@ dispatchable in order, under the constraints that answer imposes.
   `target_height` / `target_width` arguments, which are the chat seam's request
   parsing and stay owed to W8.
 - **W7 — audio tower.** The `dots` stem deltas over our Whisper encoder.
-- **W8 — MM front end + ABI.** Processor, video sampling, placeholder expansion,
-  `<|audio_comp_*|>`, `include/vllm.h` surface, the example server as a thin
-  client.
+- **W8 — the MM front end, narrowed twice.** What is left is **placeholder
+  expansion over MORE THAN ONE ITEM AND MORE THAN ONE MODALITY**, which is
+  W8a (§4.18): upstream's list of `PromptReplacement`s, each keyed by its own
+  `[start, pad, end]` target and all applied in ONE pass over the id stream
+  (`vllm/multimodal/processing/processor.py:423-519`, `:944-957` @ `9035151d6`),
+  plus the declared limits that expansion makes honest.
+  **`<|audio_comp_*|>` LEFT: W7a discharged it** — the three ids are resolved
+  from the tokenizer's added tokens by string
+  (`dots3_note_processor.cpp:388-390`), which is upstream's own
+  `vocab[AUDIO_START]` (`common/processor.py:757-760` @ `9035151d6`) — and
+  this bullet still listed it until W8a.
+  **Video decode and sampling LEFT, to [#2814](https://github.com/mudler/vllm.cpp/issues/2814)**,
+  which W8a WIDENS to hold it. Upstream decodes with `torchcodec`
+  (`common/video.py:189-204` @ `9035151d6`) and JPEG round-trips EVERY sampled
+  frame at quality 85 (`:205-211`, applied at `:281-285` and `:331`), so a
+  faithful port needs a container demuxer, an H.264/VP9/AV1 bitstream decoder
+  AND a JPEG codec. This tree vendors no media library — `third_party/` is
+  blake3, doctest, httplib, minja, nlohmann and vulkan — and its only decoders
+  are a hand-written RIFF/WAVE walker, binary PPM P6 and raw RGB. #2814 was
+  scoped to audio containers, still images and audio encode; it does not
+  contain a video bitstream decoder, and that is the widening W8a owes it.
+  **The `include/vllm.h` multimodal request path LEFT, to
+  [#2862](https://github.com/mudler/vllm.cpp/issues/2862).** There is no
+  `vllm_mm_*` symbol and the header says so twice in contract language
+  (`include/vllm.h:204-216`, `:288-293`); no model sets a precedent, because
+  Qwen3-VL reaches its tower only through `handle_chat_completions` too; and it
+  would own `scripts/abi-capability-allowlist.txt` and
+  `scripts/check-surface-coverage.py`. It must serve Qwen3-VL as well or it is
+  a per-model ABI, so it is a tree-wide row and not a dots3-note brick.
 - **W9 — quantized arms.** Blockwise FP8 and the owed GGUF k-quant arm +
   converter. **The vision MoE's FP32-scale FP8 formula belongs HERE, not to W6**
   (moved 2026-09-01 with W6a, [#2512](https://github.com/mudler/vllm.cpp/issues/2512)).
@@ -7843,6 +8209,20 @@ Carried openly under option B (§6.4), not waived:
   [#2814](https://github.com/mudler/vllm.cpp/issues/2814) tracks it as shared
   work. W7c-1 narrowed this row's container message to say so, so a reader is
   no longer told that a `.mp3` is waiting on a dots3-note brick. Owner: #2814.
+- **The `include/vllm.h` MULTIMODAL REQUEST PATH — and this one is NOT owed to
+  this row either.** W8a made ONE dots3-note request carry two `mm_features`,
+  and it made none of that reachable from the C ABI. There is no `vllm_mm_*`
+  symbol, and the header says so twice in contract language
+  (`include/vllm.h:204-216`, `:288-293`): an `image_url` or `input_audio` part
+  handed to `vllm_chat` is dropped and the request is answered as text. It left
+  this row because it cannot be a dots3-note brick — `Qwen3VLForConditionalGeneration`
+  reaches its tower through `handle_chat_completions` too, so a path that served
+  only dots3-note would be a per-model ABI — and because the change owns two
+  tree-wide surfaces this row does not: `scripts/abi-capability-allowlist.txt`
+  and `scripts/check-surface-coverage.py`. It is therefore a tree-wide row of
+  its own rather than a W8 slice, and W8a's pull request deliberately carries no
+  closing keyword for it. Owner:
+  [#2862](https://github.com/mudler/vllm.cpp/issues/2862).
 - **`vt::Conv2d` has no CUDA provider, and W7a's stem composition is the
   exception that records it.** `src/vt/cpu/cpu_conv2d.cpp:111` is the only
   `RegisterOp(OpId::kConv2d, ...)` in the tree, so the shared 2-D convolution
@@ -7910,7 +8290,11 @@ Carried openly under option B (§6.4), not waived:
   and it therefore belongs to W8 with the rest of the request parsing, not to
   the resampler W6c landed (§4.13). Nothing published selects it and the
   default `detail` resolves to the config pair the port already reads, so the
-  gap is invisible to every checkpoint this row can feed. Owner: this row, W8.
+  gap is invisible to every checkpoint this row can feed. **W8a (#2860) did NOT
+  take it**, and the reason is the one #2616 is refused for: nothing published
+  carries an `image_details` table and the default `detail` resolves to the
+  config pair the port already reads, so the code would land reachable only
+  through a fixture written to reach it. Owner: this row, a later W8 slice.
   Issue [#2645](https://github.com/mudler/vllm.cpp/issues/2645).
 - **PER-REQUEST sparse routing for a MIXED step, and the refusal that stands in
   for it.** The W4b-3c review found the route predicate and the refusal
@@ -8359,6 +8743,23 @@ Carried openly under option B (§6.4), not waived:
 
 ## Now
 
+**W8a LANDED (#2860): ONE dots3-note request now carries TWO `mm_features`, the
+first request in this repository to carry more than one.** The two sequential
+expanders are replaced by upstream's one-pass shape — a list of
+`PromptReplacement`s each keyed by its own `[start, pad, end]` target, applied
+in a single walk (`vllm/multimodal/processing/processor.py:423-519`,
+`:944-957` @ `9035151d6`) — the declared ceiling rises to upstream's
+`{"image": 512, "audio": 128}` with `video` left ABSENT so its refusal does not
+move, and a request mixing an image and an audio part is SERVED where it was
+refused by name. Everything below the seam was N-generic in shape and had never
+been exercised; it carried two on the first try, with no engine change (§4.18.7).
+The row stays `SPIKE`, for the reason it has always stayed `SPIKE`: the tower
+serves, and the 280B-A16B model still does not fit any host this project
+reaches. What LEFT W8 in the same change is video decode, to
+[#2814](https://github.com/mudler/vllm.cpp/issues/2814) widened to hold it, and
+the `include/vllm.h` multimodal request path, to
+[#2862](https://github.com/mudler/vllm.cpp/issues/2862).
+
 W0 complete; **§6.4 answered on 2026-08-15 with option B**, so the row is no
 longer blocked on a decision. **W0.5 landed the same day.** **W1 has since
 landed code** — see the `W1 — DONE` paragraph at the end of this section for
@@ -8592,8 +8993,13 @@ downloaded. The gate is a consistency gate against an independent
 double-precision reference, not a correctness claim against vLLM (§6.4 option
 B). `supports_multimodal` went TRUE -> FALSE in the same change, because the
 released config becoming loadable made a claim this port cannot honour: the
-2195 vision and 430 audio tensors are named W6/W7 deferrals and the multimodal
-front end (W8) does not exist. W8 flips it back.
+2195 vision and 430 audio tensors were named W6/W7 deferrals and no multimodal
+front end existed. **W6a flipped it back, and this paragraph said otherwise
+until W8a repaired it.** `supports_multimodal` is `true` today
+(`dots3_note_registry.cpp:97`, the trail at `:54-92`), and the sentence that
+read "the multimodal front end (W8) does not exist. W8 flips it back" was false
+from the moment #2512 landed: an `image_url` request has been served end to end
+since W6a and an `input_audio` one since W7a.
 
 **W6a — LANDED, and this row can now be asked for something over HTTP.**
 ([#2512](https://github.com/mudler/vllm.cpp/issues/2512), evidence §4.11.) The

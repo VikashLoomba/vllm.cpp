@@ -1094,6 +1094,7 @@ add_library(vllm STATIC
   src/vllm/multimodal/pil_resize.cpp
   src/vllm/multimodal/qwen3vl_processor.cpp
   src/vllm/multimodal/audio_processor.cpp
+  src/vllm/multimodal/audio_resample.cpp
   # Parakeet / FastConformer audio encoder + CTC head + its log-mel front end
   # (spike .agents/specs/parakeet-conformer-encoder.md row P4). A standalone
   # forward composed from the P1-P3 vt:: kernels, NOT a registry architecture —

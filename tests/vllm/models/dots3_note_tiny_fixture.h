@@ -988,6 +988,61 @@ inline std::vector<uint8_t> FixtureAudioWavLong(int variant, int64_t n) {
   return FixtureWavFromPcm16(FixtureAudioPcm16Long(variant, n));
 }
 
+// ── the SAME clip at ANOTHER sample rate (W7c-2, #2828) ─────────────────────
+//
+// `FixtureAudioPcm16` samples its chirp at 16000 for `kAudioSamples` frames,
+// which is 0.5 s. This samples THE SAME CONTINUOUS SIGNAL, from the same
+// closed form, at `sample_rate` for the same 0.5 s — so `sample_rate` frames
+// per second of the identical waveform and NOT a stretched or shifted copy.
+//
+// WHY THE DURATION IS HELD AND NOT THE FRAME COUNT. The resampled length is
+// `ceil(n * 16000 / sample_rate)`, and holding the duration makes that exactly
+// `kAudioSamples` for every rate that divides evenly into the 0.5 s — 44100
+// gives 22050 frames and `ceil(22050 * 160 / 441) == 8000`. So a resampled
+// request expands the SAME 7-token placeholder span as the mono clip every
+// other audio case serves, and the served case can compare the two directly.
+//
+// THAT TOKEN COUNT IS THE ASSERTION A NO-OP RESAMPLE CANNOT SURVIVE: an
+// unresampled 22050-frame waveform expands `ceil(22050 / 1280)` = 18
+// placeholders, not 7, and it does so without any reference to the resampler's
+// values.
+inline std::vector<int16_t> FixtureAudioPcm16AtRate(int variant,
+                                                    int sample_rate) {
+  const int64_t n = kAudioSamples * sample_rate / 16000;
+  std::vector<int16_t> pcm(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) {
+    const double t = static_cast<double>(i) / static_cast<double>(sample_rate);
+    double v;
+    if (variant == 0) {
+      const double f = 200.0 + 6000.0 * t;
+      v = 0.6 * std::sin(2.0 * 3.14159265358979323846 * f * t);
+    } else {
+      v = 0.35 * std::sin(2.0 * 3.14159265358979323846 * 440.0 * t) +
+          0.35 * std::sin(2.0 * 3.14159265358979323846 * 523.25 * t);
+    }
+    const double clipped = v < -1.0 ? -1.0 : (v > 0.999 ? 0.999 : v);
+    pcm[static_cast<size_t>(i)] =
+        static_cast<int16_t>(std::lround(clipped * 32767.0));
+  }
+  return pcm;
+}
+
+// That clip as a PCM16 RIFF/WAVE file whose `fmt ` chunk DECLARES the rate,
+// through the same writer every other audio case uses.
+inline std::vector<uint8_t> FixtureAudioWavAtRate(int variant, int sample_rate) {
+  return FixtureWavFromPcm16(FixtureAudioPcm16AtRate(variant, sample_rate),
+                             sample_rate, 1);
+}
+
+// ...and as the decoder would produce it, `int16 / 32768.0`.
+inline std::vector<float> FixtureAudioF32AtRate(int variant, int sample_rate) {
+  const std::vector<int16_t> pcm = FixtureAudioPcm16AtRate(variant, sample_rate);
+  std::vector<float> out(pcm.size());
+  for (size_t i = 0; i < pcm.size(); ++i)
+    out[i] = static_cast<float>(pcm[i]) / 32768.0f;
+  return out;
+}
+
 // ── the STEREO clip (W7c-1, #2813) ──────────────────────────────────────────
 //
 // TWO GENUINELY DIFFERENT CHANNELS WHOSE MEAN IS EXACTLY VARIANT 0. Left is

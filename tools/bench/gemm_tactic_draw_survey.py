@@ -16,11 +16,11 @@ for a feature:
   0.6.13's timing recipe (3 warmups / 10 iterations / 5,000 us delay;
   `src/vt/cuda/nvfp4_persistent_cache.h:25-27`). **Read the aggregation
   carefully**: `TimeCandidate` at
-  `src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu:322-357` records ONE `cudaEvent`
+  `src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu:322-363` records ONE `cudaEvent`
   pair spanning ALL TEN iterations and returns `elapsed_ms / kTimingIterations`.
   That is a MEAN, and no per-iteration timing exists anywhere -- there is no
   distribution in the tree to take a median or a minimum of. "Minimum wins"
-  describes the argmin ACROSS CANDIDATES at `:757-763`, never a min-of-10.
+  describes the argmin ACROSS CANDIDATES at `:758-764`, never a min-of-10.
   One draw per process, kept whole. The draw distribution is known to be WIDE
   in identity (18--33 of 64 shared tactic IDs across paired runs). It has never
   been measured in SPEED.
@@ -33,7 +33,7 @@ TWO ARMS SELECT BY DIFFERENT RULES, SO A DRAW SPREAD MUST NAME ITS ARM
 `Fp4FullTacticsEnabled()` (`:189-195`) reads
 `value == nullptr || value[0] != '0'`, so `VT_FP4_FULL_TACTICS` is **default
 ON**: the shipped arm is 32 candidates chosen by pure argmin. The non-default
-`=0` arm is 4 candidates AND carries a variance damper (`:766-775`) -- a tactic
+`=0` arm is 4 candidates AND carries a variance damper (`:770-776`) -- a tactic
 displaces the fixed baseline only if it beats it by more than 1%, otherwise the
 baseline is kept.
 
@@ -55,7 +55,7 @@ THE TWO INSTRUMENTS ALREADY EXIST. NEITHER IS BUILT HERE.
   process at its own cache document and `VT_FP4_AUTOTUNE_CACHE_READONLY=1`
   freezes it, which is how N independent draws are collected and then replayed.
 * `VT_FP4_AUTOTUNE_VERBOSE=1` adds one `[VT_FP4_AUTOTUNE] ... -> id=%d %s
-  (%.1f us)` line per tuned key (`:776-789`). That microsecond figure is
+  (%.1f us)` line per tuned key (`:777-788`). That microsecond figure is
   `timings[chosen] * 1000`, i.e. the CHOSEN candidate's ten-iteration mean, and
   it is the only timing number the tuner exposes. It is a DIAGNOSTIC here and
   never a gate: it is a single mean with no spread, produced by the very
@@ -107,6 +107,8 @@ import json
 import os
 import pathlib
 import re
+import shutil
+import statistics
 import subprocess
 import sys
 from typing import Any, Mapping, Sequence
@@ -227,20 +229,72 @@ def algo_selection(fields: Mapping[str, str]) -> tuple[str, str, str, str]:
     )
 
 
+# The `[VT_GEMM_ALGO]` tag has SIX emit sites and only ONE of them is a
+# selection. All six are behind the same `GemmAlgoLogEnabled()`, so a run that
+# turns the instrument on gets all six in one stderr:
+#
+#   src/vt/cuda/cuda_matmul.cu:270  SELECTION        MaybeLogGemmAlgo
+#   src/vt/cuda/cuda_matmul.cu:805  REFUSED          MaybeLogFp8PlanRefusal
+#   src/vt/cuda/cuda_matmul.cu:842  DENSE-CANDIDATES MaybeLogDenseAlgoCandidates, query failed
+#   src/vt/cuda/cuda_matmul.cu:858  DENSE-CANDIDATE  MaybeLogDenseAlgoCandidates, one per candidate
+#   src/vt/cuda/cuda_matmul.cu:883  CANDIDATES       MaybeLogFp8AlgoCandidates, query failed
+#   src/vt/cuda/cuda_matmul.cu:900  CANDIDATE rank=  MaybeLogFp8AlgoCandidates, one per candidate
+#
+# The dense dump is reached from the TN-bt lane (`:582`) -- the bf16 lane #2750
+# is about -- so these are in the same stderr as the selections, not in some
+# other workload. `a=`, `b=`, `c=` and `epilogue=` appear on the SELECTION line
+# and on none of the other five, which is what discriminates them; `algoId=` is
+# additionally required because it is what the comparison reads.
+_SELECTION_DISCRIMINANTS = ("a", "b", "c", "epilogue", "algoId")
+
+
+def is_algo_selection(fields: Mapping[str, str]) -> bool:
+    """Does this parsed `[VT_GEMM_ALGO]` line name a SELECTION?
+
+    A REFUSED line names a plan that was never built. A CANDIDATE line names one
+    entry of a heuristic LIST, and rank 0 of a list is not what the matmul ran.
+    Reading either as a selection is not a cosmetic parse error: the candidate
+    dumps repeat one shape once per ranked candidate, a first-wins map keeps
+    rank 0, and two processes whose lists came back in a different order then
+    report `UNSTABLE`. That verdict is the one that turns #2750 into a
+    benchmark-validity repair and licenses the persistent cuBLASLt cache #2750
+    says must be built ONLY in its case 4.
+
+    Stated as a POSITIVE requirement on the selection line's own fields rather
+    than as a blacklist of the five diagnostic tags, so a seventh diagnostic
+    shape added later is excluded by default. The failure mode of that polarity
+    is a selection line that stops carrying one of these fields, which reads as
+    an instrument that emitted nothing (exit `70`) -- loud, and refused by name.
+    """
+
+    return all(name in fields for name in _SELECTION_DISCRIMINANTS)
+
+
 def parse_algo_lines(text: str) -> dict[str, dict[str, str]]:
-    """Every `[VT_GEMM_ALGO]` line in one process's stderr, keyed by selection key.
+    """Every `[VT_GEMM_ALGO]` SELECTION in one process's stderr, keyed by its key.
+
+    Diagnostic shapes are counted under `_diagnostics` and excluded, because
+    "zero `[VT_GEMM_ALGO]` lines" and "zero selections among forty lines" are
+    different diagnoses of a failed run and the refusal message says which.
 
     A duplicate key inside ONE process would mean `LogOncePerKey` failed, so it
     is recorded rather than merged: `_duplicates` counts them and the caller
     reports the count instead of averaging over an instrument that misbehaved.
+    That counter is only meaningful once the candidate dumps are excluded --
+    they repeat one shape by construction, so before the exclusion it counted
+    the instrument working correctly.
     """
 
     found: dict[str, dict[str, str]] = {}
     duplicates = 0
+    diagnostics = 0
     for line in text.splitlines():
         if ALGO_TAG not in line:
             continue
         fields = kv_tokens(line[line.index(ALGO_TAG) + len(ALGO_TAG):])
+        if not is_algo_selection(fields):
+            diagnostics += 1
+            continue
         key = algo_key(fields)
         if key in found:
             duplicates += 1
@@ -248,6 +302,8 @@ def parse_algo_lines(text: str) -> dict[str, dict[str, str]]:
         found[key] = dict(fields)
     if duplicates:
         found["_duplicates"] = {"count": str(duplicates)}
+    if diagnostics:
+        found["_diagnostics"] = {"count": str(diagnostics)}
     return found
 
 
@@ -422,6 +478,18 @@ def algo_stability(runs: Mapping[str, Mapping[str, Mapping[str, str]]]) -> dict[
     if len(labels) < 2:
         verdict = "INCOMPARABLE"
         reason = "one process cannot answer a cross-process question"
+    elif duplicates:
+        # A repeated SELECTION key inside one process means the within-process
+        # dedupe did not hold, and the parser kept the FIRST line and dropped
+        # the rest. The comparison would then run over a first-wins subset of
+        # what the process said, which is not a stable run with a footnote.
+        verdict = "INCOMPARABLE"
+        reason = (
+            f"{duplicates} repeated selection line(s) inside a single process: "
+            "LogOncePerKey did not dedupe, or two processes' stderr were "
+            "concatenated. Only the first line per key was kept, so this "
+            "comparison would run over a subset of what was emitted"
+        )
     elif partial:
         verdict = "INCOMPARABLE"
         reason = (
@@ -589,6 +657,8 @@ def speed_spread(
     per_draw: Mapping[str, Sequence[float]],
     *,
     ratification_bar: float = 1.02,
+    noise_ceiling: float = 1.02,
+    min_legs: int = 3,
 ) -> dict[str, Any]:
     """#2751, speed half: is the draw-to-draw spread bigger than the harness noise?
 
@@ -606,54 +676,98 @@ def speed_spread(
     `.agents/benchmarking.md` applies to a lease, where the clock cannot be
     pinned at all.
 
-    A spread the WITHIN-draw repeat spread already covers is not a spread. It
-    is reported as `EQUIVALENT` and #2751 closes as "no divergence warranted",
-    which is the outcome the issue names first.
+    THE NOISE FLOOR IS NOT THE WORST DRAW IN THE RUN, AND A RUN THAT DID NOT
+    HOLD STILL IS REPEATED RATHER THAN CALLED EQUIVALENT. Two separate rules,
+    both learned the hard way on this host:
+
+    1.  `min_legs` is THREE. A within-draw spread over two legs is one
+        difference, not an estimate of anything, and the first revision of this
+        harness took the run's floor from such a figure at the spec's own
+        `--score-reps 2`.
+    2.  `noise_ceiling` refuses the run outright when ANY draw's own repeat
+        spread exceeds it. Without that, one restless draw sets a floor that
+        certifies every other draw as equivalent -- and `EQUIVALENT` is the
+        verdict that closes #2751 as "no divergence warranted" and unblocks
+        #2752 to pin a draw. One unchanged binary has read 36.82 and 78.86
+        tok/s at c8 on this box (`c8-measurement-admissibility.md`, #2154), so a
+        wide within-draw spread is what a box that did not hold still looks
+        like, not a rarity. `INCOMPARABLE` here means REPEAT THE RUN.
+
+    The ceiling is its OWN parameter and its own default, deliberately not
+    `ratification_bar`. They share the value 1.02 and they mean different
+    things: the bar is how much a draw-to-draw gap must be worth before a
+    divergence from the mirrored FlashInfer method is arguable, and the ceiling
+    is how much repeat noise a run may carry before it can answer that question
+    at all. A run whose own repeats are as wide as the effect it was built to
+    resolve has not measured the effect. Moving one must never move the other.
+
+    The comparison floor is then the POOLED within-draw spread -- the median of
+    the per-draw figures -- rather than the maximum, so one draw at the edge of
+    the ceiling cannot set the floor for all of them. Both are reported.
+
+    A spread the pooled WITHIN-draw repeat spread already covers is not a
+    spread. It is reported as `EQUIVALENT` and #2751 closes as "no divergence
+    warranted", which is the outcome the issue names first.
     """
 
     labels = sorted(per_draw)
     usable = {label: [v for v in per_draw[label] if v is not None] for label in labels}
-    thin = sorted(label for label in labels if len(usable[label]) < 2)
     if len(labels) < 2:
         return {"verdict": "INCOMPARABLE", "reason": "fewer than two draws scored"}
 
+    thin = sorted(label for label in labels if len(usable[label]) < min_legs)
     means = {label: sum(v) / len(v) for label, v in usable.items() if v}
-    if len(means) < 2:
-        return {"verdict": "INCOMPARABLE", "reason": "fewer than two draws produced a number"}
 
     within = {
         label: (max(v) - min(v)) / min(v) if len(v) >= 2 and min(v) > 0 else None
         for label, v in usable.items()
     }
-    within_values = [w for w in within.values() if w is not None]
-    worst_within = max(within_values) if within_values else None
+    within_values = sorted(w for w in within.values() if w is not None)
+    worst_within = within_values[-1] if within_values else None
+    pooled_within = statistics.median(within_values) if within_values else None
 
-    best_label = max(means, key=lambda label: means[label])
-    worst_label = min(means, key=lambda label: means[label])
-    ratio = means[best_label] / means[worst_label] if means[worst_label] > 0 else None
+    best_label = max(means, key=lambda label: means[label]) if means else None
+    worst_label = min(means, key=lambda label: means[label]) if means else None
+    ratio = (
+        means[best_label] / means[worst_label]
+        if best_label is not None and means[worst_label] > 0
+        else None
+    )
 
-    if ratio is None:
-        verdict, reason = "INCOMPARABLE", "a scored draw has a non-positive mean"
+    if len(means) < 2:
+        verdict = "INCOMPARABLE"
+        reason = "fewer than two draws produced a number"
     elif thin:
         verdict = "INCOMPARABLE"
         reason = (
-            f"{len(thin)} draw(s) carry fewer than two usable legs, so their "
-            "own repeat spread is undefined and a draw-to-draw gap cannot be "
-            "distinguished from it"
+            f"{len(thin)} draw(s) carry fewer than {min_legs} usable legs, so "
+            "their own repeat spread is one difference rather than an estimate "
+            "and a draw-to-draw gap cannot be distinguished from it. Three legs "
+            "per draw is the minimum this predicate accepts"
         )
-    elif worst_within is not None and (ratio - 1.0) <= worst_within:
+    elif ratio is None:
+        verdict, reason = "INCOMPARABLE", "a scored draw has a non-positive mean"
+    elif worst_within is not None and 1.0 + worst_within > noise_ceiling:
+        verdict = "INCOMPARABLE"
+        reason = (
+            f"the worst within-draw repeat spread {1.0 + worst_within:.6f} "
+            f"exceeds the {noise_ceiling:.4f}x noise ceiling: this run's own "
+            "repeats are as wide as the effect it was asked about, so it cannot "
+            "answer the question either way. REPEAT THE RUN"
+        )
+    elif pooled_within is not None and (ratio - 1.0) <= pooled_within:
         verdict = "EQUIVALENT"
         reason = (
-            f"the best/worst draw ratio {ratio:.6f} does not exceed the worst "
-            f"within-draw repeat spread {1.0 + worst_within:.6f}; this "
+            f"the best/worst draw ratio {ratio:.6f} does not exceed the pooled "
+            f"within-draw repeat spread {1.0 + pooled_within:.6f}; this "
             "measurement does not separate the draws"
         )
     elif ratio < ratification_bar:
         verdict = "SEPARATED_BELOW_BAR"
         reason = (
-            f"the best/worst draw ratio {ratio:.6f} exceeds the within-draw "
-            f"spread but is below the {ratification_bar:.4f}x bar a divergence "
-            "from the mirrored FlashInfer selection method must clear"
+            f"the best/worst draw ratio {ratio:.6f} exceeds the pooled "
+            f"within-draw spread but is below the {ratification_bar:.4f}x bar a "
+            "divergence from the mirrored FlashInfer selection method must clear"
         )
     else:
         verdict = "ABOVE_BAR"
@@ -667,13 +781,18 @@ def speed_spread(
         "verdict": verdict,
         "reason": reason,
         "ratification_bar": ratification_bar,
+        "noise_ceiling": noise_ceiling,
+        "min_legs_per_draw": min_legs,
         "best_draw": best_label,
         "worst_draw": worst_label,
-        "best_mean": means[best_label],
-        "worst_mean": means[worst_label],
+        "best_mean": means.get(best_label),
+        "worst_mean": means.get(worst_label),
         "ratio": ratio,
         "worst_within_draw_spread": (
             None if worst_within is None else 1.0 + worst_within
+        ),
+        "pooled_within_draw_spread": (
+            None if pooled_within is None else 1.0 + pooled_within
         ),
         "legs_per_draw": {label: len(v) for label, v in usable.items()},
         "means": means,
@@ -752,6 +871,30 @@ def write_json(path: pathlib.Path, payload: Any) -> None:
     tmp.replace(path)
 
 
+def mirror_evidence(local: pathlib.Path, share: pathlib.Path | None) -> None:
+    """Copy the evidence root to the share, best-effort, AFTER EACH DRAW.
+
+    `dgx.casa` has crashed roughly hourly under a long ladder (#545) and the
+    draw phase is the long one: N model loads and N tuning passes. Mirroring
+    when the phase RETURNS loses every completed draw to a crash inside it,
+    which is the crash this harness was shaped around.
+
+    Best-effort on purpose. `/workspace` is CIFS and can be slow, full, or
+    briefly absent, and none of those is a reason to throw away a draw that is
+    already on the local disk and already has its `DONE` file. A failure to
+    mirror costs the resume, never the measurement.
+    """
+
+    if share is None:
+        return
+    try:
+        share.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(local, share, symlinks=False, dirs_exist_ok=True)
+    except OSError as error:  # CIFS, ENOSPC, a share that went away
+        print(f"gemm-tactic-draw-survey: mirror to {share} failed: {error}",
+              file=sys.stderr)
+
+
 def draw_command(
     bench: pathlib.Path, model: str, cfg: Mapping[str, Any]
 ) -> list[str]:
@@ -781,18 +924,32 @@ def synthetic_draw_output(
     measurement is worse than no fixture.
 
     Draws share a plan-key SET and differ in tactic, which is the shape the real
-    evidence has (18--33 of 64 shared IDs). cuBLASLt selections are held CONSTANT
-    across draws, so the shipped fixture reads STABLE -- the mutation that proves
-    the stability predicate can fail is to vary `algo_id` with `index`.
+    evidence has (18--33 of 64 shared IDs).
+
+    ONE of the four cuBLASLt shapes MOVES its selection with the draw index and
+    the other three hold still, so the fixture reads `UNSTABLE` with exactly one
+    unstable key out of four common keys. That asymmetry is deliberate and it is
+    what makes the fixture able to detect a tainted dedupe key. When every draw
+    agreed, folding `algoId` into `algo_key` -- mutation M10 -- changed no
+    verdict and survived the whole suite; with one shape moving, the id in the
+    key turns that shape into a different key per draw and the verdict collapses
+    to `INCOMPARABLE` instead of naming the shape. The three still shapes are the
+    control: without them the case could not tell a detected instability from a
+    fixture that can never read stable.
+
+    A fixture that reports a verdict must never be mistakable for a measurement,
+    so every record it writes carries `dry_run: true` and `reduce` prints that
+    label at the top of the report.
     """
 
     shapes = [(1, 3072, 2048), (1, 12288, 2048), (512, 3072, 2048), (512, 2048, 6144)]
     algo = []
-    for m, n, k in shapes:
+    for position, (m, n, k) in enumerate(shapes):
+        moves = 1 if position == 1 else 0
         algo.append(
             f"[VT_GEMM_ALGO] backend=cublasLt m={m} n={n} k={k} a=bf16 b=bf16 "
-            f"c=bf16 epilogue=rowmajor-NN algoId={21 + (n % 3)} tile=15 stages=4 "
-            f"splitK=1 wsSize=4194304"
+            f"c=bf16 epilogue=rowmajor-NN algoId={21 + (n % 3) + moves * index} "
+            f"tile=15 stages=4 splitK=1 wsSize=4194304"
         )
     plans = []
     tuned = []
@@ -839,6 +996,7 @@ def run_draw(
     *,
     tactic_set: str = "full",
     dry_run: bool = False,
+    mirror: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     """One fresh process: its own cache path, its own stderr, its own evidence.
 
@@ -847,6 +1005,16 @@ def run_draw(
     publishes its own document at `CompletePersistentRuntime`. That is what
     makes the draws INDEPENDENT; reusing one cache path would collect one draw
     N times and report it as N.
+
+    "Does not yet exist" is ENFORCED and not assumed. A draw that published its
+    document and then died before writing `DONE` leaves that document behind; on
+    the retry the fresh process would LOAD it, tune nothing, and be refused with
+    `73` -- whose message says the draw is a copy of an earlier draw, which
+    misdescribes a crash and sends the reader looking for a duplicated cache
+    path. The unlink is skipped only on the resume path, where `DONE` says the
+    draw finished and its document is the evidence #2752 would pin.
+
+    The mirror runs HERE, per draw, rather than when the phase returns.
     """
 
     label = f"draw{index:02d}"
@@ -857,6 +1025,7 @@ def run_draw(
         return json.loads((home / "record.json").read_text(encoding="utf-8"))
 
     cache = home / "autotune_configs.json"
+    cache.unlink(missing_ok=True)
     env = dict(os.environ)
     env["VT_GEMM_ALGO_LOG"] = "1"
     env["VT_FP4_PERSISTENT_CACHE"] = "1"
@@ -905,6 +1074,7 @@ def run_draw(
     write_json(home / "record.json", record)
     if rc == 0:
         done.write_text("ok\n", encoding="utf-8")
+    mirror_evidence(evidence, mirror)
     return record
 
 
@@ -933,12 +1103,17 @@ def check_draw_preconditions(records: Sequence[Mapping[str, Any]]) -> tuple[int,
 
     for record in records:
         label = record["label"]
-        keys = {k for k in record.get("algo", {}) if not k.startswith("_")}
+        algo = record.get("algo", {})
+        keys = {k for k in algo if not k.startswith("_")}
         if not keys:
+            seen = int(algo.get("_diagnostics", {}).get("count", "0"))
             problems.append(
-                f"{label}: zero {ALGO_TAG} lines. VT_GEMM_ALGO_LOG did not reach "
-                "MaybeLogGemmAlgo, or no cuBLASLt GEMM ran. A run that logged "
-                "nothing cannot report that anything is stable"
+                f"{label}: zero {ALGO_TAG} SELECTION lines ({seen} diagnostic "
+                f"{ALGO_TAG} line(s) were seen). With none, VT_GEMM_ALGO_LOG did "
+                "not reach MaybeLogGemmAlgo or no cuBLASLt GEMM ran; with some, "
+                "the flag reached the candidate dumps and no selection was "
+                "logged. A run that logged nothing cannot report that anything "
+                "is stable"
             )
     if problems:
         return EXIT_ALGO_SILENT, problems
@@ -1128,8 +1303,69 @@ def read_score_ledger(path: pathlib.Path, metric: str) -> dict[str, list[float]]
     return per_draw
 
 
+def read_frozen_controls(evidence: pathlib.Path) -> list[dict[str, Any]]:
+    """Every scoring leg's own frozen-control record, ONE FILE PER LEG.
+
+    `check-frozen --record` writes `score/<arm>-<n>/frozen.json` as the leg
+    finishes, pass or fail. A single shared control file would be a surface
+    every leg has to write, which is the lock shape the protocol refuses; a
+    glob over per-leg files has no writer in common.
+    """
+
+    out: list[dict[str, Any]] = []
+    for path in sorted((evidence / "score").glob("*/frozen.json")):
+        try:
+            out.append(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError) as error:
+            out.append({"leg": path.parent.name, "frozen": False,
+                        "why": f"unreadable control record: {error}"})
+    return out
+
+
+def frozen_control_state(
+    controls: Sequence[Mapping[str, Any]], legs_in_ledger: int
+) -> dict[str, Any]:
+    """Did EVERY leg that contributed a number pass the frozen control?
+
+    Two ways to fail and both are the same defect: a leg that re-tuned measured
+    a plan map nobody recorded, and a leg with no control record measured one
+    nobody checked. Either way the scoring phase is N MORE DRAWS wearing the
+    label of a replay, and its numbers are attributed to the arm they were asked
+    about rather than to the map they actually ran.
+    """
+
+    passing = [c for c in controls if c.get("frozen") is True]
+    failing = [c for c in controls if c.get("frozen") is not True]
+    state = "PASS"
+    reason = f"all {legs_in_ledger} scored leg(s) replayed a frozen map"
+    if failing:
+        state = "REFUSED"
+        reason = (
+            f"{len(failing)} scoring leg(s) failed the frozen control: "
+            + "; ".join(f"{c.get('leg', '?')}: {c.get('why', '?')}" for c in failing)
+        )
+    elif len(passing) < legs_in_ledger:
+        state = "REFUSED"
+        reason = (
+            f"{legs_in_ledger} leg(s) contributed a number and only "
+            f"{len(passing)} carry a frozen-control record. A leg whose control "
+            "was never recorded measured a plan map nobody checked"
+        )
+    return {
+        "state": state,
+        "reason": reason,
+        "legs_in_ledger": legs_in_ledger,
+        "legs_with_a_passing_control": len(passing),
+        "records": [dict(c) for c in controls],
+    }
+
+
 def reduce_evidence(
-    evidence: pathlib.Path, *, metric: str, ratification_bar: float
+    evidence: pathlib.Path,
+    *,
+    metric: str,
+    ratification_bar: float,
+    noise_ceiling: float = 1.02,
 ) -> tuple[int, dict[str, Any]]:
     records = read_draw_records(evidence)
     code, problems = check_draw_preconditions(records)
@@ -1156,11 +1392,14 @@ def reduce_evidence(
         )
         return code, report
 
-    algo_runs = {
-        r["label"]: {k: v for k, v in r["algo"].items() if not k.startswith("_")}
-        for r in records
-    }
-    report["issue_2750_draw_processes"] = algo_stability(algo_runs)
+    # The WHOLE parsed map, `_duplicates` and `_diagnostics` included.
+    # `algo_stability` already excludes `_`-prefixed names from its key sets, and
+    # stripping them here left `within_process_duplicate_lines` hard-wired to 0
+    # in every report -- the one witness for `LogOncePerKey` misbehaving, unable
+    # to fire.
+    report["issue_2750_draw_processes"] = algo_stability(
+        {r["label"]: r["algo"] for r in records}
+    )
     report["issue_2751_identity"] = draw_identity(
         {r["label"]: r["fp4"]["selected"] for r in records}
     )
@@ -1175,8 +1414,32 @@ def reduce_evidence(
 
     per_draw = read_score_ledger(evidence / "score" / "legs.jsonl", metric)
     if per_draw:
+        # THE FROZEN CONTROL IS READ BEFORE ANY SPEED VERDICT IS WRITTEN.
+        # Without it a report could carry EQUIVALENT and "ship draw00" over legs
+        # that re-tuned, and the gate table's `78` would have no path to fire at
+        # all -- which is what it had before, because the file this used to read
+        # (`score/frozen-checks.json`) had no writer anywhere in the tree.
+        controls = read_frozen_controls(evidence)
+        legs_in_ledger = sum(len(values) for values in per_draw.values())
+        report["frozen_leg_control"] = frozen_control_state(controls, legs_in_ledger)
+        if report["frozen_leg_control"]["state"] != "PASS":
+            report["issue_2751_speed"] = {
+                "verdict": "REFUSED",
+                "reason": (
+                    "the scoring legs did not all replay a frozen map: "
+                    + report["frozen_leg_control"]["reason"]
+                ),
+            }
+            report["issue_2752"] = {
+                "ship": None,
+                "reason": (
+                    "no draw is pinned from legs whose frozen control did not "
+                    "pass; the numbers describe a plan map nobody recorded"
+                ),
+            }
+            return EXIT_LEG_NOT_FROZEN, report
         report["issue_2751_speed"] = speed_spread(
-            per_draw, ratification_bar=ratification_bar
+            per_draw, ratification_bar=ratification_bar, noise_ceiling=noise_ceiling
         )
         report["issue_2752"] = select_shipping_draw(
             report["issue_2751_speed"], [r["label"] for r in records]
@@ -1190,10 +1453,6 @@ def reduce_evidence(
             "ship": None,
             "reason": "the speed half has not run, so #2752 stays blocked",
         }
-
-    frozen = evidence / "score" / "frozen-checks.json"
-    if frozen.is_file():
-        report["frozen_leg_control"] = json.loads(frozen.read_text(encoding="utf-8"))
 
     clock = evidence / "score" / "clock-windows.json"
     if clock.is_file():
@@ -1237,6 +1496,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                            "argmin; the shipped default) and 'w1' sets it to 0 "
                            "(4 candidates behind the >1%% stickiness damper). The two "
                            "select by different rules, so ONE ARM PER EVIDENCE ROOT")
+    draw.add_argument("--mirror", type=pathlib.Path,
+                      help="copy the evidence root here AFTER EACH DRAW. The "
+                           "local root is a real filesystem the engine can "
+                           "publish its cache document onto; this is what "
+                           "survives the box going down mid-phase")
     draw.add_argument("--dry-run", action="store_true",
                       help="walk the resume/record path with no subprocess and no device")
 
@@ -1245,11 +1509,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     frozen.add_argument("--log", required=True, type=pathlib.Path)
     frozen.add_argument("--expected-plans", required=True, type=int)
+    frozen.add_argument("--record", type=pathlib.Path,
+                        help="write this leg's own control record here, PASS OR "
+                             "FAIL. `reduce` globs score/*/frozen.json and "
+                             "refuses (78) when a leg that contributed a number "
+                             "carries no passing record")
+    frozen.add_argument("--leg", default="?",
+                        help="the leg label recorded in --record")
 
     reduce_p = sub.add_parser("reduce", help="judge a complete evidence directory")
     reduce_p.add_argument("--evidence", required=True, type=pathlib.Path)
     reduce_p.add_argument("--metric", default="total_token_throughput")
     reduce_p.add_argument("--ratification-bar", type=float, default=1.02)
+    reduce_p.add_argument("--noise-ceiling", type=float, default=1.02,
+                          help="the widest WITHIN-draw repeat spread a run may "
+                               "carry and still be judged. Its own parameter, "
+                               "deliberately not the ratification bar: they "
+                               "share a value and mean different things")
     reduce_p.add_argument("--out", type=pathlib.Path)
 
     args = parser.parse_args(argv)
@@ -1272,6 +1548,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             record = run_draw(
                 index, args.evidence, args.bench, args.model, cfg,
                 tactic_set=args.tactic_set, dry_run=args.dry_run,
+                mirror=args.mirror,
             )
             records.append(record)
             keys = len([k for k in record.get("algo", {}) if not k.startswith("_")])
@@ -1287,16 +1564,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.evidence / "draw-preconditions.json",
             {"exit_code": code, "problems": problems},
         )
+        mirror_evidence(args.evidence, args.mirror)
         return code
 
     if args.command == "check-frozen":
         text = args.log.read_text(encoding="utf-8", errors="replace")
         ok, why = check_frozen_leg(text, args.expected_plans)
         print(f"frozen-leg: {'OK' if ok else 'REFUSED'}: {why}")
+        if args.record:
+            # WRITTEN ON BOTH OUTCOMES. A control that records itself only on
+            # success makes a refused leg indistinguishable from a leg that
+            # never ran, and `reduce` counts records against ledger rows.
+            write_json(args.record, {
+                "leg": args.leg,
+                "frozen": ok,
+                "why": why,
+                "expected_plans": args.expected_plans,
+                "log": str(args.log),
+            })
         return EXIT_OK if ok else EXIT_LEG_NOT_FROZEN
 
     code, report = reduce_evidence(
-        args.evidence, metric=args.metric, ratification_bar=args.ratification_bar
+        args.evidence, metric=args.metric, ratification_bar=args.ratification_bar,
+        noise_ceiling=args.noise_ceiling,
     )
     text = json.dumps(report, indent=2, sort_keys=True)
     print(text)

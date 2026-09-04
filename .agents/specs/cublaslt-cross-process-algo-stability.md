@@ -54,6 +54,31 @@ chain runs into a closed CUDA library. What is anchorable, and what is not:
 |---|---|---|
 | The selection call | `cublasLtMatmulAlgoGetHeuristic`, reached from `src/vt/cuda/cuda_matmul.cu` at the three bf16/f32 sites and the two fp8 sites | the function whose determinism is in question |
 | The diagnostic we read | `src/vt/cuda/gemm_algo_log.h` and `MaybeLogGemmAlgo` at `src/vt/cuda/cuda_matmul.cu:248` | our own mirror of what upstream logs under `CUBLASLT_LOG_LEVEL` and torch `_scaled_mm` verbose; we have no torch, so this flag is the equivalent |
+
+### `VT_GEMM_ALGO_LOG` has SIX emit sites and only ONE of them is a selection
+
+All six are behind the same `GemmAlgoLogEnabled()`, so a run that turns the
+instrument on gets all six in one stderr:
+
+| Site | Line | Shape |
+|---|---|---|
+| `MaybeLogGemmAlgo` | `cuda_matmul.cu:270` | **the selection**, one per unique key |
+| `MaybeLogFp8PlanRefusal` | `cuda_matmul.cu:805` | `REFUSED`: a plan that was never built |
+| `MaybeLogDenseAlgoCandidates` | `cuda_matmul.cu:842` | `DENSE-CANDIDATES`, on a failed heuristic query |
+| `MaybeLogDenseAlgoCandidates` | `cuda_matmul.cu:858` | `DENSE-CANDIDATE`, ONE PER RANKED CANDIDATE |
+| `MaybeLogFp8AlgoCandidates` | `cuda_matmul.cu:883` | `CANDIDATES`, on a failed heuristic query |
+| `MaybeLogFp8AlgoCandidates` | `cuda_matmul.cu:900` | `CANDIDATE rank=`, ONE PER RANKED CANDIDATE |
+
+Only the selection line carries `a=`, `b=`, `c=` and `epilogue=`, and that is
+what the judge requires before it reads a line as a selection. This is not a
+parsing detail. The dense dump is reached from the TN-bt lane
+(`cuda_matmul.cu:582`) -- the bf16 lane this row is about -- and it repeats one
+shape once per candidate, so a parser that accepts any `[VT_GEMM_ALGO]` line
+keeps RANK 0 of a heuristic LIST and compares that across processes. Two
+processes whose candidate lists came back in a different order then report
+`UNSTABLE`: the verdict that, per the table below, turns this row into a
+benchmark-validity repair and licenses the persistent cuBLASLt cache #2750 says
+must be built ONLY in its case 4.
 | The premise being tested | `src/vt/cuda/gemm_plan_cache.h:22`, `src/vt/cuda/fp8_plan_cache.h:17` | the claim, in our own words, that the measurement checks |
 | The pinned oracle | [`.agents/upstream-sync.md`](../upstream-sync.md) | the revision any later vLLM-side comparison must be taken at |
 
@@ -102,9 +127,16 @@ The executable spec for the judging half is therefore local:
   record / resume / precondition path with a fixture whose bytes are the
   instruments' own format strings, on a host with no GPU.
 - Every predicate is mutated against that fixture, and each mutation must turn
-  the verdict red: one `algoId` moved makes `algo_stability` `UNSTABLE`; one key
-  dropped from one run makes it `INCOMPARABLE`; a single run is `INCOMPARABLE`
-  rather than trivially stable.
+  the verdict red: one key dropped from one run makes `algo_stability`
+  `INCOMPARABLE`; a single run is `INCOMPARABLE` rather than trivially stable; a
+  candidate-dump line must not move the verdict at all.
+- **The fixture moves ONE of its four shapes with the draw index and holds the
+  other three still**, so the walk reads `UNSTABLE` with exactly one unstable
+  key out of four. A fixture in which every draw agreed could not detect a
+  tainted dedupe key: folding `algoId` into `algo_key` changed no verdict and
+  survived the whole battery, and with the id in the key a genuinely unstable
+  run would report `INCOMPARABLE` -- the two processes look like they saw
+  different keys -- for ever. The three still shapes are the control.
 
 ## Gates
 
@@ -120,7 +152,7 @@ bash scripts/dgx-gemm-tactic-draw-survey.sh \
      --evidence /workspace/gemm-draw-survey/<stamp> \
      --src /workspace/gemm-draw-survey/src.tar.gz \
      --model /workspace/ckpt/<nvfp4-checkpoint> \
-     --tactic-set full --draws 8 --score-reps 2 --concurrency 2
+     --tactic-set full --draws 8 --score-reps 3 --concurrency 2
 
 # 2. the judgement, offline, on the evidence the job left behind
 python3 tools/bench/gemm_tactic_draw_survey.py reduce \
@@ -133,7 +165,7 @@ The verdict is the `issue_2750_draw_processes` block of `REPORT.json`:
 |---|---|---|
 | `STABLE` | at least 2 processes, identical key sets, and every observed key answered with ONE `(algoId, tile, stages, splitK)` tuple | #2750 closes with that evidence, the premise's dead `.agents/state.md` citation is repaired to point at this file, and **nothing is persisted** |
 | `UNSTABLE` | any key answered with 2+ tuples | #2750 becomes a benchmark-validity repair on this row: every same-binary A/B on the bf16/f32 lane carried an uncontrolled variable, and `src/vt/cuda/nvfp4_persistent_cache.cpp` is the shape to reuse |
-| `INCOMPARABLE` | fewer than 2 runs, or a key missing from some run | no verdict; the processes did not run the same thing and the run is repeated |
+| `INCOMPARABLE` | fewer than 2 runs, a key missing from some run, or a SELECTION key repeated inside one process | no verdict; the processes did not run the same thing, or `LogOncePerKey` did not dedupe and only the first line per key was kept, so the comparison would run over a subset of what was emitted; the run is repeated |
 
 **A refusal is a result and is reported as one.** The judge exits with a named
 code before it prints any verdict when an instrument did not run: `70` for zero

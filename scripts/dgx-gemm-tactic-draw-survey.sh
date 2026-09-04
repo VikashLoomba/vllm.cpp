@@ -51,8 +51,8 @@
 # `Fp4FullTacticsEnabled()` (`src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu:189-195`)
 # reads `value == nullptr || value[0] != '0'`, so `VT_FP4_FULL_TACTICS` is
 # DEFAULT ON. The shipped arm is 32 candidates chosen by pure argmin over
-# per-candidate means (`:757-763`). The non-default `=0` arm is 4 candidates AND
-# carries a variance damper (`:766-775`): a tactic displaces the fixed baseline
+# per-candidate means (`:758-764`). The non-default `=0` arm is 4 candidates AND
+# carries a variance damper (`:770-776`): a tactic displaces the fixed baseline
 # only if it beats it by more than 1%, otherwise the baseline is kept.
 #
 # The arms therefore SELECT BY DIFFERENT RULES and their draw spreads are not
@@ -64,8 +64,8 @@
 # THE TUNER'S OWN TIMING IS A DIAGNOSTIC, NOT AN AXIS
 # ---------------------------------------------------
 # `VT_FP4_AUTOTUNE_VERBOSE=1` prints `-> id=%d %s (%.1f us)` per tuned key
-# (`:776-789`). That figure is `timings[chosen] * 1000`: ONE mean over ten
-# iterations, because `TimeCandidate` (`:322-357`) wraps all ten in a SINGLE
+# (`:777-788`). That figure is `timings[chosen] * 1000`: ONE mean over ten
+# iterations, because `TimeCandidate` (`:322-363`) wraps all ten in a SINGLE
 # `cudaEvent` pair and divides. No per-iteration sample exists in the tree, so
 # no median or minimum over iterations is computable and a robust-statistic
 # selector would have to ADD instrumentation rather than swap a reduction. This
@@ -113,7 +113,7 @@
 #        --evidence /workspace/gemm-draw-survey/<stamp> \
 #        --src /workspace/gemm-draw-survey/src.tar.gz \
 #        --model /workspace/ckpt/<nvfp4-checkpoint> \
-#        [--draws 8] [--score-reps 2] [--concurrency 2] [--phase all] \
+#        [--draws 8] [--score-reps 3] [--concurrency 2] [--phase all] \
 #        [--tactic-set full|w1]
 #
 # `--phase` is one of: all build draw score reduce. `--score-leg ARM` is the
@@ -144,7 +144,12 @@ EV_SHARE=""
 SRC_IN=""
 MODEL=""
 DRAWS=8
-SCORE_REPS=2
+# THREE, not two. The speed half's within-draw repeat spread is the floor a
+# draw-to-draw gap is compared against, and a spread over two legs is one
+# difference rather than an estimate of anything. `speed_spread` refuses a run
+# with fewer than three legs per draw (INCOMPARABLE), so two would buy a lease
+# and return no verdict.
+SCORE_REPS=3
 CONCURRENCY=2
 NUM_PROMPTS=32
 INPUT_LEN=512
@@ -173,7 +178,7 @@ while [ $# -gt 0 ]; do
     --tactic-set)    TACTIC_SET=${2:?}; shift 2 ;;
     --score-leg)     SCORE_LEG=${2:?}; shift 2 ;;
     --local-root)    LOCAL_ROOT=${2:?}; shift 2 ;;
-    -h|--help)       sed -n '2,95p' "$0"; exit 0 ;;
+    -h|--help)       sed -n '2,120p' "$0"; exit 0 ;;
     *)               die "$E_USAGE" "unknown argument '$1'" ;;
   esac
 done
@@ -188,7 +193,8 @@ FULL_TACTICS=1; [ "$TACTIC_SET" = w1 ] && FULL_TACTICS=0
 
 # THE EVIDENCE LIVES TWICE, ON PURPOSE.
 # The engine publishes its cache document with mkstemp + fsync + atomic rename
-# (nvfp4_persistent_cache.h:105-135). That wants a real local filesystem, and
+# (nvfp4_persistent_cache.cpp:682-722, the mkstemp/write/fsync/rename body of
+# WriteNativeCacheAtomically). That wants a real local filesystem, and
 # `/workspace` is CIFS with `nounix`. So the run works under $EV_LOCAL and every
 # phase MIRRORS to $EV_SHARE, which is what survives the box going down. A resume
 # that finds a local tree missing restores it from the share first, so a crashed
@@ -226,6 +232,17 @@ mark_phase() { mkdir -p "$PHASEDIR"; date -u +%Y-%m-%dT%H:%M:%SZ > "$PHASEDIR/$1
 # ---------------------------------------------------------------------------
 if [ -n "$SCORE_LEG" ]; then
   ARM=$SCORE_LEG
+  # THE SOURCE THE BUILD RECORDED, RESOLVED BEFORE ANYTHING USES IT. The leg is
+  # re-entered with `--src ''` (the driver's own `--score-leg` command line
+  # below passes exactly that), so without this `$SRC` is still the DEFAULT
+  # `$LOCAL_ROOT/src` -- which only exists when the driver was given a `--src`
+  # tarball. Run from an unpacked tree instead, the judge is somewhere else
+  # entirely, `check-frozen` fails with "can't open file", and `|| exit
+  # $E_LEG_NOT_FROZEN` reports that as 78: THE CODE THAT MEANS A LEG RE-TUNED.
+  # A missing judge and a leg that re-tuned are different repairs.
+  [ -f "$PHASEDIR/src.path" ] && SRC=$(cat "$PHASEDIR/src.path")
+  SURVEY="$SRC/tools/bench/gemm_tactic_draw_survey.py"
+  [ -f "$SURVEY" ] || die "$E_SRC" "the judging half is missing at $SURVEY; a leg cannot assert its own frozen control without it, and reporting that as $E_LEG_NOT_FROZEN would name the wrong fault"
   DRAWDIR="$EV_LOCAL/draws/$ARM"
   CACHE="$DRAWDIR/autotune_configs.json"
   [ -s "$CACHE" ] || die "$E_USAGE" "no cache document for arm '$ARM' at $CACHE"
@@ -281,8 +298,17 @@ if [ -n "$SCORE_LEG" ]; then
   # The arm is passed through as well: the tactic-set version is part of the
   # cache metadata, so a map drawn under one arm and replayed under the other is
   # rejected by `ParseNativeCache` rather than silently used.
-  python3 "$SRC/tools/bench/gemm_tactic_draw_survey.py" check-frozen \
-      --log "$D/leg.log" --expected-plans "$PLANS" || exit "$E_LEG_NOT_FROZEN"
+  # `--record` writes THIS LEG's control document, pass or fail, one file per
+  # leg. `reduce` globs `score/*/frozen.json` and refuses (78) when a leg that
+  # contributed a number carries no passing record -- without which the report
+  # could carry EQUIVALENT and "ship draw00" over legs that re-tuned. One file
+  # per writer, never one shared control file every leg has to append to.
+  python3 "$SURVEY" check-frozen \
+      --log "$D/leg.log" --expected-plans "$PLANS" \
+      --record "$D/frozen.json" --leg "$ARM-$N"
+  FZ=$?
+  mirror_out
+  [ "$FZ" = 0 ] || exit "$E_LEG_NOT_FROZEN"
 
   # EQUAL TIMES ARE NOISE; EQUAL COUNTS ARE IDENTITY (.agents/benchmarking.md).
   # A leg that completed fewer requests than it was given is not a slower leg,
@@ -389,7 +415,30 @@ stage_source() {
   return 0
 }
 
+# THE MARKER IS MIRRORED AND THE BINARY IS NOT, SO THE MARKER CAN OUTLIVE IT.
+# `$BIN` and `$SRC` live under `$LOCAL_ROOT`, outside `$EV_LOCAL`, so `mirror_in`
+# never restores them -- while `phase/build.ok` IS mirrored and comes back. A
+# wiped `/tmp` under a surviving share therefore reads as "the build is done"
+# with no binary anywhere, and the run dies further down on a missing file.
+build_artefacts_ok() {
+  [ -x "$BIN/vllm-bench" ] || return 1
+  ls "$BIN"/libvllm.so.* >/dev/null 2>&1 || return 1
+  local recorded
+  recorded=$(cat "$PHASEDIR/src.path" 2>/dev/null) || return 1
+  [ -n "$recorded" ] && [ -f "$recorded/tools/bench/gemm_tactic_draw_survey.py" ] || return 1
+  return 0
+}
+
 if [ "$PHASE" = all ] || [ "$PHASE" = build ]; then
+  if phase_done build && ! build_artefacts_ok; then
+    # REFUSED RATHER THAN REBUILT, and the reason is the one-binary rule. Every
+    # draw already recorded carries the previous binary's sha256, and the judge
+    # refuses a run whose draws did not share one binary (exit 79). Rebuilding
+    # into this evidence root would therefore spend the whole draw phase again
+    # to be refused at the end. Remove the marker only when this root holds no
+    # draws, or start a fresh evidence root.
+    die "$E_ARTEFACT" "phase/build.ok came back from the share but $BIN/vllm-bench, its library, or the source at $(cat "$PHASEDIR/src.path" 2>/dev/null) did not: /tmp was wiped under a surviving evidence root. Draws already recorded here carry the previous binary's sha256 and the judge refuses two binaries (79), so start a FRESH --evidence root, or restore the binary, or delete $PHASEDIR/build.ok if this root holds no draws yet"
+  fi
   if phase_done build; then
     say "=== [A-D] build already complete for this evidence root; skipping ==="
     SRC=$(cat "$PHASEDIR/src.path")
@@ -496,7 +545,8 @@ if [ "$PHASE" = all ] || [ "$PHASE" = draw ]; then
     ( cd "$SRC" && python3 "$SURVEY" draw --evidence "$EV_LOCAL" --bench "$BIN/vllm-bench" \
         --model "$MODEL" --draws 1 --num-prompts "$NUM_PROMPTS" --input-len "$INPUT_LEN" \
         --output-len "$OUTPUT_LEN" --concurrency "$CONCURRENCY" --seed "$SEED" \
-        --max-num-batched-tokens "$MAX_BATCHED" --tactic-set "$TACTIC_SET" )
+        --max-num-batched-tokens "$MAX_BATCHED" --tactic-set "$TACTIC_SET" \
+        --mirror "$EV_SHARE" )
     P=$?
     mirror_out
     [ "$P" = 0 ] || die "$E_PREFLIGHT" "the preflight draw did not produce usable instrument output (survey exit $P); nothing after this point could be trusted"
@@ -505,10 +555,15 @@ if [ "$PHASE" = all ] || [ "$PHASE" = draw ]; then
 
   if ! phase_done draws; then
     say "=== [G] $DRAWS independent draws, each in a fresh process ==="
+    # `--mirror` makes the judge copy the evidence root to the share AFTER EACH
+    # DRAW. Mirroring when the phase returns loses every completed draw to a
+    # crash inside it, and the draw phase is hours of model loads on a box that
+    # has gone down four times in one session (#545).
     ( cd "$SRC" && python3 "$SURVEY" draw --evidence "$EV_LOCAL" --bench "$BIN/vllm-bench" \
         --model "$MODEL" --draws "$DRAWS" --num-prompts "$NUM_PROMPTS" --input-len "$INPUT_LEN" \
         --output-len "$OUTPUT_LEN" --concurrency "$CONCURRENCY" --seed "$SEED" \
-        --max-num-batched-tokens "$MAX_BATCHED" --tactic-set "$TACTIC_SET" )
+        --max-num-batched-tokens "$MAX_BATCHED" --tactic-set "$TACTIC_SET" \
+        --mirror "$EV_SHARE" )
     G=$?
     mirror_out
     [ "$G" = 0 ] || die "$G" "the draw phase refused its own evidence (see draw-preconditions.json)"
@@ -554,6 +609,7 @@ fi
 # === [R] collect the clock windows and reduce ==============================
 if [ "$PHASE" = all ] || [ "$PHASE" = reduce ]; then
   say "=== [R] clock windows + reduction ==="
+  mkdir -p "$EV_LOCAL/score"
   python3 - "$EV_LOCAL" <<'PY' > "$EV_LOCAL/score/clock-windows.json"
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1]) / "score"
@@ -579,7 +635,10 @@ PY
   R=$?
   mirror_out
   say "reduce exit $R; report at $EV_SHARE/REPORT.json"
-  mark_phase reduce
+  # MARKED ONLY ON A REDUCTION THAT PASSED. A marker written by a refused phase
+  # makes the next run skip the work that did not happen, which is the same
+  # polarity as the build marker that outlived its binary above.
+  [ "$R" = 0 ] && mark_phase reduce
   exit "$R"
 fi
 

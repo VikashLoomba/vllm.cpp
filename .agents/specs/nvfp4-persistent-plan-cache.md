@@ -544,7 +544,7 @@ wrong. The mechanism below was re-verified in this worktree at base
 `22986c3f4` before it was written down, because the correction changes what the
 gates can even ask for.
 
-Per candidate, `TimeCandidate` (`src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu:322-357`):
+Per candidate, `TimeCandidate` (`src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu:322-363`):
 
 - three warmup launches (`kWarmupIterations`);
 - `cudaStreamSynchronize`, then a one-thread GPU delay kernel of
@@ -557,7 +557,7 @@ Per candidate, `TimeCandidate` (`src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu:322-35
 **That last line is load-bearing.** The per-candidate result is a MEAN, and
 because a single event pair spans the whole loop, **no per-iteration timing
 exists anywhere in the tree**. There is no distribution to take a median or a
-minimum of. "Minimum wins" describes the argmin ACROSS CANDIDATES at `:757-763`
+minimum of. "Minimum wins" describes the argmin ACROSS CANDIDATES at `:758-764`
 -- strict `<`, first-registered wins a tie -- and never a min-of-ten. Producing
 a robust statistic would mean ADDING per-iteration events, which is
 instrumentation work and not a reduction swap. **No gate in this section may
@@ -565,7 +565,7 @@ assume per-iteration samples exist.**
 
 ### The damper that already exists, in the arm that is not the default
 
-`:766-775`:
+The comment at `:767-769`, over the branch it describes at `:770-776`:
 
 > `// W1 used a >1% threshold relative to its fixed M baseline. Preserve that`
 > `// only in the fallback arm. FlashInfer's full autotuner chooses the`
@@ -644,7 +644,7 @@ whose speed half is refused.
 
 | Axis | Where it comes from | Status |
 |---|---|---|
-| **S, selection time** | `[VT_FP4_AUTOTUNE] ... -> id=%d %s (%.1f us)` at `:776-789`, which prints `timings[chosen] * 1000` | **DIAGNOSTIC ONLY** |
+| **S, selection time** | `[VT_FP4_AUTOTUNE] ... -> id=%d %s (%.1f us)` at `:777-788`, which prints `timings[chosen] * 1000` | **DIAGNOSTIC ONLY** |
 | **E, end-to-end** | a frozen replay of each draw on a disjoint serving workload, clock-attributed | the gate |
 
 Axis S is the only timing number the tuner exposes, and this spec records it
@@ -691,10 +691,39 @@ refuses across a boot change.
 
 | Verdict | Condition | Consequence |
 |---|---|---|
-| `EQUIVALENT` | best/worst draw ratio does not exceed the worst WITHIN-draw repeat spread | **#2751 closes as "no divergence warranted"**, which is the outcome the issue names first; the persistent cache alone is the right answer and #2752 unblocks |
-| `SEPARATED_BELOW_BAR` | ratio exceeds the within-draw spread but is under **1.02x** | the draws differ and the difference is not worth a divergence from the mirror; #2751 records the number and closes without a selector; #2752 stays blocked, because "which draw" is no longer arbitrary |
+| `EQUIVALENT` | best/worst draw ratio does not exceed the POOLED within-draw repeat spread | **#2751 closes as "no divergence warranted"**, which is the outcome the issue names first; the persistent cache alone is the right answer and #2752 unblocks |
+| `SEPARATED_BELOW_BAR` | ratio exceeds the pooled within-draw spread but is under **1.02x** | the draws differ and the difference is not worth a divergence from the mirror; #2751 records the number and closes without a selector; #2752 stays blocked, because "which draw" is no longer arbitrary |
 | `ABOVE_BAR` | ratio >= **1.02x** | #2751 escalates for **developer ratification** of one of the two options it names; no selector is written before that answer |
-| `INCOMPARABLE` | fewer than two legs on some draw, or a non-positive mean | no number; the sequence is repeated |
+| `INCOMPARABLE` | fewer than **three** legs on some draw, a non-positive mean, or ANY draw's own repeat spread over the **1.02x noise ceiling** | no number; the sequence is repeated |
+
+**The noise floor is pooled, and a restless run is repeated rather than called
+equivalent.** Two rules, and the second one is why `--score-reps` is 3 above:
+
+- **The ceiling.** If any single draw's own repeat spread exceeds 1.02x, the
+  verdict is `INCOMPARABLE` and the run is repeated. Without it, one restless
+  draw sets the floor for every other draw, and a draw-to-draw gap larger than
+  the ratification bar reads `EQUIVALENT` -- the verdict that closes #2751 AND
+  unblocks #2752 to pin a draw. This is not an exotic case here: one unchanged
+  binary has read 36.82 and 78.86 tok/s at c8 on this host
+  ([`c8-measurement-admissibility.md`](c8-measurement-admissibility.md),
+  [#2154](https://github.com/mudler/vllm.cpp/issues/2154)).
+- **The floor itself** is the MEDIAN of the per-draw spreads, not the maximum,
+  so a draw sitting just under the ceiling cannot certify the others. Both the
+  pooled and the worst figure are reported.
+
+**The ceiling is 1.02x and it is NOT the ratification bar**, even though the two
+share that value today. The bar says how much a draw-to-draw gap must be worth
+before diverging from the mirrored FlashInfer method is arguable. The ceiling
+says how much repeat noise a run may carry before it can answer that question at
+all: a run whose own repeats are as wide as the effect it was built to resolve
+has not measured the effect. They are separate parameters
+(`--ratification-bar`, `--noise-ceiling`) and moving one must not move the other.
+
+**Three legs per draw, not two.** The within-draw spread is the floor the
+draw-to-draw gap is compared against, and over two legs it is a single
+difference rather than an estimate of anything. `speed_spread` returns
+`INCOMPARABLE` below three, so `--score-reps 2` would buy a lease and return no
+verdict.
 
 **The two options ratification would choose between**, both of which diverge
 from the pinned FlashInfer oracle for the default arm and are therefore product
@@ -702,7 +731,7 @@ decisions rather than inferred ones:
 
 1. **Extend the legacy arm's >1% stickiness to the default arm.** This is the
    cheaper option and it is not an invention: the damper is already in the tree
-   at `:766-775` and already ships in the `w1` arm. The measurement makes it
+   at `:770-776` and already ships in the `w1` arm. The measurement makes it
    arguable because the harness runs both arms, so the identity spread of the
    damped arm and the undamped arm are directly comparable.
 2. **Add per-iteration events so a robust statistic is computable at all.**
@@ -779,21 +808,21 @@ bash scripts/dgx-gemm-tactic-draw-survey.sh \
      --evidence /workspace/gemm-draw-survey/<stamp>-full-c2 \
      --src /workspace/gemm-draw-survey/src.tar.gz \
      --model /workspace/ckpt/<nvfp4-checkpoint> \
-     --tactic-set full --draws 8 --score-reps 2 --concurrency 2
+     --tactic-set full --draws 8 --score-reps 3 --concurrency 2
 
 # the shipped arm, c16
 bash scripts/dgx-gemm-tactic-draw-survey.sh \
      --evidence /workspace/gemm-draw-survey/<stamp>-full-c16 \
      --src /workspace/gemm-draw-survey/src.tar.gz \
      --model /workspace/ckpt/<nvfp4-checkpoint> \
-     --tactic-set full --draws 8 --score-reps 2 --concurrency 16
+     --tactic-set full --draws 8 --score-reps 3 --concurrency 16
 
 # the damped arm, c2 -- the comparison that answers the damper question
 bash scripts/dgx-gemm-tactic-draw-survey.sh \
      --evidence /workspace/gemm-draw-survey/<stamp>-w1-c2 \
      --src /workspace/gemm-draw-survey/src.tar.gz \
      --model /workspace/ckpt/<nvfp4-checkpoint> \
-     --tactic-set w1 --draws 8 --score-reps 2 --concurrency 2
+     --tactic-set w1 --draws 8 --score-reps 3 --concurrency 2
 
 # the judgement, offline, per root
 python3 tools/bench/gemm_tactic_draw_survey.py reduce \
@@ -818,6 +847,17 @@ The frozen control has **two witnesses** and both must agree: the runtime's own
 `[VT_FP4_AUTOTUNE]` selection lines from the tuner itself. The legs therefore
 run with `VT_FP4_AUTOTUNE_VERBOSE=1` even though a frozen leg should print none
 -- a control with one witness is a control that cannot be cross-checked.
+
+**The control is RECORDED, one file per leg, and `reduce` reads it.** Each leg
+writes `score/<arm>-<n>/frozen.json` through `check-frozen --record` as it
+finishes, pass or fail; `reduce` globs those files and exits `78` when any leg
+failed the control OR when a leg that contributed a number to the ledger carries
+no passing record. A leg whose control was never recorded measured a plan map
+nobody checked, which is the same defect as a leg that re-tuned. Without that
+read, `REPORT.json` could carry `EQUIVALENT` and "ship draw00" with no evidence
+that any leg was frozen at all, and the `78` in the table above would have no
+path to fire. One file per leg rather than one shared control document, because
+a file every leg has to write is the lock shape the protocol refuses.
 
 ## Owed
 

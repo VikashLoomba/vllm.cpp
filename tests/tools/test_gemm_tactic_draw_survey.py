@@ -29,9 +29,15 @@ import contextlib
 import copy
 import io
 import json
+import os
 import pathlib
+import shutil
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
+
+import tools.bench.gemm_tactic_draw_survey as survey
 
 from tools.bench.gemm_tactic_draw_survey import (
     EXIT_ALGO_KEYSET_DIFFERS,
@@ -45,7 +51,10 @@ from tools.bench.gemm_tactic_draw_survey import (
     EXIT_FINGERPRINT_DIFFERS,
     EXIT_FP4_SILENT,
     EXIT_KEYSET_DIFFERS,
+    EXIT_LEG_NOT_FROZEN,
     EXIT_OK,
+    algo_key,
+    algo_selection,
     algo_stability,
     check_draw_preconditions,
     check_frozen_leg,
@@ -56,6 +65,7 @@ from tools.bench.gemm_tactic_draw_survey import (
     parse_autotune_lines,
     parse_bench_report,
     read_draw_records,
+    run_draw,
     reduce_evidence,
     select_shipping_draw,
     selection_time_spread,
@@ -79,6 +89,154 @@ ALGO_LINE = (
     "[VT_GEMM_ALGO] backend=cublasLt m=1 n=3072 k=2048 a=bf16 b=bf16 c=bf16 "
     "epilogue=rowmajor-NN algoId=21 tile=15 stages=4 splitK=1 wsSize=4194304"
 )
+
+
+# ---------------------------------------------------------------------------
+# `[VT_GEMM_ALGO]` HAS SIX EMIT SHAPES AND ONLY ONE OF THEM IS A SELECTION.
+#
+# Every one is behind the same `GemmAlgoLogEnabled()` flag, so a run that turns
+# the instrument on gets all six. Byte-exact from the format strings, each cited
+# at the `std::cerr` that writes it:
+#
+#   src/vt/cuda/cuda_matmul.cu:270  the SELECTION  (MaybeLogGemmAlgo)
+#   src/vt/cuda/cuda_matmul.cu:805  REFUSED        (MaybeLogFp8PlanRefusal)
+#   src/vt/cuda/cuda_matmul.cu:842  DENSE-CANDIDATES, query failed
+#   src/vt/cuda/cuda_matmul.cu:858  DENSE-CANDIDATE, one per ranked candidate
+#   src/vt/cuda/cuda_matmul.cu:883  CANDIDATES, query failed (fp8)
+#   src/vt/cuda/cuda_matmul.cu:900  CANDIDATE rank=, one per ranked candidate (fp8)
+#
+# The dense candidate dump is reached from the TN-bt lane
+# (`src/vt/cuda/cuda_matmul.cu:582`), which is the bf16 lane #2750 is about, so
+# these lines are not a hypothetical shape in some other workload -- they are in
+# the same stderr as the selections this harness compares.
+# ---------------------------------------------------------------------------
+SELECTION_LINE = (
+    "[VT_GEMM_ALGO] backend=cublasLt m=1 n=3072 k=2048 a=bf16 b=bf16 c=bf16 "
+    "epilogue=TN-bt algoId=21 tile=15 stages=4 splitK=1 wsSize=4194304"
+)
+REFUSED_LINE = (
+    "[VT_GEMM_ALGO] backend=cublasLt REFUSED m=1 n=3072 k=2048 scale_mode=0 "
+    "reason=no-heuristic pointerModeCapMask=0"
+)
+DENSE_CANDIDATES_FAILED_LINE = (
+    "[VT_GEMM_ALGO] backend=cublasLt DENSE-CANDIDATES lane=TN-bt m=1 n=3072 "
+    "k=2048 query failed: CUBLAS_STATUS_INTERNAL_ERROR"
+)
+DENSE_CANDIDATE_LINE = (
+    "[VT_GEMM_ALGO] backend=cublasLt DENSE-CANDIDATE lane=TN-bt rank=0/6 m=1 "
+    "n=3072 k=2048 algoId=31 tile=20 stages=6 splitK=1 wsSize=0 waves=1.5"
+)
+FP8_CANDIDATES_FAILED_LINE = (
+    "[VT_GEMM_ALGO] backend=cublasLt CANDIDATES m=1 n=3072 k=2048 scale_mode=0 "
+    "query failed: CUBLAS_STATUS_NOT_SUPPORTED"
+)
+FP8_CANDIDATE_LINE = (
+    "[VT_GEMM_ALGO] backend=cublasLt CANDIDATE rank=1/8 m=1 n=3072 k=2048 "
+    "scale_mode=0 algoId=41 tile=22 stages=3 splitK=2 wsSize=1024 waves=2.0"
+)
+DIAGNOSTIC_LINES = (
+    REFUSED_LINE,
+    DENSE_CANDIDATES_FAILED_LINE,
+    DENSE_CANDIDATE_LINE,
+    FP8_CANDIDATES_FAILED_LINE,
+    FP8_CANDIDATE_LINE,
+)
+SELECTION_KEY = "cublasLt|m=1 n=3072 k=2048|a=bf16 b=bf16 c=bf16|TN-bt"
+
+
+class AlgoLineShapeTest(unittest.TestCase):
+    """Five of the six shapes are DIAGNOSTICS and none of them is a selection.
+
+    Reading one as a selection is not a cosmetic parse error. The candidate
+    dumps repeat one shape once per ranked candidate, so a first-wins map keeps
+    RANK 0 -- and rank 0 of a heuristic LIST is not what the matmul ran. Two
+    processes whose candidate lists came back in a different order would then
+    report `UNSTABLE`, which is the verdict that, per
+    `.agents/specs/cublaslt-cross-process-algo-stability.md`, turns #2750 into a
+    benchmark-validity repair and licenses building a persistent cuBLASLt cache
+    that #2750 says must be built only in its case 4.
+    """
+
+    def test_only_the_selection_line_is_read_as_a_selection(self) -> None:
+        parsed = parse_algo_lines("\n".join((SELECTION_LINE,) + DIAGNOSTIC_LINES))
+        self.assertEqual(sorted(k for k in parsed if not k.startswith("_")), [SELECTION_KEY])
+
+    def test_each_diagnostic_shape_on_its_own_yields_no_selection(self) -> None:
+        for line in DIAGNOSTIC_LINES:
+            with self.subTest(shape=line.split()[2]):
+                parsed = parse_algo_lines(line)
+                self.assertEqual([k for k in parsed if not k.startswith("_")], [])
+
+    def test_a_diagnostic_never_becomes_a_synthetic_unknown_key(self) -> None:
+        # The old shape produced `...|a=? b=? c=?|?`, one key holding whatever
+        # the first unparsed line happened to say.
+        parsed = parse_algo_lines("\n".join(DIAGNOSTIC_LINES))
+        self.assertNotIn("cublasLt|m=1 n=3072 k=2048|a=? b=? c=?|?", parsed)
+
+    def test_a_candidate_dump_cannot_manufacture_an_unstable_verdict(self) -> None:
+        # The SELECTION agrees across both processes and only the candidate
+        # LIST moved. That is not an unstable selection.
+        one = parse_algo_lines(SELECTION_LINE + "\n" + DENSE_CANDIDATE_LINE)
+        two = parse_algo_lines(
+            SELECTION_LINE + "\n" + DENSE_CANDIDATE_LINE.replace("algoId=31", "algoId=57")
+        )
+        result = algo_stability({"draw00": one, "draw01": two})
+        self.assertEqual(result["verdict"], "STABLE")
+        self.assertEqual(result["keys_common"], 1)
+
+    def test_diagnostics_do_not_inflate_the_duplicate_count(self) -> None:
+        # `_duplicates` is the report's only witness for `LogOncePerKey`
+        # misbehaving. Five candidate lines sharing one shape are not that.
+        parsed = parse_algo_lines("\n".join((SELECTION_LINE,) + DIAGNOSTIC_LINES))
+        self.assertNotIn("_duplicates", parsed)
+
+    def test_a_repeated_selection_line_is_still_counted_as_a_duplicate(self) -> None:
+        parsed = parse_algo_lines(SELECTION_LINE + "\n" + SELECTION_LINE)
+        self.assertEqual(parsed["_duplicates"]["count"], "1")
+
+    def test_the_skipped_diagnostics_are_counted_rather_than_dropped_silently(self) -> None:
+        # A run whose instrument emitted ONLY candidate dumps has zero
+        # selections, and "zero lines" and "zero selections among 40 lines" are
+        # different diagnoses of a failed run.
+        parsed = parse_algo_lines("\n".join(DIAGNOSTIC_LINES))
+        self.assertEqual(parsed["_diagnostics"]["count"], str(len(DIAGNOSTIC_LINES)))
+
+
+class AlgoKeyTest(unittest.TestCase):
+    """The dedupe key must not contain the answer.
+
+    Mutation M10 -- folding `algoId` into `algo_key` -- survived all 60 tests of
+    the first revision of this suite, because nothing called `algo_key` or
+    `algo_selection` directly and the dry-run fixture held `algoId` constant
+    across draws. With the id in the key a genuinely unstable run reports
+    `INCOMPARABLE` (the two processes look like they saw different keys) rather
+    than `UNSTABLE`, for ever, and #2750 would never be answerable at all.
+    """
+
+    BODY = SELECTION_LINE[len("[VT_GEMM_ALGO]"):]
+
+    def moved(self) -> dict:
+        return kv_tokens(
+            self.BODY.replace("algoId=21", "algoId=99").replace("tile=15", "tile=20")
+            .replace("stages=4", "stages=6").replace("splitK=1", "splitK=3")
+        )
+
+    def test_two_processes_that_selected_differently_still_share_one_key(self) -> None:
+        self.assertEqual(algo_key(kv_tokens(self.BODY)), algo_key(self.moved()))
+
+    def test_the_selection_tuple_is_what_moves(self) -> None:
+        self.assertNotEqual(algo_selection(kv_tokens(self.BODY)), algo_selection(self.moved()))
+        self.assertEqual(algo_selection(kv_tokens(self.BODY)), ("21", "15", "4", "1"))
+
+    def test_the_key_is_the_shape_the_dedupe_uses(self) -> None:
+        # `LogOncePerKey`'s key at src/vt/cuda/cuda_matmul.cu:266-268, rebuilt.
+        self.assertEqual(algo_key(kv_tokens(self.BODY)), SELECTION_KEY)
+
+    def test_the_workspace_estimate_is_not_part_of_the_selection(self) -> None:
+        # The same algo reports a different wsSize under a different workspace
+        # budget; folding it in would report a change that never happened.
+        other = kv_tokens(self.BODY.replace("wsSize=4194304", "wsSize=8388608"))
+        self.assertEqual(algo_selection(kv_tokens(self.BODY)), algo_selection(other))
 
 
 class TokenizerTest(unittest.TestCase):
@@ -324,6 +482,75 @@ class AlgoStabilityTest(unittest.TestCase):
         self.assertIn("not a claim", algo_stability(self.runs())["scope"])
 
 
+class DuplicateWitnessTest(unittest.TestCase):
+    """`within_process_duplicate_lines` is the report's only witness for
+    `LogOncePerKey` misbehaving, and it was structurally unable to fire: the
+    only production caller stripped every `_`-prefixed key before
+    `algo_stability` could see `_duplicates`, so the field was hard-wired to 0
+    in every report this harness will ever write.
+
+    A duplicate also means the parser KEPT THE FIRST line and dropped the rest,
+    so the cross-process comparison would run over a first-wins subset of what
+    the process actually said. That is not a stable run with a footnote; it is a
+    run whose evidence has a hole in it.
+    """
+
+    def evidence_with_duplicates(self, tmp: str, count: int) -> pathlib.Path:
+        evidence = pathlib.Path(tmp) / "ev"
+        for index, label in enumerate(("draw00", "draw01")):
+            record = _draw_record(label, tactic_offset=index * 7)
+            if count and label == "draw00":
+                record["algo"]["_duplicates"] = {"count": str(count)}
+            home = evidence / "draws" / label
+            home.mkdir(parents=True, exist_ok=True)
+            (home / "record.json").write_text(json.dumps(record), encoding="utf-8")
+        return evidence
+
+    def test_a_duplicate_count_reaches_the_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            code, report = reduce_evidence(
+                self.evidence_with_duplicates(tmp, 3),
+                metric="total_token_throughput", ratification_bar=1.02,
+            )
+            self.assertEqual(code, EXIT_OK)
+            block = report["issue_2750_draw_processes"]
+            self.assertEqual(block["within_process_duplicate_lines"], 3)
+
+    def test_a_duplicate_refuses_a_verdict_over_a_first_wins_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, report = reduce_evidence(
+                self.evidence_with_duplicates(tmp, 3),
+                metric="total_token_throughput", ratification_bar=1.02,
+            )
+            block = report["issue_2750_draw_processes"]
+            self.assertEqual(block["verdict"], "INCOMPARABLE")
+            self.assertIn("LogOncePerKey", block["reason"])
+
+    def test_the_same_evidence_without_duplicates_is_stable(self) -> None:
+        # The control. Without it the case above cannot tell "the duplicate
+        # refused it" from "this fixture never read STABLE".
+        with tempfile.TemporaryDirectory() as tmp:
+            _, report = reduce_evidence(
+                self.evidence_with_duplicates(tmp, 0),
+                metric="total_token_throughput", ratification_bar=1.02,
+            )
+            block = report["issue_2750_draw_processes"]
+            self.assertEqual(block["verdict"], "STABLE")
+            self.assertEqual(block["within_process_duplicate_lines"], 0)
+
+
+class SilentInstrumentDiagnosisTest(unittest.TestCase):
+    def test_zero_selections_among_many_diagnostics_says_so(self) -> None:
+        # A run whose instrument emitted only candidate dumps has no selection
+        # to compare, and "the flag never reached MaybeLogGemmAlgo" is a
+        # different repair from "the flag reached it and no cuBLASLt GEMM ran".
+        records = [_draw_record("draw00"), _draw_record("draw01", tactic_offset=7)]
+        records[0]["algo"] = {"_diagnostics": {"count": "40"}}
+        code, problems = check_draw_preconditions(records)
+        self.assertEqual(code, EXIT_ALGO_SILENT)
+        self.assertIn("40", problems[0])
+
+
 class DrawIdentityTest(unittest.TestCase):
     def test_identical_draws_share_every_key(self) -> None:
         one = _draw_record("draw00")["fp4"]["selected"]
@@ -353,20 +580,20 @@ class DrawIdentityTest(unittest.TestCase):
 
 class SpeedSpreadTest(unittest.TestCase):
     def test_a_gap_inside_the_repeat_spread_is_not_a_gap(self) -> None:
-        result = speed_spread({"a": [100.0, 100.4], "b": [100.2, 100.1]})
+        result = speed_spread({"a": [100.0, 100.2, 100.4], "b": [100.2, 100.1, 100.3]})
         self.assertEqual(result["verdict"], "EQUIVALENT")
 
     def test_a_gap_above_the_spread_but_under_the_bar(self) -> None:
-        result = speed_spread({"a": [100.0, 100.05], "b": [101.0, 101.05]})
+        result = speed_spread({"a": [100.0, 100.02, 100.05], "b": [101.0, 101.02, 101.05]})
         self.assertEqual(result["verdict"], "SEPARATED_BELOW_BAR")
 
     def test_a_gap_over_the_bar_escalates_rather_than_selecting(self) -> None:
-        result = speed_spread({"a": [100.0, 100.05], "b": [105.0, 105.05]})
+        result = speed_spread({"a": [100.0, 100.02, 100.05], "b": [105.0, 105.02, 105.05]})
         self.assertEqual(result["verdict"], "ABOVE_BAR")
         self.assertGreater(result["ratio"], 1.02)
 
     def test_the_bar_is_a_parameter_and_moving_it_moves_the_verdict(self) -> None:
-        legs = {"a": [100.0, 100.05], "b": [101.0, 101.05]}
+        legs = {"a": [100.0, 100.02, 100.05], "b": [101.0, 101.02, 101.05]}
         self.assertEqual(speed_spread(legs, ratification_bar=1.005)["verdict"], "ABOVE_BAR")
 
     def test_one_leg_per_draw_cannot_separate_them(self) -> None:
@@ -374,32 +601,98 @@ class SpeedSpreadTest(unittest.TestCase):
         # difference cannot be told from the noise it might be.
         self.assertEqual(speed_spread({"a": [100.0], "b": [105.0]})["verdict"], "INCOMPARABLE")
 
+    def test_two_legs_per_draw_is_one_difference_and_not_an_estimate(self) -> None:
+        # A within-draw spread over n=2 is a single difference. The run's noise
+        # floor cannot be estimated from it, and the spec's own gate command
+        # used to ask for exactly two.
+        result = speed_spread({"a": [100.0, 100.4], "b": [100.2, 100.1]})
+        self.assertEqual(result["verdict"], "INCOMPARABLE")
+        self.assertIn("Three legs per draw", result["reason"])
+
     def test_one_draw_is_incomparable(self) -> None:
-        self.assertEqual(speed_spread({"a": [100.0, 100.1]})["verdict"], "INCOMPARABLE")
+        self.assertEqual(speed_spread({"a": [100.0, 100.05, 100.1]})["verdict"], "INCOMPARABLE")
+
+
+class SpeedNoiseFloorTest(unittest.TestCase):
+    """The noise floor cannot be the single worst draw in the run.
+
+    The `EQUIVALENT` branch used the worst WITHIN-draw pair anywhere in the run
+    as the floor, at `--score-reps 2`, where each within-draw figure is one
+    difference over two points. One unrelated noisy draw then certified every
+    other draw as equivalent -- and `EQUIVALENT` is the verdict that closes
+    #2751 as "no divergence warranted" AND unblocks #2752 to pin a draw.
+
+    This is not an exotic case on this host. One unchanged binary has read 36.82
+    and 78.86 tok/s at c8 here (`.agents/specs/c8-measurement-admissibility.md`,
+    #2154), so a large within-draw spread is the expected reading of a box that
+    did not hold still, not a rarity.
+    """
+
+    def test_one_noisy_draw_cannot_certify_the_others_as_equivalent(self) -> None:
+        # ~5.9% within `a`, and a 3% draw-to-draw gap -- half again the 1.02x
+        # ratification bar -- which the old floor read as EQUIVALENT.
+        result = speed_spread({"a": [100.0, 103.0, 106.0], "b": [100.0, 100.0, 100.0]})
+        self.assertEqual(result["verdict"], "INCOMPARABLE")
+        self.assertIn("ceiling", result["reason"])
+        self.assertGreater(result["worst_within_draw_spread"], 1.02)
+
+    def test_a_run_over_the_ceiling_ships_nothing(self) -> None:
+        # The consequence, stated where #2752 reads it.
+        result = speed_spread({"a": [100.0, 103.0, 106.0], "b": [100.0, 100.0, 100.0]})
+        self.assertIsNone(select_shipping_draw(result, ["a", "b"])["ship"])
+
+    def test_the_ceiling_is_a_named_parameter(self) -> None:
+        legs = {"a": [100.0, 103.0, 106.0], "b": [100.0, 100.0, 100.0]}
+        loosened = speed_spread(legs, noise_ceiling=1.10)
+        self.assertNotEqual(loosened["verdict"], "INCOMPARABLE")
+
+    def test_the_floor_is_pooled_over_the_draws_and_not_the_worst_one(self) -> None:
+        # Two silent draws and one that is merely restless but still admissible.
+        # Against the WORST draw the 0.83% gap reads EQUIVALENT and #2752
+        # unblocks; against the pooled estimate it is a separation below the bar
+        # and nothing ships.
+        legs = {
+            "a": [100.0, 100.0, 100.0],
+            "b": [100.0, 100.0, 100.0],
+            "c": [100.0, 101.5, 101.5],
+        }
+        result = speed_spread(legs)
+        self.assertEqual(result["verdict"], "SEPARATED_BELOW_BAR")
+        self.assertEqual(result["pooled_within_draw_spread"], 1.0)
+        self.assertAlmostEqual(result["worst_within_draw_spread"], 1.015)
+        self.assertIsNone(select_shipping_draw(result, ["a", "b", "c"])["ship"])
+
+    def test_an_equivalent_run_still_reads_equivalent(self) -> None:
+        # The control. Without it every case above passes on a predicate that
+        # can only ever refuse.
+        result = speed_spread({"a": [100.0, 100.2, 100.4], "b": [100.2, 100.1, 100.3]})
+        self.assertEqual(result["verdict"], "EQUIVALENT")
 
 
 class ShippingRuleTest(unittest.TestCase):
     ORDER = ["draw00", "draw01", "draw02"]
 
     def test_equivalent_draws_ship_the_first_in_draw_order(self) -> None:
-        spread = speed_spread({"a": [100.0, 100.4], "b": [100.2, 100.1]})
+        spread = speed_spread({"a": [100.0, 100.2, 100.4], "b": [100.2, 100.1, 100.3]})
         result = select_shipping_draw(spread, self.ORDER)
         self.assertEqual(result["ship"], "draw00")
 
     def test_the_rule_is_not_the_fastest_draw(self) -> None:
         # The whole point of #2752's refusal: a draw picked BY its own speed on
         # the workload it will be scored on is measuring around the harness.
-        spread = speed_spread({"draw00": [100.0, 100.4], "draw01": [100.5, 100.2]})
+        spread = speed_spread(
+            {"draw00": [100.0, 100.2, 100.4], "draw01": [100.5, 100.2, 100.3]}
+        )
         result = select_shipping_draw(spread, self.ORDER)
         self.assertEqual(result["ship"], "draw00")
         self.assertNotEqual(result["ship"], spread["best_draw"])
 
     def test_separated_draws_ship_nothing(self) -> None:
-        spread = speed_spread({"a": [100.0, 100.05], "b": [105.0, 105.05]})
+        spread = speed_spread({"a": [100.0, 100.02, 100.05], "b": [105.0, 105.02, 105.05]})
         self.assertIsNone(select_shipping_draw(spread, self.ORDER)["ship"])
 
     def test_below_bar_but_separated_also_ships_nothing(self) -> None:
-        spread = speed_spread({"a": [100.0, 100.05], "b": [101.0, 101.05]})
+        spread = speed_spread({"a": [100.0, 100.02, 100.05], "b": [101.0, 101.02, 101.05]})
         self.assertIsNone(select_shipping_draw(spread, self.ORDER)["ship"])
 
 
@@ -438,6 +731,160 @@ class FrozenLegTest(unittest.TestCase):
         ok, why = check_frozen_leg("nothing ran", 64)
         self.assertFalse(ok)
         self.assertIn("did not run", why)
+
+
+class FrozenControlRecordTest(unittest.TestCase):
+    """The frozen control has to REACH the report, and `reduce` has to refuse.
+
+    `reduce_evidence` read `score/frozen-checks.json`, which nothing in this
+    repository ever wrote -- so `reduce` had no path to exit 78 at all, and a
+    `REPORT.json` could carry `EQUIVALENT` plus "ship draw00" with no record
+    that any scoring leg had been frozen. The frozen control is the only thing
+    that keeps a scoring leg from re-tuning, which would make the scoring phase
+    N MORE DRAWS wearing the label of a replay, each number attributed to a plan
+    map nobody recorded.
+
+    One file per leg, read with a glob: a single shared control file would be a
+    surface every leg has to write, which the protocol names as a lock.
+    """
+
+    OK_LOG = (
+        "[VT_FP4_CACHE] complete mode=read-only loaded=2 tuned=0 rejected=0 "
+        "saved=0 selected=2 metadata=fp1"
+    )
+
+    def evidence(self, tmp: str, *, legs: int = 3, controls: int | None = None,
+                 failing: bool = False) -> pathlib.Path:
+        """Two draws, `legs` scoring legs each, and their per-leg controls."""
+
+        root = pathlib.Path(tmp) / "ev"
+        arms = ("draw00", "draw01")
+        for index, label in enumerate(arms):
+            home = root / "draws" / label
+            home.mkdir(parents=True, exist_ok=True)
+            (home / "record.json").write_text(
+                json.dumps(_draw_record(label, tactic_offset=index * 7)), encoding="utf-8"
+            )
+        ledger = root / "score" / "legs.jsonl"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        rows = []
+        for leg in range(legs):
+            for arm_index, arm in enumerate(arms):
+                rows.append(json.dumps({
+                    "arm": arm, "boot_id": "b", "rc": 0,
+                    "total_token_throughput": 100.0 + arm_index * 0.1 + leg * 0.05,
+                }))
+        ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+        written = legs * len(arms) if controls is None else controls
+        count = 0
+        for leg in range(legs):
+            for arm in arms:
+                if count >= written:
+                    break
+                home = root / "score" / f"{arm}-{leg + 1}"
+                home.mkdir(parents=True, exist_ok=True)
+                (home / "frozen.json").write_text(json.dumps({
+                    "leg": f"{arm}-{leg + 1}",
+                    "frozen": not (failing and count == 0),
+                    "why": "frozen: tuned=0 loaded=2" if not (failing and count == 0)
+                           else "tuned=3: the leg re-tuned instead of replaying the frozen draw",
+                    "expected_plans": 2,
+                }), encoding="utf-8")
+                count += 1
+        return root
+
+    def reduce(self, root: pathlib.Path):
+        return reduce_evidence(
+            root, metric="total_token_throughput", ratification_bar=1.02
+        )
+
+    def test_a_complete_control_reaches_the_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            code, report = self.reduce(self.evidence(tmp))
+            self.assertEqual(code, EXIT_OK)
+            control = report["frozen_leg_control"]
+            self.assertEqual(control["state"], "PASS")
+            self.assertEqual(control["legs_in_ledger"], 6)
+            self.assertEqual(control["legs_with_a_passing_control"], 6)
+            self.assertIn(report["issue_2751_speed"]["verdict"],
+                          ("EQUIVALENT", "SEPARATED_BELOW_BAR", "ABOVE_BAR"))
+
+    def test_a_ledger_with_no_control_at_all_refuses_78(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            code, report = self.reduce(self.evidence(tmp, controls=0))
+            self.assertEqual(code, EXIT_LEG_NOT_FROZEN)
+            self.assertEqual(report["frozen_leg_control"]["state"], "REFUSED")
+
+    def test_a_leg_that_re_tuned_refuses_78(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            code, report = self.reduce(self.evidence(tmp, failing=True))
+            self.assertEqual(code, EXIT_LEG_NOT_FROZEN)
+            self.assertIn("re-tuned", json.dumps(report["frozen_leg_control"]))
+
+    def test_a_leg_without_a_control_record_refuses_78(self) -> None:
+        # Five controls for six legs: one leg contributed a number that no
+        # control ever covered.
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _ = self.reduce(self.evidence(tmp, controls=5))
+            self.assertEqual(code, EXIT_LEG_NOT_FROZEN)
+
+    def test_a_refused_control_ships_nothing_and_reports_no_speed_verdict(self) -> None:
+        # The whole point: without this, `EQUIVALENT` + "ship draw00" could be
+        # written over legs that re-tuned.
+        with tempfile.TemporaryDirectory() as tmp:
+            _, report = self.reduce(self.evidence(tmp, controls=0))
+            self.assertEqual(report["issue_2751_speed"]["verdict"], "REFUSED")
+            self.assertIsNone(report["issue_2752"]["ship"])
+
+    def test_no_ledger_needs_no_control(self) -> None:
+        # The identity half stands on its own; a draw-only root is not refused
+        # for lacking a control over legs that were never run.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.evidence(tmp)
+            (root / "score" / "legs.jsonl").unlink()
+            code, report = self.reduce(root)
+            self.assertEqual(code, EXIT_OK)
+            self.assertEqual(report["issue_2751_speed"]["verdict"], "NOT RUN")
+
+    def test_check_frozen_writes_its_own_per_leg_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "leg.log"
+            log.write_text(self.OK_LOG, encoding="utf-8")
+            record = pathlib.Path(tmp) / "frozen.json"
+            rc = quiet_main([
+                "check-frozen", "--log", str(log), "--expected-plans", "2",
+                "--record", str(record), "--leg", "draw00-1",
+            ])
+            self.assertEqual(rc, EXIT_OK)
+            written = json.loads(record.read_text(encoding="utf-8"))
+            self.assertTrue(written["frozen"])
+            self.assertEqual(written["leg"], "draw00-1")
+
+    def test_a_refused_leg_still_writes_a_record_saying_so(self) -> None:
+        # A control that only writes itself on success is a control whose
+        # failure looks like a leg that never ran.
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "leg.log"
+            log.write_text(self.OK_LOG.replace("tuned=0", "tuned=3"), encoding="utf-8")
+            record = pathlib.Path(tmp) / "frozen.json"
+            rc = quiet_main([
+                "check-frozen", "--log", str(log), "--expected-plans", "2",
+                "--record", str(record), "--leg", "draw00-1",
+            ])
+            self.assertEqual(rc, EXIT_LEG_NOT_FROZEN)
+            written = json.loads(record.read_text(encoding="utf-8"))
+            self.assertFalse(written["frozen"])
+            self.assertIn("re-tuned", written["why"])
+
+    def test_the_noise_ceiling_reaches_the_speed_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.evidence(tmp)
+            _, report = reduce_evidence(
+                root, metric="total_token_throughput", ratification_bar=1.02,
+                noise_ceiling=1.05,
+            )
+            self.assertEqual(report["issue_2751_speed"]["noise_ceiling"], 1.05)
 
 
 class AutotuneSelectionParseTest(unittest.TestCase):
@@ -579,7 +1026,19 @@ class DryRunEndToEndTest(unittest.TestCase):
             self.assertEqual(code, EXIT_OK)
             # The fixture must never be mistakable for a measurement.
             self.assertTrue(report["dry_run"])
-            self.assertEqual(report["issue_2750_draw_processes"]["verdict"], "STABLE")
+            # THE FIXTURE MOVES ONE SHAPE'S SELECTION WITH THE DRAW INDEX, and
+            # holds the other three still. A fixture in which every draw agreed
+            # let mutation M10 -- folding `algoId` into `algo_key` -- survive all
+            # 60 tests of this suite's first revision: with the id constant, a
+            # tainted key still agreed. With one shape moving, the id in the key
+            # makes that shape look like a DIFFERENT key per draw, and the
+            # verdict collapses to INCOMPARABLE instead of naming the shape.
+            stability = report["issue_2750_draw_processes"]
+            self.assertEqual(stability["verdict"], "UNSTABLE")
+            self.assertEqual(stability["keys_common"], 4)
+            self.assertEqual(stability["keys_partial"], [])
+            self.assertEqual(len(stability["unstable_keys"]), 1)
+            self.assertEqual(stability["within_process_duplicate_lines"], 0)
             self.assertEqual(report["tactic_set"], ["full"])
             self.assertEqual(report["issue_2751_selection_time"]["state"], "DIAGNOSTIC")
             self.assertEqual(report["issue_2751_speed"]["verdict"], "NOT RUN")
@@ -610,15 +1069,293 @@ class DryRunEndToEndTest(unittest.TestCase):
                     for arm, value in (
                         ("draw00", 100.0), ("draw01", 105.0),
                         ("draw00", 100.1), ("draw01", 105.1),
+                        ("draw00", 100.05), ("draw01", 105.05),
                     )
                 ) + "\n",
                 encoding="utf-8",
             )
-            _, report = reduce_evidence(
+            # A ledger ALONE reaches no speed verdict: the frozen control is
+            # what says these legs replayed a draw rather than drawing again.
+            code, report = reduce_evidence(
                 evidence, metric="total_token_throughput", ratification_bar=1.02
             )
+            self.assertEqual(code, EXIT_LEG_NOT_FROZEN)
+            self.assertEqual(report["issue_2751_speed"]["verdict"], "REFUSED")
+
+            for arm in ("draw00", "draw01"):
+                for index in (1, 2, 3):
+                    home = evidence / "score" / f"{arm}-{index}"
+                    home.mkdir(parents=True, exist_ok=True)
+                    (home / "frozen.json").write_text(
+                        json.dumps({"leg": f"{arm}-{index}", "frozen": True,
+                                    "why": "frozen: tuned=0 loaded=8"}),
+                        encoding="utf-8",
+                    )
+            code, report = reduce_evidence(
+                evidence, metric="total_token_throughput", ratification_bar=1.02
+            )
+            self.assertEqual(code, EXIT_OK)
             self.assertEqual(report["issue_2751_speed"]["verdict"], "ABOVE_BAR")
             self.assertIsNone(report["issue_2752"]["ship"])
+
+
+DRAW_CFG = {
+    "num_prompts": 4, "input_len": 8, "output_len": 4, "concurrency": 1,
+    "seed": 0, "max_num_batched_tokens": 64,
+}
+
+
+class DrawResumeTest(unittest.TestCase):
+    """The two ways this harness loses a crashed run's work.
+
+    `dgx.casa` has crashed roughly hourly under a long ladder (#545) and the
+    whole shape of this driver -- per-phase markers, per-draw DONE files, a
+    mirrored evidence root -- exists to survive that. Both cases below defeated
+    it while the header claimed per-draw resume.
+    """
+
+    def test_a_draw_mirrors_as_it_lands_and_not_at_the_end_of_the_phase(self) -> None:
+        # The share is what survives the box going down. Mirroring after the
+        # whole `draw` subcommand returns loses EVERY completed draw to a crash
+        # inside the phase, which is the phase that takes hours.
+        with tempfile.TemporaryDirectory() as tmp:
+            local = pathlib.Path(tmp) / "local"
+            share = pathlib.Path(tmp) / "share"
+            record = run_draw(
+                0, local, pathlib.Path("/bin/true"), "/nonexistent", DRAW_CFG,
+                dry_run=True, mirror=share,
+            )
+            self.assertEqual(record["rc"], 0)
+            self.assertTrue((share / "draws" / "draw00" / "record.json").is_file())
+            self.assertTrue((share / "draws" / "draw00" / "DONE").is_file())
+
+    def test_the_draw_loop_mirrors_every_draw(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            local = pathlib.Path(tmp) / "local"
+            share = pathlib.Path(tmp) / "share"
+            rc = quiet_main([
+                "draw", "--evidence", str(local), "--bench", "/bin/true",
+                "--model", "/nonexistent", "--draws", "3", "--dry-run",
+                "--mirror", str(share),
+            ])
+            self.assertEqual(rc, EXIT_OK)
+            for label in ("draw00", "draw01", "draw02"):
+                self.assertTrue((share / "draws" / label / "record.json").is_file(), label)
+
+    def test_a_retried_draw_does_not_load_the_document_it_published(self) -> None:
+        # A draw that published its cache and then died before writing DONE
+        # leaves the document behind. On the retry the fresh process LOADS it,
+        # tunes nothing, and the judge refuses with `73` -- whose message says
+        # the draw is "a copy of an earlier draw", which misdescribes a crash.
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = pathlib.Path(tmp) / "ev"
+            home = evidence / "draws" / "draw00"
+            home.mkdir(parents=True)
+            cache = home / "autotune_configs.json"
+            cache.write_text('{"plans": ["a stale draw"]}\n', encoding="utf-8")
+            seen: dict[str, bool] = {}
+
+            def fake_run(command, **kwargs):
+                seen["cache_present"] = cache.exists()
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.object(survey.subprocess, "run", fake_run):
+                run_draw(0, evidence, pathlib.Path("/bin/true"), "/model", DRAW_CFG)
+            self.assertFalse(seen["cache_present"])
+
+    def test_a_completed_draw_is_replayed_and_not_re_run(self) -> None:
+        # The control on the unlink above: a draw with its DONE file must not
+        # lose the document it published.
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = pathlib.Path(tmp) / "ev"
+            run_draw(0, evidence, pathlib.Path("/bin/true"), "/m", DRAW_CFG, dry_run=True)
+            cache = evidence / "draws" / "draw00" / "autotune_configs.json"
+            before = cache.read_bytes()
+            calls: list[Any] = []
+            with mock.patch.object(survey.subprocess, "run", lambda *a, **k: calls.append(a)):
+                run_draw(0, evidence, pathlib.Path("/bin/true"), "/m", DRAW_CFG)
+            self.assertEqual(calls, [])
+            self.assertEqual(cache.read_bytes(), before)
+
+
+class ShellDriverTest(unittest.TestCase):
+    """The lease-side driver, on a host with no device and no toolkit.
+
+    Every case here is a resume shape. The share survives a crash and `/tmp`
+    does not, so the driver is repeatedly asked to restart from a state where
+    the two disagree.
+    """
+
+    SCRIPT = pathlib.Path(__file__).resolve().parents[2] / "scripts/dgx-gemm-tactic-draw-survey.sh"
+    SURVEY = pathlib.Path(__file__).resolve().parents[2] / "tools/bench/gemm_tactic_draw_survey.py"
+
+    FROZEN_LOG = (
+        "[VT_FP4_CACHE] complete mode=read-only loaded=2 tuned=0 rejected=0 "
+        "saved=0 selected=2 metadata=fp1"
+    )
+
+    def fake_tree(
+        self, tmp: str, *, with_binary: bool = True, local_evidence: bool = True
+    ) -> tuple[pathlib.Path, pathlib.Path]:
+        """A resumed local root plus its share, with no compiler in sight.
+
+        `local_evidence=False` is the wiped-`/tmp` shape: the share survived the
+        box going down and `$LOCAL_ROOT` did not, which is the state `mirror_in`
+        exists to restore from.
+        """
+
+        root = pathlib.Path(tmp) / "gtds"
+        share = pathlib.Path(tmp) / "share"
+        src = pathlib.Path(tmp) / "src"
+        (src / "tools" / "bench").mkdir(parents=True)
+        shutil.copy2(self.SURVEY, src / "tools" / "bench" / "gemm_tactic_draw_survey.py")
+
+        phase = share / "phase"
+        phase.mkdir(parents=True)
+        (phase / "build.ok").write_text("2026-09-04T00:00:00Z\n", encoding="utf-8")
+        (phase / "src.path").write_text(str(src) + "\n", encoding="utf-8")
+        (phase / "toolkit.path").write_text("/nonexistent/cuda\n", encoding="utf-8")
+
+        draw = share / "draws" / "draw00"
+        draw.mkdir(parents=True)
+        (draw / "autotune_configs.json").write_text('{"plans": []}\n', encoding="utf-8")
+        (draw / "stderr.log").write_text(
+            "[VT_FP4_CACHE] selected M=8 N=3072 K=2048 tactic=1\n"
+            "[VT_FP4_CACHE] selected M=8 N=2048 K=6144 tactic=2\n",
+            encoding="utf-8",
+        )
+        (draw / "DONE").write_text("ok\n", encoding="utf-8")
+
+        if local_evidence:
+            # The ordinary state: the draw phase ran in this job and left its
+            # evidence on the local disk, mirrored to the share as it landed.
+            shutil.copytree(share, root / "evidence")
+
+        if with_binary:
+            binary = root / "bin" / "vllm-bench"
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_text(
+                "#!/bin/bash\n"
+                f"cat <<'LOG'\n{self.FROZEN_LOG}\n"
+                "Successful requests:                       4\n"
+                "Total token throughput (tok/s):            1840.55\n"
+                "LOG\n",
+                encoding="utf-8",
+            )
+            binary.chmod(0o755)
+            # The build stages the shared library beside the binary and points
+            # LD_LIBRARY_PATH at it, so a resume that finds one without the
+            # other has not got a runnable binary either.
+            (binary.parent / "libvllm.so.0.9.0").write_text("not an ELF\n", encoding="utf-8")
+        return root, share
+
+    def run_driver(self, *args: str, timeout: int = 90) -> subprocess.CompletedProcess:
+        """Drive the script with its output going to FILES, never to a pipe.
+
+        The heartbeat is `( while true; do sleep 60; ...; done ) &`, and the EXIT
+        trap kills the subshell without reaping the `sleep` it is blocked in.
+        That orphan inherits the script's stdout, so `capture_output=True` waits
+        on a pipe nobody will close for up to a minute after the driver has
+        exited -- which reads exactly like a hung driver. On a lease it is
+        harmless: `rc` reads the job's output and the job is already over.
+        """
+
+        env = dict(os.environ)
+        env.pop("LD_LIBRARY_PATH", None)
+        with tempfile.TemporaryDirectory() as sink:
+            out = pathlib.Path(sink) / "stdout"
+            err = pathlib.Path(sink) / "stderr"
+            with out.open("w") as out_fh, err.open("w") as err_fh:
+                done = subprocess.run(
+                    ["bash", str(self.SCRIPT), *args],
+                    stdout=out_fh, stderr=err_fh, timeout=timeout, env=env,
+                )
+            return subprocess.CompletedProcess(
+                done.args, done.returncode,
+                out.read_text(encoding="utf-8", errors="replace"),
+                err.read_text(encoding="utf-8", errors="replace"),
+            )
+
+    def test_the_script_parses(self) -> None:
+        done = subprocess.run(["bash", "-n", str(self.SCRIPT)], capture_output=True)
+        self.assertEqual(done.returncode, 0, done.stderr.decode())
+
+    def test_a_scoring_leg_resolves_the_source_the_build_recorded(self) -> None:
+        # The re-entry ran before `phase/src.path` was read, so a leg always
+        # used the DEFAULT source path. Invoked without `--src` -- which the
+        # driver's own `--score-leg` command line does -- `check-frozen` then
+        # failed on a path that does not exist, and the failure was reported as
+        # `78`, the code that means A LEG RE-TUNED.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, share = self.fake_tree(tmp)
+            done = self.run_driver(
+                "--score-leg", "draw00", "--evidence", str(share), "--src", "",
+                "--model", tmp, "--local-root", str(root), "--num-prompts", "4",
+                "--input-len", "8", "--output-len", "4", "--concurrency", "1",
+                "--seed", "0", "--max-num-batched-tokens", "64",
+                "--tactic-set", "full",
+            )
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertIn("Total token throughput", done.stdout)
+
+    def test_a_scoring_leg_writes_its_own_frozen_control_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, share = self.fake_tree(tmp)
+            self.run_driver(
+                "--score-leg", "draw00", "--evidence", str(share), "--src", "",
+                "--model", tmp, "--local-root", str(root), "--num-prompts", "4",
+                "--input-len", "8", "--output-len", "4", "--concurrency", "1",
+                "--seed", "0", "--max-num-batched-tokens", "64",
+                "--tactic-set", "full",
+            )
+            record = root / "evidence" / "score" / "draw00-1" / "frozen.json"
+            self.assertTrue(record.is_file(), sorted((root / "evidence" / "score").glob("*")))
+            self.assertTrue(json.loads(record.read_text(encoding="utf-8"))["frozen"])
+
+    def test_a_surviving_build_marker_over_a_wiped_tmp_refuses_by_name(self) -> None:
+        # `phase/build.ok` is mirrored to the share and `$BIN` is not, so a
+        # wiped `/tmp` with a surviving share makes the driver skip the build and
+        # then die on a missing binary somewhere further down. Worse, the draws
+        # already in the share carry the previous binary's sha256, so rebuilding
+        # into the same root would produce a SECOND binary and the judge refuses
+        # that at the very end with `79`.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, share = self.fake_tree(
+                tmp, with_binary=False, local_evidence=False
+            )
+            done = self.run_driver(
+                "--phase", "build", "--evidence", str(share),
+                "--model", tmp, "--local-root", str(root),
+            )
+            self.assertEqual(done.returncode, 35, done.stdout + done.stderr)
+            self.assertIn("build.ok", done.stderr)
+
+    def test_a_build_marker_with_its_artefacts_still_skips_the_build(self) -> None:
+        # The control. Without it the case above passes on a driver that can
+        # never resume at all.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, share = self.fake_tree(tmp)
+            done = self.run_driver(
+                "--phase", "build", "--evidence", str(share),
+                "--model", tmp, "--local-root", str(root),
+            )
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertIn("skipping", done.stdout)
+
+    def test_a_refused_reduce_does_not_mark_the_phase_complete(self) -> None:
+        # Same polarity as the resume cases: a marker that a FAILED phase writes
+        # makes the next run skip the work that did not happen.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, share = self.fake_tree(tmp)
+            shutil.rmtree(share / "draws")
+            shutil.rmtree(root / "evidence" / "draws")
+            done = self.run_driver(
+                "--phase", "reduce", "--evidence", str(share),
+                "--model", tmp, "--local-root", str(root),
+            )
+            self.assertNotEqual(done.returncode, 0)
+            self.assertFalse((root / "evidence" / "phase" / "reduce.ok").is_file())
+            self.assertFalse((share / "phase" / "reduce.ok").is_file())
 
 
 if __name__ == "__main__":

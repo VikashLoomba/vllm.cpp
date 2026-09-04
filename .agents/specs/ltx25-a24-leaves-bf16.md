@@ -49,7 +49,9 @@ through it, and the encoder already passes `x.data.dtype()` to three of them
 `Ltx2ConvVideoEncode` **refuses a bf16 bag by name** (`:1969-1972`), and
 `VaeStore::Host`/`HostBegin` is documented as "an ENCODER-ONLY accessor now"
 (`ltx2_video_vae.cpp:309-317`). This row is the continuation those two were
-written for.
+written for. Both are consumed here: the refusal becomes an arm (§5.1), and
+`HostBegin` loses its last caller and is deleted, leaving `Host` as what it now
+is -- the f32 host branch of `AttnBlock3d`, which BOTH paths reach (§5.2).
 
 ### 0.2 The upsampler is a second wave 3, not a leaf
 
@@ -147,7 +149,7 @@ is `0`. All three were run before anything below was trusted.
 | patchify is pure movement | `video_vae/ops.py:6-32` | `rearrange` only |
 | the space-to-depth fold, both branches | `video_vae/sampling.py:43-49, 55-61` | `rearrange` only |
 | **frame 0 is duplicated at temporal stride 2** | `sampling.py:39-40` | `torch.cat([x[:, :, :1], x], dim=2)`, BEFORE both branches |
-| **the skip is a GROUP MEAN** | `sampling.py:47-49` | `rearrange(..., "b (c g) d h w -> b c g d h w")`; `.mean(dim=2)` |
+| **the skip is a GROUP MEAN** | `sampling.py:50-51` | `rearrange(..., "b (c g) d h w -> b c g d h w")`; `.mean(dim=2)` |
 | **and the two branches are ADDED** | `sampling.py:63` | `x = x + x_in` |
 | the skip conv is stride 1 | `sampling.py:26-33` | `stride=1`, `out_channels // prod(stride)` |
 | a strided CausalConv3d still prepends `k_t - 1` | `video_vae/convolution.py:305-307` | padding decided before the stride |
@@ -204,7 +206,7 @@ necessary: five components, five different rules. Nothing here was inherited.
 
 ### 4.1 The group mean is a WIDENED accumulate with ONE rounding — and a probe at `group_size = 2` gates nothing
 
-`sampling.py:47-49`. `[1, 8*g, 2, 4, 4]`:
+`sampling.py:50-51`. `[1, 8*g, 2, 4, 4]`:
 
 | g | scale | n | f32 accumulate | f64 accumulate | sequential bf16 accumulate | separating |
 |---|---|---|---|---|---|---|
@@ -309,13 +311,23 @@ absence of a table here is a finding and not an omission.
 **One rule, applied at four sites: the ELEMENT WIDTH follows the volume, and the
 rounding point is the STORE.**
 
-1. **`RequireF32`-shaped refusal → `RequireVaeDType`.** `Ltx2ConvVideoEncode`'s
-   `VT_CHECK(weights.dtype == kF32)` becomes wave 3's two-width check, so a
-   third width still cannot arrive by silence.
+1. **`RequireF32`-shaped refusal → `RequireVaeDType`, PLUS a token of its own.**
+   `Ltx2ConvVideoEncode`'s `VT_CHECK(weights.dtype == kF32)` becomes wave 3's
+   two-width check, so a third width still cannot arrive by silence. It is
+   preceded by an entry `VT_CHECK` carrying a message NO OTHER SITE EMITS ("the
+   encoder was handed"), because `RequireVaeDType`'s own message is the decode's
+   and `VaeStore::Alloc` emits it too, 60-odd lines downstream. A subcase
+   asserting the shared text cannot tell the entry from the staging allocation,
+   and passes with the entry deleted; §9.6 measures exactly that.
 2. **The entry narrowing is `VaeStore::Upload`.** Upstream's pixels are already
    bf16 when `forward` is entered (§2), so the port rounds once at the boundary
    and computes from there. `Ltx2ConvVideoEncode` allocates `x` at the weights'
-   dtype and fills it through `Upload` rather than through `HostBegin()`.
+   dtype and fills it through `Upload` rather than through `Host()`. That was
+   `HostBegin()`'s LAST caller, so `HostBegin` is deleted here rather than left
+   as an accessor with zero callers whose own doc describes writes that nothing
+   performs any more. `Host`'s remaining callers are `AttnBlock3d`'s `!staged`
+   branch and nothing else, so its doc and its throw message name that branch
+   instead of "the encoder path".
 3. **`Patchify` and `SpaceToDepthFold` allocate `Like` their input** and move
    elements with `LoadElem`/`StoreElem`. §4.5 says this is exact.
 4. **`SpaceToDepthDownsample`**: `grown` allocates at the input's dtype and the
@@ -355,7 +367,8 @@ wave 3 already parameterised.
   Each case asserts the separating count is non-zero before asserting the match,
   so a case that stops separating fails instead of passing.
 * **The refusal case** for a third width, so `RequireVaeDType` is not widened by
-  accident.
+  accident. It asserts the ENTRY's own token rather than the shared decode
+  message, for the reason §5.1 and §9.6 give.
 
 **Mutations the fresh reviewer must run.** Delete the `kBF16` argument at
 `ltx2_video.cpp:1657` (the production call site) — the dtype case must red.
@@ -398,6 +411,13 @@ grep -c 'Ltx2VideoVaeEncoderKeyRules(), vt::DType::kBF16' src/vllm/multimodal/lt
 
 # 2. The refusal became an arm and no third width slipped in.
 grep -c 'RequireVaeDType' src/vllm/model_executor/models/ltx2_video_vae.cpp           # >= 2
+
+# 2b. The encoder's ENTRY refusal has a token of its own, and it is UNIQUE -- which
+#     is what lets §6's subcase discriminate the entry from `VaeStore::Alloc`.
+grep -rc 'the encoder was handed' src/vllm/model_executor/models/ltx2_video_vae.cpp   # 1
+
+# 2c. `HostBegin` is gone and left no caller behind.
+grep -rc 'HostBegin' src/ include/ tests/ examples/                                   # 0
 
 # 3. The focused gate.
 cmake --build build -j 2 --target test_ltx2_vae test_ltx2_video
@@ -497,6 +517,55 @@ cast and additionally asserts they are OFF the bf16 grid, so a later change to
   `tests/vllm/models/ltx2_vae_goldens.inc` is `48 ++++`, **0 deletions**. Every
   previously committed golden reproduced byte-for-byte from the pinned checkout.
 
+
+---
+
+### 9.6 The fresh review's repairs, and the mutation that made one of them necessary
+
+The fresh review returned `PASS WITH REPAIRS`. Four were applied.
+
+**F1 — the entry refusal was NOT gated.** §6's subcase reads "at its own entry"
+and asserted `doctest::Contains("the decode serves f32")`, which is
+`RequireVaeDType`'s message. `VaeStore::Alloc` calls `RequireVaeDType` too, so
+that string is emitted at two sites and the subcase could not tell them apart:
+with the entry check deleted the whole suite stayed **55/55, 3570/3570 GREEN**.
+The repair gives the entry a token no other site emits and asserts that.
+Deleting the entry refusal now reds, and the failure names the site that had been
+answering all along:
+
+```text
+tests/vllm/models/test_ltx2_vae.cpp:1768: ERROR: CHECK_THROWS_WITH_AS( ...
+  "the encoder was handed" ... ) threw a DIFFERENT exception! (contents:
+  "vt: ltx2 video vae: the decode serves f32 ... it was handed f16 at
+   .../ltx2_video_vae.cpp:215")
+[doctest] test cases:   55 |   54 passed | 1 failed
+[doctest] assertions: 3570 | 3569 passed | 1 failed | Status: FAILURE!
+```
+
+`:215` is `RequireVaeDType`'s body, reached from `VaeStore::Alloc`. The mutation
+compiled (`cmake --build build --target test_ltx2_vae -j 2`, rc 0) and the tree
+was restored byte-for-byte, sha256 `16690621c166f21d` before and after.
+
+**F2 — `docs/FEATURES.md` stated the opposite of what ships.** The wave 3 row's
+tail read "the encoder, upsampler and duration head stay f32 and are owed", which
+this row falsifies. Its tail now names the two components that remain owed, and
+the encoder gets a row of its own in the shape of wave 3's.
+
+**F3 — prose and a runtime message this row made false.** `HostBegin` lost its
+last caller when the staging gather replaced it (§5.2) and had **zero** callers in
+`src/ include/ tests/ examples/`; it is deleted. `Host`'s doc said every caller is
+on the encoder path, and its throw sent a user to a closed row (#2786) with a
+false statement; both now name `AttnBlock3d`'s host branch, which is what remains.
+
+**F4 — a wrong upstream anchor at five sites.** `x_in.mean(dim=2)` is
+`sampling.py:51`, not `:47-49`, which is `p2=`, `p3=`, `)` of the preceding
+`rearrange`. Read again in the pinned checkout at `fd4ded7f`; every citation is
+now `sampling.py:50-51`, which spans the group `rearrange` and the mean.
+
+The **nit** was applied too: the `kLtx2VideoEncBf16GroupSize >= 4` comment claimed
+to pin what the C++ blocks produce, when the line reads only the generator's
+emitted constant. The comment now says what the line does and where the
+C++-side half is actually covered.
 
 ---
 

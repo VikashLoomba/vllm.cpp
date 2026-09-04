@@ -304,17 +304,17 @@ class VaeStore {
     return OnDevice() ? dev_.ptr() : static_cast<const void*>(host_.data());
   }
 
-  // Host bytes, with a check rather than a comment. Every caller of this is a
-  // stage that has NOT been ported to a device arm, and each one names itself.
-  // HOST BYTES AS f32, WHICH IS AN ENCODER-ONLY ACCESSOR NOW. Every caller of
-  // this is a stage that has not been ported to a device arm, and after A24 wave
-  // 3 every one of them is also on the ENCODER path, which is still f32 and is
-  // owed its own bf16 arm (#2786 `## Owed`). The dtype check is what stops a bf16
-  // decoder volume being read through a `float*`: the bytes would reinterpret
-  // silently and produce a plausible clip, which no shape-valid gate can see.
-  // `HostBegin` is an ITERATOR over the same bytes, not over a copy: the encoder's
-  // `std::copy` sites write THROUGH it.
-  float* HostBegin() { return HostF32(); }
+  // HOST BYTES AS f32, AND AFTER A24 WAVE 4 THIS IS THE f32 HOST BRANCH OF
+  // `AttnBlock3d` AND NOTHING ELSE. That block reads and writes the volume in
+  // place when it is host-resident AND stored at f32; every other case takes its
+  // `staged` branch, which downloads through `Download`/`Upload` and never asks
+  // for these bytes. Both the encoder and the decoder reach it, so this is not an
+  // encoder-only accessor and no longer names a width either path is stuck at.
+  //
+  // The dtype check is what stops a bf16 volume being read through a `float*`:
+  // the bytes would reinterpret silently and produce a plausible clip, which no
+  // shape-valid gate can see. It is a check rather than a comment for that
+  // reason.
   float* Host() { return HostF32(); }
   const float* Host() const { return const_cast<VaeStore*>(this)->HostF32(); }
 
@@ -379,8 +379,9 @@ class VaeStore {
              "device -- the caller must download it first, or be ported to a device arm (#1451)");
     VT_CHECK(dtype_ == vt::DType::kF32,
              "ltx2 video vae: a host f32 loop asked for the bytes of a volume stored at bf16. "
-             "The caller belongs on the encoder path, which is still f32 and is owed its own "
-             "bf16 arm (#2786)");
+             "The only caller is AttnBlock3d's in-place host branch, which it takes exactly when "
+             "the volume is host-resident and stored at f32; a bf16 volume belongs on its staged "
+             "branch, which downloads and re-uploads instead");
     return reinterpret_cast<float*>(host_.data());
   }
   void Release() {
@@ -1898,7 +1899,7 @@ Volume SpaceToDepthDownsample(const VideoConvSpec& spec, const Ltx2VaeWeights& w
       //
       // `torch.mean` on a bf16 tensor does not accumulate in bf16; it widens
       // internally and rounds only the output. MEASURED against upstream's own
-      // `.mean(dim=2)` (sampling.py:47-49) at two scales: an f32 accumulator and
+      // `.mean(dim=2)` (sampling.py:50-51) at two scales: an f32 accumulator and
       // an f64 one are each 0 of 256, while a sequential bf16 accumulate is 72 to
       // 145 of 256 at group_size 4 and 8. `separating = 1` -- f32 and f64 are
       // indistinguishable here and this port claims no gate on the width.
@@ -2004,8 +2005,20 @@ Ltx2LatentVolume Ltx2ConvVideoEncode(const Ltx2ConvVideoEncoderConfig& config,
   // (`distilled.py:109`) and hands it to `ImageConditioner` at `:120-125`, which
   // builds this encoder with it (`utils/blocks.py:985-986`). The f32 arm stays,
   // because it is the parity reference every committed golden is measured
-  // against; the FP8 and NVFP4 arms are A22 and `RequireVaeDType` still refuses a
-  // third width by name so one cannot arrive by silence.
+  // against; the FP8 and NVFP4 arms are A22 and this entry still refuses a third
+  // width by name so one cannot arrive by silence.
+  //
+  // THE CHECK BELOW CARRIES A TOKEN NO OTHER SITE EMITS, and that is the whole
+  // reason it exists beside `RequireVaeDType`. `VaeStore::Alloc` calls
+  // `RequireVaeDType` too, 60-odd lines downstream, so a subcase asserting the
+  // shared decode message could not tell "the encoder refuses at its own entry"
+  // from "the staging allocation refused later". Deleting this line has to go
+  // RED, and asserting a message two sites emit cannot make it.
+  VT_CHECK(weights.dtype == vt::DType::kF32 || weights.dtype == vt::DType::kBF16,
+           std::string("ltx2 video encoder: the encoder was handed ") + vt::Name(weights.dtype) +
+               "; it serves f32 (the parity arm every committed golden is measured against) and "
+               "bf16 (upstream's own model dtype, distilled.py:109). The FP8 and NVFP4 arms are "
+               "A22 and are not implemented");
   RequireVaeDType(weights.dtype);
   VT_CHECK(channels == config.in_channels,
            "ltx2 video encoder: input channel count does not match in_channels");
@@ -2060,7 +2073,7 @@ Ltx2LatentVolume Ltx2ConvVideoEncode(const Ltx2ConvVideoEncoderConfig& config,
   // the boundary, once, before any arithmetic -- which is what `Upload` is.
   //
   // The crop is a GATHER, so the frames are staged compactly first rather than
-  // written through `HostBegin()`, which is the f32-only accessor and throws on a
+  // written through `Host()`, which is the f32-only accessor and throws on a
   // bf16 store. Staging is a copy this function already made, at a different
   // place; it is not a second arithmetic path.
   const size_t elems_x = static_cast<size_t>(x.channels * x.spatial());

@@ -1750,9 +1750,13 @@ TEST_CASE("ltx2 vae: the dtype refusals this arm adds are REACHED, not merely wr
     // still stops here, by name, at the entry rather than several hundred lines
     // downstream on a `weights.Get` reporting a missing parameter.
     //
-    // FP8 and NVFP4 are A22. The encoder shares `RequireVaeDType` with the
-    // decode, so the message is the decode's; what this asserts is that the
-    // ENCODER'S entry reaches it.
+    // FP8 and NVFP4 are A22. THE ASSERTED TOKEN IS THE ENTRY'S OWN, and it has
+    // to be: the encoder also shares `RequireVaeDType` with the decode through
+    // `VaeStore::Alloc`, 60-odd lines downstream where the staging buffer is
+    // allocated, so asserting the SHARED decode message passes with the entry
+    // check deleted and measures that later site instead. "the encoder was
+    // handed" is emitted at the entry and nowhere else, so deleting the entry
+    // check goes red here.
     vllm::Ltx2ConvVideoEncoderConfig enc;
     enc.prefix = "ltx2.videoenc.";
     enc.in_channels = 3;
@@ -1763,7 +1767,7 @@ TEST_CASE("ltx2 vae: the dtype refusals this arm adds are REACHED, not merely wr
     wrong.dtype = vt::DType::kF16;
     CHECK_THROWS_WITH_AS(
         vllm::Ltx2ConvVideoEncode(enc, wrong, frames, enc.in_channels, 1, 8, 8, nullptr),
-        doctest::Contains("the decode serves f32"), std::runtime_error);
+        doctest::Contains("the encoder was handed"), std::runtime_error);
   }
 }
 
@@ -3195,9 +3199,15 @@ TEST_CASE("ltx2 vae: the video ENCODER's BF16 arm matches upstream ltx_core") {
   CHECK(latent.frames == vllm_test::kLtx2VideoEncBf16OutT);
   CHECK(latent.height == vllm_test::kLtx2VideoEncBf16OutH);
   CHECK(latent.width == vllm_test::kLtx2VideoEncBf16OutW);
-  // The fixture reaches the group size the rule needs. Asserted on BOTH sides:
-  // the generator refuses to emit below 4, and this pins the value the C++ blocks
-  // above produce, so an edit to either list that muted the rule reds here.
+  // The fixture reaches the group size the rule needs, and THIS LINE READS THE
+  // GENERATOR'S EMITTED CONSTANT, not the C++ blocks above -- it is
+  // constant-vs-constant and cannot be more. What it does buy is the
+  // GENERATOR-side half: an edit to the generator's block list that dropped every
+  // group size below 4 would mute the rule, and this reds on it (its own
+  // `assert max(group_sizes) >= 4` is the same guard, one repository away from a
+  // reader of this file). The C++-side half is covered elsewhere: an edit to the
+  // block list above changes the fixture, which the manifest and the bit-exact
+  // golden below both refuse.
   CHECK(vllm_test::kLtx2VideoEncBf16GroupSize >= 4);
 
   // EVERY RETURNED VALUE SURVIVES A bf16 ROUND TRIP. The latent is a

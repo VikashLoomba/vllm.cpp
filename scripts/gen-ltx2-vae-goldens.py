@@ -2027,7 +2027,7 @@ def section_video_encoder(out) -> None:
 #
 # THE BLOCK LIST IS CHOSEN SO ONE RULE IS NOT MUTED. `SpaceToDepthDownsample`'s
 # skip is a group mean over `group_size = in_channels * prod(stride) //
-# out_channels` (sampling.py:23, 47-49), and a TWO-element mean is exact in any
+# out_channels` (sampling.py:23, 50-51), and a TWO-element mean is exact in any
 # order, so a fixture that only reaches `group_size == 2` gates that rule at zero.
 # Section 6a's blocks both land on 2. `compress_all_res` with multiplier 2 gives
 # `8 * 8 // 16 = 4`, which is where the rule is first-order.

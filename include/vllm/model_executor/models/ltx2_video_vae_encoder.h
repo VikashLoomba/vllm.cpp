@@ -55,8 +55,10 @@
 // `:120-125`, which builds this encoder with it (utils/blocks.py:985-986). A24
 // wave 4 (row LTX25-A24-LEAVES-BF16, issue #2850) landed that arm. The f32 arm
 // stays because it is the parity reference every committed golden is measured
-// against; `RequireVaeDType` refuses a third width by name, and the FP8 and
-// NVFP4 arms are A22.
+// against; `Ltx2ConvVideoEncode`'s ENTRY refuses a third width by name -- with a
+// message of its own rather than `RequireVaeDType`'s shared one, because
+// `VaeStore::Alloc` emits that same text further down and a gate asserting it
+// cannot tell the two sites apart. The FP8 and NVFP4 arms are A22.
 //
 // THE ENTRY NARROWING IS NOT WHERE THE DECODER'S IS, and the difference is
 // load-bearing rather than incidental. `ConvVideoDecoder.forward` casts its
@@ -72,7 +74,7 @@
 // emitted beside upstream's answer; the tables are in
 // .agents/specs/ltx25-a24-leaves-bf16.md section 4.
 //  * `SpaceToDepthDownsample`'s group mean is a WIDENED accumulate with one
-//    rounding on the store (sampling.py:47-49). A sequential bf16 accumulate is
+//    rounding on the store (sampling.py:50-51). A sequential bf16 accumulate is
 //    72-145 of 256 wrong at group_size 4 and 8; at group_size 2 NOTHING
 //    separates, because a two-element mean is exact in any order.
 //  * The skip ADD separates nothing at any scale down to 2^-14 -- but carrying

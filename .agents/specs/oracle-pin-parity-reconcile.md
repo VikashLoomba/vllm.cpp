@@ -152,7 +152,14 @@ synthetic record, so none of them depends on what the live pin happens to be:
     reconciliation error — the scoping test;
 11. the live tree reconciles, both through `main([])` and through the
     reconciliation alone over the two real files, with neither value written as
-    a literal in the test.
+    a literal in the test;
+12. **the rule is REACHED.** `ParityThroughMainTests` points `main` at a
+    synthetic registry — its own `ROOT`, `ORACLES`, `AGENTS_MD`,
+    `UPSTREAM_SYNC` and `DECLARATION_ROOTS` — and asserts rc 0 on an agreeing
+    pair and rc 1 on a disagreeing one. Every other case calls the rule
+    directly, which proves the rule works and never that anything runs it.
+    Deleting the `check_parity_reconciliation` call from `main` turns this case
+    red and leaves all the others green, which is why it is here.
 
 ## Gates
 

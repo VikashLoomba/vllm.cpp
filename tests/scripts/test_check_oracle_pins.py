@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -381,6 +383,56 @@ class ParityReconciliationTests(unittest.TestCase):
         sync_text = check_oracle_pins.UPSTREAM_SYNC.read_text(encoding="utf-8")
         record_text = (check_oracle_pins.ORACLES / "vllm.md").read_text(encoding="utf-8")
         self.assertEqual(check_oracle_pins.parity_errors(record_text, sync_text), [])
+
+
+class ParityThroughMainTests(unittest.TestCase):
+    """The reconciliation is REACHED from the checker's entry point.
+
+    Every other case here calls the rule directly, which proves the rule works
+    and not that anything runs it. These two point `main` at a synthetic
+    registry and assert on its return code, so deleting the call site in
+    `main` turns this red -- the mutation AGENTS.md "Nothing lands dead" asks
+    a reviewer to perform.
+    """
+
+    AGENTS_TABLE = (
+        "<!-- oracle-registry:begin -->\n"
+        "| Oracle | Registry id | Reach for it when |\n"
+        "|---|---|---|\n"
+        "| vLLM | `vllm` | always |\n"
+        "<!-- oracle-registry:end -->\n"
+    )
+
+    def run_main(self, record_text: str, sync_text: str) -> int:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            oracles = root / "oracles"
+            oracles.mkdir()
+            (oracles / "vllm.md").write_text(record_text, encoding="utf-8")
+            (root / "upstream-sync.md").write_text(sync_text, encoding="utf-8")
+            (root / "AGENTS.md").write_text(self.AGENTS_TABLE, encoding="utf-8")
+            with mock.patch.multiple(
+                check_oracle_pins,
+                # ROOT too: `evidence` existence and the declaration glob are
+                # both resolved against it, so a half-patched module would read
+                # the real tree from inside a synthetic one.
+                ROOT=root,
+                ORACLES=oracles,
+                AGENTS_MD=root / "AGENTS.md",
+                UPSTREAM_SYNC=root / "upstream-sync.md",
+                DECLARATION_ROOTS=(root,),
+            ):
+                return check_oracle_pins.main([])
+
+    def test_main_passes_when_the_surfaces_agree(self) -> None:
+        self.assertEqual(self.run_main(PARITY_RECORD, PARITY_SYNC), 0)
+
+    def test_main_fails_when_the_surfaces_disagree(self) -> None:
+        stale = PARITY_RECORD.replace(
+            "pin = 1111111111111111111111111111111111111111",
+            "pin = 2222222222222222222222222222222222222222",
+        )
+        self.assertEqual(self.run_main(stale, PARITY_SYNC), 1)
 
 
 class LiveRegistryTests(unittest.TestCase):

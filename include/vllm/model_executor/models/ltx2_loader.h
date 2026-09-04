@@ -831,13 +831,14 @@ std::vector<Ltx2VaeKeyRule> Ltx2VocoderKeyRules();
 // the only dtypes these files carry; anything else throws by name rather than
 // being reinterpreted. An empty rule set keeps every name unchanged.
 //
-// `compute_dtype` DEFAULTS TO f32 and the video DECODER is the one call site that
-// asks for bf16 (row LTX25-A24-VIDEO-VAE-BF16, issue #2786). The default is not a
-// preference: the other six callers -- the video encoder, the audio decoder, the
-// vocoder, the audio encoder and the two upsamplers -- are still f32 ports, and a
-// default of `kBF16` would hand each of them a bag whose `Get` refuses. The audio
-// VAE's f32 is ARGUED rather than owed (`ltx2_audio_vae.cpp:7-12` ->
-// `vocoder.py:575-580`); the other four are owed and named in that row's spec.
+// `compute_dtype` DEFAULTS TO f32 and FIVE call sites now ask for bf16: the video
+// decoder (row LTX25-A24-VIDEO-VAE-BF16, #2786), the video encoder
+// (LTX25-A24-LEAVES-BF16, #2850) and both latent upsamplers
+// (LTX25-A24-UPSAMPLER-BF16, #2857). The default is not a preference: the audio
+// decoder, the vocoder and the audio encoder are still f32 ports, and a default
+// of `kBF16` would hand each of them a bag whose `Get` refuses. The audio VAE's
+// f32 is ARGUED rather than owed (`ltx2_audio_vae.cpp:7-12` ->
+// `vocoder.py:575-580`), so what remains here is argued and not debt.
 //
 // At `kBF16` a BF16 tensor is moved word for word instead of being expanded
 // through `Bf16ToF32`, which is the whole point: upstream constructs the decoder

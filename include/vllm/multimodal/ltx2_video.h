@@ -740,6 +740,52 @@ struct Ltx2ConditioningTrace {
   // the render's.
   int64_t vae_encode_not_bf16 = 0, vae_encode_values = 0;
   int64_t vae_encode_in_not_bf16 = 0, vae_encode_in_values = 0;
+  // ── the LATENT UPSAMPLER's width (A24 wave 5, row LTX25-A24-UPSAMPLER-BF16,
+  //    issue #2857) ────────────────────────────────────────────────────────
+  //
+  // A24's deliverable is a DTYPE, and no token gate can see one: the clip is
+  // identical whether the upsampler computed at bf16 or at twice the bytes.
+  // These are what a production path reads instead.
+  //
+  // TWO INSTRUMENTS, because either alone is a mute switch. `upsample_wide_calls`
+  // counts the calls whose returned latent REPORTS a width other than bf16 --
+  // the arm the weight bag selected, read back off the result. It answers "did
+  // the narrow path run" and it cannot answer "did anything run at all", which
+  // is why `upsample_calls` is beside it: a build that stops calling the
+  // upsampler drives the first counter to zero and looks perfect.
+  //
+  // `upsample_not_bf16` is the VALUE-level half: how many elements of the
+  // upsampled latent carry bits bf16 cannot hold. It is the one that survives a
+  // `dtype` field that is set correctly and computed wide, because the values
+  // would then still be f32-wide. Summed over all three production call sites --
+  // the video latent, the generated keyframe slots and DFR's temporal rounds --
+  // because a counter taken at one would report that site's width as the
+  // render's.
+  int64_t upsample_calls = 0, upsample_wide_calls = 0;
+  int64_t upsample_not_bf16 = 0, upsample_values = 0;
+  // THE THIRD INSTRUMENT, and it is the one the two above cannot stand in for.
+  // Both of them are VALUE-shaped: they read the width a stage reports and the
+  // bits its output carries. A build that rounds every stored value to bf16 and
+  // reserves `sizeof(float)` for it satisfies both, reports bf16, and moves twice
+  // the bytes -- built and run during this row's review, 9125 assertions green.
+  // A24's deliverable is the storage, so the storage is counted:
+  // `Ltx2UpsamplerStorage` (ltx2_upsampler.h), drained per call so no byte is
+  // counted twice, summed over all three production call sites.
+  //
+  // `*_volume_*` are the upsampler's intermediate buffers and `*_param_*` are
+  // the parameters it reads through. `bytes / elems` is the width, and it is 4
+  // rather than 2 wherever an arm widened.
+  int64_t upsample_volumes = 0, upsample_volume_elems = 0, upsample_volume_bytes = 0;
+  int64_t upsample_param_views = 0, upsample_param_elems = 0, upsample_param_bytes = 0;
+  // THE LOADER'S OWN FOOTPRINT, per upsampler, because the render path has TWO
+  // of them and one counter over the render reports whichever ran. Reverting the
+  // temporal loader alone to f32 left 5638 assertions green during this row's
+  // review: every value counter above is fed by the SPATIAL arm on the fixture
+  // that observes them, so the temporal checkpoint's width had no gate at all.
+  // `Ltx2VaeWeights::Bytes()` is the measurement (ltx2_audio_vae.h:104-107) and
+  // it had no caller in this tree before this row.
+  int64_t upsampler_weight_elems = 0, upsampler_weight_bytes = 0;
+  int64_t temporal_upsampler_weight_elems = 0, temporal_upsampler_weight_bytes = 0;
   // ── the IMAGE conditioning (row LTX25-IMAGE-COND, issue #644) ────────────
   //
   // Zero everywhere when the request carried no image. `image_tokens` is how

@@ -2268,12 +2268,33 @@ TEST_CASE("ltx2 upsample_video's per-channel statistics narrow and round twice a
   const std::vector<float> mean_of_means(std::begin(vllm_test::kLtx2UpsBf16StatsMean),
                                          std::end(vllm_test::kLtx2UpsBf16StatsMean));
 
-  // The whole `upsample_video` (model.py:129-143), which is the only production
-  // shape: un-normalize, upsample, re-normalize. Its OUTPUT carries the
-  // re-normalization, so a port that dropped R7 on either side lands outside the
-  // band the chain arms already pin.
+  // THE GOLDEN IS THE GATE AND THE WIDTH CHECKS ARE NOT, which this case learned
+  // the hard way. Its first version asserted only that the result reported bf16
+  // and carried bf16-representable values, and the mutation that fuses R7's two
+  // roundings into one PASSED it: 4 assertions, 0 failed. A fused rounding
+  // produces a bf16 value too. Only a comparison against upstream's own output
+  // can see which bf16 value it is.
   const vllm::Ltx2LatentVolume got =
       vllm::Ltx2UpsampleVideoLatent(config, bag.weights, latent, std_of_means, mean_of_means);
+  REQUIRE(got.data.size() == std::size(vllm_test::kLtx2UpsBf16UpsampleVideoGolden));
+  CHECK(got.channels == vllm_test::kLtx2UpsBf16UpsampleVideoOutShape[1]);
+  CHECK(got.frames == vllm_test::kLtx2UpsBf16UpsampleVideoOutShape[2]);
+  CHECK(got.height == vllm_test::kLtx2UpsBf16UpsampleVideoOutShape[3]);
+  CHECK(got.width == vllm_test::kLtx2UpsBf16UpsampleVideoOutShape[4]);
+
+  const double worst = MaxAbsDiff(got.data, vllm_test::kLtx2UpsBf16UpsampleVideoGolden,
+                                  std::size(vllm_test::kLtx2UpsBf16UpsampleVideoGolden));
+  INFO("upsample_video at bf16, max|diff| from upstream = ", worst);
+  CHECK(worst == 0.0);
+
+  // And both R7 alternatives move this output well clear of that, measured
+  // through the SAME function rather than on the isolated tensors: a rule that
+  // separates in isolation and not here would gate nothing where it matters.
+  for (const double rejected : vllm_test::kLtx2UpsBf16UpsampleVideoRejectedMaxAbs) {
+    INFO("a rejected R7 rule sits at ", rejected, " and this port is at ", worst);
+    CHECK(rejected > worst);
+  }
+
   CHECK(got.dtype == vt::DType::kBF16);
   int64_t wide = 0;
   for (const float v : got.data) {

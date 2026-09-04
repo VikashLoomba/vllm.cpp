@@ -1652,6 +1652,69 @@ def section_upsampler_bf16(out) -> None:
         )
     emit_i64(out, "kLtx2UpsBf16StatsSeparating", separating)
 
+    # ---- `upsample_video` ITSELF, which is the only shape production calls ---
+    #
+    # The isolated tensors above are evidence; THIS is the gate. A first version
+    # of the C++ case asserted only that the result reported bf16 and carried
+    # bf16-representable values, and a mutation that fused R7's two roundings
+    # into one PASSED it -- a claimed guarantee that nothing measured, which is
+    # the failure every earlier wave of A24 shipped once. Only a golden over the
+    # whole function can see the rule.
+    #
+    # `upsample_video`'s body is executed rather than its wrapper (model.py:140-142
+    # is three lines and its `video_encoder` argument is read for exactly one
+    # attribute). The modules are upstream's own; what is not executed is the
+    # signature around them, and that is stated rather than glossed.
+    ups_module = LatentUpsampler(
+        in_channels=_UPS_IN,
+        mid_channels=_UPS_MID,
+        num_blocks_per_stage=_UPS_BLOCKS,
+        dims=3,
+        spatial_upsample=True,
+        temporal_upsample=False,
+        spatial_scale=2.0,
+        rational_resampler=False,
+    )
+    ups_module.eval()
+    fill_module(ups_module, "ltx2.ups.PixelShuffle.")
+    ups_module = ups_module.to(bf)
+    with torch.no_grad():
+        video_golden = stats_bf.normalize(ups_module(stats_bf.un_normalize(stats_in)))
+    emit_i64(out, "kLtx2UpsBf16UpsampleVideoOutShape", list(video_golden.shape))
+    emit_f32(out, "kLtx2UpsBf16UpsampleVideoGolden", video_golden.float().numpy())
+
+    # The two R7 alternatives run through the SAME whole function, so the C++
+    # case can assert its band excludes each of them rather than trusting that a
+    # rule which separates in isolation still separates here.
+    def upsample_video_with(un_fn, re_fn):
+        with torch.no_grad():
+            return re_fn(ups_module(un_fn(stats_in)))
+
+    def un_one_round(x):
+        return (x.float() * std_bf + mean_bf).to(bf)
+
+    def re_one_round(x):
+        return ((x.float() - mean_bf) / std_bf).to(bf)
+
+    def un_wide_stats(x):
+        return ((x.float() * std_wide).to(bf).float() + mean_wide).to(bf)
+
+    def re_wide_stats(x):
+        return ((x.float() - mean_wide).to(bf).float() / std_wide).to(bf)
+
+    video_rejected = [
+        float((video_golden.float()
+               - upsample_video_with(un_one_round, re_one_round).float()).abs().max()),
+        float((video_golden.float()
+               - upsample_video_with(un_wide_stats, re_wide_stats).float()).abs().max()),
+    ]
+    if min(video_rejected) <= 0.0:
+        raise ValueError(
+            "R7's alternatives do not move `upsample_video`'s own output "
+            f"({video_rejected}); a golden over it would then gate nothing."
+        )
+    emit_f64(out, "kLtx2UpsBf16UpsampleVideoRejectedMaxAbs", video_rejected)
+
 
 def kernel_size_pinned() -> int:
     """`BlurDownsample.__init__`'s own default, read off upstream's signature."""

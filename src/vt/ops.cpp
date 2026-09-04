@@ -2198,11 +2198,15 @@ bool GdnChunkedPrefillEnabled() {
   return e == nullptr || e[0] != '0';
 }
 
-// KERNEL-GDN-CHUNKED-MIRROR D0. `chunked = (dtype != f32) && VT_GDN_CHUNKED != 0`.
+// KERNEL-GDN-CHUNKED-MIRROR D0. `chunked = (dtype == bf16) && VT_GDN_CHUNKED != 0`.
 // The dtype term is NOT a concession to this tree's three f32 goldens; it is the
-// mirror. Upstream has no f32 chunked path at all to mirror, on either of its
-// two implementations of the kernel, so f32 routes to the sequential recurrence
-// that upstream's own f32-capable kernel computes.
+// mirror. Upstream has no chunked path at any dtype but bf16 to mirror, on
+// either of its two implementations of the kernel, so f32 AND f16 route to the
+// sequential recurrence that upstream's own f32-capable kernel computes.
+//
+// The spec's D0 states this as `dtype != f32`, and implementing it that way was
+// a defect: f16 then took the chunked arm and was silently bf16-rounded at all
+// nine placement sites. `== bf16` is the rule; see the reason on the body below.
 bool GdnUseChunkedPrefill(DType q_dtype) {
   // BF16 ONLY, not merely "not f32". Upstream's chunked kernels accept exactly
   // one input dtype on BOTH implementations: the Triton wrapper asserts

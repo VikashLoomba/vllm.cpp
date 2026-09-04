@@ -5410,14 +5410,25 @@ TEST_CASE("gdn chunked CPU arm splits a sequence across two calls without drift"
     // gentler g ~ U(-0.5, 0), where the state genuinely carries across the
     // boundary and the bf16 snapshot at it is exercised.
     //
-    // On THAT workload, upstream's own placement in the committed replica
-    // (docs/bench-evidence/gdn-chunked-decomposition-20260902/, UPSTREAM map)
-    // reads **1.77** of its own bound, while this port reads **1.10**. So the
-    // bar here is 2.0 -- above the algorithm being mirrored, not merely above
-    // this implementation -- and its meaning is "no worse than vLLM's own
-    // placement on an input distribution vLLM's test never runs". It is a
-    // DERIVED bar with its derivation stated, not upstream's number widened
-    // until the port fit inside it.
+    // On THAT workload, upstream's own placement reads **1.77049** of its own
+    // bound while this port reads **1.09829**. So the bar here is 2.0 -- above
+    // the ALGORITHM being mirrored, not merely above this implementation -- and
+    // its meaning is "no worse than vLLM's own placement on an input
+    // distribution vLLM's test never runs". It is a DERIVED bar with its
+    // derivation stated, not upstream's number widened until the port fit.
+    //
+    // The driver is COMMITTED, so that 1.77049 is checkable without writing one:
+    //   docs/bench-evidence/gdn-chunked-decomposition-20260902/run_split.py
+    // (`python3 run_split.py`, experiment B; SPLIT_OUTPUT.txt is its captured
+    // run). It also prints the same table on upstream's OWN gating, where every
+    // arm reads 0.00000 -- which is why upstream's 1e-3 never had to bind.
+    //
+    // KNOW WHAT CARRIES THIS BAR. Of upstream's five splits, three are
+    // chunk-ALIGNED and read exactly 0.00000 (a chunk-aligned split reproduces
+    // the same chunk decomposition, so there is nothing to differ), {192,65}
+    // reads 0.00420, and only **{145,73} reads 1.77049**. The bar's
+    // discriminating power therefore rests on a SINGLE case, and a change that
+    // regressed only the aligned splits would not be caught here at all.
     CHECK(vs <= 2.0);
     ++cases;
     seed += 11;

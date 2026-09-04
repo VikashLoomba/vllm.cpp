@@ -1914,17 +1914,23 @@ TEST_CASE("qwen27 dense paged: one-shot prefill == chunked prefill (state contin
   // bf16 round-trip". vLLM does not claim bit-exactness here and neither can a
   // faithful mirror of it.
   //
-  // Reproduced independently of our C++, on the numpy replica in
-  // docs/bench-evidence/gdn-chunked-decomposition-20260902/ at T=6 split {3,3},
-  // which is exactly this case's shape (state max|d| vs one-shot):
+  // Reproduced independently of our C++, and the driver is COMMITTED so this
+  // table is checkable without writing one:
+  //   docs/bench-evidence/gdn-chunked-decomposition-20260902/run_split.py
+  // (`python3 run_split.py`, experiment A, no GPU; SPLIT_OUTPUT.txt is its
+  // captured run). At T=6, which is exactly this case's shape, state max|d| of
+  // a split prefill against the same tokens in one call:
   //
-  //     sequential recurrence      0.0            <- what 1e-4 encoded
-  //     chunked, upstream bf16     2.009496e-03   <- the mirror
-  //     chunked, f32 intermediates 5.960464e-08   <- NOT the mirror (the R1 trap)
+  //     arm                          split {3,3}     split {2,2,2}
+  //     sequential recurrence        0.0             0.0            <- what 1e-4 encoded
+  //     chunked, upstream bf16       1.694679e-03    1.700044e-03   <- the mirror
+  //     chunked, f32 intermediates   2.980232e-08    4.470348e-08   <- NOT the mirror (the R1 trap)
   //
-  // The middle row is the one vLLM computes. The bottom row shows the
-  // discontinuity is the BF16 PLACEMENT, not the chunked reassociation, so it
-  // cannot be engineered away without giving up the mirror.
+  // The middle row is the one vLLM computes. The bottom row is the control that
+  // makes this an explanation rather than an observation: it runs the SAME
+  // chunked decomposition and differs only in where the bf16 rounding falls, so
+  // the discontinuity is the BF16 PLACEMENT and not the reassociation — and the
+  // placement is the half that cannot be dropped without dropping the mirror.
   //
   // SO THE CLAIM IS SPLIT ONTO THE ARM THAT CAN CARRY IT, AND THE OTHER ARM
   // GETS A BAR WITH A CONTROL. The machinery claim — that state is carried and
@@ -1942,22 +1948,32 @@ TEST_CASE("qwen27 dense paged: one-shot prefill == chunked prefill (state contin
               << " (must be EXACTLY 0 — this arm's split is bit-identical)");
       CHECK(d == 0.0);
     }
+    // PINNED ON. Without this the block below runs whatever the ambient
+    // VT_GDN_CHUNKED selects, and under `=0` it takes the SEQUENTIAL recurrence
+    // and reads d = 0 while still calling itself the chunked arm — passing, and
+    // measuring nothing. That is the exact failure class this whole change is
+    // about, and it does not red, so nothing would tell you.
+    ScopedEnv chunked("VT_GDN_CHUNKED", "1");
     // The production default. Bar 1e-2, and it is DERIVED: the geometric mean of
-    // the correct arm's worst (3.76e-3) and a dropped state's best (2.55e-2) on
-    // this fixture, i.e. ~2.7x headroom in each direction.
+    // the correct arm's worst (3.76107e-3) and a dropped state's best
+    // (2.70987e-2) on this fixture, which is 1.0096e-2.
     const std::vector<float> one_shot = run_one_shot();
     const double d = diff_vs_one_shot(one_shot, run_chunked(split, true), tail);
     const double dropped = diff_vs_one_shot(one_shot, run_chunked(split, false), tail);
     MESSAGE("CHUNKED arm, split tail=" << tail
             << ": chunked-prefill vs one-shot max|diff| = " << d
-            << "; SAME with the carried state DROPPED = " << dropped);
+            << "; SAME with the carried state DROPPED = " << dropped
+            << " (ratio " << (d > 0.0 ? dropped / d : 0.0) << "x)");
     CHECK(d < 1e-2);
     // Without this the bar above is just a looser number. With it, the case
     // still fails if the state stops being carried — which is the whole point
     // of the case. NOTE THE COST HONESTLY: on the sequential arm the ratio
-    // between these two is infinite, and on the chunked arm it is only ~7x.
-    // Mirroring vLLM buys that discriminating power down, and no bar in this
-    // window can buy it back.
+    // between these two is INFINITE (a correct split is exactly 0); on the
+    // chunked arm it is finite — measured 9.75x at tail=3 and 10.37x at tail=2.
+    // Mirroring vLLM buys that discriminating power down and no bar in this
+    // window buys it back. The 3.0 demanded below is deliberately well under
+    // the measured ratio, so this fails on a real regression rather than on
+    // fixture noise.
     CHECK(dropped > 1e-2);
     CHECK(dropped > d * 3.0);
   }

@@ -785,6 +785,19 @@ are both about records a number agreed with and a tree did not.
 
 ## Owed
 
+* **[#2853](https://github.com/mudler/vllm.cpp/issues/2853) — `test_ltx2_video_device_forward`
+  is RED**, and this row's refusal is what it walks into. §5.6's device-bf16
+  refusal (`ltx2_video_vae.cpp`, "a bf16 decode was requested on device ... only
+  the CPU arm serves it") throws inside the pre-existing #1426 fake-accelerator
+  case, which asserts as PRECONDITIONS that the platform is `kXPU` and that a
+  backend is registered for it — so it drives exactly the path the refusal now
+  closes. Found and filed by wave GDNCPUPORT
+  ([#2845](https://github.com/mudler/vllm.cpp/issues/2845)), which touches no
+  LTX2 file and reproduces it identically under `VT_GDN_CHUNKED=0` and `=1`;
+  the refusal string is absent at that branch's pre-merge commit and present at
+  `origin/main`. It is listed HERE rather than fixed there because the choice —
+  load that case's VAE weights at f32, or land the device bf16 arm this section
+  already owes — is this row's, not a GDN kernel row's.
 * **The scope reconciliation.** §A.7's eight-row table splits the decoder, the
   device kernels and the tiled buffer into three rows this tree cannot separate
   (§0). `.agents/specs/ltx25-completion-scope.md` is operator-owned; this row

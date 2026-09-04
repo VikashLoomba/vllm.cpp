@@ -842,7 +842,9 @@ The port follows Triton and records why; the measurement is in
 **G8 FAILS, AND IT IS THIS ROW'S OWN REACHABILITY GATE.** With all four
 production `vt::GdnPrefill` call sites in `qwen3_5.cpp` disabled in a scratch
 copy (4 markers counted, build rc read separately from test rc), G1-G6 come back
-BYTE-IDENTICAL: 68/2264, 14/161, 9/19606, 4/9. The mutation bit — the positive
+BYTE-IDENTICAL: 68/2285, 14/161, 9/19606, 4/9 (cases/assertions for
+`test_ops_gdn`, `test_op_parity`, `test_cpu_threadpool`,
+`test_ops_kda_recurrence`, re-counted at this head). The mutation bit — the positive
 control is that `test_qwen35_paged_forward` and `test_qwen3_5_gdn_spec_routing`
 flip green to red — so the op IS reached from `ModelRegistry::Forward`. What no
 gate in this row measures is the REACH: every test here enters through
@@ -878,9 +880,12 @@ recurrence and is not under vLLM's chunked one.
   across it through the bf16 state snapshot (`chunk_delta_h.py:178,352`) instead
   of the intra-chunk f32 path. The committed replica reproduces it independently
   of our C++ at this case's own T=6 split {3,3} — sequential `0.0`, chunked
-  upstream-bf16 `2.009496e-03`, chunked with f32 intermediates `5.960464e-08` —
+  upstream-bf16 `1.694679e-03`, chunked with f32 intermediates `2.980232e-08` —
   so the discontinuity is the bf16 PLACEMENT, not the reassociation, and cannot
-  be engineered away without giving up the mirror. Upstream says the same thing
+  be engineered away without giving up the mirror. **The driver is committed**
+  (`docs/bench-evidence/gdn-chunked-decomposition-20260902/run_split.py`), so
+  every number these three test comments quote as a derivation is reproducible
+  without writing one. Upstream says the same thing
   in its own words: `test_chunk_gated_delta_rule_cpu_two_call_split` gates this
   exact property at `1e-3` state / `2e-2` output with the comment "State must be
   near-exact; output allows a looser bound for the bf16 round-trip".
@@ -889,7 +894,8 @@ recurrence and is not under vLLM's chunked one.
   `1e-2` bar with an IN-TEST POSITIVE CONTROL that drops the carried state and
   asserts it exceeds that bar. **State the cost honestly: on the sequential arm
   the ratio between a correct and a dropped state is infinite; on the chunked
-  arm it is ~7x (0.0038 against 0.0255).** Mirroring vLLM buys that
+  arm it is finite — measured 9.75x at tail=3 and 10.37x at tail=2 (0.00277987
+  against 0.0270987, and 0.00376107 against 0.0389975).** Mirroring vLLM buys that
   discriminating power down and no bar in that window buys it back.
 
 - `test_qwen4_exp_layer_loop.cpp`'s `CHECK(moved > 0.0)` read exactly `0`.

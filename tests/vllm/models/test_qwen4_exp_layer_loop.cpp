@@ -933,8 +933,28 @@ TEST_CASE(
   // floor below from being a second mute switch.
   const std::vector<float> all1_again = run_fresh_all_rows(ids);
   const double self = vllm_test::MaxAbsDiff(all1, all1_again);
+  // MAX-ABS IS SATURATED IN THIS FIXTURE AND DOES NOT TRACK THE PROMPT.
+  // `moved_all` reads the identical 31.8438 for every one of the six `ids2`
+  // formulas swept in #2851 — which is the same shape of defect this case was
+  // repaired for, one order up: a value that does not move when the prompt
+  // moves is not measuring the prompt. Whole-vector statistics DO move
+  // (L2 107.857 / 108.49 / 108.572 / 76.7717 and 16-or-32 of 64 elements
+  // differing across those six), so the gate below asserts on one of those as
+  // well and the MESSAGE reports all three. The residue is the fixture's
+  // prompt-invariant common mode (`max|logit|` 95090.7), which is #2851's
+  // remaining half and belongs to the qwen4_exp row.
+  double l2_diff = 0.0;
+  std::size_t n_diff = 0;
+  for (std::size_t i = 0; i < all1.size(); ++i) {
+    const double d = static_cast<double>(all1[i]) - all2[i];
+    if (all1[i] != all2[i]) ++n_diff;
+    l2_diff += d * d;
+  }
+  l2_diff = std::sqrt(l2_diff);
   MESSAGE("qwen4_exp second-prompt logit movement over ALL " << T
-          << " rows: " << moved_all << " (same-prompt rerun control: " << self << ")");
+          << " rows: max|d|=" << moved_all << " (SATURATED — see comment) L2="
+          << l2_diff << " elements differing=" << n_diff << "/" << all1.size()
+          << " (same-prompt rerun control: " << self << ")");
   // THE DETERMINISM CONTROL IS WHAT MAKES `> 0.0` A GATE RATHER THAN A MUTE
   // SWITCH, and it is the half the one-row form never had. With the same prompt
   // reproducing bit-for-bit, a nonzero difference between two prompts can only
@@ -942,6 +962,11 @@ TEST_CASE(
   // which is exactly how the row-T-1 form passed on a 7/128 rounding artifact.
   CHECK(self == 0.0);
   CHECK(moved_all > 0.0);
+  // The statistic that actually tracks the prompt, asserted alongside the one
+  // that does not, so a future regression to a saturated constant is visible
+  // here rather than only in an issue.
+  CHECK(l2_diff > 0.0);
+  CHECK(n_diff > 0);
   // NO MAGNITUDE FLOOR IS ASSERTED, and that is deliberate rather than lazy.
   // This fixture's logits are dominated by a prompt-INVARIANT common mode
   // (`max|logit|` 95090.7 against a prompt-driven movement of 0.32 on the

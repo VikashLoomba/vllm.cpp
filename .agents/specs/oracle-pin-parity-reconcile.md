@@ -62,20 +62,39 @@ on purpose, which is a true historical fact this repository refuses to rewrite
 exist for `5559679229` and `e24d1b24`. So the gate would fire on correct work
 on the day it landed.
 
-They are listed under `## Owed` below so that a later change can decide to
-structure them rather than rediscover them.
+They are listed under `## Owed` below and tracked by
+[#2883](https://github.com/mudler/vllm.cpp/issues/2883), so that a later change
+can decide to structure them rather than rediscover them. **The argument above
+is narrower than it reads**, and #2883 says so: it rules out a regex over prose.
+It does not rule out a rule that reads the authority and requires these three
+*named paths* to contain the abbreviated revision and the public version, which
+never looks at the other files and so cannot fire on a deliberate historical
+mention. What such a rule still has to settle is the abbreviation length, which
+nothing declares today.
 
 ## Design
 
 `scripts/check-oracle-pins.py` gains one authority reader and one rule.
 
-1. `read_parity_pin(path, errors) -> dict[str, str] | None` parses the single
-   ` ```parity-pin ` block out of `.agents/upstream-sync.md`, using the same
-   shape rules `tools/bench/serve_low_common.py` applies: exactly one block,
-   `key = value` lines only, no unknown key, no duplicate key, no empty value.
-   It **fails closed** — a missing, unreadable, absent, duplicated or
-   unparsable block is an error, never a skipped rule. A rule that silently
-   stops checking when it cannot find its expectation is a mute switch.
+1. `parse_parity_pin(label, text, errors) -> dict[str, str] | None` parses the
+   single ` ```parity-pin ` block out of the *text* of
+   `.agents/upstream-sync.md`, using the same shape rules
+   `tools/bench/serve_low_common.py` applies: exactly one block, `key = value`
+   lines only, no unknown key, no duplicate key, no empty value. It **fails
+   closed** — an absent, duplicated or unparsable block is an error, never a
+   skipped rule. A rule that silently stops checking when it cannot find its
+   expectation is a mute switch.
+
+   **It takes text, not a path.** `main` opens the file and turns an `OSError`
+   into the same kind of error, so the *unreadable* case is handled one level
+   up. That keeps this function pure and testable against a synthetic authority
+   with no temporary directory, which is what every case in
+   `ParityReconciliationTests` relies on. `label` is the name to report under,
+   supplied by the caller for the same reason. The name is
+   `parse_parity_pin` and not `read_parity_pin` because
+   `tools/bench/serve_low_common.py:read_parity_pin` already holds that name for
+   the path-taking reader, and two functions with one name and different
+   signatures is a trap for the next reader.
 2. `check_parity_reconciliation(record, parity, errors)` compares the vLLM
    record against that dict:
    - `pin` must **equal** `vllm_commit`, exactly.
@@ -121,7 +140,7 @@ so the next reader knows it was a decision.
 
 | risk | disposition |
 |---|---|
-| The rule fires on the thirteen other oracles | Scoped by filename stem to `vllm.md`. Tested: a synthetic registry of a secondary oracle with a `pin` that matches nothing produces zero reconciliation errors |
+| The rule fires on the thirteen other oracles | Scoped by filename stem to `vllm.md`. Tested THROUGH `main`, which is where the scope lives: a synthetic registry holding the agreeing primary plus a secondary whose `pin` and `pin_label` name a revision and a release the authority never mentions returns rc 0. Replacing `main`'s scoped call with a loop over every registry file turns that case red |
 | The rule silently stops checking when `upstream-sync.md` moves or its block is renamed | Fails closed. A missing record, a missing block, two blocks, or an unparsable line are each an error with its own message. Tested in both directions |
 | The rule reads its expectation from the file it checks | Structurally impossible: `check_parity_reconciliation` takes the parity dict as a parameter and never opens a file |
 | It blesses the duplication the checker's docstring warns against | Acknowledged in the docstring itself, which this change rewrites rather than leaves contradicting the code. The docstring now says the copy is checked *and* that removing it is still the better fix, and names #2829 |
@@ -148,18 +167,21 @@ synthetic record, so none of them depends on what the live pin happens to be:
 9. an authority whose `vllm_runtime_version` carries no local segment at all
    still reconciles, which is the degenerate case the decomposition rule is
    chosen for;
-10. a secondary oracle whose `pin` matches nothing in the authority produces no
-    reconciliation error — the scoping test;
-11. the live tree reconciles, both through `main([])` and through the
+10. the live tree reconciles, both through `main([])` and through the
     reconciliation alone over the two real files, with neither value written as
     a literal in the test;
-12. **the rule is REACHED.** `ParityThroughMainTests` points `main` at a
-    synthetic registry — its own `ROOT`, `ORACLES`, `AGENTS_MD`,
+11. **the rule is REACHED, and it is SCOPED.** `ParityThroughMainTests` points
+    `main` at a synthetic registry — its own `ROOT`, `ORACLES`, `AGENTS_MD`,
     `UPSTREAM_SYNC` and `DECLARATION_ROOTS` — and asserts rc 0 on an agreeing
-    pair and rc 1 on a disagreeing one. Every other case calls the rule
-    directly, which proves the rule works and never that anything runs it.
-    Deleting the `check_parity_reconciliation` call from `main` turns this case
-    red and leaves all the others green, which is why it is here.
+    pair, rc 1 on a disagreeing one, and rc 0 on an agreeing pair beside a
+    secondary oracle pinned to something the authority never names. Every other
+    case calls the rule directly, which proves the rule works and never that
+    anything runs it. Deleting the `check_parity_reconciliation` call from
+    `main` turns the first two red; widening it into a loop over every registry
+    file turns the third red. Both cases live here because both are properties
+    of `main` and of nothing else: `check_registry` never invokes the parity
+    rule, so a scoping test written against it cannot fail for the reason it
+    names.
 
 ## Gates
 
@@ -194,9 +216,12 @@ the work lands.
 - The three prose surfaces named in §"The third, fourth and fifth surfaces":
   `.agents/NOW.md`, `docs/FEATURES.md` and `docs/benchmarks/how-we-measure.md`
   restate the abbreviated pin and the release label, and nothing checks them
-  either. A change that wants to gate them has to give them a delimited shape
-  first, because a regex over prose cannot tell the current pin from a
-  deliberate historical mention.
+  either. Tracked by
+  [#2883](https://github.com/mudler/vllm.cpp/issues/2883), which owns them once
+  #2829 closes. That issue also records what the argument below does *not*
+  establish: the 286-file measurement rules out a regex over prose, and not a
+  rule over three named paths with a fixed extraction, which is what these
+  surfaces are.
 - The duplication itself. This change makes the copy checked; it does not
   remove it. #2829's preferred fix — the registry resolving `pin` for the
   primary oracle from the authority at read time — stays available and is

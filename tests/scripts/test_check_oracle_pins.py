@@ -84,6 +84,25 @@ flashinfer_version = 0.6.18
 ```
 """
 
+# A secondary oracle for the SCOPING case: its `pin` and `pin_label` name a
+# revision and a release PARITY_SYNC never mentions, which is the ordinary
+# state of all thirteen of them. Reconciling this record against the authority
+# reports it, so a registry-wide rule cannot stay green over this fixture.
+UNRECONCILED_SECONDARY = """# Fixture secondary, pinned to something else entirely
+
+```oracle-pin
+id = fixture
+role = secondary
+upstream = https://github.com/example/fixture
+scope = a path vLLM does not implement
+pin = 3333333333333333333333333333333333333333
+pin_label = 8.8.8
+pinned_on = 2026-09-04
+gateable = no
+evidence = #647
+```
+"""
+
 
 def record(text: str, name: str = "fixture") -> check_oracle_pins.Record | None:
     """Parse one fixture, returning None when the block will not parse."""
@@ -348,25 +367,6 @@ class ParityReconciliationTests(unittest.TestCase):
         errs = self.reconcile("# no oracle-pin block here\n", PARITY_SYNC)
         self.assertTrue(any("unchecked" in e for e in errs), errs)
 
-    def test_the_rule_does_not_fire_on_a_secondary_oracle(self) -> None:
-        # THE SCOPING TEST. Every other oracle holds its pin only in its own
-        # file. `main` selects the record by filename stem, so a secondary
-        # oracle whose pin matches nothing in the authority is never compared:
-        # a registry-wide version of this rule would fail all of them.
-        errs = check_oracle_pins.check_registry(
-            {
-                Path("vllm.md"): GOOD_PRIMARY,
-                Path("fixture.md"): GOOD_SECONDARY,
-            },
-            ["vllm", "fixture"],
-        )
-        self.assertEqual(errs, [])
-        self.assertEqual(check_oracle_pins.ORACLES.name, "oracles")
-        self.assertFalse(
-            (check_oracle_pins.ORACLES / "fixture.md").exists(),
-            "the scoping claim is about the live registry, which holds no fixture",
-        )
-
     def test_public_version_strips_only_the_local_segment(self) -> None:
         cases = {
             "0.28.1rc1.dev132+ge126687a9": "0.28.1rc1.dev132",
@@ -389,28 +389,39 @@ class ParityThroughMainTests(unittest.TestCase):
     """The reconciliation is REACHED from the checker's entry point.
 
     Every other case here calls the rule directly, which proves the rule works
-    and not that anything runs it. These two point `main` at a synthetic
+    and not that anything runs it. These three point `main` at a synthetic
     registry and assert on its return code, so deleting the call site in
     `main` turns this red -- the mutation AGENTS.md "Nothing lands dead" asks
-    a reviewer to perform.
+    a reviewer to perform. The scoping case is here for the same reason: the
+    scope is a property of `main`, so only `main` can be asked about it.
     """
 
-    AGENTS_TABLE = (
-        "<!-- oracle-registry:begin -->\n"
-        "| Oracle | Registry id | Reach for it when |\n"
-        "|---|---|---|\n"
-        "| vLLM | `vllm` | always |\n"
-        "<!-- oracle-registry:end -->\n"
-    )
+    def agents_table(self, ids: tuple[str, ...]) -> str:
+        """The AGENTS.md admissible-oracle table, naming exactly *ids*."""
+        rows = "".join(f"| Fixture | `{oracle_id}` | a fixture |\n" for oracle_id in ids)
+        return (
+            "<!-- oracle-registry:begin -->\n"
+            "| Oracle | Registry id | Reach for it when |\n"
+            "|---|---|---|\n"
+            f"{rows}"
+            "<!-- oracle-registry:end -->\n"
+        )
 
-    def run_main(self, record_text: str, sync_text: str) -> int:
+    def run_main(
+        self, record_text: str, sync_text: str, others: dict[str, str] | None = None
+    ) -> int:
+        others = others or {}
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             oracles = root / "oracles"
             oracles.mkdir()
             (oracles / "vllm.md").write_text(record_text, encoding="utf-8")
+            for stem, text in others.items():
+                (oracles / f"{stem}.md").write_text(text, encoding="utf-8")
             (root / "upstream-sync.md").write_text(sync_text, encoding="utf-8")
-            (root / "AGENTS.md").write_text(self.AGENTS_TABLE, encoding="utf-8")
+            (root / "AGENTS.md").write_text(
+                self.agents_table(("vllm", *others)), encoding="utf-8"
+            )
             with mock.patch.multiple(
                 check_oracle_pins,
                 # ROOT too: `evidence` existence and the declaration glob are
@@ -433,6 +444,22 @@ class ParityThroughMainTests(unittest.TestCase):
             "pin = 2222222222222222222222222222222222222222",
         )
         self.assertEqual(self.run_main(stale, PARITY_SYNC), 1)
+
+    def test_main_does_not_reconcile_a_secondary_oracle(self) -> None:
+        # THE SCOPING TEST, and it has to go through `main`, because `main` is
+        # where the scope lives: it selects the record to reconcile by filename
+        # stem. `UNRECONCILED_SECONDARY` names a commit and a release the
+        # authority never mentions, which is the ordinary state of the thirteen
+        # secondary oracles, so a registry-wide version of this rule reports it
+        # and returns 1. Nothing else here can see that difference -- calling
+        # `check_registry` cannot, because `check_registry` never runs the
+        # parity rule at all.
+        self.assertEqual(
+            self.run_main(
+                PARITY_RECORD, PARITY_SYNC, {"fixture": UNRECONCILED_SECONDARY}
+            ),
+            0,
+        )
 
 
 class LiveRegistryTests(unittest.TestCase):

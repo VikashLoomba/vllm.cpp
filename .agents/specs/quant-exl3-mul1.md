@@ -463,9 +463,16 @@ green is not a device result and is never reported as one.
   compiled for every architecture in the fat build. Upstream's own answer is a
   per-K compilation-unit split (`comp_units/exl3_comp_unit_K_cbX.cu`, 24 TUs of
   16 instantiations each); this tree has one TU.
-- **The shape table is gated at ONE of its four shapes, for every arm.** See
-  "What the gate does NOT reach" above. `force_shape_idx` already exists, so
-  this is a test loop rather than a port, and it is owed by the table.
+- ~~**The shape table is gated at ONE of its four shapes, for every arm.**~~
+  **CLOSED by `QUANT-EXL3` W5** ([#2749](https://github.com/mudler/vllm.cpp/issues/2749)).
+  It was owed "by the table", and the table is `src/vt/exl3_policy.cpp`, which
+  `quant-exl3-shared.md` `## Port map` claims. The gate now forces all four
+  shapes and PASSED on `thor:gpu0` on 2026-09-03; the evidence is in
+  `quant-exl3-shared.md` `### Evidence (W5)`. "What the gate does NOT reach"
+  above is the analysis it was built on and is left standing as the record of
+  why. The coverage it describes is for the (3, 1) arm; the other six arms share
+  the same four instantiations and are not separately forced, which W5 records
+  as its own remaining debt.
 - **Slice F's arm is VERIFIED on `dgx:gpu0`** (see its evidence section), which
   also closes slice C's device debt for cb 2 at four widths. What is still
   unverified is any REAL tensor of the artifact: the gate is synthetic

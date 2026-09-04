@@ -1308,6 +1308,7 @@ const ModelFactory kQwen4ExpFactory{
     // binary at the DEFAULT `max_num_seqs` of 128 now serves those three in
     // sequence instead. It is cleared by the wave that plumbs the ragged batch,
     // not by anything smaller.
+    .consumes_device_token_ids = true,
     .serves_one_sequence_per_step = true,
 };
 

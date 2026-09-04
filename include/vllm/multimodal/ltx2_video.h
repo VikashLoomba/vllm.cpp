@@ -634,6 +634,86 @@ struct Ltx2ConditioningTrace {
   // two prompts the SAME digest and RED any dependence check, but it would do so
   // for the wrong reason; this says which happened.
   double video_absmax = 0.0, audio_absmax = 0.0;
+  // ── the TOWER's output WIDTH, which no digest can report (A24 wave 1) ────
+  //
+  // How many values the TEXT TOWER produced that do NOT survive a bf16 round
+  // trip, out of how many it produced. Upstream resolves ONE pipeline dtype and
+  // it is bfloat16 (`distilled.py:109`, handed to `PromptEncoder` at `:111-113`),
+  // so on a bf16 tower these counts are ZERO and on the f32 parity arm they are
+  // essentially the whole stream.
+  //
+  // IT EXISTS BECAUSE NOTHING ELSE HERE CAN SEE THE DTYPE. The digests detect
+  // CHANGE and the absmax detects COLLAPSE; both are computed over the same f32
+  // container on either arm and are identical in shape whichever width filled it.
+  // AGENTS.md names this exact blind spot — "a token gate cannot detect a dtype
+  // that is too wide" — and it is why A24 sat invisible in this tree while every
+  // gate on this path passed. This counter is what makes the engine's arm choice
+  // (`Ltx2TextProjectionsAsBf16`) gateable from OUTSIDE the text encoder: swap
+  // that call back to `Ltx2WidenTextProjectionsToF32` and these go from 0 to the
+  // full stream with every digest, every frame byte and every other assertion on
+  // this path unmoved.
+  //
+  // SAMPLED BEFORE THE CONNECTOR, and that is a scope statement rather than a
+  // convenience. `Ltx2ConnectorForward` is A24's SECOND wave and still computes
+  // in f32, so the conditioning the DiT finally cross-attends over is f32-wide
+  // even on a bf16 tower. Measuring after it would report the connector's width
+  // and call this row's work absent. The connector's own arm is OWED — see
+  // `.agents/specs/ltx25-a24-text-tower-bf16.md` under `## Owed`.
+  int64_t tower_video_not_bf16 = 0, tower_audio_not_bf16 = 0;
+  int64_t tower_video_values = 0, tower_audio_values = 0;
+  // AND THE SAME COUNT AFTER THE CONNECTOR, which is what stops the four above
+  // from being vacuous. "Zero values wider than bf16" is a property a stream can
+  // also have for uninteresting reasons — all zeros, all small integers, a
+  // fixture whose numbers happen to land on bf16 grid points — and a gate that
+  // reads zero for one of THOSE reasons measures nothing. The connector is A24's
+  // second wave and computes in f32 on the very buffers the tower just handed it,
+  // in the same render, so it is a LIVE f32 arm on this fixture; if the fixture
+  // ever stopped being able to express sub-bf16 detail these would collapse to
+  // zero too, and the test that asserts they do not reds instead of passing.
+  // Zero when the request carried no prompt, or when the model has no connector.
+  int64_t connector_video_not_bf16 = 0, connector_audio_not_bf16 = 0;
+  int64_t connector_video_values = 0, connector_audio_values = 0;
+  // ── the VIDEO VAE DECODE's width (A24 wave 3, row LTX25-A24-VIDEO-VAE-BF16,
+  //    issue #2786) ────────────────────────────────────────────────────────
+  //
+  // How many of the DECODED PIXELS could not have come out of a bf16 store, out
+  // of how many were produced. Upstream constructs `VideoDecoder` with the one
+  // pipeline dtype (`distilled.py:146-149`, `self.dtype` at `:148`) and its
+  // forward casts the latent to the weights' dtype on entry and back on exit
+  // (`conv_video_decoder.py:283-284, 357`), so on the bf16 arm this is ZERO and
+  // on the f32 reference arm it is essentially the whole clip.
+  //
+  // SAMPLED IN THE `Ltx2VideoDecodeStreaming` SINK, which is the ONE production
+  // route into the decoder (`grep -c 'Ltx2VideoDecodeStreaming('
+  // src/vllm/multimodal/ltx2_video.cpp` = 1). Not on a hand-constructed decode:
+  // a unit test that builds the decoder itself proves the class works and never
+  // that anything reaches it.
+  //
+  // Summed over CHUNKS, because the tiled decode emits one chunk per temporal
+  // group and a counter taken on the last one would report the last group's
+  // width as the render's.
+  int64_t vae_decode_not_bf16 = 0, vae_decode_values = 0;
+  // AND THE SAME COUNT ON THE LATENT THAT ENTERS IT, which is what stops the two
+  // above from being vacuous. "Zero values wider than bf16" is a property a
+  // stream can also have for uninteresting reasons -- all zeros, all small
+  // integers, a fixture whose numbers happen to land on bf16 grid points -- and a
+  // gate that reads zero for one of THOSE reasons measures nothing. The latent is
+  // the decoder's own input in the same render, produced by the f32 CPU reference
+  // DiT arm (`ltx2.h`'s DTYPE block), so it is a LIVE wide stream on this exact
+  // fixture rather than an argument about one. If the fixture ever stopped being
+  // able to express sub-bf16 detail this would collapse to zero too, and the test
+  // that asserts it does not reds instead of muting.
+  int64_t vae_latent_not_bf16 = 0, vae_latent_values = 0;
+  // FNV-1a over the raw f32 bytes of that same latent, and its max|x|. Same
+  // instrument, same limits, as the two conditioning digests above: it detects
+  // CHANGE and it does not pin VALUES. It exists because the pixels stopped being
+  // able to report a small change once the decode moved to upstream's bfloat16 --
+  // a PPM byte is 8-bit and the decode's mantissa is now 8-bit, so an effect
+  // worth a few thousandths of a percent of the clip rounds away twice. A test
+  // that has to prove something REACHED the decoder asks the decoder's input,
+  // which no pixel quantization touches.
+  uint64_t vae_latent_digest = 0;
+  double vae_latent_absmax = 0.0;
   // ── the IMAGE conditioning (row LTX25-IMAGE-COND, issue #644) ────────────
   //
   // Zero everywhere when the request carried no image. `image_tokens` is how

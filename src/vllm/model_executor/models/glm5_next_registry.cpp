@@ -464,6 +464,7 @@ const ModelFactory kGlm5NextFactory{
     // consuming code is `glm5_next_kv.cpp` and the refusals it can raise are
     // all by name.
     .consumes_multi_kv = true,
+    .consumes_device_token_ids = true,
 };
 
 }  // namespace

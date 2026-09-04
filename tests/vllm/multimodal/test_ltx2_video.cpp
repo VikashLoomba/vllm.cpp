@@ -6942,6 +6942,121 @@ TEST_CASE("ltx2 video: a typed PROMPT conditions the render") {
   CHECK(again.trace.video_digest == fox.trace.video_digest);
   CHECK(again.trace.audio_digest == fox.trace.audio_digest);
   CHECK(again.bytes == fox.bytes);
+
+  // 7. AND IT WAS COMPUTED AT UPSTREAM'S DTYPE (A24 wave 1, #2676).
+  //
+  //    Upstream resolves ONE dtype for the whole pipeline and it is bfloat16
+  //    (`distilled.py:109`, handed to `PromptEncoder` at `:111-113`), so the
+  //    engine loads the caption projections through `Ltx2TextProjectionsAsBf16`
+  //    and every value the DiT cross-attends over is a bf16 value.
+  //
+  //    NONE OF CHECKS 1-6 CAN SEE THAT, and that is the whole reason this one
+  //    exists. Swap the engine's loader call back to
+  //    `Ltx2WidenTextProjectionsToF32` and the tower computes the same
+  //    conditioning twice as wide: the digests still differ between prompts, the
+  //    absmax is still non-zero, the frames still change with the caption, and
+  //    the render is still deterministic. Checks 1-6 stay green to the last
+  //    assertion. AGENTS.md names this exactly — "a token gate cannot detect a
+  //    dtype that is too wide" — and it is why A24 sat invisible in this tree
+  //    while every gate on this path passed.
+  //
+  //    The counter is over the SAME buffers the digests are taken from, at the
+  //    same moment, so it cannot be reporting a different tensor.
+  //    SAMPLED BEFORE THE CONNECTOR. `Ltx2ConnectorForward` is A24's SECOND wave
+  //    and still computes in f32, so the buffer the DiT finally cross-attends
+  //    over is f32-wide even on a bf16 tower. That is owed, named in the row's
+  //    spec, and NOT what this row delivers — measuring after the connector would
+  //    report the connector's width and read this row's work as absent.
+  INFO("tower output wider than bf16: video "
+       << fox.trace.tower_video_not_bf16 << " of " << fox.trace.tower_video_values
+       << ", audio " << fox.trace.tower_audio_not_bf16 << " of "
+       << fox.trace.tower_audio_values);
+  //    Not vacuous: the tower really did produce a stream, and checks 3 and 4
+  //    already established it is neither zeros nor constant across prompts. So
+  //    "zero values wider than bf16" is a statement about real conditioning
+  //    rather than about an empty buffer.
+  REQUIRE(fox.trace.tower_video_values > 0);
+  REQUIRE(fox.trace.tower_audio_values > 0);
+  CHECK(fox.trace.tower_video_not_bf16 == 0);
+  CHECK(fox.trace.tower_audio_not_bf16 == 0);
+  CHECK(whale.trace.tower_video_not_bf16 == 0);
+  CHECK(whale.trace.tower_audio_not_bf16 == 0);
+
+  //    AND THE PREDICATE DISCRIMINATES ON THIS FIXTURE. "Not vacuous" above says
+  //    the buffer is non-empty and prompt-dependent; it does not say a stream of
+  //    THESE numbers computed at f32 width would have failed the predicate. A
+  //    fixture whose conditioning happened to land on bf16 grid points would read
+  //    zero here whatever arithmetic produced it, and this whole case would go
+  //    quietly green on an f32 tower — the same shape of hole A24 sat in.
+  //
+  //    The connector is the measurement. It is A24's SECOND wave, it computes in
+  //    f32, and it runs on the buffers the tower just handed it inside this same
+  //    render, so it is a live f32 arm on this fixture rather than an argument
+  //    about one. The unit-level gate asserts the mirror of this at
+  //    tests/vllm/models/test_ltx2_text_encoder.cpp's "the production entry point
+  //    computes in bf16".
+  //
+  //    THE FLOOR IS "MOST OF THE STREAM", not a small absolute count. A floor
+  //    below the real number is a mute switch: the f32 arm reads 16384 of 16384
+  //    and 8192 of 8192 here, so half the stream leaves a factor of two of room
+  //    for fixture drift while still being unreachable by any accident that
+  //    matters. A regression that narrowed the connector to bf16 would take it to
+  //    zero, and a fixture that lost its sub-bf16 detail would take it there too;
+  //    either way this reds rather than muting the four checks above.
+  INFO("connector (f32, wave 2) wider than bf16: video "
+       << fox.trace.connector_video_not_bf16 << " of " << fox.trace.connector_video_values
+       << ", audio " << fox.trace.connector_audio_not_bf16 << " of "
+       << fox.trace.connector_audio_values);
+  REQUIRE(fox.trace.connector_video_values > 0);
+  REQUIRE(fox.trace.connector_audio_values > 0);
+  CHECK(fox.trace.connector_video_not_bf16 == 0);
+  CHECK(fox.trace.connector_audio_not_bf16 == 0);
+}
+
+TEST_CASE("ltx2 video: the VAE DECODE runs at upstream's dtype") {
+  // A24 wave 3, row LTX25-A24-VIDEO-VAE-BF16, issue #2786.
+  //
+  // Upstream constructs `VideoDecoder` with the ONE pipeline dtype
+  // (`distilled.py:146-149`, `self.dtype` at `:148`) and its forward casts the
+  // latent to the weights' dtype on entry and back on exit
+  // (`conv_video_decoder.py:283-284, 357`). It carries no float32 pin of the kind
+  // the audio vocoder has (`vocoder.py:575-580`), which is the one place in this
+  // pipeline where f32 is argued rather than owed.
+  //
+  // THE COUNTER IS SAMPLED IN THE `Ltx2VideoDecodeStreaming` SINK, which is the
+  // one production route into the decoder. A unit test that builds
+  // `Ltx2ConvVideoDecode` itself would prove the class works and never that
+  // anything reaches it (AGENTS.md `## Nothing lands dead`).
+  Workspace ws;
+  const vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
+  const Rendered fox = RenderPrompt(mp, ws.root + "/p_vaedtype", "a b c");
+
+  // 1. THE FIXTURE CARRIES SUB-BF16 DETAIL INTO THE DECODE, measured rather than
+  //    assumed. Without this the next check goes quietly green on any fixture
+  //    whose numbers happen to land on bf16 grid points -- which is exactly the
+  //    hole A24 sat in for the whole tree. The latent is the decoder's own input
+  //    in this same render, produced by the f32 CPU reference DiT arm, so it is a
+  //    LIVE wide stream rather than an argument about one.
+  //
+  //    THE FLOOR IS "MOST OF THE STREAM", not a small absolute count: a floor
+  //    below the real number is a mute switch. The measured value is printed
+  //    beside it so a reader can see the headroom.
+  INFO("latent into the decode, wider than bf16: "
+       << fox.trace.vae_latent_not_bf16 << " of " << fox.trace.vae_latent_values);
+  REQUIRE(fox.trace.vae_latent_values > 0);
+  CHECK(fox.trace.vae_latent_not_bf16 > fox.trace.vae_latent_values / 2);
+
+  // 2. AND THE DECODE ITSELF PRODUCES ONLY bf16-REPRESENTABLE PIXELS.
+  //
+  //    NOTHING ELSE ON THIS PATH CAN SEE THAT. The frame digests detect CHANGE
+  //    and the absmax detects COLLAPSE; both are computed over the same f32
+  //    container on either arm and are identical in shape whichever width filled
+  //    it. AGENTS.md names the blind spot exactly -- "a token gate cannot detect a
+  //    dtype that is too wide."
+  INFO("VAE decode output, wider than bf16: "
+       << fox.trace.vae_decode_not_bf16 << " of " << fox.trace.vae_decode_values);
+  REQUIRE(fox.trace.vae_decode_values > 0);
+  CHECK(fox.trace.vae_decode_not_bf16 == 0);
 }
 
 TEST_CASE("ltx2 video: the prompt's conditioning goes through the CONNECTOR") {
@@ -11319,8 +11434,11 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
   const std::string lora =
       WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
 
-  // `max_phase` is a LOAD extra, so each arm is its own engine.
-  const auto render = [&](const char* strength, const char* max_phase, const char* out) {
+  // `max_phase` is a LOAD extra, so each arm is its own engine. `trace` is an
+  // out-parameter rather than a second render, because two renders of the same
+  // arm would be two chances for the comparison to be about noise.
+  const auto render = [&](const char* strength, const char* max_phase, const char* out,
+                          vllm::multimodal::Ltx2ConditioningTrace* trace = nullptr) {
     vllm::multimodal::VideoModelParams mp = A2VidParams(ws.paths, lora);
     mp.extras[vllm::multimodal::kLtx2LoraStrengthExtra] = strength;
     if (max_phase != nullptr) mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = max_phase;
@@ -11329,6 +11447,11 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
     REQUIRE(engine != nullptr);
     const std::string dir = std::string(ws.root) + "/" + out;
     const vllm::multimodal::VideoResult result = engine->Generate(A2VidGen(dir, wav));
+    if (trace != nullptr) {
+      const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+      REQUIRE(ltx != nullptr);
+      *trace = ltx->last_conditioning();
+    }
     return A2VidArtifacts(dir, result);
   };
 
@@ -11351,8 +11474,9 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
   CHECK(s1_differing == 0);
 
   // ── both stages, the same two strengths ───────────────────────────────────
-  const std::string both_full = render("1.0", nullptr, "both_full");
-  const std::string both_zero = render("0.0", nullptr, "both_zero");
+  vllm::multimodal::Ltx2ConditioningTrace both_full_trace, both_zero_trace;
+  const std::string both_full = render("1.0", nullptr, "both_full", &both_full_trace);
+  const std::string both_zero = render("0.0", nullptr, "both_zero", &both_zero_trace);
   REQUIRE(both_full.size() == both_zero.size());
 
   size_t both_differing = 0;
@@ -11362,14 +11486,34 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
   MESSAGE("both stages: the adapter moves " << both_differing << " of " << both_full.size()
                                             << " artifact bytes");
   // THE HALF THAT REDS ON "STOPPED FUSING ALTOGETHER". `stage_2_loras` at `:114`
-  // DOES carry the distilled adapter, so it must reach the pixels through stage
+  // DOES carry the distilled adapter, so it must reach the render through stage
   // 2. Without this line the case above is satisfied by an engine that ignores
   // `lora_path` entirely, which is the same shape of green-but-proves-nothing
   // the row's spec rejects.
   //
-  // Strictly greater than zero and no count floor above it: a count-based
-  // tolerance would bound nothing.
-  CHECK(both_differing > 0);
+  // THE ARTIFACT-BYTE COMPARISON THAT USED TO CARRY THIS CANNOT ANY MORE, AND THE
+  // NUMBERS ARE WHY (A24 wave 3, #2786). On an f32 decode the adapter moved 19 of
+  // 146753 PPM bytes -- 0.013% of the clip, a handful of pixels that happened to
+  // straddle an 8-bit quantization boundary. The decode now runs at upstream's
+  // own bfloat16 (`distilled.py:109`, handed to `VideoDecoder` at `:148`), whose
+  // mantissa is also 8 bits, and a difference that small rounds away: measured 0
+  // of 146753. Raising the fixture's delta does NOT recover it -- at scale 8 the
+  // count is 0 as well, because a larger delta pushes the render further into the
+  // writer's clamp and both arms saturate to the same bytes. The instrument had a
+  // narrow window and the shipping dtype closed it.
+  //
+  // So the claim is made ONE STEP UPSTREAM, on the latent the decoder is handed,
+  // which is where the adapter's effect lives and which no pixel quantization
+  // touches. This is strictly a different statement from "reaches the pixels" and
+  // is written as such: it proves the adapter reaches the DECODER'S INPUT. That
+  // the decode depends on its input is gated separately and numerically by
+  // tests/vllm/models/test_ltx2_vae.cpp's decoder goldens, so the two together
+  // still close the path the byte comparison used to close alone.
+  MESSAGE("both stages: latent digest full=" << both_full_trace.vae_latent_digest
+                                             << " zero=" << both_zero_trace.vae_latent_digest);
+  REQUIRE(both_full_trace.vae_latent_values > 0);
+  REQUIRE(both_full_trace.vae_latent_absmax > 1e-6);
+  CHECK(both_full_trace.vae_latent_digest != both_zero_trace.vae_latent_digest);
 
   // ── and the two arms are not the same render ──────────────────────────────
   // Stage 2 upsamples, so a stage-1-only artifact cannot equal a two-stage one.

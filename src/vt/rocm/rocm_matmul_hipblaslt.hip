@@ -333,6 +333,45 @@ void* LtWorkspace(size_t need, hipStream_t stream) {
   });
 }
 
+// Grow-only A/B/C pointer tables for hipblasGemmBatchedEx, one entry per DEVICE,
+// on the same bookkeeping as the workspace above (src/vt/grow_only_stream_scratch.h).
+//
+// This is the THIRD grow-only pool in this file, and #2837 filed it as sharing
+// only the LIFETIME half of #2712's defect. Reading it, it shares the race half
+// too. The shipped code held its lock across the grow and then read `tab->A`,
+// `tab->B` and `tab->C` back out of the shared map entry for three
+// hipMemcpyAsync calls with the lock already released, so a second caller on the
+// same device that grew the tables freed the block the first was about to copy
+// into. GrowOnlyStreamTriple returns the three pointers BY VALUE, so there is no
+// entry left to re-read, and it retires the old block instead of freeing it --
+// which is also what makes a growth legal under hipGraph stream capture, the
+// contract rocm_backend.hip:322-330 already names.
+vt::GrowOnlyStreamTriple<int>& PtrTablePool() {
+  static vt::GrowOnlyStreamTriple<int> pool;
+  return pool;
+}
+
+// The three device tables for `batch` pointers on `device`. Throws rather than
+// returning empty tables: every caller below would otherwise hand a null array
+// to hipblasGemmBatchedEx, and the driver's error would name the GEMM instead of
+// the allocation.
+vt::GrowOnlyStreamTriple<int>::Tables EnsurePtrTables(int device, int batch) {
+  const size_t per_table = static_cast<size_t>(batch) * sizeof(void*);
+  auto tables = PtrTablePool().Ensure(device, per_table, [](size_t bytes) -> void* {
+    void* block = nullptr;
+    // hipMalloc, not hipMallocAsync, for the same reason LtWorkspace above uses
+    // it: these tables are consumed by hipBLAS, whose behaviour under capture
+    // this project has not exercised. Removing the free is the part that is
+    // verifiable, so it is the part that changed.
+    if (hipMalloc(&block, bytes) != hipSuccess) return nullptr;
+    return block;
+  });
+  if (tables.a == nullptr) {
+    throw std::runtime_error("vt rocm: matmul_bt_ptr_batch: pointer tables");
+  }
+  return tables;
+}
+
 // C[M,N] row-major = alpha * A[M,K] @ B[N,K]^T + beta * C
 // Same col-major view as hipblasGemmEx(OP_T, OP_N, m=N, n=M, k=K, B, K, A, K, C, N).
 bool MatmulBTLt(hipStream_t stream, void* C, const void* A, const void* B, int M, int N, int K,
@@ -662,41 +701,19 @@ void MatmulBTPointerBatchKernelRocm(Queue& q, void** out_ptrs, const void* a,
   const hipDataType at = ToBlasType(dtype);
 
   // Reuse device pointer tables (per-device, grows to max batch seen).
-  struct PtrTables {
-    void* A = nullptr;
-    void* B = nullptr;
-    void* C = nullptr;
-    int cap = 0;
-  };
-  static std::mutex mu;
-  static std::unordered_map<int, PtrTables> tabs;
-  PtrTables* tab = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    tab = &tabs[q.device.index];
-    if (tab->cap < batch) {
-      if (tab->A) CheckHip(hipFree(tab->A), "freeA");
-      if (tab->B) CheckHip(hipFree(tab->B), "freeB");
-      if (tab->C) CheckHip(hipFree(tab->C), "freeC");
-      const size_t psz = static_cast<size_t>(batch) * sizeof(void*);
-      CheckHip(hipMalloc(&tab->A, psz), "ptrA");
-      CheckHip(hipMalloc(&tab->B, psz), "ptrB");
-      CheckHip(hipMalloc(&tab->C, psz), "ptrC");
-      tab->cap = batch;
-    }
-  }
+  const vt::GrowOnlyStreamTriple<int>::Tables tab = EnsurePtrTables(q.device.index, batch);
   std::vector<const void*> a_host(static_cast<size_t>(batch), a);
   const size_t psz = static_cast<size_t>(batch) * sizeof(void*);
-  CheckHip(hipMemcpyAsync(tab->A, a_host.data(), psz, hipMemcpyHostToDevice, s), "H2D A");
-  CheckHip(hipMemcpyAsync(tab->B, b_ptrs, psz, hipMemcpyHostToDevice, s), "H2D B");
-  CheckHip(hipMemcpyAsync(tab->C, out_ptrs, psz, hipMemcpyHostToDevice, s), "H2D C");
+  CheckHip(hipMemcpyAsync(tab.a, a_host.data(), psz, hipMemcpyHostToDevice, s), "H2D A");
+  CheckHip(hipMemcpyAsync(tab.b, b_ptrs, psz, hipMemcpyHostToDevice, s), "H2D B");
+  CheckHip(hipMemcpyAsync(tab.c, out_ptrs, psz, hipMemcpyHostToDevice, s), "H2D C");
 
   CheckBlas(hipblasGemmBatchedEx(
                 ctx.handle, HIPBLAS_OP_T, HIPBLAS_OP_N,
                 /*m=*/N, /*n=*/M, /*k=*/K, &alpha,
-                reinterpret_cast<const void**>(tab->B), at, /*ldb=*/K,
-                reinterpret_cast<const void**>(tab->A), at, /*lda=*/K, &beta,
-                reinterpret_cast<void**>(tab->C), at, /*ldc=*/N, batch, GemmCompute(dtype),
+                reinterpret_cast<const void**>(tab.b), at, /*ldb=*/K,
+                reinterpret_cast<const void**>(tab.a), at, /*lda=*/K, &beta,
+                reinterpret_cast<void**>(tab.c), at, /*ldc=*/N, batch, GemmCompute(dtype),
                 HIPBLAS_GEMM_DEFAULT),
             "hipblasGemmBatchedEx BT");
 }
@@ -722,40 +739,18 @@ void MatmulBTPointerBatchABKernelRocm(Queue& q, void** out_ptrs, void** a_ptrs,
   const float alpha = 1.f, beta = 0.f;
   const hipDataType at = ToBlasType(dtype);
 
-  struct PtrTables {
-    void* A = nullptr;
-    void* B = nullptr;
-    void* C = nullptr;
-    int cap = 0;
-  };
-  static std::mutex mu;
-  static std::unordered_map<int, PtrTables> tabs;
-  PtrTables* tab = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    tab = &tabs[q.device.index];
-    if (tab->cap < batch) {
-      if (tab->A) CheckHip(hipFree(tab->A), "freeA");
-      if (tab->B) CheckHip(hipFree(tab->B), "freeB");
-      if (tab->C) CheckHip(hipFree(tab->C), "freeC");
-      const size_t psz = static_cast<size_t>(batch) * sizeof(void*);
-      CheckHip(hipMalloc(&tab->A, psz), "ptrA");
-      CheckHip(hipMalloc(&tab->B, psz), "ptrB");
-      CheckHip(hipMalloc(&tab->C, psz), "ptrC");
-      tab->cap = batch;
-    }
-  }
+  const vt::GrowOnlyStreamTriple<int>::Tables tab = EnsurePtrTables(q.device.index, batch);
   const size_t psz = static_cast<size_t>(batch) * sizeof(void*);
-  CheckHip(hipMemcpyAsync(tab->A, a_ptrs, psz, hipMemcpyHostToDevice, s), "H2D A");
-  CheckHip(hipMemcpyAsync(tab->B, b_ptrs, psz, hipMemcpyHostToDevice, s), "H2D B");
-  CheckHip(hipMemcpyAsync(tab->C, out_ptrs, psz, hipMemcpyHostToDevice, s), "H2D C");
+  CheckHip(hipMemcpyAsync(tab.a, a_ptrs, psz, hipMemcpyHostToDevice, s), "H2D A");
+  CheckHip(hipMemcpyAsync(tab.b, b_ptrs, psz, hipMemcpyHostToDevice, s), "H2D B");
+  CheckHip(hipMemcpyAsync(tab.c, out_ptrs, psz, hipMemcpyHostToDevice, s), "H2D C");
 
   CheckBlas(hipblasGemmBatchedEx(
                 ctx.handle, HIPBLAS_OP_T, HIPBLAS_OP_N,
                 /*m=*/N, /*n=*/M, /*k=*/K, &alpha,
-                reinterpret_cast<const void**>(tab->B), at, /*ldb=*/K,
-                reinterpret_cast<const void**>(tab->A), at, /*lda=*/K, &beta,
-                reinterpret_cast<void**>(tab->C), at, /*ldc=*/N, batch, GemmCompute(dtype),
+                reinterpret_cast<const void**>(tab.b), at, /*ldb=*/K,
+                reinterpret_cast<const void**>(tab.a), at, /*lda=*/K, &beta,
+                reinterpret_cast<void**>(tab.c), at, /*ldc=*/N, batch, GemmCompute(dtype),
                 HIPBLAS_GEMM_DEFAULT),
             "hipblasGemmBatchedEx BT AB");
 }

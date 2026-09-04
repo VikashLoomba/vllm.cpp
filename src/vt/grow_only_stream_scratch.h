@@ -103,6 +103,64 @@ class GrowOnlyStreamScratch {
   std::vector<void*> retired_;
 };
 
+// THREE equal tables per key, sliced out of ONE block of the pool above.
+//
+// hipblasGemmBatchedEx (and its cuBLAS twin) take three device arrays of `batch`
+// pointers -- A, B and C. The shipped ROCm code kept them as three separate
+// hipMalloc'd buffers behind one shared capacity, freed all three on growth, and
+// then read them back out of the shared map entry AFTER the lock had been
+// released (rocm_matmul_hipblaslt.hip, #2837). Three defects follow from that
+// shape, and this class removes all three by construction rather than by asking
+// the call site to remember:
+//
+// ONE BLOCK. Three allocations behind one `cap` can grow partially: if the third
+// hipMalloc fails after the first two replaced their pointers, `cap` describes a
+// set of buffers that were never all replaced. One block cannot be half-grown.
+//
+// BY VALUE. `Ensure` hands back the three pointers, not a reference into the
+// shared entry. The caller therefore cannot re-read the entry once the lock is
+// gone, which is exactly what the shipped code did for its three
+// hipMemcpyAsync calls: a concurrent grow freed the block the other thread was
+// about to copy into.
+//
+// RETIRE, NEVER FREE, inherited from the pool it composes, for the graph-capture
+// reason stated at the top of this file.
+template <typename KeyT>
+class GrowOnlyStreamTriple {
+ public:
+  struct Tables {
+    void* a = nullptr;
+    void* b = nullptr;
+    void* c = nullptr;
+  };
+
+  // Three tables of at least `per_table_bytes` each. `alloc` is called as
+  // `alloc(total)` with the pool's lock held and returns one block of `total`
+  // bytes; it may throw, and it returns nullptr when it cannot allocate.
+  //
+  // Every returned pointer is null when nothing could be allocated, so a caller
+  // checks one of them and refuses, exactly as it would a single block.
+  template <typename Alloc>
+  Tables Ensure(KeyT key, std::size_t per_table_bytes, Alloc&& alloc) {
+    void* block = slab_.Ensure(key, per_table_bytes * 3, static_cast<Alloc&&>(alloc));
+    if (block == nullptr) return Tables{};
+    // Every offset is a multiple of the caller's per-table size, and the sizes
+    // this serves are `batch * sizeof(void*)`, so a `void**` slice is aligned
+    // whenever the block is.
+    auto* base = static_cast<unsigned char*>(block);
+    return Tables{base, base + per_table_bytes, base + per_table_bytes * 2};
+  }
+
+  std::size_t RetiredCount() const { return slab_.RetiredCount(); }
+
+  // The per-table capacity currently published for `key`, or 0 when it has none.
+  // A third of the block, by construction.
+  std::size_t CapacityFor(KeyT key) const { return slab_.CapacityFor(key) / 3; }
+
+ private:
+  GrowOnlyStreamScratch<KeyT> slab_;
+};
+
 }  // namespace vt
 
 #endif  // VT_GROW_ONLY_STREAM_SCRATCH_H_

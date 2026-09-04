@@ -1,15 +1,27 @@
 # `qwen38-27b-exl3-gb10` — Qwen3.8-27B EXL3 3.5bpw, with and without its DFlash2 draft
 
-The published EXL3 pair runs on GB10. This file records what was measured, on
-what, and — at least as importantly — the three ways the workload differs from
-the number it is naturally compared against.
+The published EXL3 pair loads and generates on GB10. This file has the numbers,
+the conditions they were taken under, and the parts of the upstream recipe that
+are not matched here.
 
 ## Disposition
 
-**Measured, NOT comparable to the published figure.** The speed is real and
-reproducible. It is not a like-for-like reproduction of the upstream README's
-47.5 tok/s, for the reasons under [Limitations](#limitations). Read the ratio
-as "same regime on a favourable prompt", never as a win.
+Measured. On the task and temperature the [Mia-AiLab card][card] quotes, real
+HumanEval at T = 0.6, the pair decodes at 59.5 tok/s where they report 47.5. Our
+acceptance is 4.06 tokens per step against their 4.43, so the speed is not
+coming from an easier drafting task.
+
+Three things about that comparison are still open and are listed under
+[Limitations](#limitations). Their recipe uses a longer context and an NVFP4 KV
+cache, we run with the paged draft route disabled, and their card does not say
+whether its figure counts the prefill. Counted with the prefill in, the same run
+of ours reads 45.1 tok/s.
+
+There are two measurements below. The first uses a short greedy prompt and is
+kept because the correctness evidence lives there. The HumanEval numbers are the
+ones to compare against anything.
+
+[card]: https://huggingface.co/Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw
 
 ## Subject
 
@@ -28,11 +40,11 @@ download-host pins, so the bytes measured are provably the pinned artifact:
 
 ## Method
 
-Both arms ran **interleaved in one process, one boot, one binary** — target,
-draft, target, draft — because a sequential A/B measures drift as well as the
-arm, and this repository has a recorded case of one unchanged binary reading
-36.8 and 78.9 tok/s in the same session. Run 1 of every leg is a cold run and is
-discarded, which is the harness' own convention on every arm.
+Both arms ran interleaved in one process, on one boot, from one binary: target,
+draft, target, draft. A sequential A/B would measure drift along with the arm,
+and this repository has a recorded case of one unchanged binary reading 36.8 and
+78.9 tok/s in the same session. Run 1 of every leg is cold and discarded, which
+is what the harness does on every arm anyway.
 
 ```sh
 VT_DFLASH_PAGED=0 vllm-cli --model <target> --device cuda \
@@ -41,15 +53,16 @@ VT_DFLASH_PAGED=0 vllm-cli --model <target> --device cuda \
   [--speculative-config '{"method":"dflash","model":"<draft>","num_speculative_tokens":7}']
 ```
 
-## Results
+## First measurement: a short greedy prompt
 
 | arm | warm tok/s, runs 2-5 of two interleaved legs | spread |
 |---|---|---|
 | target only | 16.706 16.758 16.796 16.729 / 16.737 16.769 16.670 16.701 | 0.75% |
 | + DFlash2 draft, k=7 | 48.970 49.079 48.944 48.469 / 48.751 48.672 48.677 48.446 | 1.3% |
 
-**2.91x from speculation.** The two target legs are separated by a draft leg and
-agree to 0.75%, so drift does not account for the difference.
+The draft arm runs 2.91 times the target-only rate. The two target legs sit
+either side of a draft leg and agree to 0.75%, so drift does not explain the
+gap.
 
 ## The MATCHED workload: real HumanEval at T = 0.6
 
@@ -82,6 +95,38 @@ counted decode-only and **45.1** counted over whole-run wall time. Against the f
 convention we are 1.25x; against the second, 0.95x. Their page pins no engine revision
 either, so this cannot be settled from published material. Both numbers are given here
 for that reason.
+
+## 16.7 is a QUANTIZATION result, not an engine result
+
+This page's 16.74 tok/s invites one comparison in particular, and that comparison
+does not hold. `pangoleen/qwen3.8-27b-dgx-spark-dflash2` publishes a **12.71
+tok/s** no-drafter median for the same model on the same class of box, under
+SGLang, on `RadixArk/Qwen3.8-27B-NVFP4`. Read side by side that is 1.32x in our
+favour. It is not.
+
+Read from both checkpoints' own safetensors headers, the weights a text decode
+step sweeps once per token — everything but the vision tower, `embed_tokens`,
+which is gathered by row, and the MTP head nothing executes — are **11.661 GB**
+here and **17.608 GB** there. Their checkpoint is 1.51x the bytes, which is more
+than the whole throughput difference:
+
+| | tok/s | x decode-resident GB | achieved GB/s |
+|---|---:|---:|---:|
+| this page, EXL3 3.5bpw | 16.74 | 11.661 | **195** |
+| pangoleen, SGLang, NVFP4 | 12.71 | 17.608 | **224** |
+
+Their box measures about 231 GB/s effective, so their target forward is at 97% of
+its bandwidth limit and this one is at 85%. **Byte-normalized the comparison
+reverses sign**, 0.872x. Treat that as an indication and not a verdict: EXL3's
+trellis decode does real work per byte, so that 85% may be compute-bound rather
+than a scheduling loss, and the two numbers are on different formats, different
+engines and different harnesses. The measurement that settles it is our engine on their checkpoint, which
+is [`bench-qwen38-27b-nvfp4-matched`](../../.agents/specs/bench-qwen38-27b-nvfp4-matched.md).
+
+What follows from the table, and is not stated elsewhere on this page: the
+target forward is close to the bus on both engines, so it is not where either
+engine has room left. What is contested is the speculation multiplier, and the
+section below is where this page measures ours.
 
 ## The draft budget is a real lever, and our knee is not theirs
 
@@ -302,15 +347,17 @@ helping.
 
 ## Limitations
 
-**Three differences from the upstream README's 47.5 tok/s, and all three favour
-this measurement.** Do not quote the two numbers side by side without them.
+Two of these apply to every number on this page. The first applies only to the
+greedy measurement, and the matched HumanEval run above exists to remove it.
 
-1. **Workload.** The published figure is HumanEval-style at **T = 0.6 with
-   acceptance 4.43**. This is **greedy, T = 0**, on `The capital of France is`,
+1. **Workload — closed for the matched run, open for the first one.** The
+   published figure is HumanEval-style at **T = 0.6 with acceptance 4.43**. The
+   *first* measurement here is **greedy, T = 0**, on `The capital of France is`,
    which continues into a list of capitals — close to the easiest possible text
-   for a drafter to predict, so acceptance sits near its ceiling. The engine did
-   not report an acceptance rate for this run, so the gap cannot even be
-   quantified from here.
+   for a drafter to predict — and the engine reported no acceptance rate for it,
+   so its gap cannot be quantified at all. The **matched HumanEval run** uses
+   their task and their temperature and reports acceptance from the engine's own
+   counters, so this difference does not apply to it.
 2. **Context and KV cache.** The published recipe is `-cs 262144` with an NVFP4
    KV cache. Here auto-fit reduced `max_model_len` from 262144 to 8192 and
    `max_num_seqs` from 32 to 1 on the KV budget, and no NVFP4 KV cache was used.
@@ -342,7 +389,16 @@ two legs per arm. No multi-request batching, no long context, no second box.
   number on this page states the KV dtype it was measured on.
 - [#2274](https://github.com/mudler/vllm.cpp/issues/2274), so the shipped paged
   route can be measured rather than routed around.
-- [#2570](https://github.com/mudler/vllm.cpp/issues/2570): our `m <= 8` EXL3
-  GEMV instantiates `(3,1)` only, and this checkpoint contains **zero** `(3,1)`
-  tensors while upstream's GEMV takes 407 of its 409. That is the named,
-  still-unmeasured hypothesis for any gap that a matched workload reveals.
+- [#2570](https://github.com/mudler/vllm.cpp/issues/2570): the `m <= 8` EXL3
+  GEMV. When this page was first written it instantiated `(3,1)` only, and this
+  checkpoint has no `(3,1)` tensor at all, so the arm was dead on it. `(3,2)`
+  has since landed, which covers the 137 bits-3 modules; `(4,2)` and its 270 is
+  in flight. Upstream's GEMV takes 407 of the 409.
+
+  Instantiating an arm is not the same as reaching it. Admission runs through an
+  occupancy test, `size_n / 32 <= narrow_coresident`, and this checkpoint's
+  bits-3 shapes need that to clear 544 and 160. Measured on Thor it is 60. So
+  whether any of those 137 modules take the fast path on GB10 is **unmeasured**,
+  and the queued job reads `SM_COUNT` and `MAX_THREADS_PER_SM` before its A/B so
+  that a decline stays distinguishable from a null result. No throughput effect
+  is claimed here in either direction.

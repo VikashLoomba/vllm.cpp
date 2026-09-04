@@ -1,18 +1,29 @@
 # Spec: the device-resident async spec sampler (SPEC-DFLASH2, A2)
 
 Row: `SPEC-DFLASH2`.
-Issue: [#2116](https://github.com/mudler/vllm.cpp/issues/2116).
+Issue: [#2644](https://github.com/mudler/vllm.cpp/issues/2644), which owns wave
+A2-1 and replaces #2116 as this spec's live issue. #2116 and #2108 no longer
+resolve, authenticated or anonymously; they stay in the text below as
+provenance, and nothing should be read from their numbers.
 Discharges: `## Owed` **A2** of
 [`spec-decode-async-scheduling.md`](spec-decode-async-scheduling.md), the wave
 that turned async SCHEDULING on for the Eagle-type family and deliberately left
 the runner's input and sampler halves synchronous.
 
-**This spec commits no product code.** It is the scoping half of the split
-shape, and it exists because the measurement below turned the row's premise
-around: the veto at `src/vllm/v1/worker/gpu/runner.cpp:470` is not a stale
-guard that a mirror argument can lift. It is load-bearing for correctness on
-two independent counts, and one of them is invisible to every token gate in
-this tree.
+**This spec was committed as the scoping half of the split shape and carried
+no product code.** Wave A2-1 then landed on the same branch, so the spec now
+ships beside an implementation; `## Now` states the position and
+`## What was measured` states which head each measurement belongs to.
+
+The spec exists because its measurement turned the row's premise around: the
+veto at `src/vllm/v1/worker/gpu/runner.cpp:480`, and again at `:553` —
+GPUModelRunner has TWO constructors and each carries its own
+`async_input_combine_ =` assignment — is not a stale guard that a mirror
+argument can lift. When the spec was written it was load-bearing on two
+independent counts, one of them invisible to every token gate in this tree.
+A2-1 discharged that invisible count (reason A, the combine's arithmetic) and
+built G2 to hold it. **The veto still stands on reason B**, which A2-1 did not
+touch and which A2-2 and A2-3 own.
 
 ## Scope
 
@@ -28,18 +39,14 @@ scheduling ON for the Eagle-type family and that half is unaffected); the
 stochastic rejection path; structured output under spec (`## Owed` A3 of the
 W7 spec); the `async_tokens_to_discard` producer (A4).
 
-Explicitly out: **flipping the veto ahead of pieces 1 to 3.** The measurement
+Explicitly out: **flipping the veto ahead of pieces 1 and 2.** Piece 3 landed
+as A2-1 and did not make the flip safe on its own; the post-A2-1 measurement
 below is the reason, and it is not a judgement call.
 
 ## What was measured
 
-Measured on this branch with `f9af269f9` merged in, CPU build
-(`cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF`), target
-`test_mtp_depth`. No GPU was taken and no device measurement is claimed
-anywhere in this spec.
-
-The mutation, call it **M**, is the veto itself, deleted at both construction
-sites verbatim (`runner.cpp:470` and `:535`; `git diff --stat` = one file,
+Mutation **M** is the veto itself, deleted at both construction sites verbatim
+— the two `async_input_combine_ =` assignments (`git diff --stat` = one file,
 2 insertions, 2 deletions):
 
 ```diff
@@ -48,6 +55,29 @@ sites verbatim (`runner.cpp:470` and `:535`; `git diff --stat` = one file,
                           QueueSupportsAsyncInputCombine(queue_);
 ```
 
+**M has been run on two different heads and it does NOT produce the same
+result on both.** A2-1 changed what it proves. Both runs are recorded below,
+each against the head that produced it, because the pre-A2-1 run is the
+evidence that made this row's premise turn around and the post-A2-1 run is the
+evidence that holds on the tree a reader has in front of them. Neither
+supersedes the other, and a row from one must never be quoted against the other.
+
+Both runs used a CPU build
+(`cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF`), target
+`test_mtp_depth`. No GPU was taken and no device measurement is claimed
+anywhere in this spec.
+
+### M on `a0f12b727`, the PRE-A2-1 head (this spec's own commit)
+
+The head is identified by the md5 this section has always recorded:
+`md5sum src/vllm/v1/worker/gpu/runner.cpp` reads
+`ac6a4b61cbb9956299154020112651e7`, which is
+`git cat-file blob a0f12b727:src/vllm/v1/worker/gpu/runner.cpp` exactly. The
+veto sat at `runner.cpp:472` and `:537` on that head. The tree was restored
+byte-for-byte after the run and `git status --porcelain` reported no change to
+that file. The same mutation was run once before this branch merged, at base
+`331eda888`, and produced the same four rows and the same trace difference.
+
 | run | result | exit |
 |---|---|---|
 | baseline, whole binary | 10 cases, 10 passed, 123 assertions | 0 |
@@ -55,23 +85,60 @@ sites verbatim (`runner.cpp:470` and `:535`; `git diff --stat` = one file,
 | baseline, `-tc="*IDENTICAL*"` | 1 passed, 15 assertions | 0 |
 | **M**, `-tc="*IDENTICAL*"` | 0 passed, 1 failed, 10 assertions | 1 |
 
-The tree was restored byte-for-byte after the run:
-`md5sum src/vllm/v1/worker/gpu/runner.cpp` reads
-`ac6a4b61cbb9956299154020112651e7` before the mutation and after the restore,
-and `git status --porcelain` reports no change to that file. The same mutation
-was run once before this branch merged, at base `331eda888`, and produced the
-same four rows and the same trace difference; the numbers above are the later
-run, on the head this spec lands with.
-
-### Reason B: the async sampler has no verify arm at all
-
-**M** throws in production code, on the depth-2 front, before any verify step
-is ever reached:
+On that head **M** refused at `runner.cpp:1833`, the async draft fill:
 
 ```
 vt: async draft fill: no drafts proposed for request 'req'
 (placeholders scheduled without a matching propose)  runner.cpp:1833
 ```
+
+and, separately and silently, corrupted every verify block — the reason-A table
+in the subsection below.
+
+### M on `99d223421`, the A2-1 landing head (the head this spec ships with)
+
+Re-run for this landing, because the section previously claimed the rows above
+were taken here and they were not. `md5sum src/vllm/v1/worker/gpu/runner.cpp`
+reads `d97ab753448957cc34d21454f9fa6b75` before the mutation and again after the
+restore, and `git status --porcelain` printed nothing. The rebuild recompiled
+`runner.cpp` on both the mutation and the restore (ninja reported 3 steps, not
+`no work to do`), so neither number came off a stale object. The veto sat at
+`runner.cpp:472` and `:537` on this head as well; the record repair that
+followed this run moved them to `:480` and `:553`.
+
+| run | result | exit |
+|---|---|---|
+| baseline, whole binary | 10 cases, 10 passed, 123 assertions | 0 |
+| **M**, whole binary | 10 cases, **5 passed, 5 failed, 29 assertions** | 1 |
+| **M**, `-tc="*IDENTICAL*"` | 0 passed, 1 failed, 1 assertion | 1 |
+
+**M** now refuses somewhere else entirely, at a check A2-1 itself added:
+
+```
+vt: async input combine: this step scheduled draft tokens, but the draft
+buffer the combine scatters from is not wired yet (SPEC-DFLASH2 A2-3, #2644)
+  runner.cpp:2384
+```
+
+All five failing cases throw that one exception; `runner.cpp:1833` does not
+appear in the output at all. The `VT_CHECK(step.num_draft_tokens == 0, ...)`
+sits ahead of all three combine arms, so it fires before the combine can run.
+
+**Reason A's corruption is therefore no longer reachable through the combine.**
+Under `VT_SPEC_TRACE=1` the baseline emits 201 `draft=` lines and **M** emits
+zero: every speculative case refuses before a verify block is ever traced, so
+there is nothing to compare and nothing to corrupt. The reason-A table below
+cannot be reproduced on this head, and that is A2-1 working, not evidence going
+missing.
+
+What survives is that **M is still red, and still red for reason B.** The
+refusal it now hits is the one guarding the unwired draft buffer, which is
+A2-3's half of reason B rather than A2-2's; the sampler still has no verify arm
+either, and that half simply no longer gets the chance to refuse first.
+
+### Reason B: the async sampler has no verify arm at all
+
+This reason is unchanged by A2-1 and is the reason the veto still stands.
 
 `GPUModelRunner::sample_tokens_async` (`runner.cpp:4039-4212`) contains
 no reference to `sample_tokens_with_rejection`, to `propose_drafts`, to
@@ -84,25 +151,30 @@ they were decode rows, never verify a draft, and never propose the next block.
 `pending_drafts_` stays empty, the async scheduler's `-1` placeholders have
 nothing to fill, and the fill refuses. `Sampler::forward`'s
 `sampled_ids_out->Numel() == n` check (`src/vllm/v1/sample/sampler.cpp:382`)
-is the second refusal waiting behind it.
+is the second refusal waiting behind it. On the landing head the A2-3 draft-
+buffer check refuses ahead of both, which is why the trace above is empty.
 
-**This reason is not in the comment the veto carries.** `runner.cpp:445-455`
-names only the input combine. A reader repairing that one piece would still be
-several waves away from a flag that can be flipped, which is exactly the
-misreading this spec exists to stop.
+**This reason was not in the comment the veto carried** on the pre-A2-1 head,
+which named only the input combine. A reader repairing that one piece would
+still be several waves away from a flag that can be flipped, which is exactly
+the misreading this spec exists to stop. A2-1's landing commit rewrote both
+comment blocks so they name the reasons that still hold.
 
-### Reason A: the corruption a token gate cannot see
+### Reason A: the corruption a token gate cannot see — FIXED BY A2-1
 
-The comment's own stated reason also still holds, and it holds in the shape the
-row already warned about. `combine_sampled_and_draft_tokens`
-(`src/vllm/v1/worker/gpu/prepare_inputs.cpp:285-332`) fixes
-`num_logits = num_new_sampled_tokens` and writes the committed token at
+**Historical.** This subsection records the pre-A2-1 defect and the evidence
+for it. A2-1 fixed it, and the post-A2-1 M run above can no longer reproduce
+it. It is kept because it is why G2 exists and why R1 is written the way it is.
+
+On the pre-A2-1 head `combine_sampled_and_draft_tokens`
+(`src/vllm/v1/worker/gpu/prepare_inputs.cpp:285-332`) fixed
+`num_logits = num_new_sampled_tokens` and wrote the committed token at
 `query_end - num_logits`. With `num_new_sampled_tokens == 1` that address is
 `query_end - 1`, which on a verify step is the LAST DRAFT SLOT, not the
 committed-token slot.
 
-Under **M**, with `VT_SPEC_TRACE=1`, every verify block in every arm has its
-last draft replaced by the previous step's emitted token:
+Under **M** on `a0f12b727`, with `VT_SPEC_TRACE=1`, every verify block in every
+arm had its last draft replaced by the previous step's emitted token:
 
 | position | baseline `draft=[...]` | under M | previous step's `emit` |
 |---|---|---|---|
@@ -111,26 +183,27 @@ last draft replaced by the previous step's emitted token:
 | 6 | `7 0` | `7 9` | `9` |
 | 7 | `5 20` | `5 18` | `18` |
 
-**The emitted tokens never move.** The `emit=` column is identical in both
-runs, and the identity assertions of the arm that carries this corruption pass.
+**The emitted tokens never moved.** The `emit=` column was identical in both
+runs, and the identity assertions of the arm carrying this corruption passed.
 Speculative decoding is lossless, so a wrong draft costs acceptance and nothing
 else: `tests/vllm/v1/spec_decode/test_dflash_causality.cpp:19` calls this "the
 single defect in this row that raises nothing", and it already fired once as
-[#1366](https://github.com/mudler/vllm.cpp/issues/1366). Here it fired again,
-under a mutation that a whole-binary run still reports as one failed case for
+[#1366](https://github.com/mudler/vllm.cpp/issues/1366). There it fired again,
+under a mutation that a whole-binary run still reported as one failed case for
 an entirely unrelated reason.
 
-Two consequences follow for the waves below.
+Two consequences follow, and both still bind the waves below even though the
+defect itself is fixed.
 
-- The corruption is a property of the INPUT COMBINE, not of the scheduler.
-  The sync-scheduler arm (`VT_ASYNC_SCHED=0`) carries it identically, because
+- The corruption was a property of the INPUT COMBINE, not of the scheduler.
+  The sync-scheduler arm (`VT_ASYNC_SCHED=0`) carried it identically, because
   `async_input_combine_` is a runner-level lever that `VT_ASYNC_SCHED` does not
   reach.
-- **No acceptance gate on this fixture can see it.** The synthetic MTP head in
-  `test_mtp_depth` accepts nothing: every traced block reads `ns=1 acc=0` in
-  the baseline as well. The acceptance signal has zero dynamic range here, so
-  the draft-token comparison above, not an acceptance ratio, is the only CPU
-  instrument that discriminated.
+- **No acceptance gate on this fixture can see this class of defect.** The
+  synthetic MTP head in `test_mtp_depth` accepts nothing: every traced block
+  reads `ns=1 acc=0` in the baseline as well. The acceptance signal has zero
+  dynamic range here, so a draft-token comparison, not an acceptance ratio, is
+  the only CPU instrument that discriminates. That is what G2 is.
 
 ## Upstream anchors
 
@@ -245,16 +318,102 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
 
 ## Owed
 
-- **The G2 instrument itself.** It cannot be written against the current tree
-  without either flipping the veto or landing A2-1 first, because the drafts
-  that reach the verify step are correct today by construction. It is owed by
-  A2-1 and is that wave's red-before test.
+- **The G2 instrument itself. DISCHARGED by A2-1** (#2644), and the entry stays
+  because the reason it was owed is the reason the wave exists. It could not be
+  written against the pre-A2-1 tree without either flipping the veto or landing
+  A2-1 first, since the drafts that reached the verify step were correct there
+  by construction. It now lives in
+  `tests/vllm/v1/worker/test_combine_tokens.cpp` as seven `G2:` cases that drive
+  the draft-aware combine directly and compare the drafts landing in the verify
+  rows against the proposer's ids, one id at a time. It was red before the
+  change, with the whole draft-aware body reverted to its pre-A2-1 shape:
+  `14 test cases, 6 failed, 17 assertions failed`, and G2.2 fired on BOTH its
+  assertions, `CHECK( 5 == 6 )` at `:326` and `CHECK( 5 != 5 )` at `:327` —
+  reason A's committed token sitting in the last draft slot.
+
+  Which of those two lines fires is a property of the defect's shape and not of
+  the gate, so neither line on its own is "the reason-A assertion". The
+  committed store runs BEFORE the draft scatter, so a defect that leaves the
+  scatter's bound intact has its corrupted slot rewritten by the scatter and is
+  caught by another case instead. G2.2 is sound; the claim to make about it is
+  that the case fires, not that a chosen line does.
+- **A2-1's draft lane is UNREACHED, and A2-2 plus A2-3 own the wiring.** The
+  draft-aware halves of `combine_sampled_and_draft_tokens`
+  (`src/vllm/v1/worker/gpu/prepare_inputs.cpp`) and of
+  `vt::cuda::LaunchCombineSampledAndDraftTokens`
+  (`src/vt/cuda/cuda_combine_tokens.cu`) landed with no production step able to
+  reach them: `async_input_combine_` is vetoed for every speculative engine at
+  BOTH construction sites, `runner.cpp:480` and `:553`, so every call site passes
+  an arange `cu_num_logits` and an empty draft buffer, and `num_draft_tokens` is
+  always 0. The call sites refuse
+  loudly (`VT_CHECK(step.num_draft_tokens == 0, ...)`) rather than combine a
+  verify step against a draft buffer that is not wired. A2-3 supplies that
+  buffer, A2-5 lifts the veto, and the disclosure AGENTS.md requires is carried
+  by this entry, the landing commit body and the pull request body. Owner: row
+  `SPEC-DFLASH2`, issue #2644.
+- **The CUDA arm of A2-1 was not compiled.** No `nvcc` on the CPU box this wave
+  ran on, and no `rc` lease was taken because the wave is CPU-gateable in full.
+  `src/vt/cuda/cuda_combine_tokens.cu` therefore carries the same edit as the
+  host loop, INCLUDING its refusal (`__trap()` where the host throws a
+  `VT_CHECK`, since a kernel cannot throw), read against it line for line and
+  unbuilt. It is a no-op at every present call site (both pass null
+  `draft_tokens` and null `cu_num_logits`, so the kernel degenerates to the
+  pre-A2-1 single splice), which bounds the risk to a compile failure rather
+  than a behaviour change. The `__trap()` itself is unexercised for the same
+  reason, and A2-3 is the first wave that can run it. One host check has no
+  device counterpart and is recorded in `include/vt/cuda/combine_tokens.h`
+  rather than dropped: the host bounds the draft row against
+  `draft_tokens.size()`, and no length reaches the kernel.
+
+  **A2-3 must read that gap's CONSEQUENCE, not just the gap.** The kernel's
+  scatter reads `draft_tokens[req_state_idx * draft_tokens_stride + b]` with
+  nothing bounding it, so an over-long row is an unchecked out-of-bounds DEVICE
+  READ, and it has two outcomes. The loud one is an illegal memory access. The
+  quiet one is the dangerous one: the read lands inside another allocation,
+  garbage arrives in the draft slots, and because speculative decoding is
+  lossless a wrong draft costs acceptance and NOTHING ELSE — invisible to every
+  token gate in this tree, which is reason A's class exactly. The concrete way
+  to hit it is A2-3's own: if A2-3 sizes the draft buffer by the ACTIVE REQUEST
+  COUNT while `req_state_idx` is a req_state POOL SLOT (the indirection the
+  header documents, the one that "matters after an abort/finish reorder"), a
+  high slot indexes past the allocation with every host check satisfied. A2-3
+  either passes a length and refuses on it device-side as the host does, or
+  sizes the buffer by `num_req_states` rather than by `num_reqs`. Owner: row
+  `SPEC-DFLASH2`, issue #2644.
+- **The `VT_CHECK(step.num_draft_tokens == 0, ...)` refusals at the async
+  input-combine call sites have ZERO test coverage.** Neutralizing them leaves
+  every runner suite green. That is expected while the wave is unreached — the
+  refusal cannot be reached without the route it refuses — and a fresh review
+  traced the refusal predicate against the route predicate and found they cannot
+  disagree in either direction. Recorded rather than covered, because a test
+  that reached an unreached refusal would have to fake the route it is asserting
+  about. A2-2 and A2-3 make the route real and own the coverage with it. Owner:
+  row `SPEC-DFLASH2`, issue #2644.
+- **`assert()` is a no-op in this build, so the `num_new_sampled_tokens in
+  (0, 1)` mirror at `src/vllm/v1/worker/gpu/prepare_inputs.cpp:330` checks
+  nothing.** The Release build is `-O3 -DNDEBUG`, which compiles the assertion
+  out, so the line reads as a guard and is documentation. It mirrors upstream's
+  own assert (`input_batch.py:376-378`), which is why it is written as one.
+  PRE-EXISTING: the line predates A2-1 and this wave neither added nor moved
+  it; A2-1 is only where a fresh review named it. Not fixed here, because
+  turning it into a `VT_CHECK` changes a refusal's behaviour in released builds
+  and that is its own change with its own red-before. Owner: row
+  `SPEC-DFLASH2`, issue #2644.
 - **The `nsys` read (G4).** Needs `dgx:gpu0` under an `rc` lease. Not taken
   here; the task that produced this spec was explicitly denied a device.
 
 ## Now
 
-`SPEC-DFLASH2` stays `ACTIVE`. This spec is scoping only and changes no
-product behavior. The veto at `runner.cpp:470` STANDS, its comment now names
-both reasons rather than one, and #2116 is recorded against it. A2-1 is the
-next wave and is blocked on nothing but the decision to schedule it.
+`SPEC-DFLASH2` stays `ACTIVE`. The veto STANDS at both construction sites,
+`runner.cpp:480` and `:553`, and its comment names the reasons that still hold
+rather than the one A2-1 removed.
+
+**A2-1 has landed** (#2644): `combine_sampled_and_draft_tokens` takes its
+per-request `num_logits` from `cu_num_logits`, carries the
+`first_logit_seq_pos >= prefill_len` guard, and scatters the drafts over
+`[query_end - num_draft_tokens, query_end)`, on both the host and the CUDA side,
+which refuse the same shapes. G2 exists and is green; G1 was green before and
+after. The draft lane is UNREACHED, as the `## Owed` entry above discloses.
+
+A2-2 is the next wave. It closes reason B, and A2-3 behind it is what makes
+A2-1's draft scatter reachable.

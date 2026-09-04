@@ -1532,11 +1532,19 @@ Ltx2ConnectorConfig Ltx2ParseConnectorConfig(const nlohmann::json& config,
 }
 
 Ltx2VaeWeights Ltx2LoadConnectorWeights(const SafetensorsFile& file,
-                                        const Ltx2ConnectorConfig& config) {
+                                        const Ltx2ConnectorConfig& config,
+                                        vt::DType compute_dtype) {
   const DitPlan plan = PlanDit(file);
   const std::vector<Ltx2ConnectorTensorSpec> specs = EnumerateLtx2ConnectorTensors(config);
 
+  if (compute_dtype != vt::DType::kF32 && compute_dtype != vt::DType::kBF16) {
+    Fail(
+        "the connector weights can be materialized as f32 (the parity arm) or bf16 (upstream's "
+        "own model dtype, distilled.py:109). The FP8 and NVFP4 arms are A22 -- upstream's "
+        "quantization policies, quantization_factory.py:22-26 -- and are not implemented");
+  }
   Ltx2VaeWeights out;
+  out.dtype = compute_dtype;
   for (const Ltx2ConnectorTensorSpec& spec : specs) {
     const auto shape_it = plan.logical.find(spec.name);
     if (shape_it == plan.logical.end()) {
@@ -1556,14 +1564,32 @@ Ltx2VaeWeights Ltx2LoadConnectorWeights(const SafetensorsFile& file,
     const vt::DType dtype = MaterializeDitTensor(file, plan, {spec.name, spec.shape}, bytes);
     int64_t numel = 1;
     for (const int64_t d : spec.shape) numel *= d;
+    if (dtype != vt::DType::kBF16 && dtype != vt::DType::kF32) {
+      Fail("'" + spec.name + "' materialized as a dtype the connector bag cannot hold");
+    }
+    if (compute_dtype == vt::DType::kBF16) {
+      // THE WIDENING IS THE DEBT, so on this arm there is none: a BF16 tensor is
+      // moved word for word. At the shipped widths that is the difference between
+      // ~8 GB and ~4 GB of resident parameters, per render, on a module that runs
+      // once per request.
+      std::vector<uint16_t> narrow(static_cast<size_t>(numel));
+      if (dtype == vt::DType::kBF16) {
+        std::memcpy(narrow.data(), bytes.data(), static_cast<size_t>(numel) * sizeof(uint16_t));
+      } else {
+        const auto* src = reinterpret_cast<const float*>(bytes.data());
+        for (int64_t i = 0; i < numel; ++i) {
+          narrow[static_cast<size_t>(i)] = vt::F32ToBF16(src[static_cast<size_t>(i)]);
+        }
+      }
+      out.bf16[spec.name] = std::move(narrow);
+      continue;
+    }
     std::vector<float> widened(static_cast<size_t>(numel));
     if (dtype == vt::DType::kBF16) {
       const auto* src = reinterpret_cast<const uint16_t*>(bytes.data());
       for (int64_t i = 0; i < numel; ++i) widened[static_cast<size_t>(i)] = Bf16ToF32(src[static_cast<size_t>(i)]);
-    } else if (dtype == vt::DType::kF32) {
-      std::memcpy(widened.data(), bytes.data(), static_cast<size_t>(numel) * sizeof(float));
     } else {
-      Fail("'" + spec.name + "' materialized as a dtype the connector bag cannot hold");
+      std::memcpy(widened.data(), bytes.data(), static_cast<size_t>(numel) * sizeof(float));
     }
     out.tensors[spec.name] = std::move(widened);
   }
@@ -1576,7 +1602,7 @@ Ltx2VaeWeights Ltx2LoadConnectorWeights(const SafetensorsFile& file,
   std::string first_extra;
   for (const auto& kv : plan.logical) {
     if (!StartsWith(kv.first, config.prefix)) continue;
-    if (out.tensors.count(kv.first) != 0) continue;
+    if (out.tensors.count(kv.first) != 0 || out.bf16.count(kv.first) != 0) continue;
     if (extra == 0) first_extra = kv.first;
     ++extra;
   }
@@ -1616,8 +1642,17 @@ std::vector<Ltx2VaeKeyRule> Ltx2AudioVaeDecoderKeyRules() {
 std::vector<Ltx2VaeKeyRule> Ltx2VocoderKeyRules() { return {{"vocoder.", ""}}; }
 
 Ltx2VaeWeights Ltx2LoadVaeWeights(const SafetensorsFile& file,
-                                  const std::vector<Ltx2VaeKeyRule>& rules) {
+                                  const std::vector<Ltx2VaeKeyRule>& rules,
+                                  vt::DType compute_dtype) {
+  if (compute_dtype != vt::DType::kF32 && compute_dtype != vt::DType::kBF16) {
+    Fail(
+        "the VAE weights can be materialized as f32 (the parity arm every committed golden is "
+        "measured against) or bf16 (upstream's own model dtype, distilled.py:109, handed to "
+        "VideoDecoder at :148). The FP8 and NVFP4 arms are A22 -- upstream's quantization "
+        "policies, quantization_factory.py:22-26 -- and are not implemented");
+  }
   Ltx2VaeWeights out;
+  out.dtype = compute_dtype;
   for (const std::string& name : file.Names()) {
     std::string key = name;
     if (!rules.empty()) {
@@ -1634,13 +1669,56 @@ Ltx2VaeWeights Ltx2LoadVaeWeights(const SafetensorsFile& file,
     // A COLLISION IS NOT A LAST-WRITE-WINS. Two file names rewriting onto one
     // module name means the rule set is wrong for this checkpoint, and taking
     // either tensor binds half a model to the other half's weights.
-    if (out.tensors.count(key) != 0) {
+    if (out.tensors.count(key) != 0 || out.bf16.count(key) != 0) {
       Fail("'" + name + "' rewrites onto '" + key +
            "', which another tensor already claimed; the key rules do not fit this checkpoint");
     }
     const StTensor& t = file.Get(name);
     int64_t numel = 1;
     for (const int64_t d : t.shape) numel *= d;
+    if (compute_dtype == vt::DType::kBF16) {
+      // THE WIDENING IS THE DEBT, so on this arm there is none: a BF16 tensor is
+      // moved word for word. Upstream constructs the decoder in the pipeline's
+      // one dtype (distilled.py:146-149) and never materializes an f32 copy of
+      // it, and the widening this replaces is what made the video VAE decode
+      // move twice upstream's bytes (#2786).
+      //
+      // BYTE-WISE, through `vt::LoadUnaligned`, for the reason the f32 arm below
+      // states at length: `t.data` points into the safetensors mmap at
+      // `8 + <JSON header length> + <sum of the preceding tensors' sizes>` and
+      // none of those three terms is required to be even, so a
+      // `reinterpret_cast<const uint16_t*>` is UB on every file whose writer did
+      // not happen to pad (issue #674). A `memcpy` of the whole run has no
+      // alignment precondition either, and that is what this is.
+      std::vector<uint16_t> narrow(static_cast<size_t>(numel));
+      if (t.dtype == "BF16") {
+        if (t.nbytes != static_cast<size_t>(numel) * sizeof(uint16_t)) {
+          Fail("'" + name + "' declares " + std::to_string(t.nbytes) +
+               " BF16 bytes but its shape needs " +
+               std::to_string(static_cast<size_t>(numel) * sizeof(uint16_t)));
+        }
+        std::memcpy(narrow.data(), t.data, t.nbytes);
+      } else if (t.dtype == "F32") {
+        if (t.nbytes != static_cast<size_t>(numel) * sizeof(float)) {
+          Fail("'" + name + "' declares " + std::to_string(t.nbytes) +
+               " F32 bytes but its shape needs " +
+               std::to_string(static_cast<size_t>(numel) * sizeof(float)));
+        }
+        // ONE narrowing, here, which is what `module.to(dtype)` does to a module
+        // built from an f32 state dict. Narrowing later, per use, would round the
+        // same weight twice and put the second rounding inside the arithmetic.
+        for (int64_t i = 0; i < numel; ++i) {
+          narrow[static_cast<size_t>(i)] = vt::F32ToBF16(vt::LoadUnaligned<float>(
+              t.data + static_cast<size_t>(i) * sizeof(float)));
+        }
+      } else {
+        Fail("'" + name + "' is " + t.dtype +
+             "; the shipped VAE, upsampler and duration-head checkpoints are BF16/F32 and a "
+             "quantized one would need its scale sidecars read, not its bytes reinterpreted");
+      }
+      out.bf16.emplace(std::move(key), std::move(narrow));
+      continue;
+    }
     std::vector<float> values(static_cast<size_t>(numel));
     if (t.dtype == "BF16") {
       if (t.nbytes != static_cast<size_t>(numel) * sizeof(uint16_t)) {
@@ -1679,7 +1757,9 @@ Ltx2VaeWeights Ltx2LoadVaeWeights(const SafetensorsFile& file,
     }
     out.tensors.emplace(std::move(key), std::move(values));
   }
-  if (out.tensors.empty()) Fail("no tensor in the checkpoint matched the key rules");
+  if (out.tensors.empty() && out.bf16.empty()) {
+    Fail("no tensor in the checkpoint matched the key rules");
+  }
   return out;
 }
 

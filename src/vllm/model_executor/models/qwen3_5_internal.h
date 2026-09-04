@@ -623,6 +623,25 @@ DeviceTokenIds TakeDeviceTokenIds();
 bool ApplyDeviceTokenIds(vt::Backend& backend, vt::Queue& queue, void* dst,
                          int64_t dst_count, const char* what);
 
+// THE SAME SPLICE, over identifiers the caller was handed EXPLICITLY rather than
+// through the thread-local override.
+//
+// ENG-MM-EMBED-DEVICE-IDS (#2730). `ModelRegistry::EmbedMm` runs BEFORE the
+// forward, from `GPUModelRunner::execute_model`, so no `DeviceTokenIdsScope` is
+// live when a multimodal `embed_mm` hook reaches its identifier buffer -- the
+// scope is documented as set ONLY from the registry entry points that receive a
+// `ModelForwardInput`, and the runner's channel to that hook is
+// `MmEmbedInputs`. The publisher differs; the splice must not.
+//
+// So the seam is EXTENDED rather than copied: this is the body, and the entry
+// point above is one line that passes `TakeDeviceTokenIds()` into it. One bounds
+// check, one `Copy`, one queue argument -- which is what makes a mutation of any
+// of the three turn BOTH the text gates and the multimodal gate red instead of
+// one of them.
+bool ApplyDeviceTokenIds(vt::Backend& backend, vt::Queue& queue, void* dst,
+                         int64_t dst_count, DeviceTokenIds ids,
+                         const char* what);
+
 // ─── ENG-EXPERT-STREAM (#912): the streamed-expert lane, seen from outside ───
 //
 // The lane lives in the anonymous namespace of qwen3_5.cpp because nothing

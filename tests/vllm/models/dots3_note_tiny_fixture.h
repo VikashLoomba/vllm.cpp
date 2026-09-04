@@ -23,6 +23,7 @@
 #ifndef VLLM_TESTS_DOTS3_NOTE_TINY_FIXTURE_H_
 #define VLLM_TESTS_DOTS3_NOTE_TINY_FIXTURE_H_
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -153,6 +154,73 @@ struct TinySpec {
   int64_t v_adapter_out_override = 0;
   int64_t v_adapter_merge_override = 0;
 
+  // ── the AUDIO tower (W7a, #2703) ───────────────────────────────────────────
+  //
+  // Every dimension is the smallest that still exercises the branch it stands
+  // for, and three of them are load-bearing for a specific defect:
+  //
+  //   * `a_mels` 16 folds to `freq_after` 2 (16 -> 8 -> 4 -> 2), NOT 1. At 1 the
+  //     regroup `x.permute(0,3,1,2).reshape(B, T, C*F)` has a single frequency
+  //     per channel and a channel-major-versus-frequency-major mix-up cannot
+  //     show. At 2 it can.
+  //   * `a_d_model` 16 over `a_heads` 2 gives head_dim 8 and, at
+  //     `partial_rotary_factor` 0.5, a rotary_dim of 4 — TWO frequencies, so
+  //     `theta` matters, and FOUR untouched trailing dims, so a port that
+  //     rotated the whole head moves the answer.
+  //   * `a_ffn` 6 against `a_d_model` 16 makes `fc1` [12, 16] and `fc2` [16, 6]:
+  //     not square, and not the same width as anything in the vision tower, so
+  //     a transposed or mis-merged gate/up operand refuses on shape.
+  //
+  // `a_chunk_seconds` 1 makes the padded chunk 16000 samples and 100 mel
+  // frames, which is what lets a served request carry a real WAV. The FIXTURE
+  // CLIP is half of that (`kAudioSamples`), and §4.14 records why that matters:
+  // it leaves 50 valid mel frames of 100, so all four temporal-mask stages have
+  // something to zero AND every one of them reaches a KEPT token. See
+  // `kAudioTokens`.
+  bool with_audio = false;
+  int64_t a_d_model = 16;
+  int64_t a_heads = 2;
+  int64_t a_layers = 2;
+  int64_t a_ffn = 6;
+  int64_t a_mels = 16;
+  int64_t a_dhs = 6;        // downsample_hidden_size
+  int64_t a_chunk_seconds = 1;
+  int64_t a_max_source_positions = 64;
+  double a_partial_rotary_factor = 0.5;
+  double a_rope_theta = 97.0;   // not 10000: a wrong theta has to MOVE the answer
+  // The adapter lands in the TEXT hidden space; anything else cannot be
+  // scattered into the prompt. Zero means "follow the conformant value".
+  int64_t a_adapter_out_override = 0;
+  // The arms W7a refuses BY NAME, settable so a case can build a checkpoint
+  // that selects one and assert the refusal names it.
+  bool a_use_causal = false;
+  bool a_use_conv2d_stem = true;
+  bool a_use_rms_norm = true;
+  bool a_use_rope = true;
+  int64_t a_merge_factor = 1;
+  std::string a_encoder_type = "dots";
+  std::string a_activation_function = "swiglu";
+
+  int64_t a_head_dim() const { return a_d_model / a_heads; }
+  int64_t a_rotary_dim() const {
+    const int64_t r = static_cast<int64_t>(
+        static_cast<double>(a_head_dim()) * a_partial_rotary_factor);
+    return (r / 2) * 2;
+  }
+  int64_t a_freq_after() const {
+    int64_t f = a_mels;
+    for (int i = 0; i < 3; ++i) f = (f + 1) / 2;
+    return f;
+  }
+  int64_t a_fc1_out() const {
+    return a_activation_function == "swiglu" ? 2 * a_ffn : a_ffn;
+  }
+  int64_t a_adapter_out() const {
+    return a_adapter_out_override > 0 ? a_adapter_out_override : hidden;
+  }
+  int64_t a_chunk_samples() const { return a_chunk_seconds * 16000; }
+  int64_t a_chunk_mel_frames() const { return a_chunk_seconds * 100; }
+
   int64_t v_head_dim() const { return v_embed / v_heads; }
   int64_t v_patch_row() const {
     return v_channels * v_temporal * v_patch * v_patch;
@@ -184,6 +252,57 @@ inline constexpr int32_t kImgEndId = 16;
 // 16 / (2*2) = FOUR placeholder tokens.
 inline constexpr int64_t kImageSide = 8;
 inline constexpr int64_t kExpectedImageTokens = 4;
+
+// The three AUDIO marker ids (W7a, #2703). They are the tokenizer fixture's
+// ADDED tokens in the server gate, and they are DELIBERATELY NOT CONSECUTIVE IN
+// start/pad/end ORDER: the released `dots-studio/dots3-note-prev` carries
+// `<|audio_comp_start|>` 151718, `<|audio_comp_end|>` 151719 and
+// `<|audio_comp_pad|>` 151720 — start, END, pad — so a port that guessed
+// "start, start+1, start+2" would swap the pad and end markers. The fixture
+// reproduces that ORDER so the guess is wrong here too.
+inline constexpr int32_t kAudStartId = 17;
+inline constexpr int32_t kAudEndId = 18;
+inline constexpr int32_t kAudPadId = 19;
+
+// The fixture clip: 8000 samples at 16 kHz = 0.5 s, against a 1-second chunk.
+// That ratio is the point of it, and §4.14 works it through: 8000 // 160 = 50
+// valid mel frames of the padded 100, halving to 25, 13 and 7, while
+// `ceil(8000 / 1280)` is 7 tokens against a stem output of 13. So the padded
+// tail is HALF the chunk, all four mask stages have something to zero, and each
+// stage reaches a KEPT token through the 3x3 receptive fields — stage 3 through
+// token 6 directly, stage 2 through conv3's read of t=13, stage 1 through
+// conv2's read of t=25, stage 0 through conv1's read of mel t=50.
+//
+// A clip filling the whole chunk would mask NOTHING and the strongest assertion
+// in the audio gate would be measuring an identity.
+inline constexpr int64_t kAudioSamples = 8000;
+inline constexpr int64_t kAudioTokens = 7;
+inline constexpr int64_t kAudioStemFrames = 13;
+
+// ── W7b (#2797): the MULTI-CHUNK geometry ──────────────────────────────────
+//
+// The default `a_chunk_seconds = 1` above CANNOT carry a multi-chunk case, and
+// that is a property of the arithmetic rather than of the fixture: 16000 is not
+// a whole number of 1280-sample token strides, so the tower's per-segment sum
+// `sum_i ceil(seg_i / 1280)` and the prompt side's one `ceil(total / 1280)`
+// disagree past one chunk (spec §4.15.3) and the port refuses BY NAME. Two
+// seconds is the smallest chunk that divides — `16000 * cs % 1280 == 0` iff
+// `cs` is EVEN — and it is what the multi-chunk cases set.
+//
+//   chunk = 32000 samples = 200 mel frames = 25 stem rows = 25 token strides
+//   clip  = 80000 samples = 5 s = 2.5 chunks -> 32000, 32000, 16000
+//   rows  = 25, 25, 13 = 63 = ceil(80000 / 1280)
+//
+// THREE chunks so a reversal is not a swap of two halves, and a SHORT last one
+// so the truncation back to `token_len` and the temporal mask on a partly
+// padded chunk are both exercised. A clip that were an exact multiple of the
+// chunk would mask nothing on its last chunk and truncate nothing.
+inline constexpr int64_t kAudioLongChunkSeconds = 2;
+inline constexpr int64_t kAudioLongSamples = 80000;
+inline constexpr int64_t kAudioLongChunks = 3;
+inline constexpr int64_t kAudioLongTokens = 63;
+inline constexpr int64_t kAudioLongFullChunkTokens = 25;
+inline constexpr int64_t kAudioLongLastChunkTokens = 13;
 
 // ── deterministic values ────────────────────────────────────────────────────
 inline uint64_t Mix(uint64_t x) {
@@ -335,9 +454,57 @@ inline nlohmann::json TinyConfigDoc(const std::string& fixture_dir,
   } else {
     d.erase("vision_config");
   }
-  // The AUDIO tower is W7's and this fixture ships none, so the key that would
-  // make the loader expect one is removed.
-  d.erase("audio_config");
+  // The AUDIO tower (W7a, #2703). A spec that does not ask for one ERASES the
+  // key, which is the state every case before W7a was in: `audio_config`
+  // absent means upstream builds no audio tower either
+  // (`nvidia/multimodal.py:119-126` @ `9035151d6`), so nothing is owed and the
+  // chat seam's ceiling does not declare "audio".
+  if (s.with_audio) {
+    nlohmann::json a = nlohmann::json::object();
+    nlohmann::json wc = nlohmann::json::object();
+    wc["d_model"] = s.a_d_model;
+    wc["encoder_attention_heads"] = s.a_heads;
+    wc["encoder_layers"] = s.a_layers;
+    wc["encoder_ffn_dim"] = s.a_ffn;
+    wc["num_mel_bins"] = s.a_mels;
+    wc["max_source_positions"] = s.a_max_source_positions;
+    wc["activation_function"] = s.a_activation_function;
+    a["whisper_config"] = wc;
+    a["encoder_type"] = s.a_encoder_type;
+    a["use_conv2d_stem"] = s.a_use_conv2d_stem;
+    a["use_rope"] = s.a_use_rope;
+    a["use_rms_norm"] = s.a_use_rms_norm;
+    a["use_causal"] = s.a_use_causal;
+    a["downsample_hidden_size"] = s.a_dhs;
+    a["merge_factor"] = s.a_merge_factor;
+    a["chunk_seconds"] = s.a_chunk_seconds;
+    a["sampling_rate"] = 16000;
+    a["whisper_adapter_in_dim"] = s.a_d_model;
+    a["whisper_adapter_out_dim"] = s.a_adapter_out();
+    // `rope_parameters` (`nvidia/audio.py:53-60` @ `9035151d6`). WRITTEN, not
+    // defaulted: without it `partial_rotary_factor` and `rope_theta` fall back
+    // to the struct's own values and a case that thinks it is testing a chosen
+    // theta is testing 10000.0 instead. The first version of this fixture
+    // omitted the key and the rope case caught it.
+    nlohmann::json rp = nlohmann::json::object();
+    rp["partial_rotary_factor"] = s.a_partial_rotary_factor;
+    rp["rope_theta"] = s.a_rope_theta;
+    a["rope_parameters"] = rp;
+    a["audio_comp_start"] = "<|audio_comp_start|>";
+    a["audio_comp_span"] = "<|audio_comp_pad|>";
+    a["audio_comp_end"] = "<|audio_comp_end|>";
+    // The three MEASURED-DEAD knobs, written in because the released config
+    // writes them: `Dots3NoteAudioConfig` copies all three onto the
+    // `WhisperConfig` (`nvidia/audio.py:160-165` @ `9035151d6`) and nothing in
+    // `audio_encoder.py` ever reads one. A fixture that omitted them could not
+    // show that they are inert.
+    a["conv_chunksize"] = 500;
+    a["conv_bucket_step"] = 10;
+    a["conv_bucket_max_elements"] = 20000;
+    d["audio_config"] = a;
+  } else {
+    d.erase("audio_config");
+  }
   return d;
 }
 
@@ -360,9 +527,18 @@ inline nlohmann::json TinyPreprocessorDoc(const TinySpec& s) {
 }
 
 inline nlohmann::json TinyAddedTokensDoc() {
+  // The AUDIO markers are ALWAYS written, whether or not the spec asks for an
+  // audio tower, because upstream reads this file for the IMAGE marker and a
+  // tokenizer's added tokens do not depend on which towers a config declares.
+  // The chat seam resolves the audio ids from the TOKENIZER rather than from
+  // here (`common/processor.py:757-760` @ `9035151d6`); this document exists so
+  // the image processor's own loader can find its three.
   return nlohmann::json{{"<|img|>", kImgStartId},
                         {"<|imgpad|>", kImgPadId},
-                        {"<|endofimg|>", kImgEndId}};
+                        {"<|endofimg|>", kImgEndId},
+                        {"<|audio_comp_start|>", kAudStartId},
+                        {"<|audio_comp_end|>", kAudEndId},
+                        {"<|audio_comp_pad|>", kAudPadId}};
 }
 
 // ── the tensors ─────────────────────────────────────────────────────────────
@@ -372,6 +548,67 @@ inline nlohmann::json TinyAddedTokensDoc() {
 // half is exactly what `EnumerateDots3NoteVisionTensors` claims for an all-dense
 // tower. A name this list gets wrong refuses the load by name rather than being
 // skipped, which is what makes the fixture self-checking.
+// The AUDIO half of the fixture checkpoint (W7a, #2703) — exactly what
+// `EnumerateDots3NoteAudioTensors` claims, and nothing else. A name this list
+// gets wrong refuses the load BY NAME rather than being skipped, which is what
+// makes the fixture self-checking, and the two places it is easiest to get
+// wrong are both here: `conv_out` ships NO bias (`audio_encoder.py:479` builds
+// it `bias=False`) and `k_proj` ships NO bias (`:221` builds it `bias=False`
+// while q, v and out take the default True). Adding either would make every
+// real checkpoint refuse.
+//
+// The generators are PASSED IN rather than rebuilt, so the audio tensors draw
+// from the SAME `next()` stream the language and vision halves do: two specs
+// that differ only in `with_audio` therefore differ in the audio tensors and in
+// nothing else that a shared counter could shift.
+template <typename Next, typename Norm, typename Proj>
+inline void AppendTinyAudioEntries(const TinySpec& s, std::vector<StOut>* out,
+                                   Next&& next, Norm&& norm, Proj&& proj) {
+  if (!s.with_audio) return;
+  std::vector<StOut>& e = *out;
+  const int64_t D = s.a_d_model, F = s.a_ffn, dhs = s.a_dhs;
+  const std::string se = "audio_encoder.dots_encoder.speech_encoder.";
+  e.push_back({se + "conv2d1.weight", {dhs, 1, 3, 3}, proj(dhs * 9)});
+  e.push_back({se + "conv2d1.bias", {dhs}, Values(dhs, next(), 0.2)});
+  e.push_back({se + "conv2d2.weight", {dhs, dhs, 3, 3}, proj(dhs * dhs * 9)});
+  e.push_back({se + "conv2d2.bias", {dhs}, Values(dhs, next(), 0.2)});
+  e.push_back({se + "conv2d3.weight", {dhs, dhs, 3, 3}, proj(dhs * dhs * 9)});
+  e.push_back({se + "conv2d3.bias", {dhs}, Values(dhs, next(), 0.2)});
+  const int64_t CF = dhs * s.a_freq_after();
+  e.push_back({se + "conv_out.weight", {D, CF}, proj(D * CF)});
+  for (int64_t l = 0; l < s.a_layers; ++l) {
+    const std::string p = se + "layers." + std::to_string(l) + ".";
+    e.push_back({p + "self_attn_layer_norm.weight", {D}, norm(D)});
+    e.push_back({p + "self_attn.q_proj.weight", {D, D}, proj(D * D)});
+    e.push_back({p + "self_attn.q_proj.bias", {D}, Values(D, next(), 0.2)});
+    e.push_back({p + "self_attn.k_proj.weight", {D, D}, proj(D * D)});
+    e.push_back({p + "self_attn.v_proj.weight", {D, D}, proj(D * D)});
+    e.push_back({p + "self_attn.v_proj.bias", {D}, Values(D, next(), 0.2)});
+    e.push_back({p + "self_attn.out_proj.weight", {D, D}, proj(D * D)});
+    e.push_back({p + "self_attn.out_proj.bias", {D}, Values(D, next(), 0.2)});
+    e.push_back({p + "final_layer_norm.weight", {D}, norm(D)});
+    // The PACKED SwiGLU pair, gate then up, plus the bias that made W7a extend
+    // `layers::MlpGateUpMethodBase`. AMPLITUDE 0.5 rather than 0.1: a bias too
+    // small to move `silu(gate) * up` would leave a gate on a dropped bias
+    // measuring nothing.
+    e.push_back({p + "fc1.weight", {s.a_fc1_out(), D}, proj(s.a_fc1_out() * D)});
+    e.push_back({p + "fc1.bias", {s.a_fc1_out()},
+                 Values(s.a_fc1_out(), next(), 0.5)});
+    e.push_back({p + "fc2.weight", {D, F}, proj(D * F)});
+    e.push_back({p + "fc2.bias", {D}, Values(D, next(), 0.5)});
+  }
+  e.push_back({se + "layer_norm.weight", {D}, norm(D)});
+  const std::string ad = "audio_encoder.audio_adapter.proj.";
+  const int64_t AO = s.a_adapter_out();
+  // `proj.0` is a LAYERNORM, so it ships a weight AND a bias, both [in_dim].
+  e.push_back({ad + "0.weight", {D}, norm(D)});
+  e.push_back({ad + "0.bias", {D}, Values(D, next(), 0.1)});
+  e.push_back({ad + "1.weight", {AO, D}, proj(AO * D)});
+  e.push_back({ad + "1.bias", {AO}, Values(AO, next(), 0.1)});
+  e.push_back({ad + "3.weight", {AO, AO}, proj(AO * AO)});
+  e.push_back({ad + "3.bias", {AO}, Values(AO, next(), 0.1)});
+}
+
 inline std::vector<StOut> TinyEntries(const TinySpec& s, uint64_t seed = 7) {
   const int64_t H = s.hidden, N = s.heads, QK = s.qk_head_dim();
   std::vector<StOut> e;
@@ -419,7 +656,10 @@ inline std::vector<StOut> TinyEntries(const TinySpec& s, uint64_t seed = 7) {
     e.push_back({p + "mlp.down_proj.weight", {H, s.inter}, proj(H * s.inter)});
   }
 
-  if (!s.with_vision) return e;
+  if (!s.with_vision) {
+    AppendTinyAudioEntries(s, &e, next, norm, proj);
+    return e;
+  }
 
   const int64_t E = s.v_embed, VI = s.v_inter, D = s.v_head_dim();
   const std::string vp = "vision_encoder.";
@@ -486,6 +726,7 @@ inline std::vector<StOut> TinyEntries(const TinySpec& s, uint64_t seed = 7) {
     e.push_back({vp + "adapter.proj.1.bias", {O}, Values(O, next(), 0.1)});
     e.push_back({vp + "adapter.proj.3.weight", {O, O}, proj(O * O)});
     e.push_back({vp + "adapter.proj.3.bias", {O}, Values(O, next(), 0.1)});
+    AppendTinyAudioEntries(s, &e, next, norm, proj);
     return e;
   }
   e.push_back({vp + "adapter.ln_q.weight", {E}, norm(E)});
@@ -494,6 +735,7 @@ inline std::vector<StOut> TinyEntries(const TinySpec& s, uint64_t seed = 7) {
   e.push_back({vp + "adapter.mlp.0.bias", {M}, Values(M, next(), 0.1)});
   e.push_back({vp + "adapter.mlp.2.weight", {O, M}, proj(O * M)});
   e.push_back({vp + "adapter.mlp.2.bias", {O}, Values(O, next(), 0.1)});
+  AppendTinyAudioEntries(s, &e, next, norm, proj);
   return e;
 }
 
@@ -631,6 +873,190 @@ inline std::vector<uint8_t> FixtureImageHW(int64_t h, int64_t w, int variant) {
     }
   }
   return rgb;
+}
+
+// ── the fixture AUDIO clip (W7a, #2703) ─────────────────────────────────────
+//
+// `kAudioSamples` int16 samples at 16 kHz, mono. `variant` picks a genuinely
+// DIFFERENT waveform rather than a shifted one — a chirp whose frequency
+// sweeps against a two-tone beat — so the two disagree in every mel band and in
+// every frame. A shifted copy of one signal would leave a tower that ignored
+// its input looking correct on the LOGPROB case, which is the case that carries
+// this brick.
+inline std::vector<int16_t> FixtureAudioPcm16(int variant) {
+  std::vector<int16_t> pcm(static_cast<size_t>(kAudioSamples));
+  for (int64_t i = 0; i < kAudioSamples; ++i) {
+    const double t = static_cast<double>(i) / 16000.0;
+    double v;
+    if (variant == 0) {
+      // A linear chirp, 200 Hz -> 3200 Hz over the clip.
+      const double f = 200.0 + 6000.0 * t;
+      v = 0.6 * std::sin(2.0 * 3.14159265358979323846 * f * t);
+    } else {
+      // Two fixed tones that beat against each other.
+      v = 0.35 * std::sin(2.0 * 3.14159265358979323846 * 440.0 * t) +
+          0.35 * std::sin(2.0 * 3.14159265358979323846 * 523.25 * t);
+    }
+    const double clipped = v < -1.0 ? -1.0 : (v > 0.999 ? 0.999 : v);
+    pcm[static_cast<size_t>(i)] =
+        static_cast<int16_t>(std::lround(clipped * 32767.0));
+  }
+  return pcm;
+}
+
+// The MULTI-CHUNK clip (W7b, #2797): `n` samples of a signal whose content
+// changes across the whole clip, so two different chunks of it are two
+// different waveforms and a concatenation in the wrong ORDER cannot alias with
+// the right one.
+//
+// A SEPARATE GENERATOR rather than a longer `FixtureAudioPcm16`, deliberately:
+// that one's chirp sweeps 200 Hz -> 3200 Hz over ITS 0.5 s, so stretching it to
+// 5 s would either change the 0.5 s clip every W7a case is gated on or sweep
+// past Nyquist. This one scales the sweep to the clip it is asked for.
+inline std::vector<int16_t> FixtureAudioPcm16Long(int variant, int64_t n) {
+  std::vector<int16_t> pcm(static_cast<size_t>(n));
+  const double dur = static_cast<double>(n) / 16000.0;
+  for (int64_t i = 0; i < n; ++i) {
+    const double t = static_cast<double>(i) / 16000.0;
+    double v;
+    if (variant == 0) {
+      // A linear chirp, 200 Hz -> 3200 Hz over the WHOLE clip, so every chunk
+      // sits in a different band.
+      const double f = 200.0 + 3000.0 * t / dur;
+      v = 0.6 * std::sin(2.0 * 3.14159265358979323846 * f * t);
+    } else {
+      // The sweep run the other way, plus a fixed tone: a genuinely different
+      // signal in every chunk and not a shifted copy of variant 0.
+      const double f = 3200.0 - 3000.0 * t / dur;
+      v = 0.4 * std::sin(2.0 * 3.14159265358979323846 * f * t) +
+          0.3 * std::sin(2.0 * 3.14159265358979323846 * 261.63 * t);
+    }
+    const double clipped = v < -1.0 ? -1.0 : (v > 0.999 ? 0.999 : v);
+    pcm[static_cast<size_t>(i)] =
+        static_cast<int16_t>(std::lround(clipped * 32767.0));
+  }
+  return pcm;
+}
+
+// Any PCM16 buffer as a canonical little-endian MONO RIFF/WAVE file. Factored
+// out of `FixtureAudioWav` below by W7b so the multi-chunk clip reaches the
+// served path through the SAME writer, byte for byte, rather than a second one.
+inline std::vector<uint8_t> FixtureWavFromPcm16(const std::vector<int16_t>& pcm,
+                                                int sample_rate = 16000,
+                                                int channels = 1) {
+  const uint32_t data_bytes = static_cast<uint32_t>(pcm.size() * 2);
+  std::vector<uint8_t> out;
+  const auto put_str = [&out](const char* s4) {
+    for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(s4[i]));
+  };
+  const auto put_u32 = [&out](uint32_t v) {
+    for (int i = 0; i < 4; ++i)
+      out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+  };
+  const auto put_u16 = [&out](uint16_t v) {
+    for (int i = 0; i < 2; ++i)
+      out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+  };
+  put_str("RIFF");
+  put_u32(36 + data_bytes);
+  put_str("WAVE");
+  put_str("fmt ");
+  put_u32(16);
+  put_u16(1);  // PCM
+  put_u16(static_cast<uint16_t>(channels));
+  put_u32(static_cast<uint32_t>(sample_rate));
+  put_u32(static_cast<uint32_t>(sample_rate * channels * 2));  // byte rate
+  put_u16(static_cast<uint16_t>(channels * 2));                // block align
+  put_u16(16);                                                 // bits
+  put_str("data");
+  put_u32(data_bytes);
+  for (int16_t v : pcm) put_u16(static_cast<uint16_t>(v));
+  return out;
+}
+
+// The 0.5 s clip as that same container, which is the ONE this port decodes
+// (`DecodeWavPcm16Mono`). `sample_rate` and `channels` are parameters so a case
+// can build a deliberately non-conformant file and assert the refusal names
+// W7c.
+inline std::vector<uint8_t> FixtureAudioWav(int variant, int sample_rate = 16000,
+                                            int channels = 1) {
+  return FixtureWavFromPcm16(FixtureAudioPcm16(variant), sample_rate, channels);
+}
+
+// The MULTI-CHUNK clip as the same container (W7b, #2797).
+inline std::vector<uint8_t> FixtureAudioWavLong(int variant, int64_t n) {
+  return FixtureWavFromPcm16(FixtureAudioPcm16Long(variant, n));
+}
+
+// ── the STEREO clip (W7c-1, #2813) ──────────────────────────────────────────
+//
+// TWO GENUINELY DIFFERENT CHANNELS WHOSE MEAN IS EXACTLY VARIANT 0. Left is
+// `m + d` and right is `m - d`, where `m` is `FixtureAudioPcm16(0)` — the chirp
+// every W7a case already serves — and `d` is a QUARTER of the two-tone beat of
+// variant 1. So `(L[i] + R[i]) / 2 == m[i]` for every i, with no rounding at
+// all: the sum is `2 * m[i]`, an even integer.
+//
+// WHY THAT CONSTRUCTION AND NOT TWO ARBITRARY SIGNALS. The mean of two
+// arbitrary int16 channels is not an int16, so it could not be fed back through
+// a WAV to compare against. This one makes the EXPECTED mono waveform a clip
+// the suite already knows how to send, which turns "the mean is right" into an
+// equality between two SERVED requests rather than into a tolerance.
+//
+// NO CLIPPING IS POSSIBLE, which matters because a clip would break the
+// equality silently: |m| <= 0.6 * 32767 = 19660 and |d| <= 0.7 * 32767 / 4 =
+// 5734, so |m +- d| <= 25394, well inside int16.
+inline void FixtureAudioPcm16StereoChannels(std::vector<int16_t>* left,
+                                            std::vector<int16_t>* right) {
+  const std::vector<int16_t> m = FixtureAudioPcm16(0);
+  const std::vector<int16_t> beat = FixtureAudioPcm16(1);
+  left->resize(m.size());
+  right->resize(m.size());
+  for (size_t i = 0; i < m.size(); ++i) {
+    const int d = static_cast<int>(beat[i]) / 4;
+    (*left)[i] = static_cast<int16_t>(static_cast<int>(m[i]) + d);
+    (*right)[i] = static_cast<int16_t>(static_cast<int>(m[i]) - d);
+  }
+}
+
+// Those two channels INTERLEAVED, which is the frame order a `data` chunk
+// carries: L0 R0 L1 R1 ... The buffer is 2N int16 for N frames, so the file has
+// the SAME frame count as the mono clip and expands to the same placeholders.
+inline std::vector<int16_t> FixtureAudioPcm16StereoInterleaved() {
+  std::vector<int16_t> l, r;
+  FixtureAudioPcm16StereoChannels(&l, &r);
+  std::vector<int16_t> out(l.size() * 2);
+  for (size_t i = 0; i < l.size(); ++i) {
+    out[2 * i] = l[i];
+    out[2 * i + 1] = r[i];
+  }
+  return out;
+}
+
+// The stereo clip as a 2-channel PCM16 RIFF/WAVE file, through the SAME writer
+// every other audio case uses.
+inline std::vector<uint8_t> FixtureAudioWavStereo() {
+  return FixtureWavFromPcm16(FixtureAudioPcm16StereoInterleaved(), 16000,
+                             /*channels=*/2);
+}
+
+// The clip as the DECODER would produce it: `int16 / 32768.0`. Used by the
+// tower gate so its reference is driven from the same quantized samples the
+// served path sees, rather than from the float signal before rounding.
+inline std::vector<float> FixtureAudioF32(int variant) {
+  const std::vector<int16_t> pcm = FixtureAudioPcm16(variant);
+  std::vector<float> out(pcm.size());
+  for (size_t i = 0; i < pcm.size(); ++i)
+    out[i] = static_cast<float>(pcm[i]) / 32768.0f;
+  return out;
+}
+
+// The MULTI-CHUNK clip as the decoder would produce it (W7b, #2797).
+inline std::vector<float> FixtureAudioLongF32(int variant, int64_t n) {
+  const std::vector<int16_t> pcm = FixtureAudioPcm16Long(variant, n);
+  std::vector<float> out(pcm.size());
+  for (size_t i = 0; i < pcm.size(); ++i)
+    out[i] = static_cast<float>(pcm[i]) / 32768.0f;
+  return out;
 }
 
 }  // namespace dots3_tiny

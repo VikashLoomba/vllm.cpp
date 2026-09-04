@@ -821,9 +821,58 @@ run with `VT_FP4_AUTOTUNE_VERBOSE=1` even though a frozen leg should print none
 
 ## Owed
 
-- [#2751](https://github.com/mudler/vllm.cpp/issues/2751) -- the draw-quality
-  measurement itself. The harness and these thresholds land here; the run is
-  owed to an operator with a lease.
-- [#2752](https://github.com/mudler/vllm.cpp/issues/2752) -- the pinned GB10
-  draw. Blocked on #2751 by its own blocked-by consideration and by the shipping
-  rule above; nothing is committed until #2751 returns `EQUIVALENT`.
+### A pinned GB10 draw, so that a fresh checkout does not re-tune (#2752)
+
+The tree ships the persistent-cache machinery and no cache document.
+`src/vt/cuda/nvfp4_persistent_cache.cpp::ResolvePersistentCacheOptions` defaults
+the cache on and resolves it under
+`${XDG_CACHE_HOME:-$HOME/.cache}/vllm.cpp/nvfp4_autotune/...`, so every fresh
+checkout on every host tunes all 64 plans on its first serve and keeps whatever
+draw it drew. The tree carries no committed artifact and no way to get one, so
+the reproducibility control this row built reaches only a host that has already
+run once.
+
+[Issue #2752](https://github.com/mudler/vllm.cpp/issues/2752) owes:
+
+- one native-format GB10 draw for `sm_121`, measured under a lease, with its
+  SHA-256
+- its `src/vt/cuda/nvfp4_persistent_cache.cpp::PersistentCacheMetadataFingerprint`
+  value recorded beside it, so that a reader can check the identity without
+  running the engine
+- the install step, documented in [`docs/USAGE.md`](../../docs/USAGE.md) beside
+  the operating section this row landed for
+  [#2754](https://github.com/mudler/vllm.cpp/issues/2754)
+- a statement that the draw is a starting point for that exact configuration and
+  not a guarantee
+
+The debt is this row's, and not a documentation row's, because the capability
+landed reachable and default-on here.
+
+The artifact is a reproducibility and warmup control, and not a speed artifact.
+The measured frozen-plan steady-state component on this lane is 1.0045x at c2
+and 1.0050x at c16, and the strict result FAILED at 39 of 40 timing axes and 1
+of 8 memory axes, as
+[§ "W3-C3 corrected frozen-plan component result"](#w3-c3-corrected-frozen-plan-component-result-2026-07-13)
+records. A claim past that needs its own measurement.
+
+The path identity already closes the mismatch mode that an installed artifact
+could otherwise introduce.
+`src/vt/cuda/nvfp4_persistent_cache.cpp::ValidateMetadataMatch` compares every
+keyed field against the running configuration, so a draw installed onto a host
+it does not describe is rejected rather than silently used.
+
+**Blocked-by consideration.** If the draw-quality investigation on this row
+finds that draws differ materially in speed, which draw the tree ships stops
+being arbitrary, and this item waits for that answer rather than pinning a lucky
+or unlucky sample.
+
+### The draw-quality survey itself (#2751)
+
+[Issue #2751](https://github.com/mudler/vllm.cpp/issues/2751) owes the run, not
+the harness. `scripts/dgx-gemm-tactic-draw-survey.sh` and the thresholds in
+`## W3-F` above land with this change; the measurement is owed to an operator
+with a `dgx:gpu0` lease.
+
+The two debts are ordered. The pinned draw above is blocked on this survey:
+until #2751 returns `EQUIVALENT`, which draw we would ship is not a settled
+question, and nothing is committed.

@@ -6862,6 +6862,7 @@ into a 500.
 | non-16-bit PCM, a non-PCM `fmt`, a zero channel count, a malformed chunk walk | this row | `audio_processor.cpp`, `ParseWavPcm16` |
 | a non-positive sample rate | this row | `ResampleAudioScipy` |
 | a reduced ratio whose `max(up, down)` exceeds `kMaxPolyphaseRate` | this row, and it is a **DIVERGENCE** — see below | `ResampleAudioScipy` |
+| a reduced `up/down` above `kMaxUpsampleRatio` | this row, and it is a **DIVERGENCE** — see below | `ResampleAudioScipy` |
 | `use_causal`, `use_conv1d_stem` (`use_conv2d_stem = false`), `use_latent_input`, `merge_factor != 1`, a non-`dots` `encoder_type` | this row, unchanged by this slice | `Dots3NoteAudioRefusal` |
 | upstream's `pyav`/libswresample arm, permanently | nobody — §4.17.1 is the reason, and it does not expire | this section |
 
@@ -6877,6 +6878,46 @@ the design at ~2M taps / ~16 MB, and every real rate reduces far below it
 gives 44101). The refusal names the bound, the reason, and that upstream has
 none. It is gated in both directions: a rate just past it refuses, and 44.1 kHz
 serves.
+
+**The filter bound is not an output bound, and the gap was a denial of service
+([#2842](https://github.com/mudler/vllm.cpp/issues/2842) F2).** `up` is
+`target_sr / gcd`, so on a 16 kHz target it can never exceed 16000. A `fmt `
+chunk declaring 1 Hz therefore reduces to `up/down = 16000/1`: `max(up, down)`
+is 16000, it sails under the 100000 filter bound, it designs a cheap filter —
+and then it asks for sixteen thousand output samples per input sample. Measured
+against `libvllm.a` at `0c440b6c3`:
+
+| `orig_sr` | `n_in` | verdict | `n_out` | wall |
+|---|---|---|---|---|
+| 1 | 20000 | ACCEPTED | 320000000 (1220.7 MB) | 2.301 s |
+| 2 | 40000 | ACCEPTED | 320000000 (1220.7 MB) | 2.439 s |
+| 999983 | 1000 | REFUSED (`kMaxPolyphaseRate`) | — | — |
+
+Under `ulimit -v 900000` the 1 Hz call threw `std::bad_alloc`, which is a bare
+`std::exception` and NOT `InputValidationError`, so the server answered **HTTP
+500 for a property of the REQUEST** — exactly what the table above and the
+route's own comment say must not happen. `ParseWavPcm16` applies no rate floor
+and W7b lifted the length ceiling, so nothing upstream of the seam bounded it.
+Before W7c-2 the path did not exist, because every rate but 16000 was a 400: the
+guard closes a regression W7c-2 introduced.
+
+**The second bound is on the RATIO, and it has to be.** `up` alone cannot
+separate the two cases: a coprime 44101 Hz is a DOWNsample this seam serves, and
+gates that it serves, and it also reduces to `up = 16000`. `up/down` separates
+them completely — 0.363 against 16000. Bounding the ratio also never refuses a
+long clip, because it bounds the output as a multiple of an input the client
+already paid to upload, rather than as an absolute length.
+
+`kMaxUpsampleRatio = 8` is **four times the largest ratio this row serves**. The
+highest real upsample into 16 kHz is telephony's `8000 -> 16000 = 2`; 11025
+gives 1.451, and every rate at or above the target gives less than 1. The bound
+admits any source rate down to 2000 Hz on a 16 kHz target and an 8 kHz source on
+a 48 kHz one, and it caps the seam's allocation at 32 bytes per input sample. It
+is gated in both directions ONE HERTZ APART, at the unit seam and over HTTP:
+2000 Hz reduces to 8/1 and serves, 1999 Hz is coprime with 16000, reduces to
+16000/1999 = 8.004, and refuses. The served case also asserts the body does NOT
+name §4.15.3's chunk refusal, which is what separates "refused" from "refused
+after allocating 16000000 samples" — that is precisely what the RED-before did.
 
 
 #### 4.17.11 The gate, measured

@@ -52,6 +52,36 @@ namespace vllm::multimodal {
 // 44101 Hz gives 44101.
 inline constexpr int kMaxPolyphaseRate = 100000;
 
+// THE FILTER BOUND IS NOT AN OUTPUT BOUND, and #2842 found the gap. `up` is
+// `target_sr / gcd`, so on a 16 kHz target it can never exceed 16000: a `fmt `
+// chunk declaring 1 Hz reduces to `up/down = 16000/1`, sails under
+// `kMaxPolyphaseRate`, designs a cheap filter — and then asks for SIXTEEN
+// THOUSAND output samples per input sample. Measured on the unguarded tree, a
+// 40 KB `data` chunk produced a 1220.7 MB buffer in 2.301 s; under
+// `ulimit -v 900000` the same call threw `std::bad_alloc`, which is a bare
+// `std::exception` and NOT `vllm::v1::InputValidationError`, so the server
+// answered HTTP 500 for a property of the REQUEST.
+//
+// SO THE SECOND BOUND IS ON THE RATIO, not on `max(up, down)` and not on `up`
+// alone. `up` cannot separate the two cases: a coprime 44101 Hz — a DOWNsample
+// this seam serves, and gates that it serves — also reduces to `up = 16000`.
+// `up/down` separates them completely: 44101 gives 0.363 and 1 Hz gives 16000.
+// Bounding the RATIO also never refuses a long clip, because it bounds the
+// output as a multiple of an input the client already paid to upload.
+//
+// 8 IS FOUR TIMES THE LARGEST RATIO THIS ROW SERVES. The highest real
+// upsample into 16 kHz is telephony's 8000 -> 16000 = 2; 11025 gives 1.451 and
+// every rate at or above the target gives less than 1. The bound admits any
+// source rate down to 2000 Hz on a 16 kHz target, and an 8 kHz source on a
+// 48 kHz one, and it caps this seam's allocation at 32 bytes per input sample.
+// It is gated in BOTH directions one hertz apart: 2000 Hz reduces to 8/1 and
+// serves, 1999 Hz reduces to 16000/1999 = 8.004 and refuses.
+//
+// LIKE `kMaxPolyphaseRate`, THIS IS A DELIBERATE DIVERGENCE. Upstream has no
+// such guard because upstream is not reached from an HTTP request body. See
+// `.agents/specs/dots3-note.md` §4.17.10.
+inline constexpr int kMaxUpsampleRatio = 8;
+
 // `resample_audio_scipy(audio, orig_sr=..., target_sr=...)`.
 //
 // Returns the input unchanged when the two rates are equal, exactly as upstream
@@ -70,7 +100,8 @@ inline constexpr int kMaxPolyphaseRate = 100000;
 //
 // Throws `vllm::v1::InputValidationError` — the rate is a property of the
 // REQUEST, so the server answers HTTP 400 rather than 500 — when a rate is not
-// positive, or when the reduced ratio exceeds `kMaxPolyphaseRate`.
+// positive, when the reduced `max(up, down)` exceeds `kMaxPolyphaseRate`, or
+// when the reduced `up/down` exceeds `kMaxUpsampleRatio`.
 std::vector<float> ResampleAudioScipy(const float* samples, int64_t num_samples,
                                       int orig_sr, int target_sr);
 

@@ -2897,4 +2897,40 @@ TEST_CASE("dots3-note W7c-2: the seam REFUSES a rate it will not design a filter
       CHECK(resample(sr, 16000).empty());
     }
   }
+
+  SUBCASE("an UPSAMPLE ratio past `kMaxUpsampleRatio`, which is a SECOND bound") {
+    // `kMaxPolyphaseRate` BOUNDS THE FILTER AND NOT THE OUTPUT, and the two
+    // come apart at a LOW `orig_sr`. `up` is `target_sr / gcd`, so it can never
+    // exceed 16000 on this row; a 1 Hz `fmt ` chunk therefore reduces to
+    // `max(up, down) = 16000`, sails under the 100000 filter bound, and asks
+    // for `16000 *` the input in OUTPUT samples. Measured on the unguarded
+    // tree: 20000 input samples became 320000000 output samples, 1220.7 MB, in
+    // 2.301 s -- and TWICE per request, because the route resampled once for
+    // the features and again for the hash. Under `ulimit -v 900000` the same
+    // call threw `std::bad_alloc`, which is a bare `std::exception` and NOT
+    // `InputValidationError`, so the server answered HTTP 500 for a property
+    // of the REQUEST.
+    for (const int sr : {1, 2, 1999}) {
+      CAPTURE(sr);
+      const std::string msg = resample(sr, 16000);
+      INFO("message: ", msg);
+      CHECK(msg.find("output samples") != std::string::npos);
+      CHECK(msg.find("UPSTREAM HAS NO SUCH GUARD") != std::string::npos);
+      CHECK(msg.find("DIVERGENCE") != std::string::npos);
+      CHECK(msg.find("§4.17.10") != std::string::npos);
+    }
+    // The two bounds are INDEPENDENT and each catches what the other cannot.
+    // 999983 -> 16000 trips the filter bound at a ratio of 16000/999983, which
+    // is a DOWNsample; 1 -> 16000 trips this one at `max(up, down) = 16000`,
+    // which is well under the filter bound. Naming both keeps a future repair
+    // from folding them into one.
+    CHECK(resample(999983, 16000).find("100000") != std::string::npos);
+    CHECK(resample(1, 16000).find("100000") == std::string::npos);
+
+    // BOTH DIRECTIONS, one rate apart. 2000 Hz reduces to 8/1, which is the
+    // bound exactly and SERVES; 1999 Hz is coprime with 16000 and reduces to
+    // 16000/1999 = 8.004, which is just past it and REFUSES.
+    CHECK(resample(2000, 16000).empty());
+    CHECK(!resample(1999, 16000).empty());
+  }
 }

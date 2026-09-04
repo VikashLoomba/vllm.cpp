@@ -1423,6 +1423,55 @@ TEST_CASE("dots3-note W7c-1+W7c-2: the container refusal is NOT this row's, and 
             << "22050 Hz, " << t16 << " at 16000 Hz");
     CHECK(t22 == t16 - 2);
   }
+  SUBCASE("a PATHOLOGICAL low rate is refused BEFORE it allocates, and it is a 400") {
+    // #2842 F2. `kMaxPolyphaseRate` bounds `max(up, down)` -- the FILTER -- and
+    // NOT the output length, and the two come apart at a LOW `orig_sr`. `up` is
+    // `target_sr / gcd` and can never exceed 16000 here, so a `fmt ` chunk
+    // declaring 1 Hz reduces to 16000/1: it passes the filter bound and asks
+    // for 16000 output samples per input sample. Measured on the unguarded
+    // tree: a 40 KB `data` chunk produced a 1220.7 MB buffer in 2.301 s, TWICE
+    // per request, and under `ulimit -v 900000` it threw `std::bad_alloc` --
+    // a bare `std::exception`, so `handle_chat_completions` answered HTTP 500
+    // for a property of the REQUEST. Before W7c-2 every rate but 16000 was a
+    // 400 and this path did not exist, so it is a REGRESSION this row
+    // introduced and closes.
+    //
+    // A SHORT clip, deliberately: this fixture's `chunk_seconds` is 1, so
+    // 16000 is not a whole number of 1280-sample strides and anything past one
+    // chunk trips §4.15.3's refusal instead. 1000 frames keeps every rate in
+    // this subcase inside ONE chunk, so the only thing that can move the answer
+    // is the guard under test.
+    const std::vector<int16_t> full = dots3_tiny::FixtureAudioPcm16(0);
+    const std::vector<int16_t> pcm(full.begin(), full.begin() + 1000);
+    const auto serve = [&](int rate) {
+      return h.server.handle_chat_completions(
+          ChatBodyWithAudio(1, dots3_tiny::FixtureWavFromPcm16(pcm, rate), false)
+              .dump());
+    };
+
+    const ApiServer::DispatchResult r = serve(1);
+    INFO("body: ", r.body);
+    // NOT 500, and not an OOM: the rate is a property of the request.
+    CHECK(r.status == 400);
+    CHECK(r.body.find("output samples") != std::string::npos);
+    CHECK(r.body.find("UPSTREAM HAS NO SUCH GUARD") != std::string::npos);
+    CHECK(r.body.find("DIVERGENCE") != std::string::npos);
+    CHECK(r.body.find("§4.17.10") != std::string::npos);
+    // ...and it refused BEFORE the resample rather than after it. §4.15.3's
+    // multi-chunk refusal is downstream of the allocation, so a body naming it
+    // would mean the 16000000-sample buffer was built first. This assertion is
+    // the one that separates "refused" from "refused too late".
+    CHECK(r.body.find("chunks") == std::string::npos);
+
+    // BOTH DIRECTIONS, one hertz apart, over the SAME 1000 frames. 2000 Hz
+    // reduces to 8/1, which is `kMaxUpsampleRatio` exactly and serves; 1999 Hz
+    // is coprime with 16000 and reduces to 16000/1999 = 8.004, just past it.
+    CHECK(serve(2000).status == 200);
+    CHECK(serve(1999).status == 400);
+
+    // ...and the rate a real client sends is untouched by both bounds.
+    CHECK(serve(44100).status == 200);
+  }
   SUBCASE("a payload that is not a RIFF/WAVE buffer at all is refused, not decoded") {
     const std::vector<uint8_t> junk(2048, 0x41);
     const ApiServer::DispatchResult r = h.server.handle_chat_completions(

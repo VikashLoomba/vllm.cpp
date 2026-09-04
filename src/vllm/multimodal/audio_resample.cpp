@@ -141,6 +141,36 @@ void ValidateRates(int orig_sr, int target_sr) {
         ".agents/specs/dots3-note.md §4.17.10. Every ordinary rate reduces far "
         "below the bound (44100 -> 441, 48000 -> 3, 22050 -> 441, 8000 -> 2).");
   }
+  // THE BOUND ABOVE IS ON THE FILTER AND NOT ON THE OUTPUT (#2842). `up` is
+  // `target_sr / gcd` and can never exceed `target_sr`, so a LOW `orig_sr`
+  // gives a SMALL `max(up, down)` and a HUGE `up/down`: 1 -> 16000 reduces to
+  // 16000/1, passes the check above, and then asks for 16000 output samples
+  // per input sample. This one is on the RATIO, which is what actually sizes
+  // the allocation, and it is checked here rather than beside `n_out` so that
+  // nothing is allocated at all.
+  if (up > static_cast<int64_t>(kMaxUpsampleRatio) * down) {
+    throw v1::InputValidationError(
+        "audio resample: converting " + std::to_string(orig_sr) + " Hz to " +
+        std::to_string(target_sr) + " Hz reduces to a polyphase ratio of " +
+        std::to_string(up) + "/" + std::to_string(down) +
+        ", which turns every input sample into " + std::to_string(up) + "/" +
+        std::to_string(down) + " output samples. This port REFUSES a reduced "
+        "up/down above " + std::to_string(kMaxUpsampleRatio) +
+        " because the rate is named by the REQUEST, in a WAV `fmt ` chunk, and "
+        "an UPSAMPLE is an AMPLIFIER: a 40 KB `data` chunk declaring 1 Hz "
+        "produced a 1220.7 MB buffer in 2.301 s, and the `std::bad_alloc` that "
+        "follows under memory pressure is a bare `std::exception` rather than "
+        "an InputValidationError, so this would be answered 500 for a property "
+        "of the request. `kMaxPolyphaseRate` does NOT bound this, because it "
+        "bounds max(up, down) — the FILTER — and `up` cannot separate the two "
+        "cases: a coprime 44101 Hz, which this seam SERVES, also reduces to "
+        "up = 16000. UPSTREAM HAS NO SUCH GUARD and this is a recorded "
+        "DIVERGENCE, not a missing port: see .agents/specs/dots3-note.md "
+        "§4.17.10. Every ordinary rate reduces far below the bound "
+        "(44100 -> 160/441, 48000 -> 1/3, 22050 -> 320/441, 8000 -> 2/1, "
+        "44101 -> 16000/44101), and the bound admits any source rate down to "
+        "2000 Hz on a 16 kHz target.");
+  }
 }
 
 }  // namespace

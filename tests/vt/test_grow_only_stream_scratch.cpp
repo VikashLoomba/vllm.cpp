@@ -158,3 +158,133 @@ TEST_CASE("every concurrent caller on one stream gets a block at least its own s
     CHECK(pool.RetiredCount() + 1 == alloc.Allocations());
   }
 }
+
+// ---------------------------------------------------------------------------
+// The THREE-TABLE extension (#2837, BACKEND-ROCM-PTR-TABLE-RETIRE)
+//
+// `rocm_matmul_hipblaslt.hip` kept the A/B/C pointer tables `hipblasGemmBatchedEx`
+// needs as three separate hipMalloc'd buffers behind one shared `cap`, freed all
+// three on growth, and then read them back out of the shared map entry AFTER the
+// lock had been released -- so a concurrent grow freed the block another thread
+// was about to hipMemcpyAsync into.
+//
+// These cases hold the three guarantees the replacement makes: the tables do not
+// overlap, none is smaller than its caller asked for, and none is invalidated by
+// a later caller's growth. They run on a CPU-only runner for the same reason the
+// cases above do: the decision is portable and only the allocation is not.
+namespace {
+
+// The key is a DEVICE INDEX here, not a stream. The pool uses it as a map key
+// and nothing else, which is why one class serves both.
+using FakeDevice = int;
+
+}  // namespace
+
+TEST_CASE("triple slices one block into three non-overlapping tables") {
+  vt::GrowOnlyStreamTriple<FakeDevice> pool;
+  RecordingAllocator alloc(0);
+  auto call = [&](FakeDevice d, std::size_t per_table) {
+    return pool.Ensure(d, per_table, [&](std::size_t n) { return alloc.Allocate(n); });
+  };
+
+  const std::size_t per_table = 64 * sizeof(void*);
+  auto t = call(0, per_table);
+  REQUIRE(t.a != nullptr);
+  // ONE allocation, not three: a set of buffers behind one capacity can grow
+  // partially, and one block cannot.
+  CHECK(alloc.Allocations() == 1);
+  CHECK(alloc.CapacityOf(t.a) >= per_table * 3);
+
+  // Non-overlapping, in order, exactly one per_table apart. A stride bug here is
+  // silent on the device: the GEMM reads B's pointers out of A's array.
+  auto* a = static_cast<unsigned char*>(t.a);
+  auto* b = static_cast<unsigned char*>(t.b);
+  auto* c = static_cast<unsigned char*>(t.c);
+  CHECK(b == a + per_table);
+  CHECK(c == a + per_table * 2);
+  CHECK(pool.CapacityFor(0) >= per_table);
+
+  // Inside the capacity: the same three tables, no allocation.
+  auto again = call(0, per_table / 2);
+  CHECK(again.a == t.a);
+  CHECK(alloc.Allocations() == 1);
+
+  // Past it: one new block, and the old one is RETIRED, not freed.
+  auto grown = call(0, per_table * 4);
+  CHECK(grown.a != t.a);
+  CHECK(alloc.CapacityOf(grown.a) >= per_table * 12);
+  CHECK(alloc.Allocations() == 2);
+  // THE LIFETIME GUARANTEE, and exactly as much of it as this harness can see.
+  // The pool has no free path at all: growth pushes the old block onto the
+  // retired list and nothing ever hands it back to the allocator. So what is
+  // observable here is that the replaced block was RETAINED rather than dropped
+  // on the floor -- a pool that called hipFree instead would satisfy every other
+  // assertion in this case, and only this count separates the two. That is the
+  // limitation #2712 recorded in the same words, and it is why the device side
+  // of #2837 is also read rather than only run.
+  CHECK(pool.RetiredCount() == 1);
+  CHECK(alloc.Allocations() == 2);
+}
+
+TEST_CASE("triple keeps two devices independent") {
+  vt::GrowOnlyStreamTriple<FakeDevice> pool;
+  RecordingAllocator alloc(0);
+  auto call = [&](FakeDevice d, std::size_t per_table) {
+    return pool.Ensure(d, per_table, [&](std::size_t n) { return alloc.Allocate(n); });
+  };
+
+  auto zero = call(0, 32 * sizeof(void*));
+  auto one = call(1, 8 * sizeof(void*));
+  CHECK(zero.a != one.a);
+  // Growing device 0 must not republish device 1's tables.
+  call(0, 4096 * sizeof(void*));
+  CHECK(call(1, sizeof(void*)).a == one.a);
+}
+
+TEST_CASE("every concurrent caller on one device gets three tables at least its own size") {
+  // The #2712 case, on the triple. All threads contend on ONE device key with
+  // different batch sizes, which is the shape two hipblasGemmBatchedEx callers on
+  // one device produce.
+  constexpr int kThreads = 8;
+  constexpr int kRounds = 24;
+
+  for (int round = 0; round < kRounds; ++round) {
+    vt::GrowOnlyStreamTriple<FakeDevice> pool;
+    RecordingAllocator alloc(50);
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<int> bad{0};
+
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+      threads.emplace_back([&, t] {
+        const std::size_t per_table = static_cast<std::size_t>(t + 1) * 16 * sizeof(void*);
+        ready.fetch_add(1, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire)) {
+        }
+        auto tab = pool.Ensure(0, per_table,
+                               [&](std::size_t n) { return alloc.Allocate(n); });
+        if (tab.a == nullptr || alloc.CapacityOf(tab.a) < per_table * 3) {
+          bad.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+        // The three tables this caller was handed must lie inside the block this
+        // caller was handed, at this caller's stride.
+        auto* base = static_cast<unsigned char*>(tab.a);
+        if (static_cast<unsigned char*>(tab.b) != base + per_table ||
+            static_cast<unsigned char*>(tab.c) != base + per_table * 2) {
+          bad.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+    }
+    while (ready.load(std::memory_order_acquire) < kThreads) {
+    }
+    go.store(true, std::memory_order_release);
+    for (auto& th : threads) th.join();
+
+    CHECK(bad.load(std::memory_order_relaxed) == 0);
+    // Every block the pool replaced is retained, never dropped on the floor.
+    CHECK(pool.RetiredCount() + 1 == alloc.Allocations());
+  }
+}

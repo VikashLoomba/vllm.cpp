@@ -475,7 +475,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 616 618 1250 1346 1442 1458 1593 1597 1730 1813 1931 1973 2015 2017
+// 637 639 1271 1367 1463 1479 1614 1618 1751 1834 1952 1994 2036 2038
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -545,6 +545,27 @@ void RecordUpsampleWidth(Ltx2ConditioningTrace& trace, const Ltx2LatentVolume& l
   if (latent.dtype != vt::DType::kBF16) ++trace.upsample_wide_calls;
   trace.upsample_not_bf16 += CountWiderThanBf16(latent.data);
   trace.upsample_values += static_cast<int64_t>(latent.data.size());
+  // THE STORAGE, drained here because the call that produced `latent` is the
+  // only work that could have accumulated it. The two counters above are both
+  // value-shaped and neither can see a bf16 arm that reserved f32 bytes; this
+  // one is the byte count itself. See `Ltx2UpsamplerStorage`.
+  const Ltx2UpsamplerStorage storage = Ltx2TakeUpsamplerStorage();
+  trace.upsample_volumes += storage.volumes;
+  trace.upsample_volume_elems += storage.elems;
+  trace.upsample_volume_bytes += storage.bytes;
+  trace.upsample_param_views += storage.param_views;
+  trace.upsample_param_elems += storage.param_elems;
+  trace.upsample_param_bytes += storage.param_bytes;
+}
+
+// Elements of a whole weight bag, whichever arm holds it. `Ltx2VaeWeights` has
+// `Bytes()` and no element count, and the RATIO is what says "narrow": bytes
+// alone move with the fixture's size and would have to be quoted.
+int64_t VaeWeightElems(const Ltx2VaeWeights& weights) {
+  int64_t n = 0;
+  for (const auto& kv : weights.tensors) n += static_cast<int64_t>(kv.second.size());
+  for (const auto& kv : weights.bf16) n += static_cast<int64_t>(kv.second.size());
+  return n;
 }
 
 double AbsMax(const std::vector<float>& values) {
@@ -2767,6 +2788,20 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   const float* audio_context = im.audio_prompt_embeds.data();
   int64_t context_tokens = im.prompt_tokens;
   im.trace = Ltx2ConditioningTrace{};
+  // THE LOADED WIDTH OF EACH UPSAMPLER, recorded per render because there are
+  // TWO checkpoints and a counter over the render reports whichever one ran.
+  // `Load` asks both for `kBF16`; this is what says the file agreed, and it is
+  // the only thing standing between the temporal loader line and a silent revert
+  // to f32 -- which stayed green across 5638 assertions during this row's review.
+  if (im.has_upsampler) {
+    im.trace.upsampler_weight_elems = VaeWeightElems(im.upsampler_weights);
+    im.trace.upsampler_weight_bytes = static_cast<int64_t>(im.upsampler_weights.Bytes());
+  }
+  if (im.has_temporal_upsampler) {
+    im.trace.temporal_upsampler_weight_elems = VaeWeightElems(im.temporal_upsampler_weights);
+    im.trace.temporal_upsampler_weight_bytes =
+        static_cast<int64_t>(im.temporal_upsampler_weights.Bytes());
+  }
 
   if (!gen.prompt.empty()) {
     // W0: the phase #1269 and W4 are about. Split into the TOWER and the

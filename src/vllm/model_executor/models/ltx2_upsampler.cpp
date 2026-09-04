@@ -85,6 +85,30 @@ void RequireUpsamplerDType(vt::DType dtype) {
   }
 }
 
+// ─── THE STORAGE OBSERVABLE ──────────────────────────────────────────────────
+//
+// Declared at ltx2_upsampler.h's `Ltx2UpsamplerStorage`, where the reason lives:
+// a bf16 arm that sizes its buffers by `sizeof(float)` passes every value gate
+// this tree has, so the bytes have to be counted where they are reserved and
+// where they are read. It accumulates and the reader CLEARS, so a caller
+// brackets its own call and no byte is counted twice.
+//
+// `thread_local` and not a mutex: nothing in this file threads work, and a
+// shared counter would let two concurrent renders report each other's bytes.
+thread_local Ltx2UpsamplerStorage g_storage;
+
+void RecordVolumeBytes(int64_t elems, size_t bytes) {
+  ++g_storage.volumes;
+  g_storage.elems += elems;
+  g_storage.bytes += static_cast<int64_t>(bytes);
+}
+
+void RecordParamBytes(size_t elems, vt::DType read_width) {
+  ++g_storage.param_views;
+  g_storage.param_elems += static_cast<int64_t>(elems);
+  g_storage.param_bytes += static_cast<int64_t>(elems * vt::SizeOf(read_width));
+}
+
 // A [channels, frames, height, width] volume at batch 1 — the shape every stage
 // below operates on. Batch is carried by the caller loop.
 //
@@ -106,6 +130,11 @@ struct Volume {
   void Alloc() {
     RequireUpsamplerDType(dtype);
     bytes.assign(static_cast<size_t>(elems()) * vt::SizeOf(dtype), 0);
+    // What was RESERVED, read back off the vector rather than recomputed from
+    // `dtype`. Recomputing it here would be the tautology this instrument exists
+    // to avoid: it would report the intended width on a buffer that took the
+    // other one.
+    RecordVolumeBytes(elems(), bytes.size());
   }
   // Shape and WIDTH from another volume. A derived volume that picked its own
   // dtype would put a bf16 input through an f32 output and reinterpret the bytes
@@ -148,8 +177,19 @@ class WeightView {
     } else {
       f32_ = &weights.Get(name);
     }
+    // The bytes this view will be READ THROUGH, taken off `read_width()`, which
+    // dispatches on the same member `operator[]` does. That is what makes the
+    // number a measurement of the claim above rather than a restatement of the
+    // bag's `dtype`: a view that materialised a widened f32 copy would read
+    // through the copy, and would report f32's four bytes per element.
+    RecordParamBytes(size(), read_width());
   }
   size_t size() const { return bf16_ != nullptr ? bf16_->size() : f32_->size(); }
+  // The storage `operator[]` actually reads. Kept beside it, and derived from the
+  // same member, so the two cannot disagree.
+  vt::DType read_width() const {
+    return bf16_ != nullptr ? vt::DType::kBF16 : vt::DType::kF32;
+  }
   float operator[](size_t i) const {
     return bf16_ != nullptr ? vt::BF16ToF32((*bf16_)[i]) : (*f32_)[i];
   }
@@ -517,6 +557,12 @@ Volume BlurDownsample(const Volume& in, int64_t stride, int64_t kernel_size) {
 }
 
 }  // namespace
+
+Ltx2UpsamplerStorage Ltx2TakeUpsamplerStorage() {
+  const Ltx2UpsamplerStorage taken = g_storage;
+  g_storage = Ltx2UpsamplerStorage();
+  return taken;
+}
 
 Ltx2RationalScale Ltx2RationalForScale(double scale) {
   // spatial_rational_resampler.py:11-14, exactly this map and no nearest match.

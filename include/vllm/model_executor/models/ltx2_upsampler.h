@@ -118,7 +118,11 @@
 //         because the algorithm gate compares against upstream run in float32.
 //
 // The storage really is the width: `Volume` holds bytes at `dtype`, not an f32
-// buffer of narrowed values. Six rounding rules separate the two arms and each
+// buffer of narrowed values, and that sentence is MEASURED rather than asserted
+// -- `Ltx2UpsamplerStorage` below is the observable, because a build that keeps
+// every dtype field correct and sizes every buffer by `sizeof(float)` passes
+// every value gate and every dtype counter in this tree. Six rounding rules
+// separate the two arms and each
 // was measured against the executed module rather than read off it -- the
 // GroupNorm affine's single rounding, the f32 epsilon, SiLU's single rounding,
 // the residual add that rounds BEFORE the activation, the blur kernel's
@@ -231,6 +235,50 @@ struct Ltx2LatentVolume {
 
   int64_t elems() const { return batch * channels * frames * height * width; }
 };
+
+// ─── THE STORAGE OBSERVABLE (A24 wave 5, row LTX25-A24-UPSAMPLER-BF16, #2857) ─
+//
+// A24's deliverable is a WIDTH, and `Ltx2LatentVolume::dtype` above reports the
+// width a stage COMPUTED at, not the width it stored. Those are different
+// claims and only the first of them had a gate. The review of this row built the
+// difference and ran it: sizing every internal buffer by `sizeof(float)` while
+// still rounding each stored value to bf16 keeps every value, every golden and
+// every reported `dtype` bit-identical -- 9125 assertions, zero failures -- and
+// moves twice the bytes. That is exactly the polarity AGENTS.md names when it
+// says "a token gate cannot detect a dtype that is too wide".
+//
+// So the bytes are counted where they are actually allocated and read, and the
+// gate compares TWO RUNS on the same input rather than quoting a number: the
+// bf16 arm must be EXACTLY half the f32 arm's. This is the shape
+// `Ltx2VaeWeights::Bytes()` documents for the weight bag (ltx2_audio_vae.h:104-107)
+// applied to the one thing that bag does not cover, the upsampler's own
+// intermediate volumes.
+//
+// TWO COUNTS, because each catches a widening the other cannot see:
+//
+//   `volumes`/`elems`/`bytes` are the intermediate VOLUMES -- what `Volume::Alloc`
+//     really reserved. `bytes / elems` is the storage width, and it is 4 rather
+//     than 2 on a bf16 arm that widened its buffers.
+//   `param_views`/`param_elems`/`param_bytes` are the PARAMETERS, taken off the
+//     same member `WeightView::operator[]` dispatches on, so a view that
+//     materialises a widened f32 copy reports the width it reads THROUGH rather
+//     than the width the checkpoint is stored at. That is the claim "it is a
+//     view and not a widened copy" reduced to a number; at the shipped
+//     `mid_channels = 512` one convolution weight alone is 7.1 M parameters.
+//
+// Read-and-CLEAR, and per thread: the caller brackets its own call, so two
+// callers cannot read each other's bytes and a leftover cannot be counted twice.
+// Nothing in this file threads work, so a whole upsample accumulates on the
+// thread that asked for it.
+struct Ltx2UpsamplerStorage {
+  int64_t volumes = 0;
+  int64_t elems = 0;
+  int64_t bytes = 0;
+  int64_t param_views = 0;
+  int64_t param_elems = 0;
+  int64_t param_bytes = 0;
+};
+Ltx2UpsamplerStorage Ltx2TakeUpsamplerStorage();
 
 // LatentUpsampler.forward (model.py:82-126), the dims == 3 arms: spatial-only
 // (`[b, c, f, h, w] -> [b, c, f, 2h, 2w]` at scale 2.0) and temporal-only

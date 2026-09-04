@@ -6,104 +6,7 @@ Parent scope: `.agents/specs/ltx25-completion-scope.md` §A.7 (A24), operator-ow
 Wave 1: `.agents/specs/ltx25-a24-text-tower-bf16.md` (#2676, merge `8e582a5f9`)
 Wave 2: `.agents/specs/ltx25-a24-connector-bf16.md` (#2720, merge `77704c8d0`)
 Wave 3: `.agents/specs/ltx25-a24-video-vae-bf16.md` (#2786, merge `c20fb2ba2`)
-Wave 4: `.agents/specs/ltx25-a24-leaves-bf16.md` (#2850, merge `d2b1bda2b`) — this row is its `## Outcome
-
-### The mutations, and the two that did NOT red
-
-Every rule was mutated in a scratch copy, rebuilt, run, and the tree restored
-byte-for-byte. The harness refuses to read a build failure or an unapplied patch
-as a pass, and it caught one of each.
-
-| mutation | assertions | result |
-|---|---|---|
-| M2 — R4, sigmoid narrowed before the multiply | 79, **5 failed** | RED |
-| M3 — R5, residual add kept at compute width | 79, **3 failed** | RED |
-| M4 — R2, normalized value rounded before the affine | 79, **5 failed** | RED |
-| M5 — R3, epsilon narrowed to bf16 | 79, **2 failed** | RED |
-| M6b — R7(b), the two roundings fused into one | 13, **1 failed** | RED |
-| M7 — R7(a), the statistics not narrowed | 13, **4 failed** | RED |
-| M8 — the three production call sites deleted | 4, **1 failed** | RED |
-| M9 — the loader reverted to f32 | 7, **2 failed** | RED |
-| **M6 — R7(b) fused, against the FIRST version of its case** | 4, **0 failed** | **GREEN** |
-| **M10 — R6, the blur kernel not narrowed** | 79, **0 failed** | **GREEN** |
-
-**M5 reds on exactly 2 arms, which is what `kLtx2UpsBf16RuleCoverage` predicted
-for R3.** The coverage number is not decoration: it named the blast radius before
-the mutation was run.
-
-**M6 is the failure this campaign has shipped once per wave, caught here.** The
-first version of the `upsample_video` case asserted only that the result reported
-bf16 and carried bf16-representable values. A fused rounding produces a bf16 value
-too, so the mutation passed with 4 of 4 assertions green — a claimed guarantee
-that nothing measured. The case now compares against a golden over the whole
-function, `upsample_video`'s own body run on upstream's modules, and the same
-mutation reds. The isolated `un_normalize` tensors the generator emits are
-evidence; the whole-function golden is the gate.
-
-**M10 is a limit, not a defect, and it stays open.** At the pinned
-`kernel_size = 5` every entry of the normalized binomial kernel is a dyadic
-rational bf16 holds exactly, so narrowing the registered buffer changes no value
-and **no value gate can see whether the port does it**. The narrowing is still
-correct and still there, because it is what upstream does; what holds it down is
-`kLtx2UpsBf16BlurNarrowedEntries` — 0, 0, 0, 1, 57 at kernel sizes 3, 5, 7, 9, 11
-— which proves the site is live and the zero at the shipped width is a
-measurement rather than a blind spot. Recorded under `## Owed`.
-
-### The spec file was committed EMPTY, and the diffstat is what caught it
-
-Commit `8ad7c2e94` wrote this file to zero bytes. The edit script called
-`open(path, "w").write(open(path).read().replace(...))`, and `open(path, "w")`
-truncates before the inner read is evaluated, so it wrote an empty string's
-replacement into an emptied file. Nothing failed: the commit succeeded, the tests
-stayed green, and `git diff --stat` reported the spec as ` | 0`. A row whose spec
-is a gate requirement had no spec for one commit. Written down because the
-mechanism is not specific to this row and the symptom is a diffstat entry nobody
-reads.
-
-### The recorded reader anchors went stale INSIDE this pull request
-
-`ltx2_video.cpp` carries a READER ANCHORS list that `test_ltx2_video` derives and
-compares. The counters and loader comments this row adds shifted every one of the
-fourteen by 11 to 18 lines, and the case failed with both lists printed. Updated
-to the derived values. This is the fifth recorded instance in this tree of a line
-anchor going stale within the change that moved it, and the reason the case exists
-is that it is the only thing that notices.
-
-### The two ltx2 suites that are red, and only one is this row's
-
-`ctest -R ltx2` after the fix: **13 of 13 targets built, 12 passed**, and the one
-failure is `test_ltx2_video_device_forward`, which is
-[#2853](https://github.com/mudler/vllm.cpp/issues/2853) — **open, pre-existing,
-and wave 3's**. Its refusal string ("a bf16 decode was requested on device
-'xpu'") is present at `origin/main`, this branch touches no
-`ltx2_video_vae` file, and wave 3's spec already lists it under `## Owed`.
-Checked rather than assumed, because "a red that was already red" is exactly the
-claim a row should not be trusted to make about itself.
-
-### What the port turned out to be
-
-**Bit-exact on every arm**, which §3.1 predicted it could not be. That section
-measured the gap between upstream's bf16 convolution and the same convolution on
-f32 inputs and concluded a band was needed; the port's own `double` accumulators
-close it, because at a bf16 store the accumulation order sits below one ulp.
-Three of the six emitted bands are `0.0` and the port meets them. The band
-machinery is kept anyway: it is what the `Separates` assertion compares against,
-and a fixture at a wider `mid_channels` may need it.
-
-### Why each default has the value it has
-
-* **The arm comes from the weight bag, not from a parameter.** A caller that
-  could pick a width the checkpoint is not stored at would reinterpret the
-  parameter bytes rather than refuse.
-* **`Volume` holds bytes, not narrowed floats.** An f32 buffer of bf16 values
-  passes every value gate and moves twice the memory, which is the polarity
-  AGENTS.md says a token gate cannot see.
-* **`WeightView` is a view and not a widened copy.** Widening on load would put
-  the bf16 arm back at the f32 arm's bytes, which is the whole thing A24 removes.
-* **`SmallVar`'s scale is 2e-2** — the largest scale at which the chain is
-  bit-exact and all four rules separate (§3.2's sweep).
-
-## Owed`
+Wave 4: `.agents/specs/ltx25-a24-leaves-bf16.md` (#2850, merge `d2b1bda2b`) — this row is its `## Owed`
 Oracle: `.agents/oracles/ltx-2.md`, `fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca`
 Base: `d2b1bda2b4359f148ff759b5d2d0ad719c9f6d78`
 
@@ -466,6 +369,103 @@ python3 scripts/agent-pr-body.py --pr <N>
   recorded here rather than left for a reviewer to find.
 * **§A.7's rotted anchor** for this component (`:66-70`, should be `:108-112`).
   Operator-owned; recorded in §0.1, not edited.
+
+## Outcome
+
+### The mutations, and the two that did NOT red
+
+Every rule was mutated in a scratch copy, rebuilt, run, and the tree restored
+byte-for-byte. The harness refuses to read a build failure or an unapplied patch
+as a pass, and it caught one of each.
+
+| mutation | assertions | result |
+|---|---|---|
+| M2 — R4, sigmoid narrowed before the multiply | 79, **5 failed** | RED |
+| M3 — R5, residual add kept at compute width | 79, **3 failed** | RED |
+| M4 — R2, normalized value rounded before the affine | 79, **5 failed** | RED |
+| M5 — R3, epsilon narrowed to bf16 | 79, **2 failed** | RED |
+| M6b — R7(b), the two roundings fused into one | 13, **1 failed** | RED |
+| M7 — R7(a), the statistics not narrowed | 13, **4 failed** | RED |
+| M8 — the three production call sites deleted | 4, **1 failed** | RED |
+| M9 — the loader reverted to f32 | 7, **2 failed** | RED |
+| **M6 — R7(b) fused, against the FIRST version of its case** | 4, **0 failed** | **GREEN** |
+| **M10 — R6, the blur kernel not narrowed** | 79, **0 failed** | **GREEN** |
+
+**M5 reds on exactly 2 arms, which is what `kLtx2UpsBf16RuleCoverage` predicted
+for R3.** The coverage number is not decoration: it named the blast radius before
+the mutation was run.
+
+**M6 is the failure this campaign has shipped once per wave, caught here.** The
+first version of the `upsample_video` case asserted only that the result reported
+bf16 and carried bf16-representable values. A fused rounding produces a bf16 value
+too, so the mutation passed with 4 of 4 assertions green — a claimed guarantee
+that nothing measured. The case now compares against a golden over the whole
+function, `upsample_video`'s own body run on upstream's modules, and the same
+mutation reds. The isolated `un_normalize` tensors the generator emits are
+evidence; the whole-function golden is the gate.
+
+**M10 is a limit, not a defect, and it stays open.** At the pinned
+`kernel_size = 5` every entry of the normalized binomial kernel is a dyadic
+rational bf16 holds exactly, so narrowing the registered buffer changes no value
+and **no value gate can see whether the port does it**. The narrowing is still
+correct and still there, because it is what upstream does; what holds it down is
+`kLtx2UpsBf16BlurNarrowedEntries` — 0, 0, 0, 1, 57 at kernel sizes 3, 5, 7, 9, 11
+— which proves the site is live and the zero at the shipped width is a
+measurement rather than a blind spot. Recorded under `## Owed`.
+
+### The spec file was committed EMPTY, and the diffstat is what caught it
+
+Commit `8ad7c2e94` wrote this file to zero bytes. The edit script called
+`open(path, "w").write(open(path).read().replace(...))`, and `open(path, "w")`
+truncates before the inner read is evaluated, so it wrote an empty string's
+replacement into an emptied file. Nothing failed: the commit succeeded, the tests
+stayed green, and `git diff --stat` reported the spec as ` | 0`. A row whose spec
+is a gate requirement had no spec for one commit. Written down because the
+mechanism is not specific to this row and the symptom is a diffstat entry nobody
+reads.
+
+### The recorded reader anchors went stale INSIDE this pull request
+
+`ltx2_video.cpp` carries a READER ANCHORS list that `test_ltx2_video` derives and
+compares. The counters and loader comments this row adds shifted every one of the
+fourteen by 11 to 18 lines, and the case failed with both lists printed. Updated
+to the derived values. This is the fifth recorded instance in this tree of a line
+anchor going stale within the change that moved it, and the reason the case exists
+is that it is the only thing that notices.
+
+### The two ltx2 suites that are red, and only one is this row's
+
+`ctest -R ltx2` after the fix: **13 of 13 targets built, 12 passed**, and the one
+failure is `test_ltx2_video_device_forward`, which is
+[#2853](https://github.com/mudler/vllm.cpp/issues/2853) — **open, pre-existing,
+and wave 3's**. Its refusal string ("a bf16 decode was requested on device
+'xpu'") is present at `origin/main`, this branch touches no
+`ltx2_video_vae` file, and wave 3's spec already lists it under `## Owed`.
+Checked rather than assumed, because "a red that was already red" is exactly the
+claim a row should not be trusted to make about itself.
+
+### What the port turned out to be
+
+**Bit-exact on every arm**, which §3.1 predicted it could not be. That section
+measured the gap between upstream's bf16 convolution and the same convolution on
+f32 inputs and concluded a band was needed; the port's own `double` accumulators
+close it, because at a bf16 store the accumulation order sits below one ulp.
+Three of the six emitted bands are `0.0` and the port meets them. The band
+machinery is kept anyway: it is what the `Separates` assertion compares against,
+and a fixture at a wider `mid_channels` may need it.
+
+### Why each default has the value it has
+
+* **The arm comes from the weight bag, not from a parameter.** A caller that
+  could pick a width the checkpoint is not stored at would reinterpret the
+  parameter bytes rather than refuse.
+* **`Volume` holds bytes, not narrowed floats.** An f32 buffer of bf16 values
+  passes every value gate and moves twice the memory, which is the polarity
+  AGENTS.md says a token gate cannot see.
+* **`WeightView` is a view and not a widened copy.** Widening on load would put
+  the bf16 arm back at the f32 arm's bytes, which is the whole thing A24 removes.
+* **`SmallVar`'s scale is 2e-2** — the largest scale at which the chain is
+  bit-exact and all four rules separate (§3.2's sweep).
 
 ## Now
 

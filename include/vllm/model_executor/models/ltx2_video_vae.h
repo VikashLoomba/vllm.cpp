@@ -44,14 +44,50 @@
 //  * `unpatchify` DECOMPOSES CHANNELS AS `(c p r q)` WITH `h` TAKING q AND `w`
 //    TAKING r (ops.py:50-58) — r and q are NOT interchangeable.
 //
-// ─── DTYPE ───────────────────────────────────────────────────────────────────
-// Every buffer this header names is f32, because this is the CPU REFERENCE arm.
-// Upstream runs the decoder in the CHECKPOINT's dtype instead
-// (`sample.to(weights_dtype)` in, `sample.to(output_dtype)` out —
-// conv_video_decoder.py:283-286, 355-356), and it has none of the float32 pin the
-// audio tower carries. The bf16/NVFP4 arm that inherits the checkpoint dtype is
-// owed by phase L6; see ltx2_video_vae.cpp for why no gate here can catch a dtype
-// that is merely too WIDE.
+// ─── DTYPE: THE ARM IS THE CHECKPOINT'S (A24 wave 3, #2786) ──────────────────
+// `Ltx2ConvVideoDecode` runs at `Ltx2VaeWeights::dtype` and follows it, which is
+// upstream's own rule: `weights_dtype = next(self.parameters()).dtype` then
+// `sample.to(weights_dtype)` in and `sample.to(output_dtype)` out
+// (conv_video_decoder.py:282-284, 357). Upstream resolves ONE pipeline dtype and
+// it is bfloat16 (distilled.py:109, handed to `VideoDecoder` at :148), and the
+// conv decoder has none of the float32 pin the audio vocoder carries -- measured
+// with a control, not read off a failed grep.
+//
+// BOTH ARMS ARE LIVE, THEY ARE NOT INTERCHANGEABLE, AND THE RENDER LOADS EITHER
+// ONE. `kBF16` is what a CPU render loads and it is upstream's SDR default;
+// `kF32` is what a DEVICE render loads AND the parity REFERENCE every committed
+// tests/vllm/models/ltx2_vae_goldens.inc entry is measured against, so deleting
+// it would delete the reference. The two are ~0.025 apart on the gated fixture,
+// and that distance is now a difference BETWEEN TWO SHIPPED ARMS rather than
+// between a shipped arm and a reference.
+//
+// `kBF16` STORAGE IS CPU-ONLY, and the refusal says so by name in one place.
+// `vt::Conv3d` has no bf16 storage arm on CUDA (src/vt/cuda/cuda_conv3d.cu,
+// #1007) and every convolution here goes through it, so a bf16 volume cannot
+// reach a device kernel at all; `Ltx2ConvVideoDecode` refuses that combination
+// with the same predicate the kernels refuse on.
+//
+// THIS BLOCK USED TO SAY PRODUCTION WAS UNAFFECTED BECAUSE THE RENDER DECODES ON
+// THE CPU QUEUE ON EVERY BUILD, AND THAT WAS FALSE (#2853) -- the same sentence
+// cuda_ltx2_vae.cu carried, nine lines below the refusal it argued for. The one
+// `Ltx2VideoDecodeStreaming(` call site passes `im.on_device ? &*im.queue :
+// nullptr`, so a device render DOES hand this decode an accelerator queue, and a
+// load that asked for bf16 on both arms threw at `decode.video` on every device
+// render. `Ltx2VideoEngine::Load` now resolves the bag's width from the arm,
+// `im.on_device ? kF32 : kBF16`, which is the refusal's own second route: "load
+// the VAE weights at f32". It is not free. On the pinned checkpoint the decoder
+// bag is 86 tensors and 407,169,328 BF16 parameters, so the device arm holds
+// 1,628,677,312 bytes where the CPU arm holds 814,338,656 -- +776.6 MiB resident,
+// and again in whatever is staged -- and its `un_normalize` does not round to the
+// bf16 grid, so the arms diverge numerically too. The device bf16 arm is owed in
+// .agents/specs/ltx25-a24-video-vae-bf16.md and needs #1007 and a lease.
+//
+// `Ltx2VideoFrames::data` stays `std::vector<float>` on BOTH arms. It is the
+// public pixel return, three channels wide, and on the bf16 arm every value in
+// it is bf16-representable -- which the render path's `vae_decode_not_bf16`
+// counter gates and which no digest can see. The FP8 and NVFP4 arms are A22.
+// See ltx2_video_vae.cpp for why no gate here can catch a dtype that is merely
+// too WIDE.
 #pragma once
 
 #include <cstdint>

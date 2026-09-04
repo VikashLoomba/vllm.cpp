@@ -140,6 +140,7 @@ const ModelFactory kGlmMoeDsaFactory{
     // `factory->streams_routed_experts`, so without this the lane is never
     // built, `CheckDeviceWeightFit` charges the device the full 187.312 GiB of
     // towers against `dgx:gpu0`'s 119.631 GiB budget, and the load REFUSES.
+    .consumes_device_token_ids = true,
     .streams_routed_experts = true,
 };
 

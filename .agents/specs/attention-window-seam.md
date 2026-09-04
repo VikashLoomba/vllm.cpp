@@ -70,6 +70,10 @@ per-layer pattern); those are model shape, not the window rule, and must not mov
 into a shared function. The value each site computes must be unchanged, and a
 test asserts that per site rather than asserting the resolver in isolation.
 
+**W2 — the shared-path sites** (there are THREE; see the W2 outcome below, which
+re-derived the list. This paragraph's original text follows, wrong count and all,
+because the wrong count is what deferred the wave.)
+
 **W2 — the two shared-path sites**
 (`v1/attention/backend.cpp:323`, `mla_chunked_context.h:363`) are NOT model code
 and take an already-resolved `sliding_window`. They are listed for completeness
@@ -77,9 +81,58 @@ and deliberately deferred: they sit under paths this row cannot exercise on CPU,
 and moving them without a device gate would be the same unverified change this
 campaign has been closing, not opening.
 
-**W3 — the kill-switch asymmetry.** A decision, not a refactor: either every
-model gets one under a single spelling, or the two that have one lose it. Owed,
-not chosen here, because it changes a user-visible debugging surface.
+**W3 — the kill-switch asymmetry.** This said it was "a decision, not a
+refactor ... because it changes a user-visible debugging surface", and left the
+choice open between giving every model a switch and taking it from the two that
+have one.
+
+**That was wrong, and the rule it missed is the one at the top of `AGENTS.md`.**
+vLLM defines this behaviour, so it is mirrored rather than decided, and asking
+how a mirrored feature must behave is the thing this project does not do. At the
+pin `5559679229`, `vllm/config/model.py:248`:
+
+```python
+disable_sliding_window: bool = False
+"""Whether to disable sliding window. If True, we will disable the sliding
+window functionality of the model, capping to sliding window size. If the
+model does not support sliding window, this argument is ignored."""
+```
+
+One model-agnostic field on `ModelConfig`. Not a per-model switch, and not an
+environment variable. Its docstring also answers the asymmetry directly: a model
+with no window ignores the flag, so covering all five costs nothing at the sites
+that have nothing to disable.
+
+**Our two env vars are not a different spelling of it, they are a narrower
+behaviour**, and that is the part worth stating precisely because it is what a
+"just rename it" reading would ship:
+
+1. `model.py:766-769` — the flag nulls `hf_text_config.sliding_window`, which
+   disables the window for every layer of every model at once.
+2. `model.py:2216-2233` — `_get_and_verify_max_len` additionally caps
+   `max_model_len` to the sliding-window size when the flag is set.
+   `VT_GEMMA2_SLIDING` and `VT_GEMMA3_SLIDING` do not do this.
+3. `model.py:693-695` — the flag is set AUTOMATICALLY when a checkpoint declares
+   `sliding_window == 0`, because vLLM spells "disabled" as `None` and some
+   checkpoints spell it `0`. We have no analogue.
+
+So W3 is: one `disable_sliding_window` config field carrying the upstream name
+and all three semantics, consumed through `ResolveAttentionWindow`'s existing
+`disable_model_sliding_window` parameter — which has never had a caller passing
+anything but the default — and the two env vars deleted, with
+`docs/ENVIRONMENT.md` losing them in the same change.
+
+**The coverage gap is separate and survives the correction.** Nothing tests the
+switch in either spelling; W1's mutation proved that by rewiring gemma2's site to
+ignore `SlidingWindowEnabled()` and watching `test_gemma2_forward` stay green at
+1003 assertions under `VT_GEMMA2_SLIDING=0`. Replacing the mechanism does not by
+itself add a test, so W3's red-first test is: set the flag, assert
+`ResolveAttentionWindow` returns no window for a model whose config declares one,
+and mutate the flag read to confirm the test detects it.
+
+**One part IS still a call, and it is small:** whether to keep the two env vars
+as deprecated aliases for one release. Upstream has no env var to mirror, so
+nothing decides it either way.
 
 ## Gates
 
@@ -128,7 +181,158 @@ believed — `-Werror=parentheses` on `false && a || b`, and
 `-Werror=unused-function` when removing the switch's only caller. A mutation
 build failure reads as a passing test, and both would have.
 
+## W3 outcome — one switch, five models, and a bypass that changed the design
+
+**Landed.** `disable_sliding_window` is one model-agnostic switch carrying the
+upstream name: `EngineParams::disable_sliding_window`, C ABI v26
+`vllm_model_params.disable_sliding_window`, server `--disable-sliding-window` /
+`--enable-sliding-window`. `LoadedEngine` installs it unconditionally at
+construction, so a second load in one process overwrites the first model's answer
+rather than inheriting it — the hazard the MoE placement plan carried until
+#2382, avoided in the same shape. `VT_GEMMA2_SLIDING` and `VT_GEMMA3_SLIDING` are
+deleted, with their two `env-doc-allowlist.txt` rows; the gate now counts 408
+production env vars where it counted 410.
+
+Coverage went from **two of five** families to **five of five**: Gemma-2,
+Gemma-3, Gemma-4, OLMo-2 and Muse-Glimmer all pass
+`DisableSlidingWindowActive()` to `ResolveAttentionWindow`, whose
+`disable_model_sliding_window` parameter has carried this meaning since W1 and
+had never had a caller that passed anything but a default.
+
+**The design changed on a discovery, and this is the part worth keeping.** The
+plan was to mirror upstream exactly: `config/model.py:766-769` disables the
+window by setting `hf_text_config.sliding_window = None`, and every layer
+inherits it. **That mechanism cannot work in this tree.** Four models read
+
+```cpp
+cfg.sliding_window.value_or(RawInt(cfg.raw, "sliding_window", 0))
+```
+
+— `gemma2.cpp:103`, `gemma3.cpp:101`, `gemma4.cpp:139`, `laguna_weights.cpp:117`
+— and `cfg.raw` is the FULL UNTOUCHED checkpoint document (`hf_config.cpp:598`).
+Nulling the typed field leaves the raw one, so a faithful transcription of
+upstream's mechanism would have read correctly and left the window ON. The switch
+is therefore consumed where the window is USED, not where it is configured.
+
+That bypass is a wider defect than this row: it defeats every normalisation
+`LoadHfConfig` performs, including the existing `sliding_window == 0 -> nullopt`
+rule at `hf_config.cpp:80-87`. It is filed as
+[#2963](https://github.com/mudler/vllm.cpp/issues/2963) rather than fixed here,
+because repointing four models off `cfg.raw` changes what each reads when the
+checkpoint and the typed parse disagree, which is a per-model behaviour change
+with its own gate.
+
+**Gates.** `test_disable_sliding_window.cpp`, 5 cases / 15 assertions: the
+default is enabled (upstream's own `= False`); set, the model-level window is
+GONE rather than zero-width; a per-layer window still wins; a model with no
+window is unaffected in BOTH switch positions; and the switch is last-write.
+Mutation-proven — making `DisableSlidingWindowActive()` return a constant `false`
+compiles at rc=0 and reds 2 cases / 3 assertions.
+
+**Owed, and stated because W1's finding was exactly this shape.** No gate holds
+that the FIVE CALL SITES read the switch. Both this suite and
+`test_attention_window_adoption.cpp` exercise the resolver and a replica of the
+site expression, so mutating a production site to pass a literal `false` would
+not red either — which is the same gap W1 found for the env vars, moved rather
+than closed. Closing it needs a per-model forward fixture that sets the switch,
+or a static check that no call site passes a literal. The sites ARE reached in
+production, on the decode path of five registered models; what is missing is a
+regression gate, not the wiring.
+
+**Not implemented: upstream's second and third semantics.**
+`_get_and_verify_max_len` also caps `max_model_len` to the window when the flag
+is set (`model.py:2216-2233`), and `model.py:693-695` sets the flag automatically
+when a checkpoint declares `sliding_window == 0`. Neither is here. The third is
+partly moot — `hf_config.cpp:80-87` already normalises a 0 window to `nullopt`,
+which produces the same *window* outcome without setting a flag — but the
+max-length cap is a real missing behaviour and is owed.
+
+## W2 outcome — it never needed a device, and there were three sites, not two
+
+**Landed.** `v1/attention/backend.cpp`, `mla_chunked_context.h` and
+`deepseek_v4_dsa.cpp` now call `ResolveAttentionWindow`. No inline
+`vt::AttentionWindow{static_cast<int32_t>(sliding_window - 1), 0}` remains
+anywhere in `src/` or `include/`.
+
+**The deferral reason was wrong, and the error is worth keeping.** W2 was held
+back because those sites "sit under paths no CPU-only build exercises, and moving
+them without a device gate would be the unverified change this work has been
+closing." That conflates two questions with different answers:
+
+- *Does the resolver return the same value?* Pure arithmetic. No device. It is
+  exactly what W1 shipped for the five model sites, in the same test file.
+- *Is the site reached?* Unchanged by W2, and equally ungated before and after.
+
+Holding the first hostage to the second kept a shared seam split for no gain.
+This is the same shape as `ENG-HYBRID-PLACEMENT`'s placed branch, which sat
+"needs a GPU" for weeks and turned out to need a loopback engine.
+
+**The recorded site list was wrong in both count and location.** The spec named
+two sites; `git grep -n 'AttentionWindow{static_cast<int32_t>'` finds three, and
+`mla_chunked_context.h` had moved under
+`include/vllm/model_executor/layers/attention/`. `deepseek_v4_dsa.cpp:275` was
+never listed.
+
+**What changed, precisely.** All three guarded the inline expression with
+`if (sliding_window > 0)`, and that guard becomes the `optional` the resolver
+takes, so the VALUE is unchanged. Two behaviours are added:
+
+1. **They obey `--disable-sliding-window`.** This is a gap W3 opened: after W3 the
+   flag reached five of the eight sites carrying a window, so one engine would
+   have honoured the switch on Gemma and quietly kept the window on dots3-note's
+   windowed decode, DeepSeek-V4's DSA, and the MLA chunked-prefill context.
+2. **They refuse a window past `INT32_MAX` instead of truncating it.**
+   `static_cast<int32_t>(sliding_window - 1)` wraps, handing the kernel a
+   plausible small or negative radius. This is a deliberate behaviour change and
+   the only one W2 makes.
+
+**Gates.** `test_attention_window_adoption.cpp` grows from 5 cases / 27
+assertions to 8 / 41: the guard translation preserves `nullopt` for 0 and
+negative and reproduces the inlined value for real windows; the truncation is now
+a refusal; the three sites obey the switch. Mutation-proven, each mutant
+compiling at rc=0 — making the resolver ignore `disable_model_sliding_window`
+reds 2 assertions here and 1 in `test_disable_sliding_window`; removing the
+`INT32_MAX` bound reds 2.
+
+Value-unchanged evidence beyond the unit gate: `test_mla_attention_block`
+(2,282,067 assertions), `test_ops_mla_attn` (289,456) and
+`test_ops_mla_chunked_context` (30,797) all pass unchanged.
+
+**Owed, and it is the same debt W1 and W3 carry.** No gate executes the WINDOWED
+branch at any of the eight sites. `test_mla_attention_block:1472` sets
+`sliding_window = 513` but only calls `Validate()`; the large MLA suites run the
+unwindowed path. So mutating a production site back to its inline expression reds
+nothing. Closing that needs a windowed execution fixture per path, and it is one
+piece of work for all eight sites rather than three separate ones.
+
 ## Now
 
-W1 done. W2 (the two shared-path sites) and W3 (the kill-switch asymmetry, now
-also a coverage gap) owed.
+W1, W2 and W3 all done (see the outcomes above).
+
+Two corrections made while planning this wave are kept below, because both are
+about how the record itself went wrong rather than about the code.
+
+**The W3 landing left this section self-contradictory.** It edited around the
+`## Now` paragraph instead of through it and produced a sentence that called W3
+both done and owed. Corrected when W2 was picked up.
+
+**#2388 was closed by the W3 commit and should not have been.** Its scope is the
+generic layer and the sites that bypass it; W1 took five model sites and W3 took
+the switch, but the shared-path sites are the same issue's work and had not
+landed. Reopened rather than re-filed, because a second issue for one issue's
+remaining wave is the intake shape `AGENTS.md` asks not to create.
+
+**W2's site list in `## Work breakdown` was stale in BOTH line numbers and count**
+— resolved by the W2 outcome above, which re-derived it and found three sites.
+It names `v1/attention/backend.cpp:323` and `mla_chunked_context.h:363`. The
+header moved to
+`include/vllm/model_executor/layers/attention/mla_chunked_context.h:363`, the
+`backend.cpp` line number no longer points at a window expression, and
+`deepseek_v4_dsa.cpp:275` is a third site of the same shape that the original
+sweep did not list. Whoever takes W2 re-derives the list with
+`git grep -n 'sliding_window - 1'` rather than trusting the three names above.
+
+W3 is no longer blocked on a decision. `## Work breakdown` above records why: the
+flag is `disable_sliding_window` on vLLM's `ModelConfig`, so the shape is
+mirrored rather than chosen, and what was filed as a naming question turned out
+to be three missing behaviours. It needs no GPU and no checkpoint.

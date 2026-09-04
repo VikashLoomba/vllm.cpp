@@ -42,9 +42,11 @@
 #include "vllm/model_executor/models/ltx2_device.h"
 #include "vllm/model_executor/models/ltx2_dfr.h"
 #include "vllm/model_executor/models/ltx2_image_preprocess.h"
+#include "vllm/model_executor/models/ltx2_duration_head.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_pipeline.h"
 #include "vllm/model_executor/models/ltx2_samplers.h"
+#include "vllm/model_executor/models/ltx2_iclora_reference.h"
 #include "vllm/model_executor/models/ltx2_retake.h"
 #include "vllm/model_executor/models/ltx2_t2a.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
@@ -55,6 +57,7 @@
 #include "vllm/model_executor/models/minimax_h3.h"
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — which accelerator, if any
 #include "vllm/tokenizer/tokenizer.h"
+#include "vt/dtype.h"
 
 namespace vllm::multimodal {
 namespace {
@@ -189,6 +192,16 @@ struct StreamState {
   // was supplied. Empty on the audio stream, whose args preprocessor upstream
   // builds with no keyframes_embedding_provider (model.py:333).
   std::vector<float> keyframes_mask;
+  // `LatentState.attention_mask` (types.py:251-287), DENSE [tokens, tokens] in
+  // [0, 1], and the target token count every appending item measures the mask's
+  // block structure against. Row LTX25-IC-LORA-REF-VIDEO (#3020).
+  //
+  // EMPTY is upstream's `None` and is what every render carries unless an
+  // IC-LoRA conditioning attention mask was supplied. `noisy_tokens` is set once
+  // beside `tokens` on the target grid and never moves, which is exactly what
+  // `latent_tools.target_shape.token_count()` is upstream.
+  std::vector<float> attention_mask;
+  int64_t noisy_tokens = 0;
 };
 
 // ── StreamState <-> Ltx2LatentState (row LTX25-TOKEN-APPEND, issue #930) ────
@@ -221,6 +234,8 @@ Ltx2LatentState ToLatentState(const StreamState& s, int64_t pos_dims) {
     out.positions[i] = static_cast<float>(s.positions[i]);
   }
   out.keyframes_mask = s.keyframes_mask;
+  out.attention_mask = s.attention_mask;
+  out.noisy_tokens = s.noisy_tokens;
   return out;
 }
 
@@ -235,6 +250,8 @@ void FromLatentState(const Ltx2LatentState& in, StreamState* s) {
     s->positions[i] = static_cast<double>(in.positions[i]);
   }
   s->keyframes_mask = in.keyframes_mask;
+  s->attention_mask = in.attention_mask;
+  s->noisy_tokens = in.noisy_tokens;
 }
 
 // `post_process_latent` (utils/helpers.py:462-464):
@@ -450,31 +467,37 @@ std::string LoraIndexedListing() {
          "_<n> (n >= 2)";
 }
 
-// The one key this family DEFINES and does not SERVE. `Ltx2DurationPredict` is
-// ported and gated as a brick (`ltx2_duration_head.h`), but nothing here
-// constructs one, so a supplied path names a file the engine never opens.
+// The head's checkpoint. SERVED since row LTX25-DURATION-HEAD-WIRE (#2900):
+// the load opens the file, builds a predictor when it carries a whole head, and
+// the frame count a render uses comes from that predictor. It was the one key
+// this family defined and did not serve, which is why the paragraph below still
+// explains the distinction the list exists to keep.
 constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
+// Row LTX25-DURATION-HEAD-WIRE (#2900): upstream's `--auto-duration MIN MAX`
+// (utils/args.py:108), as a per-generation extra so no ABI change is needed.
+constexpr char kLtx2AutoDurationExtra[] = "auto_duration";
 
 // Every extra key this family DEFINES. An extra outside this set is refused
 // rather than ignored, for the same reason H3 refuses one
 // (minimax_h3_video.cpp): a mistyped knob that is silently dropped renders the
 // DEFAULT and looks like the feature not working.
 //
-// DEFINED IS NOT THE SAME AS SERVED, and conflating the two was #611: nine of
-// these ten reach a reader, and `duration_head_path` reached none, so supplying a
-// duration head substituted the recipe default in silence — the failure mode this
-// very list exists to prevent, one level in. It stays in the list because the
-// family DOES define the key and DOES know what it means; `CheckUnservedExtras`
-// refuses it by name instead, which is a different and truer message than
-// "unknown load extra". The full audit is in
-// .agents/specs/ltx25-retire-dead-arms.md §2.1.
+// DEFINED IS NOT THE SAME AS SERVED, and conflating the two is the failure this
+// list exists to prevent one level in: a key the family accepts, and no code
+// reads, substitutes a default in silence. `duration_head_path` was the tree's
+// own example of it and is no longer — row LTX25-DURATION-HEAD-WIRE (#2900)
+// gave it a reader, and `CheckUnservedExtras` no longer names it. Every key in
+// the array below now reaches one. The audit that found the class is in
+// .agents/specs/ltx25-retire-dead-arms.md §2.1; the issue it was filed under is
+// one of the three numbers that 404, tracked by
+// https://github.com/mudler/vllm.cpp/issues/2899.
 //
 // The first hand-written set of these anchors named nine lines that were readers
 // of NOTHING, in this very file, and a later merge moved the real ones again. So
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 572 574 1199 1295 1391 1407 1542 1546 1649 1727 1835 1877 1919 1921
+// 695 697 1339 1435 1531 1547 1682 1686 1844 1880 2032 2150 2192 2234 2236
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -503,6 +526,80 @@ uint64_t DigestF32(const std::vector<float>& values) {
   return h;
 }
 
+// How many values could NOT have come out of a bf16 store. The dtype instrument
+// the digest and the absmax cannot be: both are computed over the same f32
+// container on either arm and are blind to the width that filled it.
+// ─── THE BRIDGE TO THE STILL-f32 UPSAMPLER (A24 wave 3, #2786) ─────────────
+//
+// The video VAE decoder's bag is loaded at bf16 now, and the LATENT UPSAMPLER --
+// a separate component, still f32 in this tree and owed its own bf16 arm -- reads
+// the same checkpoint's `per_channel_statistics` to un-normalize and re-normalize
+// around itself (`upsample_video`, upsampler/model.py:129-143). It takes
+// `std::vector<float>`, so the two 128-element buffers are widened here.
+//
+// THE VALUES IT GETS ARE bf16-ROUNDED, AND THAT IS UPSTREAM'S ANSWER RATHER THAN
+// A LOSS THIS INTRODUCES: upstream constructs the upsampler in the SAME one
+// pipeline dtype (`VideoUpsampler`, distilled.py:138-141), so its own statistics
+// are bf16 there too. THIS BLOCK USED TO ADD THAT THE UPSAMPLER'S ARITHMETIC
+// AROUND THEM STAYS f32 AND IS OWED, AND A24 WAVE 5 FALSIFIED THAT (#2857,
+// #2919): `Load` asks both upsampler checkpoints for `kBF16` at `:1797` and
+// `:1849`, and `ltx2_upsampler.h:109-119` records the two arms. The debt that
+// sentence pointed at is discharged, and the `## Owed` bullet it named no longer
+// lists the upsampler.
+//
+// WHAT THIS FUNCTION DOES STILL STRADDLE is the VIDEO VAE's own two arms
+// (#2853). It follows that bag, so a CPU render hands the upsampler statistics
+// that were rounded to the bf16 grid and a DEVICE render hands it statistics
+// that were not. On the pinned checkpoint the two agree word for word, because
+// all 86 decoder tensors are BF16 and both arms widen the same words; the
+// divergence becomes live on an F32-storage video VAE checkpoint.
+std::vector<float> VaeStatsAsF32(const Ltx2VaeWeights& weights, const std::string& name) {
+  if (weights.dtype != vt::DType::kBF16) return weights.Get(name);
+  const std::vector<uint16_t>& raw = weights.GetBf16(name);
+  std::vector<float> out(raw.size());
+  for (size_t i = 0; i < raw.size(); ++i) out[i] = vt::BF16ToF32(raw[i]);
+  return out;
+}
+
+int64_t CountWiderThanBf16(const std::vector<float>& values) {
+  int64_t n = 0;
+  for (float v : values)
+    if (vt::BF16ToF32(vt::F32ToBF16(v)) != v) ++n;
+  return n;
+}
+
+// The A24 wave 5 instrument, in ONE place so all three upsampler call sites
+// report the same thing. `latent.dtype` is the width `Ltx2LatentUpsample` took
+// off the weight bag and actually computed at, and the value scan is the half
+// that a correctly-set field over a wide computation cannot fool.
+void RecordUpsampleWidth(Ltx2ConditioningTrace& trace, const Ltx2LatentVolume& latent) {
+  ++trace.upsample_calls;
+  if (latent.dtype != vt::DType::kBF16) ++trace.upsample_wide_calls;
+  trace.upsample_not_bf16 += CountWiderThanBf16(latent.data);
+  trace.upsample_values += static_cast<int64_t>(latent.data.size());
+  // THE STORAGE, drained here because the call that produced `latent` is the
+  // only work that could have accumulated it. The two counters above are both
+  // value-shaped and neither can see a bf16 arm that reserved f32 bytes; this
+  // one is the byte count itself. See `Ltx2UpsamplerStorage`.
+  const Ltx2UpsamplerStorage storage = Ltx2TakeUpsamplerStorage();
+  trace.upsample_volumes += storage.volumes;
+  trace.upsample_volume_elems += storage.elems;
+  trace.upsample_volume_bytes += storage.bytes;
+  trace.upsample_param_views += storage.param_views;
+  trace.upsample_param_elems += storage.param_elems;
+  trace.upsample_param_bytes += storage.param_bytes;
+}
+
+// Elements of a whole weight bag, whichever arm holds it. `Ltx2VaeWeights` has
+// `Bytes()` and no element count, and the RATIO is what says "narrow": bytes
+// alone move with the fixture's size and would have to be quoted.
+int64_t VaeWeightElems(const Ltx2VaeWeights& weights) {
+  int64_t n = 0;
+  for (const auto& kv : weights.tensors) n += static_cast<int64_t>(kv.second.size());
+  for (const auto& kv : weights.bf16) n += static_cast<int64_t>(kv.second.size());
+  return n;
+}
+
 double AbsMax(const std::vector<float>& values) {
   double m = 0.0;
   for (const float v : values) m = std::max(m, std::abs(static_cast<double>(v)));
@@ -529,26 +626,52 @@ void CheckKnownExtras(const std::map<std::string, std::string>& extras) {
   }
 }
 
-// A key this family DEFINES but does not SERVE, refused BY NAME when supplied
-// (#611). The alternative — accepting it — is the worst of the three options:
-// worse than refusing, and worse than not defining the key, because the caller
-// pointed at a specific file and got the recipe default with no diagnostic.
-//
-// Deliberately NOT the "unknown load extra" path above. That message says the
-// family does not define the key, which is false here and would send the reader
-// looking for a typo instead of for the unported head.
-void CheckUnservedExtras(const std::map<std::string, std::string>& extras) {
-  const std::string duration_head = VideoExtra(extras, kLtx2DurationHeadPathExtra);
-  if (!duration_head.empty()) {
-    Fail("the '" + std::string(kLtx2DurationHeadPathExtra) + "' extra names '" + duration_head +
-         "', but the duration head is NOT WIRED into this engine: `Ltx2DurationPredict` is ported "
-         "and gated as a brick (ltx2_duration_head.h, upstream duration_head.py:89-118) and "
-         "nothing here constructs one, so that file would never be opened and an AUTO duration "
-         "would fall back to the recipe default. Give 'num_frames', or 'duration' (exact "
-         "arithmetic against the recipe frame rate), instead. Refused rather than ignored; "
-         "recorded as owed in .agents/specs/ltx25-retire-dead-arms.md (#611).");
+// `auto_duration`'s two bounds, parsed from the "MIN,MAX" spelling that mirrors
+// upstream's `--auto-duration MIN_SECONDS MAX_SECONDS` (utils/args.py:108-122).
+// The MIN > MAX refusal is upstream's own (`:121-123`), kept here rather than
+// left to the clamp, because a reversed window is a typo and clamping it
+// silently would render something the caller did not ask for.
+struct Ltx2AutoDuration {
+  bool requested = false;
+  double min_seconds = 1.0;  // AutoDuration's defaults (utils/types.py:122-123)
+  double max_seconds = 20.0;
+};
+
+Ltx2AutoDuration ParseAutoDuration(const std::map<std::string, std::string>& extras,
+                                   const char* key) {
+  Ltx2AutoDuration out;
+  const auto it = extras.find(key);
+  if (it == extras.end() || it->second.empty()) return out;
+  const std::string& text = it->second;
+  const size_t comma = text.find(',');
+  if (comma == std::string::npos) {
+    Fail("the '" + std::string(key) + "' extra is '" + text +
+         "', and it takes TWO bounds in seconds spelled 'MIN,MAX' -- upstream's "
+         "`--auto-duration MIN_SECONDS MAX_SECONDS` (utils/args.py:108-122)");
   }
+  try {
+    out.min_seconds = std::stod(text.substr(0, comma));
+    out.max_seconds = std::stod(text.substr(comma + 1));
+  } catch (const std::exception&) {
+    Fail("the '" + std::string(key) + "' extra is '" + text +
+         "', whose two halves must each parse as a number of seconds");
+  }
+  // UPSTREAM REFUSES EXACTLY ONE THING HERE, and a `MIN <= 0` refusal was not
+  // it. `AutoDurationAction` (utils/args.py:117-122) checks `min_seconds >
+  // max_seconds` and nothing else, and `AutoDuration(min_seconds=0.0,
+  // max_seconds=20.0)` constructs at the pin, after which
+  // `seconds_to_clamped_num_frames(3.0, frame_rate=25.0, min_frames=0,
+  // max_frames=500)` returns 73. So `--auto-duration 0 20` is a request upstream
+  // serves, and refusing it by name made this port reject a working one.
+  if (out.min_seconds > out.max_seconds) {
+    Fail("the '" + std::string(key) + "' extra names MIN " + std::to_string(out.min_seconds) +
+         " > MAX " + std::to_string(out.max_seconds) +
+         ", which upstream's own parser refuses (utils/args.py:121-123)");
+  }
+  out.requested = true;
+  return out;
 }
+
 
 // Every IC-LoRA adapter the load names, in `--lora` order (row
 // LTX25-LORA-FUSION, #932).
@@ -636,11 +759,18 @@ std::string RecipeVersionKey(const std::string& declared) {
 // on a module that runs once per request over 1024 rows. A diffusion request is
 // minutes; re-reading the DiT file is not the cost that matters here.
 //
-// THE f32 IS AN ANNOTATED ESCAPE, not an inherited default. Upstream runs this
-// module at the model dtype, so f32 here is WIDER — the polarity AGENTS.md says
-// a value gate cannot catch. It is taken because `Ltx2ConnectorForward` is L5's
-// declared PARITY dtype and this is the arm its goldens cover, and its output is
-// narrowed to the stream dtype on the first upload like every other activation.
+// AND IT RUNS AT UPSTREAM'S OWN DTYPE, which is bfloat16. `distilled.py:109`
+// resolves ONE pipeline dtype and hands it to `PromptEncoder` at `:113`, which
+// constructs this module, so both the materialization above and the arithmetic
+// below are bf16 on the render path. A24 wave 2, row LTX25-A24-CONNECTOR-BF16,
+// issue #2720. The paragraph above still prices the f32 arm because that arm is
+// what the parity goldens cover and what a caller gets by default; at bf16 the
+// figure halves, to ~2.016 B parameters in about 4 GB.
+//
+// This USED to read "the f32 is an annotated escape", which is the polarity
+// AGENTS.md says a value gate cannot catch, and it was right that nothing could
+// catch it: on this render the connector's output was 16384 of 16384 values wider
+// than bf16 while every digest, absmax, frame byte and determinism check passed.
 // A phase leaf that a caller can DECLINE, which is what an empty prefix means.
 // `phase::Scope` has no disabled state and is not movable, so the choice is
 // expressed by whether the optional holds one. Named rather than written inline
@@ -705,8 +835,8 @@ class ConnectorWeightSet {
     if (loaded_) return;
     const SubPhase weights_phase(phase_prefix, ".weights");
     const SafetensorsFile file = SafetensorsFile::Open(dit_path_);
-    video_ = Ltx2LoadConnectorWeights(file, video_cfg_);
-    audio_ = Ltx2LoadConnectorWeights(file, audio_cfg_);
+    video_ = Ltx2LoadConnectorWeights(file, video_cfg_, vt::DType::kBF16);
+    audio_ = Ltx2LoadConnectorWeights(file, audio_cfg_, vt::DType::kBF16);
     loaded_ = true;
   }
 
@@ -826,8 +956,8 @@ Ltx2ConnectorEmbeddings RunConnectorFromFile(const SafetensorsFile& dit_file,
   Ltx2VaeWeights audio_weights;
   {
     const SubPhase weights_phase(phase_prefix, ".weights");
-    video_weights = Ltx2LoadConnectorWeights(dit_file, video_cfg);
-    audio_weights = Ltx2LoadConnectorWeights(dit_file, audio_cfg);
+    video_weights = Ltx2LoadConnectorWeights(dit_file, video_cfg, vt::DType::kBF16);
+    audio_weights = Ltx2LoadConnectorWeights(dit_file, audio_cfg, vt::DType::kBF16);
   }
   return RunConnector(video_weights, audio_weights, video_cfg, audio_cfg, video_in, audio_in,
                       additive, rows, phase_prefix);
@@ -970,6 +1100,17 @@ struct Ltx2VideoEngine::Impl {
   // of f32 at the shipped widths (ltx2_loader.h), the conditioning they process
   // is resolved once at load, and this box reboots rather than OOM-killing — so
   // they are loaded, used and dropped inside one scope below.
+  // ── THE DURATION HEAD (row LTX25-DURATION-HEAD-WIRE, #2900) ─────────────
+  //
+  // `has_duration_head` false IS upstream's `None` (blocks.py:838-844), and it
+  // is the state every checkpoint predating LTX-2.5 / gemma4 loads into. Unlike
+  // the connector's ~8 GB, the head is under 2 M parameters, so it is HELD
+  // rather than rebuilt per call -- which is upstream's own reasoning for this
+  // one block (blocks.py:805-808).
+  bool has_duration_head = false;
+  Ltx2VaeWeights duration_head_weights;
+  Ltx2DurationHeadConfig duration_head_cfg;
+
   bool has_connector = false;
   Ltx2ConnectorConfig video_connector_cfg, audio_connector_cfg;
   int64_t prompt_valid_rows = 0;
@@ -1017,7 +1158,6 @@ Ltx2ConditioningTrace Ltx2VideoEngine::last_conditioning() const {
 std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& params) {
   if (params.dit_path.empty()) Fail("dit_path is required");
   CheckKnownExtras(params.extras);
-  CheckUnservedExtras(params.extras);
 
   auto engine = std::unique_ptr<Ltx2VideoEngine>(new Ltx2VideoEngine());
   engine->impl_ = std::make_unique<Impl>();
@@ -1581,7 +1721,54 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     const SafetensorsFile f = SafetensorsFile::Open(params.video_vae_path);
     const nlohmann::json vae_config = Ltx2ReadCheckpointConfig(f);
     im.video_cfg = Ltx2ParseConvVideoDecoderConfig(vae_config, &im.video_kind);
-    im.video_weights = Ltx2LoadVaeWeights(f, Ltx2VideoVaeDecoderKeyRules());
+    // THE ARM UPSTREAM RUNS (A24 wave 3, row LTX25-A24-VIDEO-VAE-BF16, #2786).
+    // `distilled.py:109` resolves ONE pipeline dtype and hands it to
+    // `VideoDecoder` at `:148`, so the conv video VAE decodes at bfloat16
+    // upstream. Asking for it HERE, at the load, is what makes the decode's arm a
+    // property of the checkpoint bag rather than of a flag:
+    // `Ltx2ConvVideoDecode` reads `weights.dtype` and follows it, which is
+    // upstream's own `weights_dtype = next(self.parameters()).dtype` followed by
+    // `sample.to(weights_dtype)` (conv_video_decoder.py:283-284).
+    //
+    // IT ALSO STOPS THE WIDENING, which is half the point: the f32 arm expanded
+    // every checkpoint BF16 word through `Bf16ToF32`, so the decoder's parameters
+    // were resident at twice the checkpoint's bytes for a render.
+    //
+    // This is the DELETION SITE for the reachability mutation: swap the `kBF16`
+    // limb below back to the default and `vae_decode_not_bf16` goes from 0 to the
+    // whole clip while every digest, absmax, frame byte and determinism check on
+    // this path stays green.
+    //
+    // AND IT IS ASKED FOR ONLY WHERE IT CAN RUN (#2853). `vt::Conv3d` has no
+    // bf16 storage arm on an accelerator -- `src/vt/cuda/cuda_conv3d.cu` refuses
+    // f16/bf16 storage by name and #1007 owes the arm -- and EVERY convolution of
+    // this decode goes through it, so `Ltx2ConvVideoDecode` refuses a bf16 bag on
+    // a non-CPU queue by name (`ltx2_video_vae.cpp`, "only the CPU arm serves
+    // it"). The decode IS handed a device queue on the device arm: the one
+    // `Ltx2VideoDecodeStreaming` call site in this file passes
+    // `im.on_device ? &*im.queue : nullptr`. So a load that asked for bf16 on
+    // BOTH arms made every device render throw at `decode.video`, which is what
+    // #2853 caught through the #1426 fake-accelerator case.
+    //
+    // THE REFUSAL IS NOT WEAKENED, AND THE ROUTE PREDICATE IS THE SAME PREDICATE
+    // IT ALWAYS WAS. This is the load taking the refusal's own second route --
+    // "load the VAE weights at f32" -- on the one arm where the first route is
+    // not available. The CPU arm keeps upstream's bfloat16, which is where every
+    // width gate on this path sits (`test_ltx2_video.cpp`, `vae_decode_not_bf16
+    // == 0`), and the device arm decodes at the width its convolution serves.
+    // When the device bf16 arm lands -- `## Owed` in
+    // `.agents/specs/ltx25-a24-video-vae-bf16.md`, which needs #1007 and a lease
+    // -- this conditional is the one line it deletes.
+    //
+    // The ENCODER below asks for bf16 UNCONDITIONALLY, and the asymmetry is the
+    // route and not an oversight: `Ltx2ConvVideoEncode` takes no queue at all
+    // (both call sites in this file), so it runs on the host on every build and
+    // no device convolution is reachable from it. It is a separate call because
+    // it is a separate port with its own route and its own weights bag. A24
+    // wave 4 (#2850) landed its arm; wave 3 recorded it owed here.
+    const vt::DType video_vae_dtype = im.on_device ? vt::DType::kF32 : vt::DType::kBF16;
+    im.video_weights =
+        Ltx2LoadVaeWeights(f, Ltx2VideoVaeDecoderKeyRules(), video_vae_dtype);
 
     // `ImageConditioner` builds its VideoEncoder from the SAME checkpoint with
     // `VAE_ENCODER_COMFY_KEYS_FILTER` (blocks.py:956-961). It builds it lazily
@@ -1592,7 +1779,15 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     // configurator, same weights.
     if (Ltx2CheckpointHasVideoEncoder(f.Names())) {
       im.video_encoder_cfg = Ltx2ParseConvVideoEncoderConfig(vae_config);
-      im.video_encoder_weights = Ltx2LoadVaeWeights(f, Ltx2VideoVaeEncoderKeyRules());
+      // A24 wave 4 (#2850): THE PRODUCTION WIRING, and it is the single site the
+      // reachability mutation deletes. `ImageConditioner` builds the encoder at
+      // the pipeline dtype (distilled.py:120-125, utils/blocks.py:985-986), so
+      // the bag it is fed is bf16. Removing this argument leaves every value
+      // gate in `test_ltx2_vae` green and reds the render-path dtype case, which
+      // is the polarity that makes that case measure a capability rather than a
+      // class.
+      im.video_encoder_weights =
+          Ltx2LoadVaeWeights(f, Ltx2VideoVaeEncoderKeyRules(), vt::DType::kBF16);
       im.has_video_encoder = true;
 
       // The encoder's LATENT WIDTH against the DiT's input, asserted rather
@@ -1652,8 +1847,118 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     const SafetensorsFile f = SafetensorsFile::Open(upsampler_path);
     const nlohmann::json config = Ltx2ReadCheckpointConfig(f);
     im.upsampler_cfg = Ltx2ParseUpsamplerConfig(config);
-    im.upsampler_weights = Ltx2LoadVaeWeights(f);
+    // A24 wave 5 (#2857). Upstream resolves ONE model dtype (distilled.py:109)
+    // and hands it to the latent upsampler at :138-141, so the checkpoint is
+    // loaded at the width it is stored and RUN at, not widened to f32. The
+    // shipped spatial upsampler is 512 mid-channels of Conv3d weight, so the
+    // widening this removes is the whole point rather than a tidy-up.
+    im.upsampler_weights = Ltx2LoadVaeWeights(f, {}, vt::DType::kBF16);
     im.has_upsampler = true;
+  }
+
+  // ── the optional DURATION HEAD (row LTX25-DURATION-HEAD-WIRE, #2900) ──────
+  //
+  // `DurationPredictor.from_checkpoint` (blocks.py:816-848), at upstream's own
+  // position: the pipeline CONSTRUCTOR (t2a_one_stage.py:103,
+  // ti2vid_one_stage.py:126, distilled.py:163, dfr_pipeline.py:262), not the
+  // first request. The head is under 2 M parameters, so it is held for the
+  // engine's life rather than rebuilt per call -- upstream's own reasoning for
+  // this one block (blocks.py:805-808), and the opposite of what the connector
+  // does two hundred lines up for a module three orders of magnitude larger.
+  //
+  // A FILE WITH NO HEAD IN IT LOADS AND LEAVES NO PREDICTOR. That is upstream's
+  // `None` and not an error: every checkpoint predating LTX-2.5 / gemma4 is such
+  // a file, and refusing would reject checkpoints upstream runs happily. A
+  // PARTIAL head is `None` too (`:838` asks `any(param.is_meta)`), so this
+  // cannot hand `Generate` a predictor that faults in the forward.
+  //
+  // THE CONFIG'S TWO CROSS-ATTENTION DIMS MIRROR THE DiT'S, exactly as
+  // `DurationHeadConfigurator.from_metadata` reads them off the transformer
+  // config (model_configurator.py:28-29). Everything else takes upstream's
+  // placeholder defaults, which is what that configurator does too.
+  const std::string duration_head_path =
+      VideoExtra(params.extras, kLtx2DurationHeadPathExtra);
+  if (!duration_head_path.empty()) {
+    const phase::Scope duration_phase("load.duration_head");
+    const SafetensorsFile f = SafetensorsFile::Open(duration_head_path);
+    im.duration_head_cfg = Ltx2DurationHeadConfig{};
+    // The two cross-attention dims default to the DiT's own, which is what
+    // `from_metadata` reads out of the transformer config
+    // (model_configurator.py:28-29) and what a head shipped beside this DiT was
+    // trained against.
+    im.duration_head_cfg.video_cross_attention_dim = im.dit.params.cross_attention_dim;
+    im.duration_head_cfg.audio_cross_attention_dim = im.dit.params.audio_cross_attention_dim;
+    im.duration_head_cfg.prefix = "duration_head.";
+    // THE HEAD'S FOUR HYPERPARAMETERS COME FROM THE CHECKPOINT, NOT FROM HERE.
+    // `DurationHeadConfigurator.from_metadata` reads them out of a `duration_head`
+    // sub-dict with `.get(name, default)` (model_configurator.py:24-35), and
+    // upstream's own docstring says why the indirection exists: the head "has no
+    // finalized config schema yet", so the sub-dict is a PLACEHOLDER whose
+    // defaults match JAX. Taking the defaults unconditionally would load every
+    // head at 256 pooler channels and refuse any checkpoint trained at another
+    // width -- a refusal that would read as a corrupt file rather than as this
+    // port ignoring the config.
+    //
+    // AN ABSENT CONFIG IS NOT AN ERROR, because `.get` has a default and a head
+    // stored inside a DiT monolith carries no config of its own. That is why
+    // this reads `__metadata__` directly instead of through
+    // `Ltx2ReadCheckpointConfig`, which refuses a checkpoint with no config and
+    // is right to for a VAE, whose geometry cannot be guessed.
+    {
+      const auto meta = f.Metadata().find("config");
+      if (meta != f.Metadata().end()) {
+        nlohmann::json parsed;
+        try {
+          parsed = nlohmann::json::parse(meta->second);
+        } catch (const std::exception& e) {
+          Fail(std::string("the duration head's __metadata__[\"config\"] is not readable JSON: ") +
+               e.what());
+        }
+        if (parsed.is_object()) {
+          const auto read_int = [](const nlohmann::json& obj, const char* key, int64_t fallback) {
+            if (!obj.is_object()) return fallback;
+            const auto at = obj.find(key);
+            if (at == obj.end() || !at->is_number_integer()) return fallback;
+            return at->get<int64_t>();
+          };
+          const nlohmann::json transformer =
+              parsed.contains("transformer") ? parsed["transformer"] : nlohmann::json::object();
+          const nlohmann::json head =
+              parsed.contains("duration_head") ? parsed["duration_head"] : nlohmann::json::object();
+          Ltx2DurationHeadConfig& cfg = im.duration_head_cfg;
+          cfg.video_cross_attention_dim =
+              read_int(transformer, "cross_attention_dim", cfg.video_cross_attention_dim);
+          cfg.audio_cross_attention_dim =
+              read_int(transformer, "audio_cross_attention_dim", cfg.audio_cross_attention_dim);
+          cfg.pooler_hidden_dim = read_int(head, "pooler_hidden_dim", 256);
+          cfg.num_queries = read_int(head, "num_queries", 1);
+          cfg.num_pooler_heads = read_int(head, "num_pooler_heads", 4);
+          cfg.mlp_hidden = read_int(head, "mlp_hidden", 256);
+        }
+      }
+    }
+    // UPSTREAM'S OWN MODEL DTYPE, and this line is the whole of A24's eighth
+    // component at the call side. `DurationPredictor.from_checkpoint` takes the
+    // pipeline dtype (distilled.py:163-165) and `:109` resolves that to
+    // `torch.bfloat16`, so a head materialized f32 here moves twice the bytes
+    // upstream moves and computes at a width upstream never uses. Row
+    // LTX25-A24-DURATION-HEAD-BF16, .agents/specs/ltx25-a24-duration-head-bf16.md.
+    //
+    // THE TWO CALLS ARE REVERTED INDEPENDENTLY IN MUTATION. Wave 5 reverted two
+    // loader sites together and could not see either one alone.
+    im.has_duration_head = Ltx2LoadDurationHeadWeights(f, im.duration_head_cfg,
+                                                       vt::DType::kBF16,
+                                                       &im.duration_head_weights);
+    if (!im.has_duration_head) {
+      // The BARE spelling, for a head stored without upstream's key prefix.
+      // `DURATION_HEAD_KEY_OPS` strips `duration_head.` on the way in
+      // (model_configurator.py:9-11), so a file written from an already-stripped
+      // state dict carries bare names and is the same head.
+      im.duration_head_cfg.prefix = "";
+      im.has_duration_head = Ltx2LoadDurationHeadWeights(f, im.duration_head_cfg,
+                                                         vt::DType::kBF16,
+                                                         &im.duration_head_weights);
+    }
   }
 
   // ── the optional latent TEMPORAL upsampler (DFR's rounds loop, #986) ───────
@@ -1704,7 +2009,7 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
            "it is handed a 4-D tensor. The frame axis is gone by then, which is why no 2-D arm "
            "can upsample it.");
     }
-    im.temporal_upsampler_weights = Ltx2LoadVaeWeights(f);
+    im.temporal_upsampler_weights = Ltx2LoadVaeWeights(f, {}, vt::DType::kBF16);
     im.has_temporal_upsampler = true;
   }
 
@@ -1786,7 +2091,17 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     im.feature_cfg = Ltx2SelectTextFeatureVariant(
         dit_config.contains("transformer") ? dit_config.at("transformer") : dit_config,
         te.gemma_hidden_size, te.gemma_num_hidden_layers);
-    im.caption_projections = Ltx2WidenTextProjectionsToF32(te);
+    // UPSTREAM'S OWN DTYPE, and the arm the whole tower runs in. `distilled.py:109`
+    // resolves one pipeline dtype, `torch.bfloat16`, and hands it to
+    // `PromptEncoder` at `:111-113`; every parameter under it inherits it. This
+    // call keeps the checkpoint's 16-bit values instead of doubling them, which is
+    // ~2.3 GB rather than ~4.6 GB for the two projections and halves every
+    // full-width activation buffer the extractor materializes. It is also what
+    // SELECTS the arm — `Ltx2EncodePromptToConditioning` reads the dtype off the
+    // weights rather than taking a parameter, exactly as upstream reads it off the
+    // module. Swapping this line back to `Ltx2WidenTextProjectionsToF32` puts the
+    // render on the f32 parity arm, which is the mutation the row's spec names.
+    im.caption_projections = Ltx2TextProjectionsAsBf16(te);
 
     // 5. THE TWO WIDTHS MUST BE THE DiT's. `Ltx2SelectTextFeatureVariant` reads
     //    them from the SAME transformer config the DiT's cross-attention
@@ -2326,6 +2641,55 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
 
   if (gen.output_dir.empty()) Fail("output_dir is required");
   phase::Scope setup_phase("generate.setup");
+
+  // ── `require_num_frames_source` (blocks.py:894-905), AT THE TOP ────────────
+  //
+  // THE POSITION IS THE BEHAVIOUR. Upstream is explicit that this belongs at the
+  // very top of `__call__`, before prompt encoding or any other work, so a
+  // checkpoint with no head fails fast instead of paying for work whose result
+  // is discarded (`:896-899`). A guard that refused the same requests from
+  // further down would be a different pipeline from the reference, which is why
+  // `test_ltx2_video` gates the ORDER -- with a request that is ALSO invalid
+  // later -- and not only the message.
+  //
+  // AUTO IS REQUESTED TWO WAYS, and the second is upstream's DEFAULT rather than
+  // a convenience. `num_frames` defaults to `DEFAULT_AUTO_DURATION` upstream
+  // (distilled.py:195, dfr_pipeline.py:276), so omitting every frame source
+  // means auto-predict. This port has a RECIPE where upstream has a required
+  // argument, so omission auto-predicts exactly when a head is loaded and keeps
+  // the recipe default otherwise: an engine given no `duration_head_path`
+  // behaves as it did before this row, and nothing changes for a caller who did
+  // not opt in.
+  const Ltx2AutoDuration auto_duration =
+      ParseAutoDuration(gen.extras, kLtx2AutoDurationExtra);
+  const bool has_explicit_frames = gen.num_frames > 1 || gen.duration_seconds > 0.0;
+  if (auto_duration.requested && has_explicit_frames) {
+    Fail("this request carries both '" + std::string(kLtx2AutoDurationExtra) +
+         "' and an explicit frame count or duration. Upstream's `num_frames` is ONE "
+         "argument that is either a count or an `AutoDuration` (utils/types.py:116), so "
+         "there is no request that is both; refusing rather than letting one silently win");
+  }
+  // A RETAKE HAS NO PREDICTOR TO ASK, and this refuses rather than ignoring the
+  // request. `retake.py` takes its frame count from the SOURCE clip's metadata
+  // (`get_videostream_metadata`, :220) and never constructs a `DurationPredictor`
+  // at all, so there is no upstream behaviour for an auto duration here to
+  // mirror -- the source clip already fixes the length. Ignoring the extra would
+  // be the same silent win this call refuses two statements up for an explicit
+  // count, so it refuses by name for the same reason. The IMPLICIT auto request
+  // -- no count, a head loaded -- is NOT refused: it asked for nothing, and the
+  // retake's own geometry is what an omitted count resolves to.
+  const bool retake_requested = !VideoExtra(gen.extras, kLtx2RetakeStartTimeExtra).empty() ||
+                                 !VideoExtra(gen.extras, kLtx2RetakeEndTimeExtra).empty();
+  if (auto_duration.requested && retake_requested) {
+    Fail("this request carries both '" + std::string(kLtx2AutoDurationExtra) +
+         "' and a retake window. A retake's length is the SOURCE clip's "
+         "(retake.py:220 reads it from the file, and that pipeline constructs no "
+         "DurationPredictor), so an auto duration here would be dropped; refusing rather "
+         "than letting the retake silently win");
+  }
+  const bool wants_auto_duration =
+      auto_duration.requested || (!has_explicit_frames && im.has_duration_head);
+  Ltx2RequireNumFramesSource(wants_auto_duration, im.has_duration_head);
   for (const auto& kv : gen.extras) {
     // The per-generation extras this family DEFINES, and the list is the one
     // below rather than this sentence: `image_crf` (row LTX25-IMAGE-COND), the
@@ -2334,11 +2698,12 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // SERVED by row LTX25-DFR-PIPELINE #986) and `temporal_upsample_rounds`
     // (#986). DEFINED is still not SERVED — the last one is defined so that its
     // own refusal can name the missing loop, exactly as `CheckUnservedExtras`
-    // does on the load side (#611). Everything OUTSIDE the list is refused
+    // does on the load side. Everything OUTSIDE the list is refused
     // rather than ignored, for the reason `CheckKnownExtras` gives for the load
     // side: a mistyped knob that is silently dropped renders the DEFAULT and
     // looks like the feature not working.
-    const bool known = kv.first == kLtx2ImageCrfExtra || kv.first == kLtx2AudioPathExtra ||
+    const bool known = kv.first == kLtx2AutoDurationExtra ||
+                       kv.first == kLtx2ImageCrfExtra || kv.first == kLtx2AudioPathExtra ||
                        kv.first == kLtx2AudioStartTimeExtra ||
                        kv.first == kLtx2AudioMaxDurationExtra ||
                        kv.first == kLtx2GeneratedKeyframesExtra ||
@@ -2363,7 +2728,15 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                        kv.first == kLtx2VideoSkipStepExtra ||
                        kv.first == kLtx2VideoStgBlocksExtra ||
                        kv.first == kLtx2A2vGuidanceScaleExtra ||
-                       kv.first == kLtx2V2aGuidanceScaleExtra;
+                       kv.first == kLtx2V2aGuidanceScaleExtra ||
+                       // The IC-LoRA reference row (row LTX25-IC-LORA-REF-VIDEO,
+                       // #3020). DEFINED here on every kind so that the refusal
+                       // below can name the pipeline that serves them; a knob
+                       // dropped from this list is refused as a TYPO, which
+                       // tells a caller nothing about which pipeline to load.
+                       kv.first == kLtx2RefVideoStrengthExtra ||
+                       kv.first == kLtx2CondAttentionMaskDirExtra ||
+                       kv.first == kLtx2CondAttentionStrengthExtra;
     if (!known) {
       Fail("unknown per-generation extra '" + kv.first + "'. This family defines: " +
            std::string(kLtx2ImageCrfExtra) + ", " + kLtx2AudioPathExtra + ", " +
@@ -2377,7 +2750,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
            kLtx2AudioStgBlocksExtra + ", " + kLtx2VideoCfgScaleExtra + ", " +
            kLtx2VideoStgScaleExtra + ", " + kLtx2VideoRescaleScaleExtra + ", " +
            kLtx2VideoSkipStepExtra + ", " + kLtx2VideoStgBlocksExtra + ", " +
-           kLtx2A2vGuidanceScaleExtra + ", " + kLtx2V2aGuidanceScaleExtra);
+           kLtx2A2vGuidanceScaleExtra + ", " + kLtx2V2aGuidanceScaleExtra + ", " +
+           kLtx2RefVideoStrengthExtra + ", " + kLtx2CondAttentionMaskDirExtra + ", " +
+           kLtx2CondAttentionStrengthExtra);
     }
   }
   // ── the knobs that belong to ONE pipeline (#1005, corrected by #1092) ─────
@@ -2417,7 +2792,12 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                                      kLtx2VideoCfgScaleExtra,   kLtx2VideoStgScaleExtra,
                                      kLtx2VideoRescaleScaleExtra, kLtx2VideoSkipStepExtra,
                                      kLtx2VideoStgBlocksExtra,  kLtx2A2vGuidanceScaleExtra,
-                                     kLtx2V2aGuidanceScaleExtra};
+                                     kLtx2V2aGuidanceScaleExtra,
+                                     // A reference CLIP is a picture (#3020),
+                                     // and so is the mask that attenuates it.
+                                     kLtx2RefVideoStrengthExtra,
+                                     kLtx2CondAttentionMaskDirExtra,
+                                     kLtx2CondAttentionStrengthExtra};
     for (const char* key : kNotOnT2a) {
       if (im.recipe.audio_only && !VideoExtra(gen.extras, key).empty()) {
         Fail("the '" + std::string(key) +
@@ -2506,8 +2886,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // statement (:211-212) and its CLI refuses the source geometry before the
   // pipeline is even constructed (:340-353) — both before any model work is
   // paid for.
-  const bool wants_retake = !VideoExtra(gen.extras, kLtx2RetakeStartTimeExtra).empty() ||
-                            !VideoExtra(gen.extras, kLtx2RetakeEndTimeExtra).empty();
+  // Resolved at the TOP of this call, where the auto-duration guard needs it;
+  // named again here so the retake block below reads as one thing. One
+  // expression, so the two cannot drift apart into disagreeing about what a
+  // retake request is.
+  const bool wants_retake = retake_requested;
   double retake_start = 0.0, retake_end = 0.0, retake_fps = 0.0;
   bool regenerate_video = true, regenerate_audio = true;
   Ltx2RetakeSourceGeometry retake_source;
@@ -2671,6 +3054,29 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   const float* audio_context = im.audio_prompt_embeds.data();
   int64_t context_tokens = im.prompt_tokens;
   im.trace = Ltx2ConditioningTrace{};
+  // THE LOADED WIDTH OF EACH UPSAMPLER, recorded per render because there are
+  // TWO checkpoints and a counter over the render reports whichever one ran.
+  // `Load` asks both for `kBF16`; this is what says the file agreed, and it is
+  // the only thing standing between the temporal loader line and a silent revert
+  // to f32 -- which stayed green across 5638 assertions during this row's review.
+  if (im.has_upsampler) {
+    im.trace.upsampler_weight_elems = VaeWeightElems(im.upsampler_weights);
+    im.trace.upsampler_weight_bytes = static_cast<int64_t>(im.upsampler_weights.Bytes());
+  }
+  if (im.has_temporal_upsampler) {
+    im.trace.temporal_upsampler_weight_elems = VaeWeightElems(im.temporal_upsampler_weights);
+    im.trace.temporal_upsampler_weight_bytes =
+        static_cast<int64_t>(im.temporal_upsampler_weights.Bytes());
+  }
+  // THE DURATION HEAD'S STORAGE WIDTH (A24 wave 6, #2955), recorded the same way
+  // and for the same reason: `Load` asks for `kBF16` and this is the only thing
+  // that says the file agreed. Without it, reverting either loader call site
+  // leaves every assertion on this path green.
+  if (im.has_duration_head) {
+    im.trace.duration_head_weight_elems = VaeWeightElems(im.duration_head_weights);
+    im.trace.duration_head_weight_bytes =
+        static_cast<int64_t>(im.duration_head_weights.Bytes());
+  }
 
   if (!gen.prompt.empty()) {
     // W0: the phase #1269 and W4 are about. Split into the TOWER and the
@@ -2686,6 +3092,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     prompt_video = encoded.conditioning.video;
     prompt_audio = encoded.conditioning.audio;
     context_tokens = encoded.seq;
+    // A24 wave 1: the TOWER's own output width, sampled HERE — before the
+    // connector, because the connector is wave 2 and still computes in f32. See
+    // `Ltx2ConditioningTrace::tower_video_not_bf16`.
+    im.trace.tower_video_not_bf16 = CountWiderThanBf16(prompt_video);
+    im.trace.tower_audio_not_bf16 = CountWiderThanBf16(prompt_audio);
+    im.trace.tower_video_values = static_cast<int64_t>(prompt_video.size());
+    im.trace.tower_audio_values = static_cast<int64_t>(prompt_audio.size());
 
     if (im.has_connector) {
       const std::vector<float>& mask = encoded.conditioning.additive_mask;
@@ -2711,6 +3124,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       connector_phase.Close();
       prompt_video = through.video;
       prompt_audio = through.audio;
+      // The f32 population the tower counters are measured against — see
+      // `Ltx2ConditioningTrace::connector_video_not_bf16`. Same fixture, same
+      // render, same buffers, one wave later.
+      im.trace.connector_video_not_bf16 = CountWiderThanBf16(prompt_video);
+      im.trace.connector_audio_not_bf16 = CountWiderThanBf16(prompt_audio);
+      im.trace.connector_video_values = static_cast<int64_t>(prompt_video.size());
+      im.trace.connector_audio_values = static_cast<int64_t>(prompt_audio.size());
     }
     video_context = prompt_video.data();
     audio_context = prompt_audio.data();
@@ -2751,7 +3171,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // about a video stream this pipeline does not have, and a `t2a` request that
   // fell through would be refused by a message about latent grids.
   if (im.recipe.audio_only) {
-    VideoResult audio_only = GenerateAudioOnly(im, gen, audio_context, context_tokens);
+    VideoResult audio_only = GenerateAudioOnly(im, gen, audio_context, context_tokens,
+                                              wants_auto_duration, auto_duration.min_seconds,
+                                              auto_duration.max_seconds);
     generate_span.Close();
     WritePhaseLog(gen.output_dir, kLtx2VideoFamily, phase_device, &audio_only.phase_log_path);
     return audio_only;
@@ -2816,120 +3238,125 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   const bool wants_first_frame = !gen.first_frame_path.empty() || !gen.first_frame_ppm.empty();
   const bool wants_last_frame = !gen.last_frame_path.empty();
   const bool wants_image = wants_first_frame || wants_last_frame;
-  // `!wants_retake` IS LOAD-BEARING, and it narrows this refusal rather than
-  // weakening it. Retake and IC-LoRA reference conditioning both arrive as
-  // `ref_video_dir`, and they consume it in completely different ways: retake
-  // encodes the clip at its OWN resolution and seeds the video stream's initial
-  // latent with it (retake.py:238-247, :273), while the reference item is
-  // downscaled by the adapter's factor, temporally subsampled, and APPENDED as
-  // extra tokens to a stage-1-only adapter (iclora_utils.py:112-117, :87-89,
-  // :144-148). Serving the first says nothing about the second, so the second
-  // stays refused and #975 stays open.
-  if (!wants_retake && (!gen.ref_image_paths.empty() || !gen.ref_video_dir.empty())) {
-    // TWO CAUSES REMAIN, AND NEITHER IS ONE THIS MESSAGE HAS EVER GIVEN. The
-    // message names both, and then names the three ruled-out reasons with what
-    // ruled each one out, because a reader who arrives here in a month should
-    // re-check the claim rather than re-derive the refutation for a third time.
-    //
-    // 1. THE REFERENCE CLIP HAS NO PIXEL PATH. Upstream resolves the reference
-    //    at `height // scale` by `width // scale` (iclora_utils.py:116-117),
-    //    refuses a target either axis of which the factor does not divide
-    //    (:112-115), keeps frame 0 and then every Nth frame (`temporal_subsample`,
-    //    :87-89, called at :144), and encodes the whole clip (:145-148). This
-    //    engine's only pixel-to-latent route for a REFERENCE item is
-    //    `Ltx2LoadImageAndPreprocess` followed by `Ltx2ConvVideoEncode` at
-    //    `frame_count = 1` and the phase's OWN height and width, and it refuses
-    //    an encode that returns more than one latent frame.
-    //
-    //    THIS USED TO SAY "nothing anywhere reads `ref_video_dir`", and that was
-    //    false about the tree even when it was written (#987): MiniMax-H3 has
-    //    always consumed the directory in full — `ReadReferenceClipChw`,
-    //    `minimax_h3_video.cpp:135`, called at `:650`. Since row LTX25-RETAKE
-    //    (#924) the LTX-2.5 side reads it too, through
-    //    `Ltx2ReadFrameDirectory`. So the missing piece is NOT a reader. It is
-    //    the reference item's own geometry: the downscale-factor resize and the
-    //    temporal subsample, neither of which retake performs and neither of
-    //    which any reader supplies.
-    //
-    //    THE SECOND REASON THIS MESSAGE GAVE IS NOW FALSE, and it is recorded
-    //    here rather than deleted because it is the third reason in this block
-    //    to come true and a reader needs to know which. It said: "the reference
-    //    item belongs to stage 1 and stage 2 must run unfused —
-    //    `ICLoraPipeline` gives stage 1 `loras=tuple(loras)` (ic_lora.py:108)
-    //    and stage 2 `loras=()` (:119), and this engine holds ONE `Ltx2Dit`,
-    //    fused at load, that every phase of the recipe runs. Serving the arm
-    //    needs a second unfused DiT or a phase-scoped adapter."
-    //
-    //    Row LTX25-PHASE-LORA (#1118) landed the phase-scoped adapter.
-    //    `Ltx2PhaseRecipe::loras` (ltx2_pipeline.h) carries upstream's per-stage
-    //    set and the phase loop in this file honours it through
-    //    `Ltx2RebindDitLoras`, which re-materializes only the tensors an adapter
-    //    targets — so a two-phase recipe CAN now give stage 1 the adapter and
-    //    stage 2 none, which is exactly `ic_lora.py:108` against `:119`, and it
-    //    does so without a second resident weight set. `A2VidTwoStageRecipe` is
-    //    the executable proof it exists: it gives stage 1 `kNoAdapters` and the
-    //    gate "the distilled adapter rides stage 2 ALONE" renders both states
-    //    through this ABI and compares the pixels.
-    //
-    //    What that leaves is reason 1 ALONE, and reason 1 is unrelated to
-    //    weights: it is the reference clip's own geometry. The conditioning
-    //    split is also still upstream's — stage 1 takes `_create_conditionings`,
-    //    which appends the reference item (:269-278, :377-402), and stage 2
-    //    takes plain `combined_image_conditionings` with no reference item
-    //    (:314-321) — but that is a conditioning question, not a fused-weight
-    //    one, and serving the arm on one phase only is upstream's `skip_stage_2`
-    //    (:302-308), a different request.
-    std::string factors = "no adapter was supplied, so none were read";
-    if (im.dit.lora_fused_tensors > 0) {
-      factors = "the supplied adapter declares downscale=" +
-                std::to_string(im.dit.lora_reference.downscale) +
-                " temporal=" + std::to_string(im.dit.lora_reference.temporal) +
-                ", fused into " + std::to_string(im.dit.lora_fused_tensors) + " tensors";
-    }
+  // ── IC-LoRA REFERENCE CONDITIONING (row LTX25-IC-LORA-REF-VIDEO, #3020) ──
+  //
+  // ONE PREDICATE, READ ONCE, and it is what makes this block correct rather
+  // than merely present. `serves_reference` is bound here and used by BOTH the
+  // routing branch in the phase loop and every refusal below it. A refusal and
+  // its route predicate written as two expressions is how this campaign shipped
+  // a silently wrong answer, and the two are one local for exactly that reason.
+  //
+  // WHY IT IS A RECIPE FLAG. `ICLoraPipeline` (ic_lora.py:60) is the only
+  // pipeline in `ltx-pipelines` that calls
+  // `append_ic_lora_reference_video_conditionings`; `distilled.py`, `dfr`,
+  // `retake` and the four `*_two_stage` arms call none. Serving the reference on
+  // any of them would be inventing conditioning the reference does not have.
+  const bool serves_reference = im.recipe.ic_lora_reference;
+  const std::string cond_mask_dir = VideoExtra(gen.extras, kLtx2CondAttentionMaskDirExtra);
+  const double cond_attention_strength =
+      ExtraDouble(gen.extras, kLtx2CondAttentionStrengthExtra, 1.0);
+  const double ref_video_strength = ExtraDouble(gen.extras, kLtx2RefVideoStrengthExtra, 1.0);
+
+  // `!wants_retake` IS LOAD-BEARING, and it narrows rather than weakens. Retake
+  // and IC-LoRA reference conditioning both arrive as `ref_video_dir`, and they
+  // consume it in completely different ways: retake encodes the clip at its OWN
+  // resolution and seeds the video stream's initial latent with it
+  // (retake.py:238-247, :273), while the reference item is downscaled by the
+  // adapter's factor, temporally subsampled, and APPENDED as extra tokens to a
+  // stage-1-only adapter (iclora_utils.py:112-117, :87-89, :144-148).
+  const bool wants_reference_video = !wants_retake && !gen.ref_video_dir.empty();
+
+  if (!wants_retake && !gen.ref_image_paths.empty()) {
+    // REFERENCE IMAGES ARE NOT UPSTREAM'S IC-LoRA SHAPE, and this stays refused
+    // whatever pipeline is loaded. `--video-conditioning` takes a video file or
+    // a directory of scene-linear EXR frames (ic_lora.py:416-425) and there is
+    // no `--reference-image` anywhere in `ltx-pipelines`. Serving a still here
+    // by encoding it at `frame_count = 1` would be a conditioning item upstream
+    // does not build, and it would silently answer a request for a different
+    // feature. Recorded owed in .agents/specs/ltx25-ic-lora-ref-video.md.
     Fail(
-        "reference-image / reference-video conditioning is not served. TWO things are "
-        "missing. FIRST, the reference CLIP has no pixel path: upstream reads it at "
-        "`height // reference_downscale_factor` by `width // reference_downscale_factor` "
-        "(iclora_utils.py:116-117), refuses a target the factor does not divide (:112-115), "
-        "keeps frame 0 and then every Nth frame (`temporal_subsample`, :87-89, called at "
-        ":144) and encodes the whole clip (:145-148), while this engine's only "
-        "pixel-to-latent route for a REFERENCE item encodes exactly ONE frame at the phase's "
-        "own resolution. WHAT IS *NOT* THE REASON here: the READER. This message used to say "
-        "\"nothing reads `ref_video_dir` at all\", which was false about the tree when it was "
-        "written (#987) — MiniMax-H3 consumes the directory in full at "
-        "`minimax_h3_video.cpp:650` — and is doubly false now that row LTX25-RETAKE (#924) "
-        "reads it on this side through `Ltx2ReadFrameDirectory`. What is missing is the "
-        "reference item's own geometry, the downscale resize and the temporal subsample, "
-        "which no reader supplies. SECOND, the reference item is a STAGE-1 item and stage 2 "
-        "takes `combined_image_conditionings` with no reference item at all: `ICLoraPipeline` "
-        "gives stage 1 the reference conditioning (ic_lora.py:269-278) and stage 2 none "
-        "(:314-321), and this phase loop appends the same conditioning set to every phase. "
-        "That is a CONDITIONING gap and not a weights one. WHAT IS *NOT* THE REASON, because "
-        "this refusal has now given THREE reasons that later became false: (a) the IC-LoRA "
-        "METADATA. Row LTX25-IC-LORA (#923) "
-        "closed that; supply `lora_path` and the factors are read at load "
-        "(iclora_utils.py:30-49) — right now, " + factors +
-        ". (b) the TOKEN-APPEND machinery. This message blamed it on 2026-08-15 and row "
-        "LTX25-TOKEN-APPEND (#930) landed it in `c7cb59fbb` the next day: the phase loop "
-        "now binds a `target_tokens` local, grows `video.tokens` past it on an appending "
-        "item, carries the grown count through denoise, and trims back through "
-        "`Ltx2ClearConditioning` (ltx_core/tools.py:88-117) before unpatchify. The "
-        "last-frame keyframe arm is SERVED on exactly that machinery, which is the "
-        "executable proof it exists. (c) `Ltx2LatentState` carrying no attention-mask "
-        "field. On the DEFAULT arm upstream builds no mask: at "
-        "`conditioning_attention_strength >= 1.0` with no latent mask `attn_mask` is None "
-        "(iclora_utils.py:159-160) and `ConditioningItemAttentionStrengthWrapper` is "
-        "applied only `if attn_mask is not None` (:168-169). The sub-1.0 arm is owed by "
-        "#932, and it is not what blocks this one. (d) the FUSED-AT-LOAD adapter. This "
-        "message said until 2026-08-17 that stage 2 must run with no adapter while \"this "
-        "engine holds one DiT, fused at load, that every phase runs\", and row "
-        "LTX25-PHASE-LORA (#1118) closed it: `Ltx2PhaseRecipe::loras` carries upstream's "
-        "per-stage set and the phase loop rebinds the DiT through `Ltx2RebindDitLoras`, so "
-        "`loras=tuple(loras)` on stage 1 against `loras=()` on stage 2 (ic_lora.py:108, "
-        ":119) is now expressible with no second weight set. `a2vid_two_stage`'s stage 1 "
-        "runs `kNoAdapters` on exactly that machinery, which is the executable proof it "
-        "exists. Use first_frame_ppm / first_frame_path "
-        "for image-to-video, and last_frame_path for a closing keyframe.");
+        "reference-IMAGE conditioning is not served, and it is not what an IC-LoRA reference is. "
+        "Upstream's IC-LoRA flag is `--video-conditioning PATH STRENGTH`, whose PATH is a video "
+        "file or a directory of scene-linear .exr frames (ic_lora.py:416-425); there is no "
+        "reference-image conditioning anywhere in `ltx-pipelines`, so serving a still here would "
+        "build a conditioning item the reference does not have. Use `ref_video_dir` with "
+        "'pipeline_kind' 'ic_lora' for a reference CLIP, first_frame_ppm / first_frame_path for "
+        "image-to-video, or last_frame_path for a closing keyframe. Recorded owed (#3020).");
+  }
+  if (wants_reference_video && !serves_reference) {
+    // The SAME predicate the route uses, negated. A reference clip on a pipeline
+    // that has no reference conditioning is a request for a different pipeline,
+    // and saying so is more useful than saying the feature is missing — it is
+    // not missing, it is elsewhere.
+    std::string factors_note = "no adapter was supplied, so none were read";
+    if (im.dit.lora_fused_tensors > 0) {
+      factors_note = "the supplied adapter declares downscale=" +
+                     std::to_string(im.dit.lora_reference.downscale) +
+                     " temporal=" + std::to_string(im.dit.lora_reference.temporal) +
+                     ", fused into " + std::to_string(im.dit.lora_fused_tensors) + " tensors";
+    }
+    Fail("the '" + im.pipeline_kind +
+         "' pipeline does not condition on a reference clip, so `ref_video_dir` has no meaning on "
+         "it. `ICLoraPipeline` is the only pipeline in `ltx-pipelines` that calls "
+         "`append_ic_lora_reference_video_conditionings` (ic_lora.py:381-402); `distilled.py`, "
+         "`dfr_pipeline.py`, the four `*_two_stage` arms and `t2a_one_stage.py` call none of it. "
+         "Load with 'pipeline_kind' 'ic_lora' to serve a reference clip, or supply "
+         "'retake_start_time' and 'retake_end_time' to RETAKE a window of this directory instead "
+         "— which is a different operation: retake encodes the clip at its own resolution and "
+         "SEEDS the video latent with it (retake.py:238-247), while the reference item downscales "
+         "it, temporally subsamples it and APPENDS it as extra tokens (iclora_utils.py:112-117, "
+         ":87-89, :144-148). Right now, " + factors_note + ".");
+  }
+  if (!cond_mask_dir.empty() && !serves_reference) {
+    Fail("the '" + std::string(kLtx2CondAttentionMaskDirExtra) + "' extra attenuates the IC-LoRA "
+         "REFERENCE tokens' attention (iclora_utils.py:151-156, :168-169) and the '" +
+         im.pipeline_kind +
+         "' pipeline appends none, so there would be nothing for it to attenuate. Upstream applies "
+         "`ConditioningItemAttentionStrengthWrapper` at exactly one site and its argument is "
+         "always the `VideoConditionByReferenceLatent` built two lines above it; "
+         "`combined_image_conditionings` never wraps. Load with 'pipeline_kind' 'ic_lora'.");
+  }
+  if (serves_reference && !wants_reference_video) {
+    // `--video-conditioning` is `required=True` on this parser
+    // (ic_lora.py:416-425). An IC-LoRA render with no reference is upstream's
+    // distilled two-stage render, and defaulting to it silently would answer a
+    // request for a conditioned clip with an unconditioned one.
+    Fail("the 'ic_lora' pipeline conditions on a reference clip and this request supplied none. "
+         "`--video-conditioning PATH STRENGTH` is `required=True` upstream "
+         "(ic_lora.py:416-425), because `ICLoraPipeline` without it is exactly the distilled "
+         "two-stage pipeline. Set `ref_video_dir` to a directory of frame_%06d.ppm, or load with "
+         "'pipeline_kind' 'distilled_two_stage' for an unconditioned render.");
+  }
+  // UNCONDITIONAL, exactly as upstream's is. `ic_lora.py:230-233` sits in the
+  // method body, before anything about the mask and outside every `if
+  // args.conditioning_attention_mask is not None`. Guarding it on a mask made
+  // this engine ACCEPT an out-of-range strength whenever none was supplied and
+  // then never read it, because its only reader is inside the mask branch: a
+  // knob that takes a value, refuses nothing, and does nothing.
+  if (cond_attention_strength < 0.0 || cond_attention_strength > 1.0) {
+    Fail("'" + std::string(kLtx2CondAttentionStrengthExtra) + "' must be in [0.0, 1.0], got " +
+         std::to_string(cond_attention_strength) +
+         ". This is upstream's own refusal (ic_lora.py:230-233): the value multiplies a mask in "
+         "[0, 1] and the product becomes a log-space attention bias, so a value above 1 would "
+         "AMPLIFY attention rather than attenuate it.");
+  }
+  if (cond_mask_dir.empty() && cond_attention_strength < 1.0) {
+    // UPSTREAM HAS THIS BRANCH AND ITS CLI CANNOT REACH IT
+    // (`elif conditioning_attention_strength < 1.0`, iclora_utils.py:157-158).
+    // `conditioning_attention_strength` is assigned only inside
+    // `if args.conditioning_attention_mask is not None` (ic_lora.py:452-455) and
+    // is 1.0 otherwise, so a sub-1.0 strength always arrives WITH a mask.
+    // MEASURED rather than read: `kLtx2RefWrapScalarBelowOne` is what the pinned
+    // module returned for the no-mask, strength-0.5 call, and it is `true` — so
+    // the branch is real and this refusal is naming a Python-API-only arm rather
+    // than a branch that does not exist. Recorded owed (#3020).
+    Fail("'" + std::string(kLtx2CondAttentionStrengthExtra) + "' below 1.0 without '" +
+         std::string(kLtx2CondAttentionMaskDirExtra) +
+         "' is upstream's scalar-only attention arm (iclora_utils.py:157-158), which its own CLI "
+         "cannot reach: the strength is assigned only alongside a mask (ic_lora.py:452-455) and "
+         "is 1.0 otherwise. It is a Python-API-only branch, it is not ported, and it is recorded "
+         "owed (#3020) rather than guessed at. Supply a mask directory, or leave the strength at "
+         "1.0.");
   }
   if (!gen.ref_audio_path.empty() || !gen.ref_audio_wav.empty()) {
     Fail(
@@ -3014,22 +3441,43 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                                       : (gen.height > 0 ? gen.height : recipe.height);
   const int64_t width = wants_retake ? retake_source.width
                                      : (gen.width > 0 ? gen.width : recipe.width);
+  // The VAE's causal temporal factor, named before `factors` is declared below
+  // so the auto-duration snap and the latent shapes cannot disagree about it.
+  const int64_t factors_time_for_duration = Ltx2ScaleFactors{}.time;
   int64_t frames =
       wants_retake ? retake_source.frames : (gen.num_frames > 1 ? gen.num_frames : recipe.num_frames);
   if (gen.duration_seconds > 0.0) {
-    // `resolve_num_frames` (utils/blocks.py) turns an AUTO duration into frames
-    // through the DURATION HEAD. THE REASON THIS IS UNSERVED MOVED IN L13 and the
-    // old one is recorded so a reader can re-check it: it used to be "the head
-    // needs an encoded prompt this engine cannot produce", and since `has_encoder`
-    // above the engine produces exactly that. What is missing now is the head
-    // itself — `ltx2_duration_head.h` is ported and gated as a brick, but nothing
-    // here constructs one. `duration_head_path` used to be ACCEPTED while no code
-    // read it, so a caller who supplied a head silently landed on this line
-    // instead; `CheckUnservedExtras` now refuses that key by name at load (#611,
-    // .agents/specs/ltx25-retire-dead-arms.md §2). What remains owed is the head
-    // itself. An explicit duration is exact arithmetic, so it is served; the AUTO
-    // path is what is missing, and `num_frames` is how to avoid it.
+    // An EXPLICIT duration is exact arithmetic against the recipe frame rate.
+    // This is not `resolve_num_frames`: upstream has no "duration in seconds"
+    // request field at all, so nothing here is being mirrored and nothing is
+    // owed. The auto path below is the one that mirrors upstream.
     frames = static_cast<int64_t>(std::llround(gen.duration_seconds * fps));
+  } else if (wants_auto_duration && !wants_retake) {
+    // ── `resolve_num_frames` (utils/blocks.py:908-928) ──────────────────────
+    //
+    // AT UPSTREAM'S POSITION: after prompt encoding, where the connector outputs
+    // exist (distilled.py:231-238 sits below its `PromptEncoder` call, and
+    // `:908-913` says so in as many words). `require_num_frames_source` already
+    // ran at the top of this call, so a missing head was refused before any of
+    // the work above was paid for and `im.has_duration_head` is true here.
+    //
+    // BOTH STREAMS ARE PASSED. `DurationHead.forward` takes either or both
+    // (duration_head.py:104-105) and the video path has both, so withholding one
+    // would predict from half the signal the reference uses.
+    float predicted_seconds = 0.0F;
+    // THE ARITHMETIC WIDTH, sampled on the ONE production route into the head
+    // (A24 wave 6, #2955). Not on a hand-constructed forward: a unit test that
+    // builds the head itself proves the class works and never that anything
+    // reaches it.
+    Ltx2DurationWidthCounts head_widths;
+    frames = Ltx2DurationPredictFrames(
+        im.duration_head_cfg, im.duration_head_weights, video_context, context_tokens,
+        audio_context, context_tokens, fps, auto_duration.min_seconds,
+        auto_duration.max_seconds, factors_time_for_duration, &predicted_seconds, &head_widths);
+    im.trace.duration_seconds = predicted_seconds;
+    im.trace.duration_frames = frames;
+    im.trace.duration_head_not_bf16 = head_widths.not_bf16;
+    im.trace.duration_head_values = head_widths.values;
   }
   if (frames < 1) Fail("num_frames resolved to " + std::to_string(frames));
 
@@ -3686,8 +4134,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // the VAE checkpoint, not in the upsampler's.
       const Ltx2LatentVolume up = Ltx2UpsampleVideoLatent(
           im.upsampler_cfg, im.upsampler_weights, in,
-          im.video_weights.Get("per_channel_statistics.std-of-means"),
-          im.video_weights.Get("per_channel_statistics.mean-of-means"));
+          VaeStatsAsF32(im.video_weights, "per_channel_statistics.std-of-means"),
+          VaeStatsAsF32(im.video_weights, "per_channel_statistics.mean-of-means"));
+      RecordUpsampleWidth(im.trace, up);
       if (up.channels != vshape.channels || up.frames != vshape.frames ||
           up.height != vshape.height || up.width != vshape.width) {
         Fail("the upsampled latent is " + std::to_string(up.channels) + "x" +
@@ -3713,8 +4162,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       if (slot_keyframes.frames > 0) {
         const Ltx2LatentVolume up_slots = Ltx2UpsampleVideoLatent(
             im.upsampler_cfg, im.upsampler_weights, slot_keyframes,
-            im.video_weights.Get("per_channel_statistics.std-of-means"),
-            im.video_weights.Get("per_channel_statistics.mean-of-means"));
+            VaeStatsAsF32(im.video_weights, "per_channel_statistics.std-of-means"),
+            VaeStatsAsF32(im.video_weights, "per_channel_statistics.mean-of-means"));
+        RecordUpsampleWidth(im.trace, up_slots);
         if (up_slots.height != vshape.height || up_slots.width != vshape.width ||
             up_slots.channels != vshape.channels ||
             up_slots.frames != static_cast<int64_t>(slot_positions.size())) {
@@ -3754,6 +4204,12 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     StreamState video;
     video.width = vshape.channels;  // patch_size 1 (VideoLatentPatchifier(1))
     video.tokens = target_tokens;
+    // ...and remembers it, because every appending item measures the attention
+    // mask's block structure against the count BEFORE any item ran
+    // (mask_utils.py:236 gives the noisy rows the cross weight and `:242` leaves
+    // the prior-reference rows at zero). Bound to the SAME local the schedule
+    // reads, so a change to one moves both.
+    video.noisy_tokens = target_tokens;
     {
       std::vector<float> volume(static_cast<size_t>(vshape.channels) *
                                 static_cast<size_t>(vshape.frames) *
@@ -3938,6 +4394,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       const Ltx2LatentVolume encoded = Ltx2ConvVideoEncode(
           im.video_encoder_cfg, im.video_encoder_weights, pixels,
           im.video_encoder_cfg.in_channels, /*frame_count=*/1, phase_h, phase_w, &cropped);
+      // A24 wave 4 (#2850): the encoder's INPUT and OUTPUT widths, on a
+      // production route. Summed over images. See `Ltx2ConditioningTrace` for
+      // why both halves are needed and why nothing else here can see either.
+      im.trace.vae_encode_in_not_bf16 += CountWiderThanBf16(pixels);
+      im.trace.vae_encode_in_values += static_cast<int64_t>(pixels.size());
+      im.trace.vae_encode_not_bf16 += CountWiderThanBf16(encoded.data);
+      im.trace.vae_encode_values += static_cast<int64_t>(encoded.data.size());
       if (encoded.frames != 1) {
         Fail("the video VAE encoder returned " + std::to_string(encoded.frames) +
              " latent frames for a single image; both arms of "
@@ -4331,6 +4794,175 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                    "size while omitting the trained embedding.");
     }
 
+    // ── THE IC-LoRA REFERENCE CLIP (row LTX25-IC-LORA-REF-VIDEO, #3020) ─────
+    //
+    // AFTER every image and keyframe item, because upstream appends it after
+    // `combined_image_conditionings` (ic_lora.py:377-402 runs at the END of
+    // `_create_conditionings`) and conditioning items are applied in list order
+    // (`state_with_conditionings`, helpers.py:448-458). Order is not cosmetic
+    // here: appended tokens land at the END of the sequence and
+    // `Ltx2ClearConditioning` trims from the end, so two appends in the wrong
+    // order swap their positions while every count still agrees.
+    //
+    // PHASE 0 ONLY, and that is upstream's split rather than an optimisation.
+    // `ICLoraPipeline` gives stage 1 `_create_conditionings`, which appends the
+    // reference item (ic_lora.py:269-281), and stage 2 plain
+    // `combined_image_conditionings` with NO reference item (`:314-321`).
+    // Appending it to stage 2 as well would put the reference tokens into a
+    // 3-step refinement that upstream runs unconditioned — and the clip would
+    // come out the right length at the right resolution.
+    //
+    // THE SAME `serves_reference` LOCAL the refusals above read. Two expressions
+    // for one predicate is how a refusal and its route drift apart.
+    if (serves_reference && phase_index == 0) {
+      // `scale = reference_downscale_factor` and the divisibility refusal
+      // (iclora_utils.py:111-115), then `height // scale` by `width // scale`
+      // (`:116-117`). Measured against the phase's OWN grid, which is stage 1's
+      // half resolution — the same number `ic_lora.py:460-461` spells
+      // `args.height // 2`, derived here rather than assumed.
+      const Ltx2IcLoraReferenceGeometry ref_geom = Ltx2ResolveIcLoraReferenceGeometry(
+          phase_h, phase_w, im.dit.lora_reference.downscale);
+
+      // `decode_video_by_frame(path, frame_cap=num_frames)` then
+      // `video_preprocess(frames, ref_height, ref_width, ...)`
+      // (iclora_utils.py:141-142). `Ltx2ReadFrameDirectory` IS `video_preprocess`
+      // over the folder arm — row LTX25-RETAKE ported and gated it — so what is
+      // new here is only the GEOMETRY it is called at.
+      const Ltx2RetakeSourceGeometry ref_probe = Ltx2ProbeFrameDirectory(gen.ref_video_dir);
+      // `frame_cap` (`:141`). The reference may be longer than the render, and a
+      // clip read past the cap would append tokens for moments the target grid
+      // has no time for.
+      const int64_t ref_frames = std::min<int64_t>(ref_probe.frames, frames);
+      const std::vector<float> ref_pixels =
+          Ltx2ReadFrameDirectory(gen.ref_video_dir, ref_geom.height, ref_geom.width);
+      const int64_t ref_channels = im.video_encoder_cfg.in_channels;
+      const int64_t ref_plane = ref_geom.height * ref_geom.width;
+      std::vector<float> ref_clip;
+      if (ref_frames == ref_probe.frames) {
+        ref_clip = ref_pixels;
+      } else {
+        // The cap, applied on the FRAME axis of a channel-major volume. A plain
+        // prefix of the buffer would keep whole channels and drop others.
+        ref_clip.resize(static_cast<size_t>(ref_channels * ref_frames * ref_plane));
+        for (int64_t c = 0; c < ref_channels; ++c) {
+          const size_t src = static_cast<size_t>(c * ref_probe.frames * ref_plane);
+          const size_t dst = static_cast<size_t>(c * ref_frames * ref_plane);
+          std::copy(ref_pixels.begin() + static_cast<ptrdiff_t>(src),
+                    ref_pixels.begin() +
+                        static_cast<ptrdiff_t>(src + static_cast<size_t>(ref_frames * ref_plane)),
+                    ref_clip.begin() + static_cast<ptrdiff_t>(dst));
+        }
+      }
+
+      // `if reference_temporal_scale_factor > 1: video = temporal_subsample(...)`
+      // (`:143-144`). GUARDED, and the guard is measured: at factor 1 upstream
+      // hands the encoder all 5 frames of the probe fixture and at factor 2 it
+      // hands it 3, which `kLtx2RefEncodedFramesN1` and `...N2` pin.
+      int64_t ref_kept = ref_frames;
+      if (im.dit.lora_reference.temporal > 1) {
+        ref_clip = Ltx2TemporalSubsample(ref_clip, ref_channels, ref_frames, ref_plane,
+                                         im.dit.lora_reference.temporal);
+        ref_kept = static_cast<int64_t>(
+            Ltx2TemporalSubsampleIndices(ref_frames, im.dit.lora_reference.temporal).size());
+      }
+
+      // `encoded_video = video_encoder(video)` (`:148`) — the WHOLE clip, which
+      // is the same multi-frame encode the retake arm already drives. The
+      // `tiled_encode` arm (`:145-146`) is not reached: this engine tiles the
+      // target's decode and not a reference's encode, and it is recorded owed.
+      int64_t ref_cropped = 0;
+      const Ltx2LatentVolume ref_encoded = Ltx2ConvVideoEncode(
+          im.video_encoder_cfg, im.video_encoder_weights, ref_clip, ref_channels, ref_kept,
+          ref_geom.height, ref_geom.width, &ref_cropped);
+      im.trace.ic_lora_reference_digest = DigestF32(ref_encoded.data);
+      im.trace.ic_lora_reference_absmax = AbsMax(ref_encoded.data);
+
+      // ── the MASK half (gap A16) ─────────────────────────────────────────
+      //
+      // Built BEFORE the item is applied, because it needs the reference
+      // LATENT's shape (`reference_video_shape`, `:149`) and because the
+      // wrapper measures its block structure against the PRE-append state
+      // (attention_strength_wrapper.py:49-64).
+      std::vector<float> cross_mask;
+      if (!cond_mask_dir.empty()) {
+        // `_load_mask_video` (ic_lora.py:511-537): the same read, at the STAGE's
+        // resolution rather than the reference's — upstream passes
+        // `args.height // 2` and not `ref_height` (`:460-461`) — then mean over
+        // channels, `(x + 1) / 2`, clamp.
+        const Ltx2RetakeSourceGeometry mask_probe = Ltx2ProbeFrameDirectory(cond_mask_dir);
+        const int64_t mask_frames = std::min<int64_t>(mask_probe.frames, frames);
+        const std::vector<float> mask_pixels =
+            Ltx2ReadFrameDirectory(cond_mask_dir, phase_h, phase_w);
+        const std::vector<float> mask_video = Ltx2MaskVideoFromPixels(
+            mask_pixels, ref_channels, mask_probe.frames, phase_h * phase_w);
+        std::vector<float> capped(
+            mask_video.begin(),
+            mask_video.begin() + static_cast<ptrdiff_t>(mask_frames * phase_h * phase_w));
+        // `downsample_mask_video_to_latent(mask, target_latent_shape=
+        // reference_video_shape)` (`:151-155`) — the REFERENCE's latent shape and
+        // not the target's, because these weights attenuate the reference's own
+        // tokens.
+        std::vector<float> latent_mask = Ltx2DownsampleMaskVideoToLatent(
+            capped, mask_frames, phase_h, phase_w, ref_encoded.frames, ref_encoded.height,
+            ref_encoded.width);
+        // `attn_mask = latent_mask * conditioning_attention_strength` (`:156`).
+        for (float& v : latent_mask) v *= static_cast<float>(cond_attention_strength);
+        // `resolve_cross_mask`'s 1-D arm (mask_utils.py:49-54), which refuses a
+        // length that is not the new-token count rather than broadcasting.
+        cross_mask = Ltx2ResolveCrossMask(latent_mask, /*scalar=*/1.0,
+                                          static_cast<int64_t>(latent_mask.size()));
+      }
+
+      // THE SEQUENCE LENGTH AND THE MASK BEFORE THIS ITEM. The wrapper snapshots
+      // the ORIGINAL state (attention_strength_wrapper.py:50) and builds against
+      // it; building against the post-append count would place the new block
+      // over the tokens it just added while every dimension still agreed.
+      const int64_t before_reference = video.tokens;
+      const std::vector<float> mask_before = video.attention_mask;
+
+      Ltx2LatentState state = ToLatentState(video, /*pos_dims=*/3);
+      Ltx2ConditionVideoByReference(&state, ref_encoded, /*patch_size=*/1, factors, fps,
+                                    im.dit.lora_reference.downscale,
+                                    im.dit.lora_reference.temporal, ref_video_strength,
+                                    /*causal_fix=*/true);
+      FromLatentState(state, &video);
+
+      const int64_t ref_tokens = video.tokens - before_reference;
+      VT_CHECK(ref_tokens > 0,
+               "ltx2 video: the reference item must APPEND tokens "
+               "(reference_video_cond.py:96-108) and this one left the sequence unchanged");
+      VT_CHECK(static_cast<int64_t>(video.latent.size()) == video.tokens * video.width &&
+                   static_cast<int64_t>(video.clean.size()) == video.tokens * video.width &&
+                   static_cast<int64_t>(video.mask.size()) == video.tokens &&
+                   static_cast<int64_t>(video.keyframes_mask.size()) == video.tokens &&
+                   static_cast<int64_t>(video.positions.size()) == 3 * video.tokens * 2,
+               "ltx2 video: after the reference append every per-token buffer must have one entry "
+               "per token. A buffer that did not grow with the others is invisible to the "
+               "render's SHAPE — the clip comes out the right size and describes the wrong "
+               "tokens.");
+      // MEASURED GROWTH, not a count recomputed from the latent's shape. A
+      // derived number agrees with itself on a build that computed the shape and
+      // appended nothing.
+      im.trace.ic_lora_reference_tokens = ref_tokens;
+
+      // `ConditioningItemAttentionStrengthWrapper.apply_to` (`:55-71`): the mask
+      // is built from the ORIGINAL state and its `num_new_tokens` is the
+      // measured difference, then it REPLACES whatever the inner item's own
+      // `update_attention_mask(None, ...)` left (which is the pad-with-ones
+      // form, or nothing at all on a first item).
+      if (!cross_mask.empty()) {
+        VT_CHECK(static_cast<int64_t>(cross_mask.size()) == ref_tokens,
+                 "ltx2 video: the conditioning attention mask resolved to " +
+                     std::to_string(cross_mask.size()) + " weights but the reference item "
+                     "appended " + std::to_string(ref_tokens) +
+                     " tokens. The mask is downsampled to the REFERENCE latent's own shape "
+                     "(iclora_utils.py:151-155), so these cannot differ unless one of the two "
+                     "read a different grid.");
+        video.attention_mask = Ltx2BuildAttentionMask(mask_before, video.noisy_tokens, ref_tokens,
+                                                      before_reference, cross_mask);
+      }
+    }
+
     // The noiser draws VIDEO first, AUDIO second, from one generator
     // (blocks.py:554-563 builds the video state before the audio one; :576-580,
     // which this used to cite, is the TEARDOWN and proves nothing about order).
@@ -4583,6 +5215,47 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                  "keyframe was supplied. Handing the forward no marker would render without a "
                  "trained term and look exactly like a working render.");
         vin.keyframes_mask = video.keyframes_mask.data();
+      }
+
+      // ── THE PRODUCTION ASSIGNMENT OF `attention_mask` (#3020) ────────────
+      //
+      // THIS LINE IS WHAT THIS ROW EXISTS FOR. `Ltx2ModalityInput::attention_mask`,
+      // `Ltx2PrepareSelfAttentionMask`, `self_bias` on host and device, and the
+      // additive bias inside `vt::AttentionCross` were all built and all
+      // correct, and until this row NOTHING IN `src/` ASSIGNED EITHER FIELD:
+      // the only assignments in the tree were four lines of a `BuildModalities`
+      // helper in `test_ltx2.cpp` and `test_ltx2_device.cpp`. That is the shape
+      // .agents/reachability.md names — a unit test that constructs the type
+      // proves the class works, never that anything reaches it. Deleting this
+      // assignment is the mutation the reachability case must red on.
+      //
+      // THE DENSE FORM, `rows == tokens`. `build_attention_mask` returns
+      // (B, N+M, N+M) unconditionally (mask_utils.py:220) and its block
+      // structure is not expressible as one row.
+      //
+      // SIZE CHECKED BEFORE `data()` IS TAKEN, exactly as the keyframes mask
+      // above is and for the identical reason: an empty vector's `data()` is a
+      // null pointer, which the forward reads as upstream's legal "no mask". A
+      // mask built and then dropped renders a finite, correctly shaped, plausible
+      // clip with a trained term silently omitted.
+      if (!video.attention_mask.empty()) {
+        VT_CHECK(static_cast<int64_t>(video.attention_mask.size()) ==
+                     video.tokens * video.tokens,
+                 "ltx2 video: a self-attention strength mask must be dense [tokens, tokens] "
+                 "(mask_utils.py:220). One that is short of the sequence is NOT a shape error "
+                 "downstream — it is read as the key-only broadcast form and masks the wrong "
+                 "axis.");
+        vin.attention_mask = video.attention_mask.data();
+        vin.attention_mask_rows = video.tokens;
+        // Observed off the buffer HANDED OVER, not off the one built. `min` and
+        // `max` both, because an all-ones mask is the identity: it renders
+        // correctly, it has the right shape, and it is exactly what a downsample
+        // that lost its values produces.
+        const auto range =
+            std::minmax_element(video.attention_mask.begin(), video.attention_mask.end());
+        im.trace.ic_lora_attention_mask_rows = vin.attention_mask_rows;
+        im.trace.ic_lora_attention_mask_min = static_cast<double>(*range.first);
+        im.trace.ic_lora_attention_mask_max = static_cast<double>(*range.second);
       }
       // AND THE HANDOVER IS CHECKED SEPARATELY FROM THE CONSTRUCTION, because the
       // check above cannot see the handover. It reads `video.keyframes_mask` — the
@@ -5223,8 +5896,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       before_round.data = video_latent_volume;
       const Ltx2LatentVolume upsampled = Ltx2UpsampleVideoLatent(
           im.temporal_upsampler_cfg, im.temporal_upsampler_weights, before_round,
-          im.video_weights.Get("per_channel_statistics.std-of-means"),
-          im.video_weights.Get("per_channel_statistics.mean-of-means"));
+          VaeStatsAsF32(im.video_weights, "per_channel_statistics.std-of-means"),
+          VaeStatsAsF32(im.video_weights, "per_channel_statistics.mean-of-means"));
+      RecordUpsampleWidth(im.trace, upsampled);
       ++im.trace.temporal_upsample_calls;
 
       // (:408) The canvas doubles as `2 * (frames - 1) + 1`, not as `2 * frames`.
@@ -5638,6 +6312,14 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // least half of this render's `decode.video.chunk` seconds.
   size_t chunk_handle =
       phase::PhaseLog::Instance().Open("decode.video.chunk", /*span=*/false);
+  // A24 wave 3 (#2786). The decoder's INPUT width, taken here rather than in the
+  // sink because this is the last point the latent exists as itself. It is the
+  // live control that makes the sink's counter mean something: the two are the
+  // same fixture, in the same render, one statement apart.
+  im.trace.vae_latent_not_bf16 = CountWiderThanBf16(video_latent_volume);
+  im.trace.vae_latent_values = static_cast<int64_t>(video_latent_volume.size());
+  im.trace.vae_latent_digest = DigestF32(video_latent_volume);
+  im.trace.vae_latent_absmax = AbsMax(video_latent_volume);
   Ltx2VideoDecodeStreaming(
       im.video_kind, im.video_cfg, im.video_weights, video_latent_volume, video_lc, video_lf,
       video_lh, video_lw, &decode_noise,
@@ -5645,6 +6327,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       [&](const Ltx2VideoChunk& chunk) {
         phase::PhaseLog::Instance().Close(chunk_handle);
         phase::PhaseLog::Instance().Close(decode_handle);
+        // A24 wave 3 (#2786): the decode's OUTPUT width, on the one production
+        // route into the decoder. Summed over chunks, because the tiled decode
+        // emits one per temporal group and the last one is not the render.
+        im.trace.vae_decode_not_bf16 += CountWiderThanBf16(chunk.frames.data);
+        im.trace.vae_decode_values += static_cast<int64_t>(chunk.frames.data.size());
         phase::Scope write_phase("artifacts.frames");
         MiniMaxH3VideoFrameShape shape;
         shape.channels = chunk.frames.channels;
@@ -5858,7 +6545,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
 // move every anchor under it for a reason that has nothing to do with this row.
 VideoResult Ltx2VideoEngine::GenerateAudioOnly(Impl& im, const VideoGenParams& gen,
                                                const float* audio_context,
-                                               int64_t context_tokens) {
+                                               int64_t context_tokens, bool wants_auto_duration,
+                                               double auto_min_seconds,
+                                               double auto_max_seconds) {
   const Ltx2PipelineRecipe& recipe = im.recipe;
   VT_CHECK(recipe.audio_only, "ltx2 t2a: reached the audio-only path on a video recipe");
   // This path does NOT run the phase loop — it reads `phases.front()` and
@@ -5897,6 +6586,26 @@ VideoResult Ltx2VideoEngine::GenerateAudioOnly(Impl& im, const VideoGenParams& g
   int64_t frames = gen.num_frames > 1 ? gen.num_frames : recipe.num_frames;
   if (gen.duration_seconds > 0.0) {
     frames = static_cast<int64_t>(std::llround(gen.duration_seconds * fps));
+  } else if (wants_auto_duration) {
+    // `resolve_num_frames` on the AUDIO-ONLY pipeline, which is why
+    // `DurationHead.forward` has to admit a null video stream at all:
+    // `T2AOneStagePipeline` passes `video_encoding=None` (t2a_one_stage.py:103-107)
+    // because a text-to-audio request never builds a video conditioning. Passing
+    // the audio stream twice, or refusing here, would each be a different
+    // prediction from the reference's.
+    float predicted_seconds = 0.0F;
+    // The SECOND production route into the head, and it reports its width like
+    // the first. `Ltx2VideoEngine::Generate` reset the trace before it called in
+    // here, so these are this render's.
+    Ltx2DurationWidthCounts head_widths;
+    frames = Ltx2DurationPredictFrames(
+        im.duration_head_cfg, im.duration_head_weights, /*video_tokens=*/nullptr,
+        /*video_token_count=*/0, audio_context, context_tokens, fps, auto_min_seconds,
+        auto_max_seconds, Ltx2ScaleFactors{}.time, &predicted_seconds, &head_widths);
+    im.trace.duration_seconds = predicted_seconds;
+    im.trace.duration_frames = frames;
+    im.trace.duration_head_not_bf16 = head_widths.not_bf16;
+    im.trace.duration_head_values = head_widths.values;
   }
 
   // ── the guider (t2a_one_stage.py:196-205) ─────────────────────────────────

@@ -263,6 +263,19 @@ jobs:
         # would trip, so it has to run on a lane nobody has to remember.
         run: |
           python3 tests/scripts/test_env_agnostic_tooling.py
+      - name: The layer-fingerprint comparator parses every tap the instrument prints
+        # Registered in TWO places, like the bring-up suite above: here and in
+        # the `SUITES` array of `scripts/agent-preflight.sh`, and pinned in
+        # `REQUIRED_SUITE_REGISTRATIONS` so deleting either one reds
+        # `check-test-registration.py` rather than passing at rc=0 (#1833).
+        #
+        # It ran on NO lane when it landed (#2877), and the defect that cost is
+        # exactly what a lane would have caught: `taps=N END` is a RUNNING TOTAL
+        # and the tool read it per-step, so it exited 2 on every genuine
+        # multi-step fingerprint while eleven single-step cases stayed green.
+        # Standard library only, no artifact and no GPU.
+        run: |
+          python3 tests/scripts/test_q4exp_layerfp_diff.py
       - name: The docs site's content invariants hold
         # `hugo version` first, deliberately. It is the one line that fails
         # LEGIBLY when the setup step above stopped providing a binary, and it
@@ -486,9 +499,21 @@ jobs:
           python3 tests/scripts/test_agent_pr_body.py
           python3 tests/scripts/test_agent_issue_index.py
           python3 tests/scripts/test_ab_arms_differ.py
-          python3 tests/scripts/test_tier_hidden_delta.py
+          # The variadic-load harness's controls (#2970). Standard
+          # library plus a loopback mock server: no numpy, no GPU, no
+          # network beyond 127.0.0.1.
+          python3 tests/scripts/test_variadic_harness.py
+          # The ROCM-TIER-DIVERGENCE (#2590) attribution suite stays HERE, and
+          # its two siblings do not (#2705). This one drives
+          # `scripts/tier-delta-attribution.py`, which imports `statistics` and
+          # nothing else, so it runs in a step with no numpy. The hidden-state
+          # and logit comparators both `import numpy as np`, and they landed on
+          # these lines by mistake: numpy is installed in the NEXT step, so all
+          # three were invoked before the dependency existed and the first of
+          # them reduced the whole step to a `ModuleNotFoundError` wearing an
+          # `AssertionError: 1 != 0`. The two that need numpy moved to the lane
+          # that installs it. Do not reunite them here.
           python3 tests/scripts/test_tier_delta_attribution.py
-          python3 tests/scripts/test_tier_logit_delta.py
       - name: The LTX-2.5 pixel comparison and its harness run on a lane (#1612)
         # Registered in TWO places, like the baseline and preflight suites above:
         # here and in `scripts/agent-preflight.sh`. Both suites ran on NO lane
@@ -537,6 +562,19 @@ jobs:
           # never be silent.
           python3 tests/scripts/test_convert_glm5_next_gguf.py
           python3 tests/scripts/test_ltx25_pixel_ab_harness.py
+          # Same numpy-only lane, same reason (#2705, repairing #2590): the two
+          # ROCM-TIER-DIVERGENCE comparators read raw activation and logit dumps
+          # with `np.fromfile`, and `tier-hidden-delta.py` decodes bf16 by
+          # widening `uint16` and viewing it as `float32`, so numpy is not a
+          # convenience there. Both suites shell out to their tool and assert on
+          # its return code, which is why a missing import presented as a content
+          # failure. Neither is in preflight's `SUITES`, so this lane is the ONLY
+          # place either one runs, and a skip-when-absent guard is therefore not
+          # the repair: the paragraph above records why a skip is honest on a
+          # developer box and would be silence on a lane, and for these two it
+          # would be silence everywhere.
+          python3 tests/scripts/test_tier_hidden_delta.py
+          python3 tests/scripts/test_tier_logit_delta.py
       - name: The LTX-2 latent-dump driver's own controls are executed (#2514)
         # `tools/oracle/ltx2_latent_dump.py` runs only inside an `rc` lease, and
         # nothing in this tree executed it: two defects rode a merged branch to a
@@ -597,6 +635,36 @@ jobs:
         run: |
           python3 scripts/check-conflict-markers.py
           python3 tests/scripts/test_check_conflict_markers.py
+      - name: The staged gfx1151 paired measurement still refuses to run (#2497)
+        # Registered in TWO places, like the suites above, and it was in ONE.
+        # `scripts/agent-preflight.sh` held it from the start and this file never
+        # did, so the ONE behaviour of `BACKEND-GATE-ROCM-LLAMACPP` that a test
+        # can falsify -- `.agents/scripts/rocm-strix-ourarm-staged.sh` refusing
+        # unless `STRIX_ARM_SPEED_RATIFIED_BY` names a ratifying decision --
+        # gated on a developer box and was green on the forge. #2497 has already
+        # had one measurement retracted for being taken ahead of that arm's token
+        # gate, which reads `TOKEN_GATE=FAIL` at 3 of 6, so a staged script whose
+        # refusal nothing on a lane enforces is that defect parked in a file.
+        #
+        # Nothing here can skip: `bash` and the standard library over one
+        # committed script, in a scratch working directory. No GPU, no lease, no
+        # toolchain, no checkpoint, no network, under a second.
+        run: |
+          python3 tests/scripts/test_rocm_strix_ourarm_staged.py
+      - name: The TOKENGATE job installs the PIN's build requirements (#2895)
+        # Registered in TWO places, like the suites above, and in the same change
+        # that adds it -- the paragraph on the render-compare suite records what
+        # happens otherwise. `.agents/scripts/tokengate-e126687-job.sh` builds
+        # vLLM with `pip wheel --no-build-isolation`, which makes pip skip
+        # `pyproject.toml`'s `[build-system] requires` entirely, and the list the
+        # script installed by hand had fallen three names behind the pin. Job
+        # efc30c74 spent a lease and a queue position to die in 3 seconds on
+        # `No module named 'setuptools_rust'`.
+        #
+        # Nothing here can skip: the standard library over one committed script,
+        # in scratch directories. No GPU, no lease, no vLLM checkout, no network.
+        run: |
+          python3 tests/scripts/test_tokengate_buildreq.py
       - name: The pre-push hook refuses a checker it names but cannot find
         # #1779. The hook named six checkers, three of which had been deleted,
         # and skipped each missing one in silence while still exiting 0. The

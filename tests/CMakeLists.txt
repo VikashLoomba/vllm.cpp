@@ -112,6 +112,11 @@ target_include_directories(test_qwen36_weights PRIVATE
 vllm_cpp_add_test(test_gguf_qwen36_loader vllm/test_gguf_qwen36_loader.cpp)
 vllm_cpp_add_test(test_gguf_keep_quant vllm/test_gguf_keep_quant.cpp)
 vllm_cpp_add_test(test_model_loader_gguf vllm/test_model_loader_gguf.cpp)
+# The dots3-note cases compare FromModelDir's thrown bytes with
+# `vllm::Dots3NoteGgufRefusal()`, declared in the MODEL-PRIVATE header
+# src/vllm/model_executor/models/dots3_note.h (#2882 W9a). Same arrangement
+# test_dots3_note_scaffold uses.
+target_include_directories(test_model_loader_gguf PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_model_registry vllm/models/test_model_registry.cpp)
 vllm_cpp_add_test(test_vocoder1d vllm/models/test_vocoder1d.cpp)
 # For src/vt/cpu/cpu_conv1d_block.h: the multi-block case asserts the geometry
@@ -456,6 +461,7 @@ target_compile_definitions(test_ltx2_pipeline PRIVATE
 # CLI-stage validations. Its own target rather than cases inside
 # test_ltx2_pipeline, which several concurrent rows of this campaign edit. The
 # REACHABILITY proof for the same row lives in test_ltx2_video.
+vllm_cpp_add_test(test_ltx2_iclora_reference vllm/models/test_ltx2_iclora_reference.cpp)
 vllm_cpp_add_test(test_ltx2_retake vllm/models/test_ltx2_retake.cpp)
 vllm_cpp_add_test(test_ltx2_lora vllm/models/test_ltx2_lora.cpp)
 vllm_cpp_add_test(test_ltx2_loader vllm/models/test_ltx2_loader.cpp)
@@ -750,6 +756,11 @@ vllm_cpp_add_test(test_gemma4_honesty vllm/models/test_gemma4_honesty.cpp)
 # case that wants a different one.
 vllm_cpp_add_test(test_gemma4_moe_device_arm_guard
                   vllm/models/test_gemma4_moe_device_arm_guard.cpp)
+# Its own binary, not a case in the file above: `RunGemma4Moe` freezes
+# `VT_GEMMA4_FP8_NATIVE` in a function-local `static const` on the first call in
+# the process, and these two files must disagree about it (#2623).
+vllm_cpp_add_test(test_gemma4_moe_fp8_native_arm_guard
+                  vllm/models/test_gemma4_moe_fp8_native_arm_guard.cpp)
 vllm_cpp_add_test(test_gemma4_indexed_max_t vllm/models/test_gemma4_indexed_max_t.cpp)
 target_compile_definitions(test_gemma4_indexed_max_t PRIVATE
   VLLM_CPP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -1250,7 +1261,32 @@ target_include_directories(test_dots3_note_attn PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # performance number is claimable. CPU-only, no checkpoint download, no GPU.
 vllm_cpp_add_test(test_dots3_note_vision vllm/models/test_dots3_note_vision.cpp)
 target_compile_definitions(test_dots3_note_vision PRIVATE
-  DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
+  DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev"
+  # W9d (#2881): the reference-independence case re-reads THIS file and counts
+  # the qualified names in each reference namespace, through the shared
+  # instrument in `dots3_note_ref_independence.h`. Same arrangement the audio
+  # target uses; the instrument takes the path as an argument precisely so the
+  # two targets share one scan and one pp-number rule.
+  DOTS3_VISION_TEST_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/test_dots3_note_vision.cpp")
+
+# dots3-note W7a (#2703): the AUDIO tower and its front end. Two fixture
+# directories, because the two halves are gated against different things — the
+# tower against the committed dots3-note config, and the SHARED slaney
+# filterbank against `voxtral_mel_filters_f32.bin`, which is a third party's
+# implementation of the same `mel_filter_bank` call and the only real oracle
+# this row gets.
+vllm_cpp_add_test(test_dots3_note_audio vllm/models/test_dots3_note_audio.cpp)
+target_compile_definitions(test_dots3_note_audio PRIVATE
+  DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev"
+  VOXTRAL_AUDIO_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/multimodal/fixtures/voxtral_audio"
+  # The reference-independence case re-reads THIS file and counts the qualified
+  # names in each reference namespace, so the enumeration is a measurement
+  # rather than a transcription asserted against itself.
+  DOTS3_AUDIO_TEST_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/test_dots3_note_audio.cpp")
+# dots3_note.h and dots3_note_audio.h are MODEL-PRIVATE headers under src/, not
+# include/vllm/ — same arrangement test_dots3_note_vision uses.
+target_include_directories(test_dots3_note_audio PRIVATE
+  ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 # Same model-private-header arrangement as the two gates above: dots3_note.h and
 # dots3_note_vision.h live under src/, because W1 ships nothing on the public ABI
 # and include/vllm/ is a USER_USAGE_PREFIXES surface (#515).
@@ -1381,6 +1417,10 @@ target_include_directories(test_nemotron_h_paged_forward PRIVATE
 vllm_cpp_add_test(test_kimi_linear_forward vllm/models/test_kimi_linear_forward.cpp)
 vllm_cpp_add_test(test_kimi_linear_paged vllm/models/test_kimi_linear_paged.cpp)
 vllm_cpp_add_test(test_kimi_linear_fold_gate vllm/models/test_kimi_linear_fold_gate.cpp)
+# #2840: the committed K=3 oracle capture is what LICENSES the strict bar, and
+# the checkpoint-free case that reads it needs to find the goldens tree.
+target_compile_definitions(test_kimi_linear_fold_gate PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 
 # KDA (Kimi Delta Attention) net-new gated-linear-attention primitives — host
 # reference + unit gate (KERNEL-KDA-DELTA). Shared unblocker for Kimi-Linear-48B
@@ -1412,6 +1452,10 @@ target_include_directories(test_deepseek_v2_paged_engine PRIVATE
 # query branch AND the noaux_tc grouped router. Loader gate (host, MTP-tail skip)
 # + the SACRED paged-engine greedy gate (checkpoint-gated, dgx-only).
 vllm_cpp_add_test(test_glm4_moe_lite_load vllm/models/test_glm4_moe_lite_load.cpp)
+# The MoE ROUTER DTYPE gate (#2928): GLM's fp32 router is a property of
+# `Glm4MoE`, not a config key, and the difference is measured through the CPU
+# forward at GLM's top-4-of-64 `noaux_tc` shape. Host-only, no checkpoint.
+vllm_cpp_add_test(test_glm4_moe_lite_router_dtype vllm/models/test_glm4_moe_lite_router_dtype.cpp)
 vllm_cpp_add_test(test_glm4_moe_lite_paged_engine vllm/models/test_glm4_moe_lite_paged_engine.cpp)
 target_compile_definitions(test_glm4_moe_lite_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
@@ -1423,6 +1467,12 @@ target_include_directories(test_qwen27_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}
 # is the property the Q4_K_M token gate is decided by and which no token gate we
 # own can see. Public headers only, so no extra include directory.
 vllm_cpp_add_test(test_qwen35_gguf_logits_f32 vllm/models/test_qwen35_gguf_logits_f32.cpp)
+# BACKEND-TENSTORRENT-KEEPQUANT W3 (#2959): the q4km vehicle's dequantized-
+# artifact dump — the teacher-forcing oracle input the row spec prescribes
+# (our bit-exact loader writes a safetensors dir; the pinned transformers
+# cannot parse the `qwen35` GGUF arch). Env-gated: skips loudly unless
+# VLLM_CPP_QWEN35_Q4KM_GGUF and VLLM_CPP_QWEN35_Q4KM_DUMP_DIR are both set.
+vllm_cpp_add_test(test_qwen35_gguf_q4km_dequant_dump vllm/models/test_qwen35_gguf_q4km_dequant_dump.cpp)
 # #2534. `detail::ActDType` caches its getenv in a function-local static, so one
 # process observes exactly ONE value of VT_ACT_F32 and a single run cannot tell a
 # resolver that READS the lever from one hardwired to its default answer. Re-run
@@ -1779,6 +1829,19 @@ vllm_cpp_add_test(test_deepseek_v4_paged_equiv
   vllm/models/test_deepseek_v4_paged_equiv.cpp)
 vllm_cpp_add_test(test_multi_kv_refusal
   vllm/model_executor/test_multi_kv_refusal.cpp)
+vllm_cpp_add_test(test_device_token_ids_refusal
+  vllm/model_executor/test_device_token_ids_refusal.cpp)
+# ENG-MM-EMBED-DEVICE-IDS (#2730): the MULTIMODAL half of the same channel --
+# `MmEmbedInputs` carries the device identifiers, both registered `embed_mm`
+# hooks splice them over the buffer they gather from, and a hook that does not
+# declare the capability is refused instead of embedding token id 0.
+vllm_cpp_add_test(test_mm_embed_device_token_ids
+  vllm/models/test_mm_embed_device_token_ids.cpp)
+# The dots3-note case loads the tiny on-disk checkpoint through the REAL loader,
+# for the same reason its own gates do: `Dots3NoteLoadedModel` lives in the
+# anonymous namespace of its registry translation unit and cannot be borrowed.
+target_compile_definitions(test_mm_embed_device_token_ids PRIVATE
+  DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
 vllm_cpp_add_test(test_device_placement
   vllm/model_executor/test_device_placement.cpp)
 
@@ -1804,6 +1867,15 @@ vllm_cpp_add_test(test_placement_dump_dtype
   vllm/model_executor/test_placement_dump_dtype.cpp)
 target_include_directories(test_placement_dump_dtype PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# ENG-HYBRID-PLACEMENT W3i (#2714): the placement round trip, executed rather
+# than reasoned about. ITS OWN BINARY, and for the same reason its siblings above
+# are -- it registers a loopback backend and platform in the process-global kXPU
+# slot to give the seam an engine that is not the CPU, and that registration must
+# not leak into a suite whose subject is a different device.
+vllm_cpp_add_test(test_placed_moe_roundtrip
+  vllm/model_executor/test_placed_moe_roundtrip.cpp)
+target_include_directories(test_placed_moe_roundtrip PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 vllm_cpp_add_test(test_act_dump
   vllm/model_executor/test_act_dump.cpp)
 target_include_directories(test_act_dump PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -1814,6 +1886,11 @@ target_include_directories(test_moe_fit_resolver PRIVATE ${CMAKE_SOURCE_DIR}/src
 
 vllm_cpp_add_test(test_attention_window_adoption
   vllm/model_executor/layers/attention/test_attention_window_adoption.cpp)
+
+# ENG-ATTENTION-WINDOW W3 (#2388): the kill switch itself, which had no test in
+# either of the two environment spellings it replaced.
+vllm_cpp_add_test(test_disable_sliding_window
+  vllm/model_executor/layers/attention/test_disable_sliding_window.cpp)
 target_include_directories(test_attention_window_adoption PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # `vllm-cli`'s `--offload-config` (#1135). It runs the BINARY, because that is the
 # only thing that proves the FLAG arrives: `test_weight_residency_reach` already
@@ -1878,6 +1955,14 @@ target_include_directories(test_expert_stream_device_slot PRIVATE ${CMAKE_SOURCE
 # UnifiedMemory(), which is a process-global registration and not a per-case flag.
 vllm_cpp_add_test(test_resident_weight_host_addressable vllm/model_executor/test_resident_weight_host_addressable.cpp)
 target_include_directories(test_resident_weight_host_addressable PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ENG-EXPERT-STREAM-DEVICE (#2711): does `ResidentWeightF32` still hold its copy
+# source when the copy runs? Its own binary for the same reason as the sibling
+# above -- it registers a fake backend and a fake platform in the process-global
+# kXPU slot -- and separately because its backend DEFERS every `Copy` until a
+# `Synchronize`, which is the opposite of the sibling's eager `memcpy` and would
+# change what every case in that file measures.
+vllm_cpp_add_test(test_resident_weight_f32_copy_retires vllm/model_executor/test_resident_weight_f32_copy_retires.cpp)
+target_include_directories(test_resident_weight_f32_copy_retires PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # ENG-EXPERT-STREAM (#1091): the step clock at the MoE entry points ForwardLayers
 # does NOT cover, and the final statistics line. Its own binary because it is the
 # only one that can observe `steps == 0` -- the store is a process-lifetime
@@ -1918,6 +2003,19 @@ vllm_cpp_add_test(test_logits_processor_host_addressable
   vllm/v1/sample/test_logits_processor_host_addressable.cpp)
 vllm_cpp_add_test(test_prepare_inputs vllm/v1/worker/test_prepare_inputs.cpp)
 vllm_cpp_add_test(test_combine_tokens vllm/v1/worker/test_combine_tokens.cpp)
+vllm_cpp_add_test(test_combine_row_predicate vllm/v1/worker/test_combine_row_predicate.cpp)
+# SPEC-DFLASH2 A2-2 (#2802): the spec-decode VERIFY route predicate, and the
+# per-STEP reduction both sampling entry points and the input-combine refusal
+# turn on. Same shape and same reason as the row predicate above.
+vllm_cpp_add_test(test_verify_route_predicate vllm/v1/worker/test_verify_route_predicate.cpp)
+# SPEC-DFLASH2 A2-3 (#2911): the async placeholder fill's per-request rule, read
+# off the same per-req_state draft buffer the combine's scatter reads. Same shape
+# and same reason as the two predicates above -- one rule, one expression.
+vllm_cpp_add_test(test_draft_fill vllm/v1/worker/test_draft_fill.cpp)
+# SPEC-DFLASH2 A2-4 (#3004): the async decode arm's propose reads this step's
+# committed ids where they live, on every write-back branch, instead of refusing
+# by name when the branch that ran left them unreadable on the host.
+vllm_cpp_add_test(test_committed_ids vllm/v1/worker/test_committed_ids.cpp)
 vllm_cpp_add_test(test_async_output vllm/v1/worker/test_async_output.cpp)
 vllm_cpp_add_test(test_async_runner_flag vllm/v1/worker/test_async_runner_flag.cpp)
 # ENG-POOL-BEST-FIT (#1922): the shared scratch pool must reach a steady state
@@ -2448,6 +2546,18 @@ if(TARGET vllm-bench OR VLLM_CPP_BUILD_EXAMPLES)
   target_compile_definitions(test_bench_kv_cache_dtype
     PRIVATE VLLM_BENCH_BINARY="$<TARGET_FILE:vllm-bench>")
 endif()
+# #2759: `--ignore-eos` / `--skip-chat-template` / `--chat-template` on
+# `vllm-bench`. Same shape and the same reason as the row above -- it runs the
+# BINARY, because `test_bench` drives `RunBench` from a hand-built `BenchConfig`
+# and stayed green on every day these flags did not exist. Registered
+# UNCONDITIONALLY so that with examples off the suite exits 77 and CTest reports
+# the gate's absence instead of hiding it behind an option.
+vllm_cpp_add_test(test_bench_eos_chat_template
+  examples/test_bench_eos_chat_template.cpp)
+if(TARGET vllm-bench OR VLLM_CPP_BUILD_EXAMPLES)
+  target_compile_definitions(test_bench_eos_chat_template
+    PRIVATE VLLM_BENCH_BINARY="$<TARGET_FILE:vllm-bench>")
+endif()
 
 # C ABI (M3.5 Task 1): the C++ test drives the public C API over a synthetic
 # engine via the internal MakeEngineHandle hook (reached under src/).
@@ -2529,6 +2639,12 @@ set_tests_properties(test_backend_cross_device_vt_attn_decode_d128 PROPERTIES
 # of that skeleton carrying a DECISION is gated on a CPU-only CI runner with no
 # AMD GPU. The rest of the ROCm skeleton is under VLLM_CPP_HIP below.
 vllm_cpp_add_test(test_rocm_arch vt/test_rocm_arch.cpp)
+# The grow-only per-stream device scratch pool (#2712). UNCONDITIONAL for the
+# same reason test_rocm_arch is: src/vt/grow_only_stream_scratch.h is free of
+# HIP and CUDA headers, so the piece of the ROCm scratch allocators that holds
+# the SYNCHRONISATION is gated on a CPU-only runner with no accelerator.
+vllm_cpp_add_test(test_grow_only_stream_scratch vt/test_grow_only_stream_scratch.cpp)
+target_include_directories(test_grow_only_stream_scratch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # #785 P1 host package (fixture/oracle/trace classifier). CPU-only.
 vllm_cpp_add_test(test_ops_paged_attn_sharedk_wmma_p1
   vt/test_ops_paged_attn_sharedk_wmma_p1.cpp)
@@ -2545,6 +2661,11 @@ if(VLLM_CPP_HIP)
 # case no-ops when the build has HIP but the box has no AMD GPU.
 vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
 vllm_cpp_add_test(test_rocm_fp8_kv_cache vt/test_rocm_fp8_kv_cache.cpp)
+# BACKEND-ROCM silu-gate dtype rounding repair (#2889 silu item, #1954): the
+# ROCm SiluAndMul/MoeSiluMul kernels narrow silu(gate) to the gate dtype before
+# the multiply, matching the CPU oracle RoundThrough and upstream vLLM silu_kernel.
+# Self-skipping without a ROCm device, mirroring test_rocm_backend.cpp guard.
+vllm_cpp_add_test(test_ops_rocm_silu_rounding vt/test_ops_rocm_silu_rounding.cpp)
 # #785 P1 GPU product-seam witness. Executable only — NOT add_test.
 # Ordinary CTest must not see this target. Runner fail-closes on 77/nonzero.
 add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu
@@ -2717,6 +2838,12 @@ vllm_cpp_add_test(test_qwen35_exl3 vllm/models/test_qwen35_exl3.cpp)
 # and forward, gated through LoadQwen3DFlash over a real safetensors file and
 # then through Qwen3DFlashModel::ForwardBlockLogits.
 vllm_cpp_add_test(test_qwen3_dflash2_exl3 vllm/models/test_qwen3_dflash2_exl3.cpp)
+# MODEL-DFLASH2-NVFP4 (#2758): the ModelOpt NVFP4 arm of the same DRAFT loader,
+# gated through MakeQwen3DFlashDraftConfig + LoadQwen3DFlash over a real
+# safetensors file — the exact pair LoadDflashDraft calls. A load gate and not a
+# forward twin: vt::MatmulNvfp4 is registered for CUDA only, so there is no host
+# path to decode a packed weight against.
+vllm_cpp_add_test(test_qwen3_dflash2_nvfp4 vllm/models/test_qwen3_dflash2_nvfp4.cpp)
 # QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
 # i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
 # and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM
@@ -3119,6 +3246,7 @@ vllm_cpp_add_test(test_ops_rmsnorm_elem_dispatch vt/test_ops_rmsnorm_elem_dispat
 target_include_directories(test_ops_rmsnorm_elem_dispatch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_dflash_block_attn vt/test_ops_dflash_block_attn.cpp)
 vllm_cpp_add_test(test_dflash_attn_grid vt/test_dflash_attn_grid.cpp)
+vllm_cpp_add_test(test_dflash_attn_mask vt/test_dflash_attn_mask.cpp)
 vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_block_attn.cpp)
 # SPEC-DFLASH2 W2 (#1314): the DFlash2 grouped dynamic depthwise convolution,
 # gated against upstream's own sequential reference at block 5 (modulo arm), 8
@@ -3939,3 +4067,17 @@ target_include_directories(test_glm_moe_dsa_forward PRIVATE
 # lane's environment where a reader of the build looks for it.
 set_tests_properties(test_glm_moe_dsa_forward PROPERTIES
   ENVIRONMENT "VT_MOE_EXPERT_STREAM=1")
+
+# QUANT-QWEN38-27B-NVFP4-ARM W7 (#2760). A ModelOpt checkpoint that DECLARES
+# `quant_algo: "NVFP4"` -- 4-bit weights AND 4-bit ACTIVATIONS -- and that this
+# build runs W4A16 has to say so at load. Every case enters through
+# `vllm::LoadQwen3_5Dense` with stderr captured, never through the notice
+# function alone, because a test that calls the function directly stays green
+# when the production call site is deleted. Cases 1-6 are hermetic over a
+# one-layer synthetic checkpoint in the artifact's own module names, as is case
+# 8; case 7 is env-gated on VLLM_CPP_QWEN38_27B_RADIXARK_DIR and reads only
+# `config.json` and the three shards' safetensors headers.
+vllm_cpp_add_test(test_qwen38_27b_radixark_w4a4_notice
+  vllm/models/test_qwen38_27b_radixark_w4a4_notice.cpp)
+target_include_directories(test_qwen38_27b_radixark_w4a4_notice PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)

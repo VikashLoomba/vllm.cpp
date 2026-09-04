@@ -128,13 +128,13 @@ demonstrably happens is not a bounds bug. It is the wrong function, and the
 verdict does not rest on this row's own code.
 
 **Why it was the wrong function, and the reading error that hid it.**
-`async_input_combine_` is assigned DIRECTLY in the runner constructor
-(`runner.cpp:472` and `:537`) from `AsyncRunnerEnvDefault()`, and
-`AsyncRunnerFlagIsOn` answers TRUE when `VT_ASYNC_RUNNER` is unset
+`async_input_combine_` is assigned DIRECTLY in the runner constructor, at both
+`async_input_combine_ = AsyncRunnerEnvDefault()` assignments in `runner.cpp`,
+and `AsyncRunnerFlagIsOn` answers TRUE when `VT_ASYNC_RUNNER` is unset
 (`async_runner_flag.h`). So the production default samples in the
-DEVICE-RESIDENT branch of `sample_tokens_async`, which has its own
-`assemble_sample_logits` at `runner.cpp:4733`. `sample_tokens` is the fallback,
-not the default.
+DEVICE-RESIDENT branch of `runner.cpp::sample_tokens_async`, which calls
+`runner.cpp::assemble_sample_logits` itself instead of reaching the call in
+`runner.cpp::sample_tokens`. `sample_tokens` is the fallback, not the default.
 
 I had ruled this branch out and was wrong. I grepped the SETTER
 `set_async_input_combine`, found no caller, and concluded the flag stayed false.
@@ -229,9 +229,9 @@ gap is 0.0625 rising to 0.125 at magnitude 16-32, and five of the six contested
 gaps (0.027 to 0.178) are at or below it. Six steps in 288 are EXACT ties in our
 arithmetic; the six argmax flips are exactly the six recorded rank-2 steps.
 
-The site is `qwen3_5.cpp:3205` routing to `MatmulBf16LogitsF32D` (`:1721`), which
-computes the `[M, vocab]` product in bf16 and widens with `vt::CastF32`. Widening
-cannot recover a discarded mantissa.
+The site is `qwen3_5.cpp::DenseLogitsF32D` routing to
+`qwen3_5.cpp::MatmulBf16LogitsF32D`, which computes the `[M, vocab]` product in
+bf16 and widens with `vt::CastF32`. Widening cannot recover a discarded mantissa.
 
 Evidence:
 [`qwen38-27b-q4km-logit-delta-20260902.md`](../../docs/bench-evidence/qwen38-27b-q4km-logit-delta-20260902.md).
@@ -245,9 +245,9 @@ what the fourth shape did for time, and what nothing did for resolution.
 
 ## Owed
 
-- Confirm which arm of `qwen3_5.cpp:3205` this checkpoint takes (is its GGUF
-  `lm_head` loaded `nk`). The bf16 grid is certain at 288 of 288; the routing
-  predicate is inferred from being the only matching site.
+- Confirm which arm of `qwen3_5.cpp::DenseLogitsF32D` this checkpoint takes (is
+  its GGUF `lm_head` loaded `nk`). The bf16 grid is certain at 288 of 288; the
+  routing predicate is inferred from being the only matching site.
 - Whether an f32 logits head makes the arm PASS is not established. Two contested
   gaps sit below the f32-vs-oracle agreement measured at those steps, so widening
   is necessary and not obviously sufficient.

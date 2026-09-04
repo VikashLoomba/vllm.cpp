@@ -31,6 +31,7 @@
 #include "vllm/model_executor/models/interfaces.h"  // #607 L3 kVisionTowerStageName
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits (shared carrier)
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
+#include "vllm/model_executor/models/qwen3_5_internal.h"  // detail::ApplyDeviceTokenIds
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/ResidentWeight/MakeTensor
 #include "vllm/model_executor/models/qwen3_vl.h"
 #include "vllm/model_executor/models/qwen3_vl_text.h"  // merge + deepstack + get_rope_index
@@ -305,6 +306,19 @@ MmForwardBuffers EmbedMmQwen3VLForConditionalGeneration(
   std::vector<uint16_t> emb_bits(static_cast<size_t>(T * H));
   {
     dense_attn::DBuf ids(d, vt::DType::kI32, {T}, token_ids.data());
+    // ENG-MM-EMBED-DEVICE-IDS (#2730): SPLICE the runner's device identifiers
+    // over the host upload just made, before the gather reads it. The host
+    // vector is deliberately stale for decode rows -- the combine wrote each
+    // sampled token into `MmEmbedInputs::device_token_ids` on the main queue and
+    // never wrote it back -- so without this the decode rows of an image request
+    // embed token id 0. The `Copy` is enqueued on this same queue, which is why
+    // it is ordered AFTER that combine rather than racing it, and it is the
+    // SHARED splice the text device arm uses rather than a second copy of it.
+    // Null on every non-mirror step, where it writes nothing and this hook is
+    // byte-identical to its pre-#2730 self.
+    detail::ApplyDeviceTokenIds(
+        d.b, d.q, ids.ptr(), T,
+        detail::DeviceTokenIds{inputs.device_token_ids, T}, "qwen3-vl mm embed");
     dense_attn::DBuf emb(d, vt::DType::kBF16, {T, H});
     vt::Tensor table = dense_attn::ResidentWeight(
         d, weights.text.embed_tokens, {config.vocab_size, H});
@@ -492,6 +506,25 @@ const ModelFactory kQwen3VLFactory{
     .embed_mm = &EmbedMmQwen3VLForConditionalGeneration,
     .mrope_prompt_positions = &MropeQwen3VLForConditionalGeneration,
     .is_dense_model = true,
+    // ENG-MM-EMBED-DEVICE-IDS (#2730). BOTH bits, and the pair is the design.
+    //
+    // The HOOK bit is the plain statement: `EmbedMmQwen3VLForConditionalGeneration`
+    // splices `MmEmbedInputs::device_token_ids` over the buffer it gathers from.
+    //
+    // The FORWARD bit is the one that needs its reason written down, because
+    // `ForwardQwen3VLForConditionalGeneration` reads no token identifier at all.
+    // It refuses a step without `input.mm` BY NAME and then embeds
+    // `mm.inputs_embeds`. Through `ModelRegistry::Forward` the only way it is
+    // reachable is from the runner branch that has ALREADY called
+    // `ModelRegistry::EmbedMm` with the same device pointer on the same step --
+    // `forward_input.mm` is assigned inside the same
+    // `supports_mm_inputs() && batch_carries_mm()` window that produced it -- so
+    // this registration's whole reachable path resolves its identifiers from the
+    // device buffer. Without the bit the hook above would compute a correct
+    // `inputs_embeds` and the forward's own guard would throw it away on the same
+    // step, which is a fix nothing can reach.
+    .consumes_device_token_ids = true,
+    .embed_mm_consumes_device_token_ids = true,
 };
 
 }  // namespace

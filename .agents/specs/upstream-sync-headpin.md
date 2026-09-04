@@ -8,8 +8,36 @@ Guide: [`../upstream-sync.md`](../upstream-sync.md) §"The sync cycle".
 
 ## Now
 
-The pin has **not** advanced and does not advance in this wave. The active parity
-pin remains `5559679229bc961848b121ccdeaa8fa5d79bec98`.
+**The pin has advanced**, to `e126687a9a828d513c01a07cd69f025f27d63280`, on
+2026-09-03, by wave PINADVANCE
+([#2817](https://github.com/mudler/vllm.cpp/issues/2817),
+[`upstream-pin-advance-e126687.md`](upstream-pin-advance-e126687.md),
+[`../sync/2026-09-03-e126687-advance.md`](../sync/2026-09-03-e126687-advance.md)).
+The order was inverted by a developer ruling: step 6 now runs against the new pin
+and is owed by [#2818](https://github.com/mudler/vllm.cpp/issues/2818), where a
+red requires REVERTING the pin.
+
+**The declared token-exact gate is no longer owed.** It ran on `dgx:gpu0` on
+2026-09-04 and **PASSED** — `IDS mismatched_positions 0 of 96`,
+`IDS_BYTE_EQUAL True`, `TOKENGATE_VERDICT PASS` — closing
+[#2794](https://github.com/mudler/vllm.cpp/issues/2794)
+([`../sync/2026-09-05-e126687-pingate.md`](../sync/2026-09-05-e126687-pingate.md),
+[`../../docs/bench-evidence/opt125m-token-gate-e126687-dgx-20260904.md`](../../docs/bench-evidence/opt125m-token-gate-e126687-dgx-20260904.md)).
+This line used to list it as still owed, which the capture falsifies. What that
+gate bought is narrow: the OPT-125m oracle bar on one board. **The other four
+strict goldens at the target — 27B W4A4, 32B-NVFP4A16, 35B, Coder — are still
+owed**, un-anchored under `## Owed` in
+[`upstream-sync-headpin-tokengate.md`](upstream-sync-headpin-tokengate.md)
+rather than on a closed issue, because an `## Owed` bullet pointing at a closed
+issue is how an obligation stops being read.
+
+Still owed at the new pin: the 290-entry PORT-NOW queue
+([#2611](https://github.com/mudler/vllm.cpp/issues/2611)), and `qwen4_exp` still
+does not run on this fleet
+([#2626](https://github.com/mudler/vllm.cpp/issues/2626)).
+
+This wave (HEADPIN) did **not** advance it; §1 below is its own scope and stop
+condition, unchanged.
 
 ## 1. Scope
 

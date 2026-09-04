@@ -639,7 +639,20 @@ detail::DeviceTokenIds detail::TakeDeviceTokenIds() {
 
 bool detail::ApplyDeviceTokenIds(vt::Backend& backend, vt::Queue& queue,
                                  void* dst, int64_t dst_count, const char* what) {
-  const DeviceTokenIds ov = TakeDeviceTokenIds();
+  return ApplyDeviceTokenIds(backend, queue, dst, dst_count,
+                             TakeDeviceTokenIds(), what);
+}
+
+// #2730 — the body, once, for both publishers. The override arm above takes and
+// clears the thread-local; the multimodal arm is handed
+// `MmEmbedInputs::device_token_ids` directly, because `ModelRegistry::EmbedMm`
+// runs before any forward has established a scope. Everything after the source
+// differs by nothing at all, and that is the point: the bounds check that refuses
+// a shape disagreement, and the `Copy` that goes ON `queue` so it is ordered
+// AFTER the runner's combine rather than racing it, are one expression.
+bool detail::ApplyDeviceTokenIds(vt::Backend& backend, vt::Queue& queue,
+                                 void* dst, int64_t dst_count,
+                                 DeviceTokenIds ov, const char* what) {
   if (ov.ids == nullptr) return false;
   VT_CHECK(ov.count <= dst_count,
            std::string(what) + ": device input ids longer than the embed input");
@@ -1358,23 +1371,15 @@ void ActDumpStream(Dev d, int64_t step, int64_t layer, DBuf& hidden, DBuf& res,
 // logical view (e.g. {conv_dim, Kw}).
 Tensor ResidentWeightF32(Dev d, const OwnedTensor& w,
                          const std::vector<int64_t>& shape) {
-  if (!w.d_dev_f32) {
-    std::vector<float> f = WeightF32(w);
-    // Same defect and same fix as ResidentWeight above (issue #125): this handed
-    // out `std::vector<float>::data()`, a plain heap pointer, to any non-CUDA
-    // device backend. It would have thrown immediately after the embed one was
-    // fixed, on the q/k-norm and GDN f32 weights.
-    if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
-      auto* buf = new std::vector<float>(std::move(f));
-      w.d_dev_f32 = std::shared_ptr<void>(buf->data(), [buf](void*) { delete buf; });
-    } else {
-      const size_t nb = f.size() * sizeof(float);
-      void* p = d.b.Alloc(nb);
-      d.b.Copy(d.q, p, f.data(), nb);
-      Backend* bk = &d.b;
-      w.d_dev_f32 = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
-    }
-  }
+  // THIS HELPER STAYS PRIVATE (see :790) BUT ITS UPLOAD DOES NOT. The install
+  // is `dense_attn::InstallResidentF32` (dense_device_glue.h, included at :24),
+  // the same one `dense_attn_block.h` uses. What used to be private was a
+  // verbatim second copy of the upload, which is why #2711 -- an asynchronous
+  // `Copy` out of a function-local `std::vector<float>` that died at this
+  // closing brace -- had to be found and repaired twice. The behaviour this
+  // file's version carries beyond the shared one is in `ResidentWeight`, not
+  // here: the two f32 bodies were identical.
+  if (!w.d_dev_f32) dense_attn::InstallResidentF32(d, w, WeightF32(w));
   return MakeTensor(w.d_dev_f32.get(), DType::kF32, d.q.device, shape);
 }
 
@@ -10574,8 +10579,13 @@ struct Qwen3_5DecodeGraph::Impl {
     // once per process into a function-local static. These were the LAST TWO of
     // the six batched-driver reads the spec's `## Our baseline` item 1 counted.
     Backend& b = vt::GetBackend(queue.device.type);
+    // #2812/#1625 gate: the captured arm joins the evidence families through
+    // the arch-scoped overload, so ambient captures and VT_TT_DECODE_CAPTURE=0
+    // opts out — the same shape as the qwen3 driver's gate.
     enabled = vt::GraphCaptureEnabled() &&
               vllm::platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
+              !vllm::platforms::GetPlatform(queue.device.type)
+                   .static_graph_requires_opt_in(config.architectures) &&
               b.SupportsGraphCapture();
     dbuf = enabled && DecodeGraphDoubleBufferEnabled();
     poison = enabled && std::getenv("VT_ASYNC_EXECUTOR_POISON") != nullptr;
@@ -11193,8 +11203,13 @@ struct Qwen3_5DenseDecodeGraph::Impl {
     // once per process into a function-local static. These were the LAST TWO of
     // the six batched-driver reads the spec's `## Our baseline` item 1 counted.
     Backend& b = vt::GetBackend(queue.device.type);
+    // #2812/#1625 gate: the captured arm joins the evidence families through
+    // the arch-scoped overload, so ambient captures and VT_TT_DECODE_CAPTURE=0
+    // opts out — the same shape as the qwen3 driver's gate.
     enabled = vt::GraphCaptureEnabled() &&
               vllm::platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
+              !vllm::platforms::GetPlatform(queue.device.type)
+                   .static_graph_requires_opt_in(config.architectures) &&
               b.SupportsGraphCapture();
     dbuf = enabled && DecodeGraphDoubleBufferEnabled();
     poison = enabled && std::getenv("VT_ASYNC_EXECUTOR_POISON") != nullptr;
@@ -11244,6 +11259,9 @@ struct Qwen3_5DenseDecodeGraph::Impl {
     int fa_cols = -1;                 // captured block-table column count
     bool warm = false;
     int64_t replays = 0;
+    // R2: the cur_pos the device held after this slot's last seeding step or
+    // replay (WarmDecodePos continuation predicate, qwen3.cpp #2469).
+    int64_t expected_cur_pos = -1;
     // #1380: what the EAGER step at THIS shape demanded of the scratch pool, per
     // size class. Taken at the end of the cold step and handed back to
     // `DevicePool::PreGrowForCapture` immediately before this slot's capture, so
@@ -11521,7 +11539,94 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   const bool cols_changed = (s.fa_cols != -1 && s.fa_cols != cols);
   s.Refresh(ptok, ppos, pam, pgm);
   s.fa_cols = cols;
-  if (cols_changed && s.graph.captured()) {
+  bool seq_continuation = true;  // no seq_lens -> no boundary to detect
+  // TT captured arm (the WarmRopeCosSin populate-outside / content-HIT-inside
+  // pattern; qwen3.cpp:827-900 ported to the dense driver): refresh every
+  // persistent device input the captured region reads, OUTSIDE capture, on
+  // every step (warm, capture, replay). No-op off the TT host-free decode lane.
+  if (d.q.device.type == vt::DeviceType::kTENSTORRENT) {
+    // Fused-preamble cos|sin table: refreshed so the captured
+    // kAttnQkNormRopeGate serves a table matching the in-region
+    // RopeCosSinCacheKernel refill of these same positions.
+    vt::tenstorrent::WarmAttnCosSin(
+        s.positions.data(), S, impl_->config.rotary_dim,
+        static_cast<double>(static_cast<float>(impl_->config.rope_theta)));
+    // Paged-KV device shadows for EVERY layer (must precede WarmRacIdx, which
+    // builds its persistent sharded input from the shadows).
+    for (const auto& kv : attn_kv) {
+      const int64_t max_slot = pam.slot_mapping.empty() ? 0
+          : *std::max_element(pam.slot_mapping.begin(), pam.slot_mapping.end());
+      const int64_t used = (max_slot < 0) ? 1
+          : std::max<int64_t>(1, max_slot / kv.block_size + 1);
+      const size_t half = static_cast<size_t>(kv.block_size * kv.num_kv_heads *
+                                              kv.head_size) * vt::SizeOf(kv.dtype);
+      char* base = static_cast<char*>(kv.data);
+      vt::tenstorrent::WarmPagedKvShadow(
+          base, base + half, kv.num_blocks, kv.block_size,
+          kv.num_kv_heads, kv.head_size, used);
+    }
+    // R2 cur_pos: seed outside capture; replay steps leave it to the captured
+    // plus_one (the #1476/#2469 continuation predicate).
+    if (!pam.seq_lens.empty()) {
+      const bool continuation =
+          (static_cast<int64_t>(pam.seq_lens[0]) - 1) == s.expected_cur_pos;
+      seq_continuation = continuation;
+      vt::tenstorrent::WarmDecodePos(
+          pam.seq_lens.data(), static_cast<int64_t>(pam.num_reqs),
+          /*replay_regime=*/s.graph.captured() && continuation);
+      s.expected_cur_pos = pam.seq_lens[0] - 1;
+    }
+    vt::tenstorrent::WarmRacIdx(
+        pam.slot_mapping.data(), pam.slot_mapping.data(),
+        static_cast<int64_t>(pam.slot_mapping.size()),
+        attn_kv.empty() ? 32 : attn_kv[0].block_size,
+        pam.block_table_tensor.data(),
+        static_cast<int64_t>(pam.block_table_num_cols),
+        pam.seq_lens.data());
+    if (!pam.block_table_tensor.empty() && !pam.seq_lens.empty()) {
+      vt::tenstorrent::WarmPaMeta(
+          pam.block_table_tensor.data(),
+          static_cast<int64_t>(pam.num_reqs),
+          static_cast<int64_t>(pam.block_table_num_cols),
+          static_cast<int64_t>(pam.block_table_num_cols), 1,
+          pam.seq_lens.data());
+    }
+  }
+  // #2469 (qwen3.cpp:903-921 port): a same-size request boundary must
+  // re-capture, not seed-and-replay. The boundary seed alone leaves the first
+  // post-boundary replays running a trace whose baked state the per-step
+  // warms do not refresh; the qwen3 driver routes the boundary through the
+  // proven cols-change lane instead: destroy the trace, run THIS step eagerly
+  // against the freshly seeded cur_pos, and re-capture on the next step. The
+  // dense captured arm was seed-only, and every request diverged from the
+  // valid eager path at its 4th decode token.
+  //
+  // CONV-SHADOW GATE (TT captured arm): a prefill-bearing step transitions
+  // the same conv_state buffer to the ssm/cache role (GdnStateGather, the
+  // #2201 dual-role lane), which clears the transposed shadow AND REPLACES
+  // the slot's device tensor. A replay would keep reading the trace's baked
+  // stale pointer — the persistent post-boundary corruption this row chased —
+  // and a capture-time rebuild is the refused read that aborted the boundary
+  // probe (EnsureHost before its refusal CHECK). Query every layer OUTSIDE
+  // capture: a miss takes the same lane — eager step rebuilds the shadow,
+  // and the capture on the next step bakes the fresh pointers. Converges:
+  // once the joining request's prefill chunks are done, one eager decode
+  // step restores serveability and the next step captures.
+  bool conv_shadow_stale = false;
+  if (d.q.device.type == vt::DeviceType::kTENSTORRENT) {
+    for (const auto& st : gdn_state) {
+      if (!vt::tenstorrent::ConvShadowServeable(
+              st.conv_state.data, st.conv_state.shape[0],
+              st.conv_state.shape[1], st.conv_state.shape[2])) {
+        conv_shadow_stale = true;
+        break;
+      }
+    }
+  }
+  const bool tt_boundary =
+      d.q.device.type == vt::DeviceType::kTENSTORRENT && !seq_continuation;
+  if (((cols_changed || tt_boundary) && s.graph.captured()) ||
+      (conv_shadow_stale && (s.graph.captured() || s.warm))) {
     s.graph.Reset();
     Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
     s.pinned.clear();
@@ -11538,7 +11643,31 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // Fast path: this size's graph is captured. Embed OUTSIDE the graph into the
   // persistent hidden buffer, stage this step's inputs into the persistent device
   // buffers (Option A: H2D out of the captured region), then relaunch the graph.
-  if (s.graph.captured()) {
+  //
+  // TT RECAPTURE WORKAROUND (qwen3.cpp:928-950 port): on this tt-metal pin,
+  // interleaved `copy_to_device` refreshes into trace-input buffers between
+  // replays perturb the dispatch `expected_num_workers_completed` accounting,
+  // and after ~38-50 perturbations the next replay's DISPATCH_WAIT never
+  // completes — the main thread futex-waits forever (spec:
+  // .agents/specs/tt-metal-trace-replay-write-desync.md). The dense captured
+  // arm refreshes the SAME toxic class every step (WarmRacIdx + WarmPaMeta
+  // INT32 idx/page-table copies), and the 0.8B captured run deadlocked at
+  // ~30 replays exactly as documented. Destroy + re-capture the graph every
+  // VT_TT_RECAPTURE_EVERY replays; the qwen3 battery runs the identical
+  // setting (RC=8) green across 16-prompt cases.
+  bool do_replay = s.graph.captured();
+  if (do_replay && d.q.device.type == vt::DeviceType::kTENSTORRENT) {
+    const char* rc_env = std::getenv("VT_TT_RECAPTURE_EVERY");
+    const int rc_n = rc_env != nullptr ? std::atoi(rc_env) : 0;
+    if (rc_n > 0 && s.replays >= rc_n) {
+      s.graph.Reset();
+      Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+      s.pinned.clear();
+      s.warm = false;
+      do_replay = false;
+    }
+  }
+  if (do_replay) {
     DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     if (dbuf) {
       StageStepInputs(d, s);
@@ -11686,6 +11815,20 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
                               s.gdn_meta, attn_kv, gdn_state, impl_->weights,
                               impl_->config, {}, nullptr, nullptr, aux_ids_arg,
                               aux_out_arg, dbuf ? s.dev.get() : nullptr);
+      // R2 (the qwen3.cpp:1054-1061 port): advance cur_pos on-device
+      // (plus_one) INSIDE the captured trace, at the END of the body — after
+      // every cur_pos read in the layers' RAC/PA. cur_pos/update_idxs are
+      // ALIASED to this one device buffer (WarmRacIdx/WarmPaMeta), so without
+      // the in-trace advance a replayed trace re-reads the seeded position
+      // forever: RAC rewrites one frozen slot, PA attends a frozen window,
+      // and the captured arm emits deterministic garbage that no token gate
+      // can distinguish from a correct run by shape alone. The NEXT replay
+      // then sees cur_pos+1, which is what the hooks' replay regime expects.
+      if (d.q.device.type == vt::DeviceType::kTENSTORRENT &&
+          !pam.seq_lens.empty()) {
+        vt::tenstorrent::CaptureDecodePosAdvance(
+            static_cast<int64_t>(pam.num_reqs));
+      }
     }  // ~GraphCaptureScope closes the segment and files it on s.graph
     // NOT CAPTURED covers TWO states, and returning the buffer is correct for
     // exactly one of them. `~GraphCaptureScope` must swallow a throwing

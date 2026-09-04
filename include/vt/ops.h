@@ -820,6 +820,11 @@ enum class OpId : uint8_t {
   // Appended before kCount so no existing op's id shifts.
   kGlm5NextKpoolCompress,
   kGlm5NextKpoolSelect,
+  // Packed k-quant block decode: packed {rows, blocks} (dtype carries the
+  // encoding; bytes per row = blocks * BlockBytes) -> f32 {rows,
+  // blocks * BlockElems}. Decode-only (BACKEND-TENSTORRENT-KEEPQUANT W1);
+  // the dot provider and the keep-quant predicate arm ride W2.
+  kKeepQuantDecode,
   kCount
 };
 
@@ -1312,6 +1317,25 @@ struct Mamba2Args {
   // W1 lands tp_world_size == 1 only; see RmsNormGatedGroupArgs::tp_world_size.
   int64_t tp_world_size = 1;
 };
+
+// KERNEL-GDN-CHUNKED-MIRROR (.agents/specs/gdn-chunked-mirror.md D0/D3).
+// THE algorithm predicate for GDN prefill, shared by every backend so that a
+// `--device cpu` run and a `--device cuda` run cannot end up on different
+// algorithms because only one of them read the flag.
+//
+// `GdnChunkedPrefillEnabled()` is the raw `VT_GDN_CHUNKED` read, lifted
+// verbatim out of cuda_gdn.cu (the bespoke `e == nullptr || e[0] != '0'` parse
+// is KEPT as-is rather than rewritten to EnvOnOr: the off-value spelling is
+// recorded in four evidence files and six spec lines, so changing the accepted
+// spellings would be a semantic change wearing a cleanup).
+//
+// `GdnUseChunkedPrefill(dtype)` adds D0's dtype term. vLLM's chunked kernels
+// REFUSE f32 — the Triton wrapper asserts (`chunk.py:213-215`) and the CPU
+// kernel type-checks (`csrc/cpu/sgl-kernels/fla.cpp:2205-2207`, bf16 only) — so
+// at f32 the sequential recurrence IS the mirror, because it is the only gated
+// delta rule upstream will execute at that dtype.
+bool GdnChunkedPrefillEnabled();
+bool GdnUseChunkedPrefill(DType q_dtype);
 
 struct GdnArgs {
   // q scale, applied to q only after l2norm; upstream default Dk^-0.5
@@ -2273,6 +2297,7 @@ using LayerNormFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor*, cons
 using ReluFn = void (*)(Queue&, Tensor&, const Tensor&);
 using AddFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using EmbeddingFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+using KeepQuantDecodeFn = void (*)(Queue&, Tensor& out, const Tensor& packed);
 using RopeFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const RopeArgs&);
 using RopeFromCacheFn = void (*)(Queue&, Tensor&, Tensor*, const Tensor&,
                                  const Tensor&, const RopeArgs&);
@@ -2557,8 +2582,8 @@ using ComputeProbsFn = void (*)(Queue&, Tensor&, const Tensor&);
 using ComputeLogprobsFn = void (*)(Queue&, Tensor&, const Tensor&);
 using RandomSampleFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 // --- Greedy spec-decode rejection sampling (SPEC-REJECTION I3).
-using GreedyRejectionSampleFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&,
-                                         const Tensor&);
+using GreedyRejectionSampleFn = void (*)(Queue&, Tensor&, Tensor&, Tensor&, const Tensor&,
+                                         const Tensor&, const Tensor&);
 // --- V1 penalty / mask / builtin-proc ops (M1.7 Task 3). See the section at the
 // bottom of this header for the full contracts.
 using ApplyPenaltiesFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
@@ -2996,9 +3021,20 @@ void QuantFp8Group(Queue& q, Tensor& out_fp8, Tensor& out_scale, const Tensor& x
 // (scaled_mm_helper.hpp:54), so this mirrors a refusal rather than deferring a
 // feature.
 //
-// CPU only. A CORRECTNESS REFERENCE, NOT A PERFORMANCE PATH — it is the
-// numerical oracle #1189 milestone M5's CUTLASS kernel is measured against, and
-// it makes no speed claim. M5 owns the CUDA arm.
+// CPU + CUDA, and the CUDA arm is NARROW. This line read "CPU only" until W9d
+// (#2881) and had been stale since #1189 milestone M5 (`489a9a4c0`) landed
+// `src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu`. That TU is compiled only for
+// the `cutlass-fp8` arch cell `12.0a,12.1a` (cmake/CudaArchFeatures.cmake), so
+// its registrar runs only there and the op is genuinely UNREGISTERED on every
+// other CUDA arch — sm_110 and sm_87 among them. `dense_fp8_block::
+// BlockFp8Runnable` is the runtime question and `RefuseUnrunnableFp8BlockWeight`
+// is the message; neither reads this comment, which is why the comment could
+// drift for as long as it did.
+//
+// The CPU arm is A CORRECTNESS REFERENCE, NOT A PERFORMANCE PATH — it is the
+// numerical oracle the CUTLASS kernel is measured against, and it makes no
+// speed claim. That kernel has still never executed on hardware
+// (.agents/specs/vt-matmul-fp8-block-cuda.md).
 void MatmulFp8BlockScaled(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& a_scale,
                           const Tensor& b_fp8, const Tensor& b_scale, int block_n,
                           int block_k);
@@ -5440,12 +5476,24 @@ void RandomSample(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor
 //                 deterministic and the ported legacy-sampler assertions read
 //                 directly. Recorded deviation.
 //   num_sampled   [num_reqs] i32            OUT; accepted_length + 1
+//   target_argmax [num_logits] i32          SCRATCH, written then read by this
+//                 op: the per-expanded-row argmax of `logits`, upstream's
+//                 `_compute_global_target_argmax` output (:923-946). It is a
+//                 PARAMETER and not a private static for one reason
+//                 (SPEC-DFLASH2 A2-2, #2802): the CUDA arm launches two kernels
+//                 and returns while both are still queued, so the buffer between
+//                 them has to be owned by whoever owns the in-flight window. A
+//                 process-global grow-only scratch cannot be: a second caller
+//                 with more rows frees it under the first caller's queued accept
+//                 kernel. The caller allocates it, keeps it alive until it has
+//                 waited, and frees it then —
+//                 `vllm::v1::RejectionSamplerDeviceOutput` is that owner.
 //
 // Argmax tie-break is LOWEST INDEX (torch.argmax), identical to vt::GreedyArgmax,
 // so a k=0 request reduces EXACTLY to the non-speculative greedy sampler.
 void GreedyRejectionSample(Queue& q, Tensor& sampled, Tensor& num_sampled,
-                           const Tensor& logits, const Tensor& draft_sampled,
-                           const Tensor& cu_num_logits);
+                           Tensor& target_argmax, const Tensor& logits,
+                           const Tensor& draft_sampled, const Tensor& cu_num_logits);
 
 // --- V1 penalty / mask / builtin-proc ops (M1.7 Task 3). Ported from
 // vllm/model_executor/layers/utils.py (apply_penalties), vllm/_custom_ops.py

@@ -813,6 +813,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/dots3_note_attn.cpp
   src/vllm/model_executor/models/dots3_note_device.cpp
   src/vllm/model_executor/models/dots3_note_vision.cpp
+  src/vllm/model_executor/models/dots3_note_audio.cpp
   src/vllm/model_executor/models/dots3_note_registry.cpp
   src/vllm/model_executor/models/qwen4_exp_ple.cpp
   src/vllm/model_executor/models/qwen4_exp.cpp
@@ -971,6 +972,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/ltx2_video_vae_encoder_load.cpp
   src/vllm/model_executor/models/ltx2_audio_vae_encoder_load.cpp
   src/vllm/model_executor/models/ltx2_audio_input.cpp
+  src/vllm/model_executor/models/ltx2_iclora_reference.cpp
   src/vllm/model_executor/models/ltx2_image_preprocess.cpp
   # LTX-2.5 RETAKE (row LTX25-RETAKE, #924): the temporal region mask, the
   # truncate-or-pad conform, and the frame-directory source. Its own TU for the
@@ -1086,9 +1088,15 @@ add_library(vllm STATIC
   # Per-modality input-count limits and the refusal they carry
   # (ENG-MM-INPUT-PIPELINE L1, #607).
   src/vllm/multimodal/processing/context.cpp
+  src/vllm/multimodal/processing/processor.cpp
   src/vllm/multimodal/dots3_note_processor.cpp
+  src/vllm/multimodal/mel_filter_bank.cpp
+  # Pillow's BICUBIC resampler, which is NOT torchvision's and NOT a four-tap
+  # cubic (dots3-note W6c, #2537).
+  src/vllm/multimodal/pil_resize.cpp
   src/vllm/multimodal/qwen3vl_processor.cpp
   src/vllm/multimodal/audio_processor.cpp
+  src/vllm/multimodal/audio_resample.cpp
   # Parakeet / FastConformer audio encoder + CTC head + its log-mel front end
   # (spike .agents/specs/parakeet-conformer-encoder.md row P4). A standalone
   # forward composed from the P1-P3 vt:: kernels, NOT a registry architecture —
@@ -1140,6 +1148,7 @@ add_library(vllm STATIC
   src/vllm/v1/sample/ops/bad_words.cpp
   src/vllm/v1/sample/logits_processor/builtin.cpp
   src/vllm/v1/sample/sampler.cpp
+  src/vllm/v1/spec_decode/metrics.cpp
   src/vllm/v1/spec_decode/rejection_sampler.cpp
   src/vllm/v1/spec_decode/ngram_proposer.cpp
   src/vllm/v1/spec_decode/draft_model_proposer.cpp
@@ -1718,6 +1727,7 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_moe_router.hip
     src/vt/rocm/rocm_moe_chain.hip
     src/vt/rocm/rocm_grouped_gemm.hip
+    src/vt/rocm/rocm_moe_gate_up_swiglu.hip
     src/vt/rocm/rocm_exl3.hip
     src/vt/rocm/rocm_sample.hip
     src/vt/rocm/rocm_gdn_state.hip
@@ -1726,6 +1736,8 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_gdn_scan.hip
     src/vt/rocm/rocm_gdn_fused.hip
     src/vt/rocm/rocm_mla_fused_norm_rope.hip
+    src/vt/rocm/rocm_mla_ops.hip
+    src/vt/rocm/rocm_mla_attn.hip
     src/vt/rocm/rocm_skinny_gemm.hip
     src/vt/rocm/rocm_ops.hip)
   if(VLLM_CPP_HIP_ARCHITECTURES)
@@ -1743,6 +1755,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_moe_router.hip
       src/vt/rocm/rocm_moe_chain.hip
       src/vt/rocm/rocm_grouped_gemm.hip
+      src/vt/rocm/rocm_moe_gate_up_swiglu.hip
       src/vt/rocm/rocm_exl3.hip
       src/vt/rocm/rocm_sample.hip
       src/vt/rocm/rocm_gdn_state.hip
@@ -1751,6 +1764,8 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_gdn_scan.hip
       src/vt/rocm/rocm_gdn_fused.hip
       src/vt/rocm/rocm_mla_fused_norm_rope.hip
+      src/vt/rocm/rocm_mla_ops.hip
+      src/vt/rocm/rocm_mla_attn.hip
       src/vt/rocm/rocm_skinny_gemm.hip
       src/vt/rocm/rocm_ops.hip
       PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
@@ -2987,6 +3002,11 @@ endif()
 # absent `vllm-bench` and report a verdict about a binary it did not build.
 if(TARGET test_bench_kv_cache_dtype AND TARGET vllm-bench)
   add_dependencies(test_bench_kv_cache_dtype vllm-bench)
+endif()
+# #2759: the same ordering, for the same reason, for the EOS / chat-template
+# flag gate.
+if(TARGET test_bench_eos_chat_template AND TARGET vllm-bench)
+  add_dependencies(test_bench_eos_chat_template vllm-bench)
 endif()
 
 # Render the compiled-arch manifest (issue #1357). Last, so it observes whatever

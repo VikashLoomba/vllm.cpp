@@ -4,31 +4,174 @@ The reference checkout, fetch remote and eligible gate host come from the
 untracked `developer-preferences.md`. The parity pin and classification rules
 are repository-wide; machine paths are not.
 
-**Active pin (advanced 2026-07-26):** current parity pin `555967922` (vLLM
-0.26.0.dev0 + transformers 5.14.1, Torch 2.13.0, FlashInfer 0.6.15.post1, CUTLASS
-DSL 4.6.0), FLIPPED from the prior `e24d1b24`/0.25.0 pin at W5 (`bc415a3e`), see
-[specs/pin-advance.md](specs/pin-advance.md) §7. The advance re-validated with
+**Active pin (advanced 2026-09-03):** current parity pin `e126687a9a` (vLLM
+0.28.1rc1.dev132 + Torch 2.13.0, FlashInfer 0.6.18, CUTLASS DSL 4.6.2,
+`transformers` floor `>= 5.10.4`), vllm#53896, 2026-08-31, the revision that
+registers `Qwen4ExpForCausalLM`. 1465 commits past the prior `555967922` pin. See
+[specs/upstream-pin-advance-e126687.md](specs/upstream-pin-advance-e126687.md)
+and [`sync/2026-09-03-e126687-advance.md`](sync/2026-09-03-e126687-advance.md)
+([#2817](https://github.com/mudler/vllm.cpp/issues/2817)).
+
+**This advance re-validated NOTHING, and that is the difference from the last
+one.** The 2026-07-26 advance re-captured goldens on the new oracle on GB10 and
+recorded zero real drift. This one ran no build, no lease, no GPU and no golden
+re-capture. Every committed golden in this tree was captured against `555967922`
+or earlier, and the declared token-exact gate at this pin is owed by
+[#2794](https://github.com/mudler/vllm.cpp/issues/2794). Step 5 did not run
+either, so **at least 177** files whose `Ported from:` header names `55596792`
+are now BEHIND the pin, counted over `include/`, `src/` and `tests/`. **It is a
+FLOOR, not a count**, and the reason is in
+[`sync/2026-09-03-e126687-advance.md`](sync/2026-09-03-e126687-advance.md) §5.3:
+a header wraps, so no single probe sees all of them, and the figure is the union
+of three probes each with a different blind spot. 556 files carry such a header
+at all, and at least 330 still name `e24d1b24`, the pin before that one — they
+were already behind, and this advance neither causes nor fixes that. This
+paragraph is the ledger note §Concepts asks for, and the queue is
+[#2611](https://github.com/mudler/vllm.cpp/issues/2611).
+
+**Step 6 ran AFTER step 7, by developer ruling, and the ruling is recorded as
+one.** §"The sync cycle" orders the re-measurement before the advance. Wave STEP6
+([#2771](https://github.com/mudler/vllm.cpp/issues/2771), landed as
+[#2783](https://github.com/mudler/vllm.cpp/pull/2783)) established by hermetic
+probe that this order cannot be executed here: `tools/bench/online_gate.py`
+refuses every oracle that is not the pinned one, on the distribution version, the
+runtime version, the commit and the FlashInfer version, and all four come out of
+the block below by way of `tools/bench/serve_low_common.py`. Editing the block IS
+step 7, so step 6 is a precondition of its own precondition. STEP6 filed the
+ordering `NEEDS_DECISION`.
+
+> **The developer ruled that the pin advances first and step 6 re-runs against
+> it.** That inverts a documented step order. It is a developer decision, not a
+> reading this protocol permits, and its consequence is part of the ruling:
+> **step 6 becomes post-hoc validation, and a red there requires REVERTING the
+> pin, not holding it while the rows are re-argued.** Owed by
+> [#2818](https://github.com/mudler/vllm.cpp/issues/2818), which covers the five
+> affected rows across `vllm-online-serving` and `speculative-decoding` and the
+> withdrawn `nvidia-cutlass-dsl` discharge (`C1c`). No checker enforces the
+> inversion and none is added; a gate over step order would have to read the same
+> block it is deciding about.
+
+**Prior pin (advanced 2026-07-26):** `555967922` (vLLM 0.26.0.dev0 + transformers
+5.14.1, Torch 2.13.0, FlashInfer 0.6.15.post1, CUTLASS DSL 4.6.0), FLIPPED from
+`e24d1b24`/0.25.0 at W5 (`bc415a3e`), see
+[specs/pin-advance.md](specs/pin-advance.md) §7. That advance re-validated with
 zero real golden drift (27B-W4A4 + 32B-NVFP4A16 bit-identical, 35B/Coder
 byte-stable) and unblocked DFlash (vllm#40898), Gemma-4 (`transformers.gemma4`),
 and OLMo-3 (nested rope); a `vllm-oracle-v0.25.0-stage` rollback is preserved.
 
 **The pin, as a running oracle reports itself.** The paragraph above names the
 release; the block below carries the exact strings a runtime identity check can
-compare, measured 2026-08-12 from `~/venvs/vllm-oracle-next` on dgx. They are not
-derivable from the release number — the oracle reports
-`0.23.1rc1.dev1511+g555967922`, not `0.26.0.dev0`, and its distribution metadata
-adds a `.precompiled` suffix its runtime string lacks. `tools/bench/` reads this
+compare. Every value in it was MEASURED at the target and none was transcribed:
+the runtime and distribution strings from `IMPORT VLLM_VERSION` and
+`DIST DIST_VERSION` read from `cd /`
+([`sync/2026-09-02-e126687.md`](sync/2026-09-02-e126687.md) §5.4, reproduced by
+the source build in [`sync/2026-09-03-e126687-runhalf.md`](sync/2026-09-03-e126687-runhalf.md)
+§2 and §5), the FlashInfer version from `PIPLIST flashinfer-python` in the same
+lease (§5.2). They are not derivable from the release number — the oracle reports
+`0.28.1rc1.dev132+ge126687a9`, not `0.28.1rc1`. **This sentence used to end "and
+its distribution metadata adds a `.precompiled` suffix its runtime string
+lacks", which the correction below made false and which nothing then removed;**
+on a source build the two strings are equal, and a source build is the only mode
+that runs on this architecture. `tools/bench/` reads this
 block rather than duplicating it (#520); the duplicate drifted once, and the
 harness spent 17 days *refusing* the oracle this record required. Advance it only
 as part of a sync cycle, from a measured oracle, never by transcribing a version
 number.
 
 ```parity-pin
-vllm_commit = 5559679229bc961848b121ccdeaa8fa5d79bec98
-vllm_runtime_version = 0.23.1rc1.dev1511+g555967922
-vllm_distribution_version = 0.23.1rc1.dev1511+g555967922.precompiled
-flashinfer_version = 0.6.15.post1
+vllm_commit = e126687a9a828d513c01a07cd69f025f27d63280
+vllm_runtime_version = 0.28.1rc1.dev132+ge126687a9
+vllm_distribution_version = 0.28.1rc1.dev132+ge126687a9
+flashinfer_version = 0.6.18
 ```
+
+**This field now records the SOURCE build, corrected 2026-09-04 on developer
+instruction (#2896).** The `.precompiled` suffix is a BUILD-MODE property, and
+recording it made the harness unsatisfiable on this architecture: `online_gate.py`
+compares this field for EQUALITY, and on aarch64 `VLLM_USE_PRECOMPILED=1`
+downloads nothing and leaves a 13,872-byte editable install with **no compiled
+extensions** — so the only mode that matched the string could not execute a
+kernel, while the only mode that can execute was refused. No cross-engine
+measurement was possible at this pin in either direction.
+
+**The new value is measured, not transcribed**, which is the constraint this block
+exists to enforce. `VLLM_USE_PRECOMPILED=0 VLLM_TARGET_DEVICE=cuda` at this
+revision produced
+`vllm-0.28.1rc1.dev132+ge126687a9-cp312-cp312-linux_aarch64.whl`, with no suffix
+([`sync/2026-09-03-e126687-runhalf.md`](sync/2026-09-03-e126687-runhalf.md) §2,
+lines 52 and 56). Writing a string nobody read is the #520 failure and is not what
+happened here.
+
+**A second build has since ATTESTED the same string on a second device, from the
+wheel name.** Job `7386f034-246a-4af5-9a04-f98aafffce54` built this revision from
+source on `dgx:gpu0` (GB10, `sm_121a`) on 2026-09-04 and produced
+`vllm-0.28.1rc1.dev132+ge126687a9-cp312-cp312-linux_aarch64.whl`, with no suffix
+(its log at L111 and L114). A wheel filename carries the DISTRIBUTION version, so
+it attests THIS field — but as a second corroboration OF THE SAME KIND
+`5d97007c2` already took from the Thor build's wheel name, on a second device,
+not as a reading of the field.
+
+**That job did not read the field, and an earlier version of this paragraph said
+it did.** Its identity block is `cd /` then `import torch, vllm` then
+`print("VLLM_VERSION", vllm.__version__)`
+([`scripts/tokengate-e126687-job.sh`](scripts/tokengate-e126687-job.sh) lines
+234-241 at `17fcdd5e3^`, the byte sequence that ran; sha256 `bf77dfbb3383d837`
+is that WHOLE FILE, which is the hash the share copy was matched on, and lines
+234-241 on their own hash `23c52138b006feda`).
+The directory is right and the FIELD is wrong: that is the RUNTIME string. All
+316 of the job's log lines carry zero `importlib` and zero `metadata`, against
+positive controls of one `VLLM_VERSION`, six `autotun` and four `kernel_warmup`
+counted the same way, once on the raw lines and once on the whitespace-stripped
+file so a wrap could not defeat the search. Of every block in this repository
+this is the one where that substitution cannot be made, because the
+`.precompiled` question IS the difference between the two fields, and this block
+is the one whose own prose says every value in it was measured and none
+transcribed. The job's full record is
+[`../docs/bench-evidence/opt125m-token-gate-e126687-dgx-20260904.md`](../docs/bench-evidence/opt125m-token-gate-e126687-dgx-20260904.md).
+
+**The distribution field itself was read on 2026-09-05, by a different job.**
+`d7908816-96a3-40ed-8024-c3ad0cc34d77` read `importlib.metadata.version("vllm")`
+from `cd /` against a source build on `dgx:gpu0`, and recorded
+`metadata_vllm='0.28.1rc1.dev132+ge126687a9'` beside an equal
+`runtime_vllm___version__` in `/workspace/step6-c1a-2818/versions.txt`. Its own
+log records the read succeeding: `VERSION_READ_RC=0` at `step35.log:73`, the
+`metadata_vllm=` block at `:75`, and `step35.sh:51` is the line that writes the
+file. That is the reading
+[#2818](https://github.com/mudler/vllm.cpp/issues/2818) item 1 asked a lease to
+take, and it is what this field now rests on.
+
+**It was NOT taken by `8c4f639c-0ebb-44de-b5e4-0e192143f7c3`, which this file
+credited until now.** That job attempted the same read and it FAILED:
+`VERSION_READ_RC=1` at `stepA.log:1119`, its `cat` of `versions.txt` produced
+nothing, and `versions.err` is
+`ModuleNotFoundError: No module named 'vllm'` — its venv `/tmp/oracle-e126687`
+never got the wheel installed, and the job records that too:
+`INSTALL_VLLM_RC=1` at `stepA.log:912`, after `Failed to build installable
+wheels for some pyproject.toml based projects` / `instanttensor` at `:909-910`. The job nevertheless finished `succeeded` with
+`exit_code 0`, because `stepA.sh` echoes `VERSION_READ_RC=$?` instead of
+propagating it. **An exit code attests the job, never a step inside it**, and
+that exit 0 was the whole of the corroboration this attribution rested on. Three
+things place the file with `d7908816`: its mtime `2026-09-05 22:42:39Z` falls
+inside that job's `22:33:48Z`–`23:08:22Z` window and after `8c4f639c` finished
+at `22:33:48Z` (`rc jobs -n 200 --device dgx:gpu0 -o json`, read directly); it
+carries
+`vllm___file__='/root/step6/venv/lib/python3.12/site-packages/vllm/__init__.py'`,
+which is `step35.sh`'s venv and not `stepA.sh`'s; and `stepA.sh`'s own `cat` of
+it is empty.
+
+`rc logs` returns nothing today for EITHER job — a positive control on the same
+client still returns `7386f034`'s 316 lines — so the share artifacts under
+`/workspace/step6-c1a-2818/` are the only record, which is why the record exists.
+[`sync/2026-09-05-e126687-step6-c1a.md`](sync/2026-09-05-e126687-step6-c1a.md)
+§R1 states the same reading and still names the wrong job; that record belongs
+to another wave and its repair is owed by
+[#2997](https://github.com/mudler/vllm.cpp/issues/2997).
+
+Whoever next builds the oracle records WHICH mode they used and, if the field is
+wrong for it, corrects it from THAT measurement — never by editing the block to
+make a run pass. **A build that carries `.precompiled` on aarch64 is not a
+runnable oracle**, so a future correction back toward it needs a measurement
+showing the install can actually serve.
 
 **`vllm_runtime_version` must carry a `+g<sha>` segment naming `vllm_commit`.**
 That is a permanent constraint of this design, not a property of today's values:
@@ -42,18 +185,23 @@ from a release number. If a future pin is genuinely a released wheel, give the
 commit its own asserted field first; do not delete the assertion to make the
 block parse.
 
-**One measured source build does NOT match the full `vllm_runtime_version`
-string, and the discrepancy is OPEN.** A build of this pin inside an `rc` lease
-on `dgx:gpu0`, 2026-08-18, reports `vllm.__version__ = 0.1.dev1+g555967922`
-against the `0.23.1rc1.dev1511+g555967922` recorded above
+**A shallow clone rewrites the version prefix, and the discrepancy that taught us
+this is still OPEN.** A build of the PRIOR pin inside an `rc` lease on
+`dgx:gpu0`, 2026-08-18, reported `vllm.__version__ = 0.1.dev1+g555967922` against
+that pin's recorded `0.23.1rc1.dev1511+g555967922`
 ([#1185](https://github.com/mudler/vllm.cpp/issues/1185),
 [`specs/oracle-wheel-in-lease.md`](specs/oracle-wheel-in-lease.md)). The binding
-constraint holds, because the `+g<sha>` segment names `vllm_commit`. The cause of
-the prefix difference is the shallow fetch that build used: `setuptools_scm`
-cannot count the commits since the last tag and falls back to a default. A gate
-that compares the FULL string needs either a deeper fetch or an explicit
-pretend-version carrying that reason. Do NOT edit the block above to match a
-build. The block records the pin, and a shallow clone is a property of one job.
+constraint held, because the `+g<sha>` segment named `vllm_commit`. The cause is
+the shallow fetch that build used: `setuptools_scm` cannot count the commits
+since the last tag and falls back to a default. The mechanism is general and
+still applies. It is also why the CURRENT block's full string is trustworthy: the
+build that measured it recorded `SHALLOW=false REVCOUNT=20591
+GIT_DESCRIBE=v0.28.1rc0-132-ge126687a9`
+([`sync/2026-09-03-e126687-runhalf.md`](sync/2026-09-03-e126687-runhalf.md) §2),
+so `setuptools_scm` had the history it needs. A gate that compares the FULL string
+needs either a deep fetch or an explicit pretend-version carrying that reason. Do
+NOT edit the block above to match a build. The block records the pin, and a
+shallow clone is a property of one job.
 
 **vLLM-Omni's pin does NOT live here.** It is a separate repository, and under
 AGENTS.md §"When vLLM has no implementation" every oracle carries its own file:
@@ -134,6 +282,14 @@ superseded it at **55/124 axes pass, 69 fail**; the current binding is `9ecd9d0`
    required release-gate hardware is unavailable, retain the gate as `PENDING`
    with an exact handoff. If benchmarks are baselined, the vLLM baseline must
    be re-measured at TARGET before comparing.
+   **This step cannot run at TARGET through the committed online-serving harness
+   until step 7 has moved the block**, because `online_gate.py` refuses every
+   oracle that is not the pinned one on four values it reads from that block
+   (measured by [`sync/2026-09-03-e126687-step6.md`](sync/2026-09-03-e126687-step6.md)
+   §6.1). The 2026-09-03 cycle resolved that circularity by a developer ruling,
+   recorded above and in
+   [specs/upstream-pin-advance-e126687.md](specs/upstream-pin-advance-e126687.md)
+   §1. The ruling is that cycle's, not a change to this order.
 7. **Advance the pin.** Fast-forward the reference checkout to TARGET, update
    the PARITY PIN line above, append an indexed immutable state event linking the
    sync report. A cycle that stalls mid-way keeps the old pin and records

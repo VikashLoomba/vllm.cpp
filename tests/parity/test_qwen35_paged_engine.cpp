@@ -9,9 +9,10 @@
 // pinned vLLM oracle (commit 555967922, runtime 0.23.1rc1.dev1511+g555967922).
 //
 // ORACLE PROVENANCE — DIFFERENT FROM THE QWEN3-DENSE GATE. There is no dgx/CUDA
-// capture for this model: the 0.8B GDN checkpoint was only ever stood up on the
-// gfx1100 box (issue #41 lane), which is also the only board that hosts a
-// vLLM-ROCm oracle. The base golden pair here is therefore ROCm-captured:
+// capture for this model. The 0.8B GDN checkpoint runs on the gfx1100 box, which
+// also hosts the vLLM-ROCm oracle. Issue #2772 refreshed the committed base
+// files from the restored immutable image in production mode. The default
+// production oracle and the local default both select wvSplitK. The files are:
 //   greedy_ids.npy  [N,T]   i32  the pinned ROCm oracle's per-prompt greedy
 //                                (K=10 per-prompt runs DETERMINISTIC in every
 //                                cell — see greedy_dist.npy).
@@ -26,13 +27,14 @@
 // forced via scripts/qwen3-neartie-gap-transformers.py — vLLM has no TT
 // backend, so `transformers` is the secondary oracle per AGENTS.md's registry).
 //
-// PROVENANCE OF THE GREEN: the committed our_ids/near-tie pair is the
-// FIXED engine's sequence, oracle-re-derived after the AttnQkNormRopeGate
-// output-dtype dispatch fix (row/ROCM-GDN-08B-FIX). The PRE-FIX capture
-// (13/16 forward-divergent, max first-divergence gap 1.062 nats) is recorded
-// as evidence in .agents/specs/rocm-m4-oracle.md and the parity ledger — the
-// gate landed green-shaped per review, with the RED capture kept as history
-// rather than as committed goldens.
+// PROVENANCE OF THE GREEN: the committed our_ids/near-tie pair is the fixed
+// engine's sequence. The oracle was re-derived after the AttnQkNormRopeGate
+// output-dtype dispatch fix in row/ROCM-GDN-08B-FIX. Issue #2772 then re-derived
+// all four ROCm arrays in production mode. The historical eager capture is
+// diagnostic evidence only. It selected a different branch of an exact tie.
+// The pre-fix capture had 13/16 forward-divergent prompts and a maximum first-
+// divergence gap of 1.062 nats. That result remains in
+// .agents/specs/rocm-m4-oracle.md and the parity ledger.
 //
 // METHODOLOGY — identical to the Qwen3-dense gate (see that file's header and
 // [[near-tie-distributional-gate]]): STRICT token-exact is reported, but the
@@ -70,6 +72,7 @@
 #include "vllm/sampling_params.h"
 #include "vt/op_provider.h"  // the "which backend actually ran" proof
 #include "vt/ops.h"
+#include "vt/tenstorrent/tenstorrent_device.h"
 
 namespace fs = std::filesystem;
 
@@ -156,14 +159,22 @@ GateArtifactState RequireGateArtifacts(const fs::path& gdir, const char* label,
                       "qwen3-neartie-gap.py");
 }
 
-void RunGate(const std::string& golden_subdir, const char* label) {
+// `model` is the checkpoint the gate loads: the bf16 HF snapshot for the
+// SACRED ROCm pair, the q4km GGUF path for the keep-quant vehicle arm.
+// `keep_quant` selects the dispatch set the backend-proof block asserts: the
+// bf16 vehicle dispatches plain kMatmulBT and kSiluAndMul, while the
+// keep-quant vehicle swaps those two for the W3 decode surface — every matmul
+// weight stays block-encoded and decodes on-core (kMatmulBTQuant) and the
+// split gate/up dense MLP routes through kMoeSiluMul (qwen3_5.cpp:7610) — so
+// the same selections>0/declines==0 proof covers the quant path's e2e reach.
+void RunGate(const std::string& golden_subdir, const char* label,
+             const std::string& model, const bool keep_quant = false) {
   const char* probe_dir = std::getenv("VT_QWEN35_GATE_PREREQ_PROBE_DIR");
   const bool probe = probe_dir != nullptr;
-  const std::string snap = probe ? std::string() : parity::Qwen35_08BSnapshot();
+  const std::string snap = probe ? std::string() : model;
   if (!probe && snap.empty()) {
-    SkipGate(label, "models--Qwen--Qwen3.5-0.8B snapshot at the pinned revision "
-                    "2fc06364 not cached — this gate runs where the ROCm oracle "
-                    "was captured (gfx1100)");
+    SkipGate(label, "model artifact not cached — resolve the snapshot or GGUF "
+                    "path this gate is pinned to first");
   }
   const fs::path gdir = probe ? fs::path(probe_dir)
                               : fs::path(PARITY_GOLDENS_DIR) / golden_subdir;
@@ -233,7 +244,7 @@ void RunGate(const std::string& golden_subdir, const char* label) {
       vllm::entrypoints::LoadedEngine::FromModelDir(
           snap, vllm::entrypoints::EngineParams{});
 
-  // The base golden pair for this model is ROCm-captured (see the file header).
+  // The base golden pair is production-mode ROCm evidence after issue #2772.
   // The Tenstorrent device lane carries its OWN oracle-backed golden pair
   // (the Mistral gate's treatment); every other device still skips loudly.
   const vt::DeviceType run_dev = loaded->runner().device().type;
@@ -252,16 +263,20 @@ void RunGate(const std::string& golden_subdir, const char* label) {
   }
 
   // The GDN op set this model dispatches — all must be proven on the running
-  // device (selections > 0, declines == 0; fan-out spike Risk 4).
+  // device (selections > 0, declines == 0; fan-out spike Risk 4). The last two
+  // entries are the GEMM/MLP pair that differs per arm (see RunGate's
+  // keep_quant comment).
   const std::vector<vt::OpId> kGdnOps = {
-      vt::OpId::kEmbedding,        vt::OpId::kMatmulBT,
-      vt::OpId::kRmsNorm,          vt::OpId::kRmsNormGated,
+      vt::OpId::kEmbedding,        vt::OpId::kRmsNorm,
+      vt::OpId::kRmsNormGated,
       vt::OpId::kCausalConv1dFwd,  vt::OpId::kCausalConv1dUpdate,
       vt::OpId::kGdnPrefill,       vt::OpId::kGdnDecode,
       vt::OpId::kGdnPostConv,      vt::OpId::kSigmoidGateBf16,
       vt::OpId::kAttnQkNormRopeGate,
       vt::OpId::kReshapeAndCache,  vt::OpId::kPagedAttention,
-      vt::OpId::kSiluAndMul,       vt::OpId::kGreedyArgmax};
+      vt::OpId::kGreedyArgmax,
+      keep_quant ? vt::OpId::kMatmulBTQuant : vt::OpId::kMatmulBT,
+      keep_quant ? vt::OpId::kMoeSiluMul : vt::OpId::kSiluAndMul};
   if (rocm || device_golden) {
     for (vt::OpId op : kGdnOps) {
       CHECK(vt::OpRegistered(op, run_dev));
@@ -282,33 +297,51 @@ void RunGate(const std::string& golden_subdir, const char* label) {
   // goldens).
   //
   // Each Tenstorrent decode ARM gates against its OWN captured pair (#2115).
-  // VT_TT_HOST_FREE_DECODE=0 (the eager opt-out; same parsing convention as
-  // vt::tenstorrent::HostFreeDecodeEnabled) is a LEGITIMATE ALTERNATE GREEDY
-  // PATH, not a drift: it differs from the ambient pair at 61 of 256 cells
-  // across prompts 2,7,8,10,13,15 (first splits at (2,1),(7,3),(8,4),(10,10),
-  // (13,2),(15,9); prompt 2's suffix re-agrees transiently at (2,8)). Every
-  // differing cell is a near-tie on BOTH teacher-forced paths — ambient gaps
-  // <= 375 mnats at all 61 cells; eager max is exactly 500 mnats at (15,9),
-  // the band edge (stored int 500, so the `mn > kNearTieMnats` check passes).
-  // At (2,1) the top-2 logits are TIED (gap 0 on both paths): the ambient arm
-  // takes the oracle-greedy 1814, the eager arm flips to the tied runner-up
-  // 15039. So the eager leg loads the host_free_off pair captured on that arm,
-  // and the near-tie band (kNearTieMnats) and the exact-match anchor REQUIRE
-  // stay as they are. An earlier "differs at exactly one cell (2,1), re-syncs
-  // at tok=2" note was an artifact of this REQUIRE aborting at the first
-  // divergence — retired by the #2115 full-suffix diff (c31cad9c1 precedent).
+  // The ambient pair (refreshed 2026-09-05 with the device-pure GDN wave:
+  // the PA bf16 decode cast unlocked device sdpa_decode on the eager arm,
+  // and the boundary re-capture + conv-shadow gate fixed the captured arm)
+  // is a LEGITIMATE ALTERNATE GREEDY PATH, not a drift: teacher-forced
+  // against the transformers oracle it diverges from greedy_ids at 81 cells
+  // with max gap 375 mnats (69 of 81 cells our token IS the teacher-forced
+  // argmax), inside the 500-mnat band. The captured pair diverges at 68
+  // cells, also max gap 375 mnats. The two arms differ from each other at
+  // 59 of 256 cells — near-ties on both paths, the same shape the Mistral
+  // gate records. At exact ties the arm may take the tied runner-up, so the
+  // near-tie band (kNearTieMnats) and the exact-match anchor REQUIRE stay
+  // as they are. The pre-wave pairs' "uniform tok3 divergence" was a real
+  // defect (prefill dual-role transitions replaced the conv/ssm shadow
+  // device tensors the captured graph had baked; see the row spec), not an
+  // alternate path — retired with the fix, not adjudicated.
   const char* hf_env = std::getenv("VT_TT_HOST_FREE_DECODE");
   const bool host_free_off =
       tenstorrent && hf_env != nullptr && std::string_view(hf_env) == "0";
-  const char* ids_name = tenstorrent ? (host_free_off
+  // Selection follows the engine's arm: the #1625 flip defaults TT capture
+  // on for the evidence families (Qwen3.5-GDN joined with its own committed
+  // pair), so — like the qwen3 test — the ambient leg keys on
+  // DecodeCaptureEnabled() alone ("0" opts out to the eager arm and its
+  // pair). A hardcoded eager name would adjudicate a captured run against
+  // eager goldens when the arm IS captured.
+  const bool tt_capture =
+      tenstorrent && !host_free_off && vt::tenstorrent::DecodeCaptureEnabled();
+  const char* ids_name = tenstorrent
+                             ? (tt_capture
+                                    ? "our_ids_tenstorrent_capture.npy"
+                                    : (host_free_off
                                            ? "our_ids_tenstorrent_host_free_off.npy"
-                                           : "our_ids_tenstorrent.npy")
-                                     : "our_ids.npy";
+                                           : "our_ids_tenstorrent.npy"))
+                             : "our_ids.npy";
   const char* gap_name = tenstorrent
-                             ? (host_free_off
-                                    ? "neartie_gap_mnats_tenstorrent_host_free_off.npy"
-                                    : "neartie_gap_mnats_tenstorrent.npy")
+                             ? (tt_capture
+                                    ? "neartie_gap_mnats_tenstorrent_capture.npy"
+                                    : (host_free_off
+                                           ? "neartie_gap_mnats_tenstorrent_host_free_off.npy"
+                                           : "neartie_gap_mnats_tenstorrent.npy"))
                              : "neartie_gap_mnats.npy";
+  if (tt_capture && !fs::exists(gdir / ids_name) && !dump) {
+    MESSAGE(label << " TT capture pair absent (the committed pair was removed "
+            "or renamed); skipping on Tenstorrent");
+    return;
+  }
   parity::NpyArray o_dev, gap_dev;  // keep the device arrays alive for the loop
   bool bootstrap_only = false;
   if (device_golden) {
@@ -345,6 +378,16 @@ void RunGate(const std::string& golden_subdir, const char* label) {
 
   const int32_t* anchor_ids = od;
   const int32_t* gap_ids = gapd;
+
+  // KEEPQUANT W3 capture-safety probe: the staging counter counts ONLY
+  // capture-active word-shadow misses (EnsureKeepQuantWords refuses a
+  // capture-time arrival by name, so a miss would have CHECK-aborted before
+  // this point). The engine's pre-capture eager step warms every shadow, so
+  // across a captured run the count must read ZERO — a positive count is the
+  // #2812 class surviving the W3 fix. On the bf16 arm no keep-quant weight
+  // exists and the count is trivially zero; the invariant costs one atomic read.
+  if (tenstorrent && tt_capture)
+    vt::tenstorrent::ResetKeepQuantCaptureStagingWritesForTest();
 
   int strict_exact = 0;
   int neartie_only = 0;
@@ -419,6 +462,15 @@ void RunGate(const std::string& golden_subdir, const char* label) {
     CHECK(prompt_ok);
   }
 
+  if (tenstorrent && tt_capture) {
+    const int64_t staged = vt::tenstorrent::KeepQuantCaptureStagingWrites();
+    CHECK_MESSAGE(staged == 0,
+                  label << ": keep-quant decode staged " << staged
+                        << " word uploads DURING the captured e2e (the #2812 "
+                           "class — a captured graph reading bytes its replay "
+                           "cannot refresh)");
+  }
+
   // Backend proof: token equality alone does not prove which device ran.
   // The bootstrap dump path does not exercise the full op set to a comparison,
   // so its stats prove reachability only (still selections > 0, declines == 0).
@@ -447,7 +499,8 @@ void RunGate(const std::string& golden_subdir, const char* label) {
 
   if (dump) {
     const std::string dump_name =
-        tenstorrent ? "our_ids_tenstorrent.i32" : "our_ids.i32";
+        tt_capture ? "our_ids_tenstorrent_capture.i32"
+                   : (tenstorrent ? "our_ids_tenstorrent.i32" : "our_ids.i32");
     const std::string path = (gdir / dump_name).string();
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (f != nullptr) {
@@ -480,5 +533,31 @@ void RunGate(const std::string& golden_subdir, const char* label) {
 // Qwen3.5-0.8B (GDN hybrid: linear-attention recurrence + full-attention
 // layers) — the first GDN-architecture gate, ROCm-oracle-backed (issue #41 M4).
 TEST_CASE("qwen3.5-0.8B GDN paged-engine greedy near-tie correctness gate (ROCm, SACRED)") {
-  RunGate("qwen35_greedy_0_8b", "qwen3.5-0.8B");
+  RunGate("qwen35_greedy_0_8b", "qwen3.5-0.8B", parity::Qwen35_08BSnapshot());
+}
+
+// KEEPQUANT W3 (issue #2959): the SAME gate shape driven through the
+// quantized vehicle — unsloth's Qwen3.5-0.8B Q4_K_M GGUF, the mixed-quant
+// artifact that forced W3's decode set (Q6_K token_embd, Q5_K attn_qkv/
+// ssm_out, Q8_0 ssm_alpha/ssm_beta; see the row spec's falsification
+// section). On Tenstorrent the matmul weights keep their blocks (the
+// widened kTENSTORRENT predicate) and every GEMM decodes on-core from the
+// resident i32 word shadow; the Q6_K embedding table still expands (the
+// gather arm needs kEmbeddingQuant, unregistered on TT) — bounded at 0.8B.
+// The Tenstorrent lane gates against its OWN captured pair with the
+// teacher-forced near-tie band, exactly the bf16 gate's treatment; the
+// oracle is `transformers` on the DEQUANTIZED artifact (never the bf16
+// safetensors checkpoint: those logits are a different model's).
+// Checkpoint-gated: absent VLLM_CPP_QWEN35_Q4KM_GGUF -> loud SKIP.
+TEST_CASE("qwen3.5-0.8B GGUF Q4_K_M paged-engine greedy near-tie gate (Tenstorrent, checkpoint-gated)") {
+  const char* gguf = std::getenv("VLLM_CPP_QWEN35_Q4KM_GGUF");
+  if (gguf == nullptr || gguf[0] == '\0') {
+    SkipGate("qwen35-gguf-q4km",
+             "VLLM_CPP_QWEN35_Q4KM_GGUF is absent — set it to the local "
+             "Qwen3.5-0.8B-Q4_K_M.gguf (unsloth/Qwen3.5-0.8B-GGUF @ 6ab46149, "
+             "sha256 bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a0"
+             "6121dc517, 532517120 bytes) to run the keep-quant vehicle gate");
+  }
+  RunGate("qwen35_gguf_q4km", "qwen35-gguf-q4km", std::string(gguf),
+          /*keep_quant=*/true);
 }

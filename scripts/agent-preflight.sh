@@ -192,10 +192,26 @@ SUITES=(
   test_agent_issue_index
   test_check_symbol_anchors
   test_check_oracle_denominator_flags
+  test_rocm_strix_ourarm_staged
+  # The TOKENGATE job's build stage (#2895). `--no-build-isolation` makes pip
+  # skip the pin's [build-system] requires, so the harness has to install them
+  # itself, and the hand-kept list it used had drifted three names behind the
+  # pin. That cost a dgx lease and a queue position for a 3-second traceback.
+  # Bash and the standard library over one committed script: no GPU, no lease,
+  # no toolchain, no network, and nothing in it can skip.
+  test_tokengate_buildreq
   test_check_conflict_markers
   test_check_tree_compiles
   test_prepush_checker_names
   test_ab_arms_differ
+  # The variadic-load harness's own controls (#2970). It measures two
+  # engines on a leased GPU, but every property it CLAIMS -- linear
+  # percentiles, a closed loop that really overlaps, a warmup the
+  # measured window cannot see, a token count that comes from `usage`
+  # and never from a chunk count -- is a property of the client and the
+  # report. All of them are checkable against a loopback mock with no
+  # lease, no toolchain and no weights, which is where they belong.
+  test_variadic_harness
   test_ltx25_pixel_ab_harness
   test_ltx2_dit_attn_knob_arms
   test_ltx25_ab_memwatch
@@ -214,6 +230,12 @@ SUITES=(
   test_ci_walk_base
   test_rc_stage_checkpoint
   test_sglang_lease_identity
+  # #2877. Registered in TWO places -- here and in `.github/workflows/ci.yml` --
+  # and pinned in `REQUIRED_SUITE_REGISTRATIONS`, so neither registration is
+  # deletable at rc=0. It landed on NO lane at all: absent from this array and
+  # from CI, while the tool it gates had never been run on a real fingerprint.
+  # Standard library only, ~1.2 s, no artifact and no GPU.
+  test_q4exp_layerfp_diff
 )
 
 failed=()

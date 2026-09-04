@@ -29,6 +29,7 @@
 
 #include "capi/chat_prompt.h"
 #include "capi/engine_handle.h"
+#include "capi/spec_acceptance.h"  // FillSpecAcceptance (ABI v25)
 #include "vllm/config/offload.h"
 #include "vllm/config/kv_transfer.h"   // ParseKVTransferConfigJson (ABI v9)
 #include "vllm/config/multimodal.h"    // ParseLimitMmPerPromptJson (ABI v19)
@@ -531,6 +532,7 @@ VLLM_API vllm_model_params vllm_model_params_default(void) {
   p.scheduling_policy = nullptr;   // NULL => "fcfs" (ABI v9).
   p.kv_transfer_config = nullptr;  // NULL => no connector (ABI v9).
   p.enable_jump_forward = 0;       // 0 => env-resolved, default OFF (ABI v10).
+  p.disable_sliding_window = 0;    // 0 => sliding window ENABLED (ABI v26).
   p.device = 0;  // 0 => auto: the accelerator-first probe (ABI v14).
   p.gpu_memory_utilization = 0.92;  // vLLM default fraction (ABI v16).
   p.kv_cache_memory_bytes = 0;      // 0 => unset (ABI v16).
@@ -734,6 +736,28 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
             "or 2 (off)");
         return VLLM_ERR_INVALID_ARGUMENT;
     }
+    // ABI v26: model-level sliding-window kill switch (0=default/enabled,
+    // 1=disable, 2=explicitly enable), mirroring vLLM's
+    // ModelConfig.disable_sliding_window (vllm/config/model.py:248). 0 leaves
+    // ep.disable_sliding_window unset (nullopt), which resolves to upstream's own
+    // `= False` -- the byte-identical default. There is NO environment override
+    // here, on purpose: this field replaces two env knobs and a third spelling
+    // would re-create what it removes.
+    switch (params->disable_sliding_window) {
+      case 0:
+        break;  // default (nullopt) => window ENABLED.
+      case 1:
+        ep.disable_sliding_window = true;
+        break;
+      case 2:
+        ep.disable_sliding_window = false;
+        break;
+      default:
+        SetError(
+            "vllm_engine_load: disable_sliding_window must be 0 (default), 1 "
+            "(disable), or 2 (enable)");
+        return VLLM_ERR_INVALID_ARGUMENT;
+    }
     // ABI v14: explicit device selection (0=auto, 1=cpu, 2=cuda), mirroring
     // vLLM's DeviceConfig.device names (vllm/config/device.py:13). 0 leaves
     // ep.device at kAuto — the byte-identical accelerator-first probe. An
@@ -821,6 +845,48 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
 }
 
 VLLM_API void vllm_engine_free(vllm_engine* engine) { delete engine; }
+
+// ABI v25 (row `SPEC-DFLASH2`, issue #2832): the engine's own speculative
+// acceptance counters, read back. THIS FUNCTION COMPUTES NOTHING. All three
+// values are incremented in `GPUModelRunner`'s post-verify write-back and are
+// already read by `examples/bench/bench_core.h` through the internal
+// `LoadedEngine::runner()` seam; the DFlash2 speed gate drives `examples/cli`,
+// which is a pure client of `vllm.h`, so that seam is closed to it.
+//
+// THE MAPPING ITSELF LIVES IN `capi/spec_acceptance.h` AND MUST STAY THERE.
+// Which counter becomes which field, and which element of the per-depth vector
+// is read, is silently wrong under a swap and cannot be reached from here by
+// anything smaller than a test that links the whole library. That header states
+// the reason and is pinned by a probe the focused gate compiles and runs. Do
+// not re-inline these three assignments.
+VLLM_API vllm_status vllm_engine_spec_acceptance(const vllm_engine* engine,
+                                                 vllm_spec_acceptance* out) {
+  if (out == nullptr) {
+    SetError("vllm_engine_spec_acceptance: out is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  out->drafts_proposed = 0;
+  out->drafts_accepted = 0;
+  out->drafted_request_steps = 0;
+  if (engine == nullptr) {
+    SetError("vllm_engine_spec_acceptance: engine is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  if (!RequireTextEngine(engine, "vllm_engine_spec_acceptance")) {
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    vllm::capi::FillSpecAcceptance(engine->loaded->runner(), out);
+    // Like every other entry point that returns VLLM_OK: a success clears the
+    // thread-local message, so a caller that reads `vllm_last_error()` after a
+    // successful call does not read the previous failure's string.
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::exception& error) {
+    SetError(std::string("vllm_engine_spec_acceptance: ") + error.what());
+    return VLLM_ERR_RUNTIME;
+  }
+}
 
 VLLM_API vllm_status vllm_complete(vllm_engine* engine, const char* prompt,
                                    const vllm_sampling_params* params,

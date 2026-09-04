@@ -210,6 +210,13 @@ std::string Qwen4ExpQsaIndexerName(size_t layer) {
 // #2496 is a whole-output symptom on the RELEASED artifact: `--device cuda`
 // emits `11751 271 271 271 271 271 0 0` where `--device cpu` on the same tree
 // and the same file emits `11751 13 15767 411 2029 11 1092 369`. Token 0 agrees,
+// [KERNEL-GDN-CHUNKED-MIRROR, #2612: that CPU sequence was measured while the
+// CPU GDN prefill ran the SEQUENTIAL recurrence. It is now the arm behind
+// `VT_GDN_CHUNKED=0`, because the CPU default moved to vLLM's chunked
+// decomposition, so the ids the default emits are EXPECTED TO DIFFER and have
+// NOT been re-measured -- that needs the 67.564 GiB artifact and a lease. Set
+// `VT_GDN_CHUNKED=0` to reproduce the sequence quoted here. The paragraph is
+// kept as written because it is the record of what #2496 was diagnosed from.]
 // so prefill is right; every decode token is wrong, and bit-stably so across
 // builds and across `CUDA_LAUNCH_BLOCKING`. What is left is state the second
 // step carries, computed differently on the two arms.

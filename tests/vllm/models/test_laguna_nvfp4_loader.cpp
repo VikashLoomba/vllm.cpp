@@ -19,6 +19,9 @@
 #include "doctest/doctest.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/laguna.h"
+#include "vllm/model_executor/models/model_registry.h"
+#include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits carrier
+#include "vllm/v1/attention/backend.h"
 
 namespace vllm {
 void StageLagunaGraphEmbedding(const OwnedTensor& embed, int32_t token,
@@ -430,5 +433,149 @@ TEST_CASE("laguna nvfp4 forward: fp4 MoE branch runs finite + deterministic (CPU
   bool differs = false;
   for (size_t i = 0; i < out1.size(); ++i)
     if (out1[i] != out3[i]) { differs = true; break; }
+  CHECK(differs);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #2618 — the REGISTRY step. Everything above enters `LagunaForwardGguf` by
+// name; nothing above proves that the PRODUCTION entry point reaches it. It did
+// not: `ForwardLagunaForCausalLM` sent both of its branches to
+// `LagunaModel::Forward`, the f32 reference, whose `moe.experts_*` this
+// safetensors loader leaves EMPTY (it fills `experts_*_fp4` instead), so the
+// reference sliced `exp_g.begin() + id*gu_stride` out of an empty vector and the
+// process died inside `memcpy`. The GGUF arm did not crash — its
+// `moe.experts_*` ARE filled, with Q4_K/Q5_K blocks that `ReadF32` refuses by
+// name — so the two arms failed differently and only one of them failed loudly.
+//
+// These cases enter ONLY through `ModelRegistry::Load` + `ModelRegistry::Forward`.
+// See `.agents/specs/laguna-registry-forward-2618.md`.
+namespace {
+
+// A `ModelForwardInput` over one sequence, built the way the runner builds one.
+// `multi_kv` stays NULL: `kLagunaFactory` leaves `consumes_multi_kv` false, so a
+// topology here would be refused by the engine guard before dispatch and the
+// case would measure that guard instead of this forward.
+struct RegistryStep {
+  std::vector<int32_t> token_ids;
+  std::vector<int32_t> positions;
+  std::vector<int32_t> logits_indices;
+  vllm::v1::CommonAttentionMetadata attn_meta{};
+  vllm::v1::GDNAttentionMetadata gdn_meta{};
+  std::vector<vllm::PagedKvCache> attn_kv;
+  std::vector<vllm::GdnStateCache> gdn_state;
+  vllm::HfConfig config = TinyConfig();
+  vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+
+  explicit RegistryStep(std::vector<int32_t> ids, std::vector<int32_t> want)
+      : token_ids(std::move(ids)), logits_indices(std::move(want)) {
+    const int T = static_cast<int>(token_ids.size());
+    positions.resize(token_ids.size());
+    for (int i = 0; i < T; ++i) positions[static_cast<size_t>(i)] = i;
+    attn_meta.num_reqs = 1;
+    attn_meta.num_actual_tokens = T;
+    attn_meta.num_computed_tokens_cpu = {0};
+    attn_meta.seq_lens_cpu = {T};
+    attn_meta.seq_lens = attn_meta.seq_lens_cpu;
+    attn_meta.query_start_loc = {0, T};
+    attn_meta.query_start_loc_cpu = attn_meta.query_start_loc;
+  }
+
+  vllm::ModelForwardInput Get() {
+    vllm::ModelForwardInput in{.token_ids = token_ids,
+                               .positions = positions,
+                               .attn_meta = attn_meta,
+                               .gdn_meta = gdn_meta,
+                               .attn_kv = attn_kv,
+                               .gdn_state = gdn_state,
+                               .config = config,
+                               .queue = queue,
+                               .logits_indices = logits_indices,
+                               .num_reqs = 1};
+    return in;
+  }
+};
+
+std::unique_ptr<vllm::LoadedModel> LoadThroughRegistry(
+    const std::vector<SafetensorsFile>& shards) {
+  return vllm::ModelRegistry::Load(TinyConfig(),
+                                   vllm::ModelSource::FromSafetensors(shards));
+}
+
+}  // namespace
+
+// (1) The step RUNS through the production entry point and produces finite
+// logits of the right shape. RED on `ca07f6e94` is a SIGSEGV, not an assertion:
+// the process dies inside `LagunaModel::Forward`, so doctest prints no counts.
+TEST_CASE("laguna registry forward: ModelRegistry::Forward runs the NVFP4 arm") {
+  TempFile f(BuildSt(BuildFiniteTensors()));
+  std::vector<SafetensorsFile> shards;
+  shards.push_back(SafetensorsFile::Open(f.path()));
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(shards);
+  REQUIRE(model != nullptr);
+
+  RegistryStep step({1, 3, 2}, {0, 1, 2});
+  const vllm::ForwardLogits out = vllm::ModelRegistry::Forward(*model, step.Get());
+  CHECK(out.vocab == V);
+  CHECK(out.rows == 3);
+  REQUIRE(out.host.size() == static_cast<size_t>(3 * V));
+  for (float x : out.host) CHECK(std::isfinite(x));
+}
+
+// (2) WHICH forward it reached. (1) alone passes for any forward that returns
+// finite numbers of the right shape, so it cannot tell `LagunaForwardGguf` from
+// a zero-filled stub. These logits must be BYTE-IDENTICAL to the direct
+// `LagunaForwardGguf` call the loader run-gate above already trusts.
+TEST_CASE("laguna registry forward: registry logits == LagunaForwardGguf logits") {
+  TempFile f(BuildSt(BuildFiniteTensors()));
+  std::vector<SafetensorsFile> shards;
+  shards.push_back(SafetensorsFile::Open(f.path()));
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(shards);
+  REQUIRE(model != nullptr);
+
+  const LagunaWeights w = LoadLagunaForCausalLMWeights(shards, TinyConfig());
+  REQUIRE(w.has_nvfp4_weights);
+  vt::Queue cpuq{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const std::vector<int32_t> tokens = {1, 3, 2};
+  const std::vector<int32_t> positions = {0, 1, 2};
+  const std::vector<int32_t> want = {0, 1, 2};
+  const std::vector<float> direct =
+      vllm::LagunaForwardGguf(w, cpuq, tokens, positions, want);
+
+  RegistryStep step(tokens, want);
+  const vllm::ForwardLogits out = vllm::ModelRegistry::Forward(*model, step.Get());
+  REQUIRE(out.host.size() == direct.size());
+  CHECK(std::memcmp(out.host.data(), direct.data(),
+                    direct.size() * sizeof(float)) == 0);
+}
+
+// (3) The routed experts are CONSUMED on the registry path, not only on the
+// direct one: zeroing every routed expert's packed gate codes (e2m1 code 0 ==
+// 0.0, so silu(gate) collapses the routed contribution regardless of which
+// expert top-1 picks) must move the registry's logits.
+TEST_CASE("laguna registry forward: routed experts reach the registry step") {
+  RegistryStep step({1, 3, 2}, {0, 1, 2});
+
+  TempFile f(BuildSt(BuildFiniteTensors()));
+  std::vector<SafetensorsFile> shards;
+  shards.push_back(SafetensorsFile::Open(f.path()));
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(shards);
+  const vllm::ForwardLogits base = vllm::ModelRegistry::Forward(*model, step.Get());
+
+  std::vector<Fx> ts2 = BuildFiniteTensors();
+  for (Fx& t : ts2)
+    if (t.name.find("mlp.experts.") != std::string::npos &&
+        t.name.find("gate_proj.weight_packed") != std::string::npos)
+      std::fill(t.bytes.begin(), t.bytes.end(), '\x00');
+  TempFile f2(BuildSt(ts2));
+  std::vector<SafetensorsFile> shards2;
+  shards2.push_back(SafetensorsFile::Open(f2.path()));
+  std::unique_ptr<vllm::LoadedModel> model2 = LoadThroughRegistry(shards2);
+  const vllm::ForwardLogits zeroed =
+      vllm::ModelRegistry::Forward(*model2, step.Get());
+
+  REQUIRE(base.host.size() == zeroed.host.size());
+  bool differs = false;
+  for (size_t i = 0; i < base.host.size(); ++i)
+    if (base.host[i] != zeroed.host[i]) { differs = true; break; }
   CHECK(differs);
 }

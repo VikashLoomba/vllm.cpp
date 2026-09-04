@@ -717,8 +717,18 @@ arm at tier 3c in BOTH configs of the envelope; make the eight bits-4 admission
 thresholds executable; measure the decode effect on `dgx:gpu0`.
 
 **Out of scope and owed, not silently dropped:** the 2 bpw GEMV arm, `(4, 0)`
-and `(4, 1)`, the fused MoE arm, `kExl3HadR` on ROCm, the four-shape coverage of
-the regular kernel's shape table. Each is under `## Owed` with its reason.
+and `(4, 1)`, and the fused MoE arm. Each is under `## Owed` with its reason.
+
+Two items that stood in this list when the slice was written are no longer owed
+by anyone, and both closed on `main` while this branch was in flight. The
+four-shape coverage of the regular kernel's shape table CLOSED under
+`QUANT-EXL3` W5 ([#2749](https://github.com/mudler/vllm.cpp/issues/2749)), which
+forces all four shapes and gates them from both sides of every threshold.
+`kExl3HadR` on ROCm was WITHDRAWN as a false record
+([#2757](https://github.com/mudler/vllm.cpp/issues/2757)): ROCm implements the
+Hadamard natively in `rocm_exl3.hip` and calls it from `Exl3GemmKernelRocm`, so
+it never used the reference tier, and `Exl3HadR128(` has no production caller on
+any backend, which is why Vulkan declines to register it too.
 
 ## Slice B design — what a width costs that a codebook does not
 

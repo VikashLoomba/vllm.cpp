@@ -37,6 +37,7 @@
 
 #include "vllm/model_executor/models/dense_attn_block.h"  // MakeTensor
 #include "vllm/model_executor/models/dots3_note.h"
+#include "vllm/model_executor/models/qwen3_5_internal.h"  // detail::ApplyDeviceTokenIds
 #include "vllm/model_executor/models/dots3_note_vision.h"
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits carrier
 #include "vllm/multimodal/inputs.h"  // MultiModalFeatureSpec
@@ -70,15 +71,19 @@ namespace {
 // features for it. A registry entry is a support claim, and this one now has
 // both halves behind it.
 //
-// SAY THE OTHER HALF IN THE SAME BREATH. The RELEASED
-// `dots-studio/dots3-note-prev` still REFUSES an image, by name, because 17 of
-// its 42 vision blocks are pyramid MoE (W6b) and 1960 of its 2195
-// `vision_encoder.*` tensors belong to that brick. The flag says this
-// ARCHITECTURE has a served multimodal path, which is now true; it has never
-// meant that every checkpoint of it loads. VIDEO (W7) and AUDIO (W8) are
-// refused by name in `EncodeMmDots3NoteForCausalLM`, and the chat seam declares
-// a ceiling of exactly one IMAGE so a video part is refused at the entrypoint
-// with upstream's own message.
+// W6b (#2613) then made the RELEASED `dots-studio/dots3-note-prev` load its
+// whole 42-block vision tower, and W7a (#2703) added the AUDIO half: an
+// `input_audio` part now reaches the 32-layer `dots` speech encoder through the
+// same two hooks. The flag says this ARCHITECTURE has a served multimodal path,
+// which is now true for two modalities; it has never meant that every
+// checkpoint of it loads.
+//
+// W7 IS AUDIO AND W8 IS VIDEO, and this comment used to say the reverse. The
+// loader has said so since W2 — `Dots3NoteDeferredTowers()` registers
+// `audio_encoder.` against brick "W7" — and #2703 is titled "W7: the audio
+// tower". VIDEO is refused by name in `EncodeMmDots3NoteForCausalLM` and owed
+// to W8, and the chat seam declares a ceiling of one IMAGE and one AUDIO so a
+// video part is refused at the ENTRYPOINT with upstream's own message.
 //
 // MEASURED, and still true: `supports_multimodal` has no production reader
 // outside `model_registry.h` — every other occurrence is a registration writing
@@ -169,28 +174,126 @@ ForwardLogits ForwardDots3NoteForCausalLM(LoadedModel& model,
 // The runner owns the encoder CACHE and the gather between them; it never sees
 // a tower.
 
+// ─── W7a (#2703): the AUDIO arm of `encode_mm` ──────────────────────────────
+//
+// `_process_audio_input` (`nvidia/multimodal.py:156-170` @ `9035151d6`): run
+// the tower on ONE item and return its rows. Split out of
+// `EncodeMmDots3NoteForCausalLM` below rather than inlined as a branch, because
+// the two towers share exactly one thing — the bf16 store at the end — and
+// interleaving them would make each harder to read than either.
+MmEncoderOutput EncodeAudioDots3Note(Dots3NoteLoadedModel& d3,
+                                     const HfConfig& config, vt::Queue& queue,
+                                     const multimodal::MultiModalFeatureSpec& item) {
+  const Dots3NoteWeights& w = d3.weights();
+  // THE REFUSAL CARRIES ITS REASON, same as the vision arm's.
+  VT_CHECK(w.audio.present,
+           "Dots3NoteForCausalLM encoder: this load carries no audio tower — " +
+               (w.audio_refusal.empty()
+                    ? std::string("the loader did not materialize one")
+                    : w.audio_refusal) +
+               ". See .agents/specs/dots3-note.md §4.14 and issue #2703.");
+  VT_CHECK(item.audio_data != nullptr && !item.audio_data->empty(),
+           "Dots3NoteForCausalLM encoder: the multimodal item carries no "
+           "processed audio features (MultiModalFeatureSpec::audio_data).");
+
+  const Dots3NoteAudioParams& a = w.audio_params;
+  const int64_t width = a.adapter_out_dim;
+  // DEFENCE IN DEPTH, and no longer the FIRST line: `Dots3NoteAudioRefusal`
+  // makes this same comparison at INSTALL, because reaching it HERE throws
+  // inside the engine's busy loop and stops `AsyncLLM` for the life of the
+  // process. Keep the two predicates identical — a check added here and not
+  // there re-opens that cascade through a narrower door.
+  VT_CHECK(width == config.hidden_size,
+           "Dots3NoteForCausalLM encoder: the audio adapter emits " +
+               std::to_string(width) + "-wide rows but the text tower is " +
+               std::to_string(config.hidden_size) +
+               " wide (`whisper_adapter_out_dim`, nvidia/audio.py:33-35 @ "
+               "9035151d6)");
+
+  // The STACKED padded mels and the PER-CHUNK lengths, exactly as the processor
+  // produced them (W7b, #2797). `chunk_num_samples[i]` and
+  // `chunk_num_tokens[i]` are two different numbers and neither is derivable
+  // from the other — see `Dots3NoteAudioForward`'s own note — and they are
+  // per-chunk because upstream's `encode_waveform` carries them that way
+  // (`audio_sample_lens` / `token_lens`, nvidia/audio.py:217-218 @ 9035151d6).
+  // A one-chunk item takes exactly W7a's path through the same call.
+  const multimodal::AudioKwargs& mel = *item.audio_data;
+  VT_CHECK(!mel.chunk_num_tokens.empty(),
+           "Dots3NoteForCausalLM encoder: the multimodal item carries mel "
+           "features with no per-chunk lengths. `Dots3NoteAudioProcessor::"
+           "ProcessWaveform` fills both vectors for every waveform it accepts.");
+  const std::vector<float> tower = Dots3NoteAudioForwardChunks(
+      mel.input_features, mel.chunk_num_samples, mel.chunk_num_tokens,
+      /*hop_length=*/160, w.audio, a, vt::GetBackend(queue.device.type));
+
+  const int64_t rows =
+      width > 0 ? static_cast<int64_t>(tower.size()) / width : 0;
+  VT_CHECK(rows > 0 && rows * width == static_cast<int64_t>(tower.size()),
+           "Dots3NoteForCausalLM encoder: the audio tower produced " +
+               std::to_string(tower.size()) +
+               " floats, which is not a whole number of " +
+               std::to_string(width) + "-wide rows");
+  VT_CHECK(rows == static_cast<int64_t>(item.length),
+           "Dots3NoteForCausalLM encoder: the audio tower produced " +
+               std::to_string(rows) + " embedding rows for a placeholder span "
+               "of " + std::to_string(item.length) +
+               " tokens. The processor's `ceil(num_samples / token_stride)` and "
+               "the tower's row count disagree, and a masked scatter would then "
+               "splice the wrong rows into the prompt.");
+
+  // Stored in the MODEL dtype, for the reason the vision arm records: every
+  // tensor of this tower is bf16 on disk and every GEMM above ran in it, so an
+  // f32 store would double the encoder cache for values that carry no extra
+  // information (porting.md's memory-format rule).
+  vt::Backend& backend = vt::GetBackend(queue.device.type);
+  std::vector<uint16_t> bits(tower.size());
+  for (size_t i = 0; i < tower.size(); ++i) bits[i] = vt::F32ToBF16(tower[i]);
+  const size_t bytes = bits.size() * vt::SizeOf(vt::DType::kBF16);
+  void* p = backend.Alloc(bytes);
+  std::shared_ptr<void> storage(p, [&backend](void* qq) { backend.Free(qq); });
+  backend.Copy(queue, p, bits.data(), bytes);
+  backend.Synchronize(queue);
+  MmEncoderOutput out;
+  out.storage = std::move(storage);
+  out.embeds = dense_attn::MakeTensor(p, vt::DType::kBF16, queue.device,
+                                      {rows, width});
+  return out;
+}
+
 MmEncoderOutput EncodeMmDots3NoteForCausalLM(
     LoadedModel& model, const HfConfig& config, vt::Queue& queue,
     const multimodal::MultiModalFeatureSpec& item) {
   auto& d3 = ModelAs<Dots3NoteLoadedModel>(model, "Dots3NoteForCausalLM");
   const Dots3NoteWeights& w = d3.weights();
 
+  // TWO MODALITIES REACH A TOWER, and the third is refused BY NAME with the
+  // brick that owes it.
+  //
+  // W7 IS AUDIO AND W8 IS VIDEO. This message used to say the opposite, against
+  // the loader's own `Dots3NoteDeferredTowers()` table and against #2703's own
+  // title, so an operator who sent audio to a checkpoint was told to wait for
+  // the wrong brick.
+  VT_CHECK(item.modality == "image" || item.modality == "audio",
+           "Dots3NoteForCausalLM encoder: modality '" + item.modality +
+               "' is not ported. IMAGE is (W6a/W6b/W6c) and AUDIO is (W7a); "
+               "VIDEO needs the multi-frame cu_seqlens builder, the frame "
+               "sampler and the interleaved image/audio emission order "
+               "(nvidia/multimodal.py:172-223 @ 9035151d6) and is W8. Refused "
+               "by name rather than served from another modality's path. See "
+               "issues #2512 and #2703.");
+
+  if (item.modality == "audio") return EncodeAudioDots3Note(d3, config, queue, item);
+
   // THE REFUSAL CARRIES ITS REASON. `vision_refusal` is the message
-  // `Dots3NoteVisionRefusal` produced at load; for the RELEASED checkpoint it
-  // names the first pyramid MoE block and the brick that owes it. Reporting
-  // only "no tower" would tell an operator nothing they could act on.
+  // `Dots3NoteVisionRefusal` produced at load; for a checkpoint whose tower is
+  // owed it names the first unrepresentable feature and the brick that owes it.
+  // Reporting only "no tower" would tell an operator nothing they could act on.
   VT_CHECK(w.vision.present,
            "Dots3NoteForCausalLM encoder: this load carries no vision tower — " +
                (w.vision_refusal.empty()
                     ? std::string("the loader did not materialize one")
                     : w.vision_refusal) +
                ". See .agents/specs/dots3-note.md §4.11 and issue #2512.");
-  VT_CHECK(item.modality == "image",
-           "Dots3NoteForCausalLM encoder: modality '" + item.modality +
-               "' is not ported. IMAGE is (W6a); VIDEO needs the multi-frame "
-               "cu_seqlens builder and the video sampler and is W7; AUDIO has "
-               "no tower at all and is W8. Refused by name rather than served "
-               "from the image path. See issue #2512.");
   VT_CHECK(item.data != nullptr && !item.data->empty(),
            "Dots3NoteForCausalLM encoder: the multimodal item carries no "
            "processed image features (MultiModalFeatureSpec::data).");
@@ -282,6 +385,19 @@ MmForwardBuffers EmbedMmDots3NoteForCausalLM(LoadedModel& model,
   std::vector<uint16_t> merged(static_cast<size_t>(T * H));
   {
     dense_attn::DBuf ids(d, vt::DType::kI32, {T}, token_ids.data());
+    // ENG-MM-EMBED-DEVICE-IDS (#2730): SPLICE the runner's device identifiers
+    // over the host upload just made, before the gather reads it. The host
+    // vector is deliberately stale for decode rows -- the combine wrote each
+    // sampled token into `MmEmbedInputs::device_token_ids` on the main queue and
+    // never wrote it back -- so without this the decode rows of an image request
+    // embed token id 0. The `Copy` is enqueued on this same queue, which is why
+    // it is ordered AFTER that combine rather than racing it, and it is the
+    // SHARED splice the text device arm uses rather than a second copy of it.
+    // Null on every non-mirror step, where it writes nothing and this hook is
+    // byte-identical to its pre-#2730 self.
+    detail::ApplyDeviceTokenIds(
+        d.b, d.q, ids.ptr(), T,
+        detail::DeviceTokenIds{inputs.device_token_ids, T}, "dots3-note mm embed");
     dense_attn::DBuf emb(d, vt::DType::kBF16, {T, H});
     vt::Tensor table = dense_attn::ResidentWeight(
         d, w.device.embed_tokens, {config.vocab_size, H});
@@ -367,6 +483,20 @@ const ModelFactory kDots3NoteFactory{
     .encode_mm = &EncodeMmDots3NoteForCausalLM,
     .embed_mm = &EmbedMmDots3NoteForCausalLM,
     .is_dense_model = false,
+    // ENG-MM-EMBED-DEVICE-IDS (#2730): the HOOK bit, and DELIBERATELY NOT the
+    // forward's beside it. `EmbedMmDots3NoteForCausalLM` splices
+    // `MmEmbedInputs::device_token_ids` over the buffer it gathers from, so the
+    // merged embeds are built from the identifiers the combine actually wrote.
+    // `ForwardDots3NoteForCausalLM` does not: it reaches
+    // `Dots3NoteModel::ForwardDevice(input.token_ids, ...)`, and the runner takes
+    // the multimodal branch when ANY request in the batch carries multimodal
+    // items -- so a batch of TEXT-ONLY requests to this architecture takes the
+    // text arm and embeds the stale host vector. It is class (b) of
+    // `.agents/specs/eng-async-device-ids-refusal.md` and stays refused by
+    // `ModelRegistry::Forward` until the row that ports that arm lands
+    // ([#2732](https://github.com/mudler/vllm.cpp/issues/2732)). One bit could
+    // not express this pair, which is why there are two.
+    .embed_mm_consumes_device_token_ids = true,
 };
 
 }  // namespace

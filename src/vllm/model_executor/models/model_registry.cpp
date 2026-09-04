@@ -789,6 +789,58 @@ MmForwardBuffers ModelRegistry::EmbedMm(LoadedModel& model,
                "' was asked to build multimodal forward inputs but its "
                "ModelFactory leaves `embed_mm` null. "
                "ENG-MM-INPUT-PIPELINE P2 (#2379).");
+  // ENG-MM-EMBED-DEVICE-IDS (#2730): the multimodal half of the guard
+  // `ModelRegistry::Forward` already applies, on the SAME free predicate rather
+  // than a second copy of it. A copy of a three-term predicate is a copy that can
+  // drift, and every one of the three terms is load-bearing here.
+  //
+  // WHAT IT STOPS. The runner leaves `MmEmbedInputs::token_ids` stale for decode
+  // rows by design; `token_ids_cpu` is zero-initialised, so a hook that gathers
+  // from it alone merges `inputs_embeds` out of TOKEN ID 0 on every decode row of
+  // an image request, at rc=0, with plausible-looking output. Nothing downstream
+  // can see it: the registered multimodal forward reads `mm.inputs_embeds` and
+  // never a token identifier, so the defect is invisible in the model's own
+  // translation unit -- which is why it survived the sweep that read all 36
+  // registered forwards (#2544).
+  //
+  // WHAT IT SPARES, and this is why the middle term is not optional. An image
+  // request's PREFILL step is all-prefill: the combine splices no row,
+  // `host_token_ids_stale` is false, and the guard cannot fire. Every image
+  // request in this tree reaches its first token through such a step, so a
+  // nullness-only guard here would refuse multimodal serving outright.
+  if (DeviceTokenIdsRefusalApplies(inputs.device_token_ids,
+                                   inputs.host_token_ids_stale,
+                                   factory.embed_mm_consumes_device_token_ids)) {
+    const std::string arch(model.registration().architecture);
+    VT_CHECK(
+        false,
+        std::string("multimodal embed: architecture '") + arch +
+            "' reached `embed_mm` on a step whose HOST token identifiers are "
+            "stale -- the asynchronous runner's combine spliced at least one "
+            "row's sampled token into the DEVICE buffer on the main queue and "
+            "deliberately never wrote it back -- and the `embed_mm` hook "
+            "registered for '" +
+            arch +
+            "' does not read `MmEmbedInputs::device_token_ids`: its ModelFactory "
+            "leaves `embed_mm_consumes_device_token_ids` false. Refusing rather "
+            "than merging `inputs_embeds` out of a host array the runner never "
+            "wrote, which embeds token id 0 (token_ids_cpu is zero-initialised) "
+            "on every decode row at rc=0 with plausible-looking output. "
+            "`batch_carries_mm()` returns true on the decode steps of an image "
+            "request BY DESIGN, and `async_device_mirror()` is the DEFAULT on "
+            "CUDA, integrated parts included, so this is the default arm and not "
+            "an opt-in. TO FIX: splice the published identifiers over the buffer "
+            "this hook gathers from -- `detail::ApplyDeviceTokenIds` "
+            "(src/vllm/model_executor/models/qwen3_5_internal.h), the overload "
+            "taking the identifiers explicitly -- and set "
+            "`embed_mm_consumes_device_token_ids = true` beside the hook. TO "
+            "ROLL BACK instead, run with VT_ASYNC_DEVICE_MIRROR=0, which returns "
+            "the host combine and makes the host identifiers authoritative "
+            "again. THIS GUARD IS THE ENGINE'S (ENG-MM-EMBED-DEVICE-IDS, #2730) "
+            "and it fires BEFORE dispatch to that architecture's own hook, so "
+            "the consuming hook is owed by the row that ports '" +
+            arch + "'. #1305, #2496, #2544, #2710, #2730");
+  }
   return factory.embed_mm(model, config, queue, inputs);
 }
 

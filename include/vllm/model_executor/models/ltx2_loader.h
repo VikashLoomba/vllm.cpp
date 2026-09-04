@@ -753,8 +753,16 @@ bool Ltx2CheckpointHasConnector(const SafetensorsFile& file, Ltx2ConnectorStream
 Ltx2ConnectorConfig Ltx2ParseConnectorConfig(const nlohmann::json& config,
                                              Ltx2ConnectorStream stream);
 
-// Materialize one connector family out of the DiT checkpoint, widened to f32 —
-// which is `Ltx2ConnectorForward`'s declared parity dtype.
+// Materialize one connector family out of the DiT checkpoint at `compute_dtype`.
+//
+// `kBF16` is what the render path asks for and it is upstream's own answer
+// (`distilled.py:109` resolves ONE pipeline dtype and hands it to `PromptEncoder`
+// at `:113`, which constructs this module). It keeps the checkpoint's own 16-bit
+// words instead of expanding them, which HALVES the figure below. `kF32` is the
+// parity arm the five upstream goldens cover and is kept as the reference the
+// bf16 arm is measured against. A checkpoint that stores F32 under a bf16 request
+// is narrowed once here, which is what `.to(dtype)` does to a module built from an
+// f32 state dict. Row LTX25-A24-CONNECTOR-BF16, issue #2720.
 //
 // IT IS NOT CHEAP AND THE CALLER MUST TREAT IT AS EXPENSIVE. 129 tensors is 8
 // blocks of four dim x dim projections plus a 4x-wide feed-forward, so at the
@@ -772,8 +780,17 @@ Ltx2ConnectorConfig Ltx2ParseConnectorConfig(const nlohmann::json& config,
 // tensor of the family may be left over. A config that says 2 layers against a
 // file carrying 8 is refused by name here rather than binding the first two and
 // rendering.
+//
+// `compute_dtype` has NO DEFAULT, and that is deliberate. It selects between the
+// arm upstream runs (bf16, distilled.py:109) and the WIDER f32 parity arm the
+// five connector goldens are measured against. A default of either one makes the
+// other arrive by silence: with `kF32` a new call site would get twice the bytes
+// and a precision upstream does not have, and the only instrument that would
+// notice is the prompted-render path's `connector_video_not_bf16` counter. The
+// caller knows which arm it wants; it says so.
 Ltx2VaeWeights Ltx2LoadConnectorWeights(const SafetensorsFile& file,
-                                        const Ltx2ConnectorConfig& config);
+                                        const Ltx2ConnectorConfig& config,
+                                        vt::DType compute_dtype);
 
 // `__metadata__["model_version"]` ("2.5.0"), which is what
 // `detect_model_version` reads to pick a recipe (ltx-pipelines
@@ -809,18 +826,28 @@ std::vector<Ltx2VaeKeyRule> Ltx2VideoVaeDecoderKeyRules();
 std::vector<Ltx2VaeKeyRule> Ltx2AudioVaeDecoderKeyRules();
 std::vector<Ltx2VaeKeyRule> Ltx2VocoderKeyRules();
 
-// Every tensor a rule set keeps, widened to f32 and keyed by the REWRITTEN name,
-// which is `Ltx2VaeWeights`' whole contract (ltx2_audio_vae.h:60-70). BF16 and
-// F32 are the only dtypes these files carry; anything else throws by name rather
-// than being reinterpreted. An empty rule set keeps every name unchanged.
+// Every tensor a rule set keeps, keyed by the REWRITTEN name at `compute_dtype`,
+// which is `Ltx2VaeWeights`' whole contract (ltx2_audio_vae.h). BF16 and F32 are
+// the only dtypes these files carry; anything else throws by name rather than
+// being reinterpreted. An empty rule set keeps every name unchanged.
 //
-// f32 here is NOT a widening of a production path: `Ltx2VaeWeights` is declared
-// f32 by phases L4/L5 because f32 is their parity dtype, and this materializes
-// onto that declared contract. The VAEs together are ~1.8 GB bf16, so the
-// widened copy is ~3.7 GB — small next to the DiT, and the reason the DiT does
-// NOT take this path.
+// `compute_dtype` DEFAULTS TO f32 and the video DECODER is the one call site that
+// asks for bf16 (row LTX25-A24-VIDEO-VAE-BF16, issue #2786). The default is not a
+// preference: the other six callers -- the video encoder, the audio decoder, the
+// vocoder, the audio encoder and the two upsamplers -- are still f32 ports, and a
+// default of `kBF16` would hand each of them a bag whose `Get` refuses. The audio
+// VAE's f32 is ARGUED rather than owed (`ltx2_audio_vae.cpp:7-12` ->
+// `vocoder.py:575-580`); the other four are owed and named in that row's spec.
+//
+// At `kBF16` a BF16 tensor is moved word for word instead of being expanded
+// through `Bf16ToF32`, which is the whole point: upstream constructs the decoder
+// in the pipeline's one dtype (`distilled.py:146-149`) and never materializes an
+// f32 copy of it. A checkpoint that stores F32 under a bf16 request is narrowed
+// once here, which is what `.to(dtype)` does to a module built from an f32 state
+// dict. The VAEs together are ~1.8 GB bf16, so the f32 arm's copy is ~3.7 GB.
 Ltx2VaeWeights Ltx2LoadVaeWeights(const SafetensorsFile& file,
-                                  const std::vector<Ltx2VaeKeyRule>& rules = {});
+                                  const std::vector<Ltx2VaeKeyRule>& rules = {},
+                                  vt::DType compute_dtype = vt::DType::kF32);
 
 // `_build_conv_video_decoder` (video_vae/model_configurator.py:81-94) applied to
 // `config["vae"]`, plus `_vae_class_name_from_metadata` (:21-24) recovered into

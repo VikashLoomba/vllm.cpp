@@ -445,29 +445,37 @@ GPUModelRunner::GPUModelRunner(
   max_num_reqs_ = max_num_reqs;
   max_num_batched_tokens_ = max_num_batched_tokens;
   // SPEC-MTP I5e: the async input-combine splices the device-resident
-  // last_sampled token over each decode row's input id with
-  // num_new_sampled_tokens==1; it is NOT spec-aware and would overwrite the
-  // draft token at a verify step's draft position with the committed token.
-  // A speculator therefore keeps the sync HOST INPUT path (its drafts are
-  // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
-  // and its sampler is the sync one, so the host arrays stay fresh).
+  // last_sampled token over each decode row's input id. A speculator keeps the
+  // sync HOST INPUT path instead (its drafts are spliced into token_ids_cpu by
+  // update_req_spec_token_ids + prepare_inputs, and its sampler is the sync
+  // one, so the host arrays stay fresh).
   // Since SPEC-DFLASH2 W7 (#1824) this veto is INPUT-side only: async
   // SCHEDULING stays on for the Eagle-type family via async_sched_supported_
   // below. Byte-identical for non-spec (spec_config_ is nullopt there, so
   // this is AsyncRunnerEnvDefault()).
   //
-  // SPEC-DFLASH2 A2 (#2116): the combine is the SMALLER of the two reasons,
-  // and naming only it has read as "make the combine draft-aware, then flip
-  // this". sample_tokens_async has NO verify arm at all — no rejection
-  // sampler, no propose — so with the veto lifted a spec engine samples the
-  // EXPANDED (1 + k) verify rows as if they were decode rows, proposes
-  // nothing, and refuses at the async draft fill below ("no drafts proposed
-  // for request"). Measured on the CPU tier: deleting !spec_config_.has_value()
-  // here reds test_mtp_depth's W7 identity case through that refusal, and
-  // SEPARATELY overwrites the last draft of every verify block with the
-  // previous step's committed token — a change no token gate in this tree can
-  // see, because the verify is lossless and only acceptance moves. Both
-  // halves, the wave order and the gate that would catch the second one are in
+  // SPEC-DFLASH2 A2-1 (#2644) REMOVED the reason this comment used to lead
+  // with. The combine was not spec-aware and overwrote a verify step's last
+  // draft with the committed token; it now takes each row's num_logits from
+  // cu_num_logits, so a verify step keeps that draft. Do not read the veto as
+  // waiting on the combine's arithmetic — that half has landed.
+  //
+  // TWO reasons keep it standing, and A2-2 and A2-3 own them:
+  //   Reason B — sample_tokens_async has NO verify arm at all: no rejection
+  //   sampler, no propose. With the veto lifted a spec engine would sample the
+  //   EXPANDED (1 + k) verify rows as if they were decode rows and propose
+  //   nothing. A2-2 closes this.
+  //   The draft buffer is still UNWIRED — pending_drafts_ is host-resident and
+  //   per-request, so the draft_tokens argument A2-1's scatter reads does not
+  //   exist yet. A2-3 supplies it, and until it does the async input-combine
+  //   call site refuses any step that scheduled drafts.
+  // Measured on the CPU tier at this head: deleting !spec_config_.has_value()
+  // at both construction sites reds test_mtp_depth to 5 of 10 cases failed
+  // (29 assertions, exit 1). Every one of the five throws at that call site's
+  // own VT_CHECK ("the draft buffer the combine scatters from is not wired
+  // yet"), which fires ahead of the combine, so no verify block is reached and
+  // reason B's own refusal below never gets the chance to fire. The wave
+  // order and the gates are in
   // .agents/specs/dflash2-async-spec-sampler.md.
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
                          QueueSupportsAsyncInputCombine(queue_);
@@ -510,29 +518,37 @@ GPUModelRunner::GPUModelRunner(
   max_num_reqs_ = max_num_reqs;
   max_num_batched_tokens_ = max_num_batched_tokens;
   // SPEC-MTP I5e: the async input-combine splices the device-resident
-  // last_sampled token over each decode row's input id with
-  // num_new_sampled_tokens==1; it is NOT spec-aware and would overwrite the
-  // draft token at a verify step's draft position with the committed token.
-  // A speculator therefore keeps the sync HOST INPUT path (its drafts are
-  // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
-  // and its sampler is the sync one, so the host arrays stay fresh).
+  // last_sampled token over each decode row's input id. A speculator keeps the
+  // sync HOST INPUT path instead (its drafts are spliced into token_ids_cpu by
+  // update_req_spec_token_ids + prepare_inputs, and its sampler is the sync
+  // one, so the host arrays stay fresh).
   // Since SPEC-DFLASH2 W7 (#1824) this veto is INPUT-side only: async
   // SCHEDULING stays on for the Eagle-type family via async_sched_supported_
   // below. Byte-identical for non-spec (spec_config_ is nullopt there, so
   // this is AsyncRunnerEnvDefault()).
   //
-  // SPEC-DFLASH2 A2 (#2116): the combine is the SMALLER of the two reasons,
-  // and naming only it has read as "make the combine draft-aware, then flip
-  // this". sample_tokens_async has NO verify arm at all — no rejection
-  // sampler, no propose — so with the veto lifted a spec engine samples the
-  // EXPANDED (1 + k) verify rows as if they were decode rows, proposes
-  // nothing, and refuses at the async draft fill below ("no drafts proposed
-  // for request"). Measured on the CPU tier: deleting !spec_config_.has_value()
-  // here reds test_mtp_depth's W7 identity case through that refusal, and
-  // SEPARATELY overwrites the last draft of every verify block with the
-  // previous step's committed token — a change no token gate in this tree can
-  // see, because the verify is lossless and only acceptance moves. Both
-  // halves, the wave order and the gate that would catch the second one are in
+  // SPEC-DFLASH2 A2-1 (#2644) REMOVED the reason this comment used to lead
+  // with. The combine was not spec-aware and overwrote a verify step's last
+  // draft with the committed token; it now takes each row's num_logits from
+  // cu_num_logits, so a verify step keeps that draft. Do not read the veto as
+  // waiting on the combine's arithmetic — that half has landed.
+  //
+  // TWO reasons keep it standing, and A2-2 and A2-3 own them:
+  //   Reason B — sample_tokens_async has NO verify arm at all: no rejection
+  //   sampler, no propose. With the veto lifted a spec engine would sample the
+  //   EXPANDED (1 + k) verify rows as if they were decode rows and propose
+  //   nothing. A2-2 closes this.
+  //   The draft buffer is still UNWIRED — pending_drafts_ is host-resident and
+  //   per-request, so the draft_tokens argument A2-1's scatter reads does not
+  //   exist yet. A2-3 supplies it, and until it does the async input-combine
+  //   call site refuses any step that scheduled drafts.
+  // Measured on the CPU tier at this head: deleting !spec_config_.has_value()
+  // at both construction sites reds test_mtp_depth to 5 of 10 cases failed
+  // (29 assertions, exit 1). Every one of the five throws at that call site's
+  // own VT_CHECK ("the draft buffer the combine scatters from is not wired
+  // yet"), which fires ahead of the combine, so no verify block is reached and
+  // reason B's own refusal below never gets the chance to fire. The wave
+  // order and the gates are in
   // .agents/specs/dflash2-async-spec-sampler.md.
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
                          QueueSupportsAsyncInputCombine(queue_);
@@ -2371,6 +2387,20 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // embeds the spliced ids instead of the (deliberately stale) host vector.
   const int32_t* device_input_ids = nullptr;
   if (async_input_combine_ && num_reqs > 0) {
+    // SPEC-DFLASH2 A2-1 made combine_sampled_and_draft_tokens draft-aware, but
+    // the buffer it scatters FROM is still owed: `pending_drafts_` is host-
+    // resident and per-request, and wave A2-3 (row SPEC-DFLASH2, #2644) is what
+    // turns it into the [num_req_states, k] draft_tokens buffer these calls
+    // would pass. Today the veto below at the `async_input_combine_`
+    // construction site keeps every speculative engine off this path, so
+    // step.num_draft_tokens is always 0 here and every call passes an empty
+    // draft buffer with an arange cu_num_logits. Refuse loudly rather than
+    // combine a verify step against a draft buffer that is not there, if that
+    // veto ever moves before A2-3 lands.
+    VT_CHECK(step.num_draft_tokens == 0,
+             "async input combine: this step scheduled draft tokens, but the "
+             "draft buffer the combine scatters from is not wired yet "
+             "(SPEC-DFLASH2 A2-3, #2644)");
 #ifdef VLLM_CPP_CUDA
     // W4 device-resident sampled tokens. Preferred whenever engaged
     // (async_device_mirror(): CUDA + VT_ASYNC_DEVICE_MIRROR, INTEGRATED OR
@@ -2407,9 +2437,14 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       stage_upload(*dev, dev->seq_lens, step.seq_lens.data(), num_reqs);
       stage_upload(*dev, dev->prefill_len, input_batch_.prefill_len.data(),
                    num_reqs);
+      // draft_tokens / cu_num_logits null: no draft buffer on the device yet
+      // (A2-3), and a null cu_num_logits is the arange the non-speculative path
+      // produces, which the VT_CHECK above has already established.
       vt::cuda::LaunchCombineSampledAndDraftTokens(
           queue_, dev->input_ids, /*idx_mapping=*/nullptr, dev->last_sampled,
-          dev->query_start_loc, dev->seq_lens, dev->prefill_len, num_reqs,
+          dev->query_start_loc, dev->seq_lens, dev->prefill_len,
+          /*draft_tokens=*/nullptr, /*draft_tokens_stride=*/0,
+          /*cu_num_logits=*/nullptr, num_reqs,
           /*num_new_sampled_tokens=*/1);
       device_input_ids = dev->input_ids;
     } else if (vllm::platforms::GetPlatform(queue_.device.type)
@@ -2427,10 +2462,15 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       // is_integrated_gpu() decouples a future discrete GPU (answers false → host
       // combine below, the right path there since its host arrays are not
       // device-addressable).
+      // draft_tokens / cu_num_logits null for the same reason as the mirror arm
+      // above: A2-3 owns the draft buffer, and null cu_num_logits is the arange
+      // this non-speculative path produces.
       vt::cuda::LaunchCombineSampledAndDraftTokens(
           queue_, step.input_token_ids.data(), /*idx_mapping=*/nullptr,
           input_batch_.last_sampled_tokens.data(), step.query_start_loc.data(),
-          step.seq_lens.data(), input_batch_.prefill_len.data(), num_reqs,
+          step.seq_lens.data(), input_batch_.prefill_len.data(),
+          /*draft_tokens=*/nullptr, /*draft_tokens_stride=*/0,
+          /*cu_num_logits=*/nullptr, num_reqs,
           /*num_new_sampled_tokens=*/1);
     } else
 #endif
@@ -2440,6 +2480,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       combine_sampled_and_draft_tokens(
           step.input_token_ids, idx_mapping, input_batch_.last_sampled_tokens,
           step.query_start_loc, step.seq_lens, input_batch_.prefill_len,
+          /*draft_tokens=*/{}, /*draft_tokens_stride=*/0, step.cu_num_logits,
           /*num_new_sampled_tokens=*/1);
     }
   }
@@ -2547,6 +2588,29 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     positions.push_back(static_cast<int32_t>(position));
   }
 
+  // ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710) / ENG-MM-EMBED-DEVICE-IDS (#2730):
+  // WHETHER the host vector actually disagrees with the device buffer for this
+  // step. The pointer alone says the device buffer is authoritative; it does not
+  // say the two differ, and on an all-prefill step they do not.
+  //
+  // COMPUTED ONCE, HERE, and read by BOTH channels below -- `MmEmbedInputs` and
+  // `ModelForwardInput`. It used to sit beside the `ModelForwardInput`
+  // assignment, which is AFTER the multimodal embed, so the embed could not have
+  // been told. Two calls would be two derivations that can disagree about one
+  // step, and the embed's guard and the forward's guard must not.
+  //
+  // It shares `v1::CombineSplicesRow` with the combine that does the splicing,
+  // so the guards' predicate is the route's predicate. `idx_mapping` is null for
+  // the same reason the combine launch above passes null: the persistent batch is
+  // condensed dense, so batch row == req_state slot. Only meaningful when the
+  // pointer is live, so it is computed only there -- false on every non-mirror
+  // path, where both guards are inert anyway.
+  const bool host_token_ids_stale =
+      device_input_ids != nullptr
+          ? v1::AnyRowSplicedByCombine(step.seq_lens, input_batch_.prefill_len,
+                                       /*idx_mapping=*/nullptr, num_reqs)
+          : false;
+
   // ─── ENG-MM-INPUT-PIPELINE P2 (#2379): what FILLS ModelForwardInput::mm ────
   //
   // The gather takes the encoder-output rows this step's window reaches; the
@@ -2578,6 +2642,16 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     // EMPTY, not null, when the model declares no M-RoPE hook — upstream's
     // `uses_mrope == False`, where the model reads the 1-D positions instead.
     embed_inputs.mrope_positions = &mrope_positions;
+    // ENG-MM-EMBED-DEVICE-IDS (#2730): THE assignment this row exists for.
+    // `token_ids` above is the host step vector, which this runner deliberately
+    // leaves STALE for decode rows -- the combine spliced each decode row's
+    // sampled token into `device_input_ids` on the main queue and never wrote it
+    // back. `batch_carries_mm()` is true on those decode steps BY DESIGN (see its
+    // own comment), so without these two lines `EmbedMm` merged `inputs_embeds`
+    // out of token id 0 on every one of them. Null / false on every non-mirror
+    // step, where the hooks are byte-identical to their pre-#2730 selves.
+    embed_inputs.device_token_ids = device_input_ids;
+    embed_inputs.host_token_ids_stale = host_token_ids_stale;
     mm_buffers = ModelRegistry::EmbedMm(*model_, config_, queue_, embed_inputs);
   }
 
@@ -2750,23 +2824,10 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   forward_input.device_token_ids = device_input_ids;
   // ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710): and WHETHER the host vector actually
   // disagrees with that buffer, which is what `ModelRegistry::Forward` refuses
-  // on. The pointer alone says the device buffer is authoritative; it does not
-  // say the two differ, and on an all-prefill step they do not.
-  //
-  // Computed HERE, beside the assignment, because this is the one place that
-  // holds both arrays. It shares `v1::CombineSplicesRow` with the combine that
-  // does the splicing, so the guard's predicate is the route's predicate and not
-  // a second derivation of it. `idx_mapping` is null for the same reason the
-  // combine launch above passes null: the persistent batch is condensed dense, so
-  // batch row == req_state slot.
-  //
-  // Only meaningful when the pointer is live, so it is computed only there —
-  // leaving it false on every non-mirror path, where the guard is inert anyway.
-  if (device_input_ids != nullptr) {
-    forward_input.host_token_ids_stale = v1::AnyRowSplicedByCombine(
-        step.seq_lens, input_batch_.prefill_len, /*idx_mapping=*/nullptr,
-        num_reqs);
-  }
+  // on. The one derivation, taken above the multimodal embed so that
+  // `MmEmbedInputs` could be told the same fact (#2730), and READ here rather
+  // than recomputed.
+  forward_input.host_token_ids_stale = host_token_ids_stale;
   // ENG-MM-INPUT-PIPELINE P2 (#2379): THE assignment this row exists for. Set
   // after aggregate construction for the same reason `device_token_ids` is —
   // the field sits past the positional initializers other callers use. nullopt

@@ -750,6 +750,11 @@ vllm_cpp_add_test(test_gemma4_honesty vllm/models/test_gemma4_honesty.cpp)
 # case that wants a different one.
 vllm_cpp_add_test(test_gemma4_moe_device_arm_guard
                   vllm/models/test_gemma4_moe_device_arm_guard.cpp)
+# Its own binary, not a case in the file above: `RunGemma4Moe` freezes
+# `VT_GEMMA4_FP8_NATIVE` in a function-local `static const` on the first call in
+# the process, and these two files must disagree about it (#2623).
+vllm_cpp_add_test(test_gemma4_moe_fp8_native_arm_guard
+                  vllm/models/test_gemma4_moe_fp8_native_arm_guard.cpp)
 vllm_cpp_add_test(test_gemma4_indexed_max_t vllm/models/test_gemma4_indexed_max_t.cpp)
 target_compile_definitions(test_gemma4_indexed_max_t PRIVATE
   VLLM_CPP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -1251,6 +1256,25 @@ target_include_directories(test_dots3_note_attn PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_dots3_note_vision vllm/models/test_dots3_note_vision.cpp)
 target_compile_definitions(test_dots3_note_vision PRIVATE
   DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
+
+# dots3-note W7a (#2703): the AUDIO tower and its front end. Two fixture
+# directories, because the two halves are gated against different things — the
+# tower against the committed dots3-note config, and the SHARED slaney
+# filterbank against `voxtral_mel_filters_f32.bin`, which is a third party's
+# implementation of the same `mel_filter_bank` call and the only real oracle
+# this row gets.
+vllm_cpp_add_test(test_dots3_note_audio vllm/models/test_dots3_note_audio.cpp)
+target_compile_definitions(test_dots3_note_audio PRIVATE
+  DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev"
+  VOXTRAL_AUDIO_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/multimodal/fixtures/voxtral_audio"
+  # The reference-independence case re-reads THIS file and counts the qualified
+  # names in each reference namespace, so the enumeration is a measurement
+  # rather than a transcription asserted against itself.
+  DOTS3_AUDIO_TEST_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/test_dots3_note_audio.cpp")
+# dots3_note.h and dots3_note_audio.h are MODEL-PRIVATE headers under src/, not
+# include/vllm/ — same arrangement test_dots3_note_vision uses.
+target_include_directories(test_dots3_note_audio PRIVATE
+  ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 # Same model-private-header arrangement as the two gates above: dots3_note.h and
 # dots3_note_vision.h live under src/, because W1 ships nothing on the public ABI
 # and include/vllm/ is a USER_USAGE_PREFIXES surface (#515).
@@ -1781,6 +1805,17 @@ vllm_cpp_add_test(test_multi_kv_refusal
   vllm/model_executor/test_multi_kv_refusal.cpp)
 vllm_cpp_add_test(test_device_token_ids_refusal
   vllm/model_executor/test_device_token_ids_refusal.cpp)
+# ENG-MM-EMBED-DEVICE-IDS (#2730): the MULTIMODAL half of the same channel --
+# `MmEmbedInputs` carries the device identifiers, both registered `embed_mm`
+# hooks splice them over the buffer they gather from, and a hook that does not
+# declare the capability is refused instead of embedding token id 0.
+vllm_cpp_add_test(test_mm_embed_device_token_ids
+  vllm/models/test_mm_embed_device_token_ids.cpp)
+# The dots3-note case loads the tiny on-disk checkpoint through the REAL loader,
+# for the same reason its own gates do: `Dots3NoteLoadedModel` lives in the
+# anonymous namespace of its registry translation unit and cannot be borrowed.
+target_compile_definitions(test_mm_embed_device_token_ids PRIVATE
+  DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
 vllm_cpp_add_test(test_device_placement
   vllm/model_executor/test_device_placement.cpp)
 
@@ -1880,6 +1915,14 @@ target_include_directories(test_expert_stream_device_slot PRIVATE ${CMAKE_SOURCE
 # UnifiedMemory(), which is a process-global registration and not a per-case flag.
 vllm_cpp_add_test(test_resident_weight_host_addressable vllm/model_executor/test_resident_weight_host_addressable.cpp)
 target_include_directories(test_resident_weight_host_addressable PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ENG-EXPERT-STREAM-DEVICE (#2711): does `ResidentWeightF32` still hold its copy
+# source when the copy runs? Its own binary for the same reason as the sibling
+# above -- it registers a fake backend and a fake platform in the process-global
+# kXPU slot -- and separately because its backend DEFERS every `Copy` until a
+# `Synchronize`, which is the opposite of the sibling's eager `memcpy` and would
+# change what every case in that file measures.
+vllm_cpp_add_test(test_resident_weight_f32_copy_retires vllm/model_executor/test_resident_weight_f32_copy_retires.cpp)
+target_include_directories(test_resident_weight_f32_copy_retires PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # ENG-EXPERT-STREAM (#1091): the step clock at the MoE entry points ForwardLayers
 # does NOT cover, and the final statistics line. Its own binary because it is the
 # only one that can observe `steps == 0` -- the store is a process-lifetime
@@ -2532,6 +2575,12 @@ set_tests_properties(test_backend_cross_device_vt_attn_decode_d128 PROPERTIES
 # of that skeleton carrying a DECISION is gated on a CPU-only CI runner with no
 # AMD GPU. The rest of the ROCm skeleton is under VLLM_CPP_HIP below.
 vllm_cpp_add_test(test_rocm_arch vt/test_rocm_arch.cpp)
+# The grow-only per-stream device scratch pool (#2712). UNCONDITIONAL for the
+# same reason test_rocm_arch is: src/vt/grow_only_stream_scratch.h is free of
+# HIP and CUDA headers, so the piece of the ROCm scratch allocators that holds
+# the SYNCHRONISATION is gated on a CPU-only runner with no accelerator.
+vllm_cpp_add_test(test_grow_only_stream_scratch vt/test_grow_only_stream_scratch.cpp)
+target_include_directories(test_grow_only_stream_scratch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # #785 P1 host package (fixture/oracle/trace classifier). CPU-only.
 vllm_cpp_add_test(test_ops_paged_attn_sharedk_wmma_p1
   vt/test_ops_paged_attn_sharedk_wmma_p1.cpp)
@@ -3122,6 +3171,7 @@ vllm_cpp_add_test(test_ops_rmsnorm_elem_dispatch vt/test_ops_rmsnorm_elem_dispat
 target_include_directories(test_ops_rmsnorm_elem_dispatch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_dflash_block_attn vt/test_ops_dflash_block_attn.cpp)
 vllm_cpp_add_test(test_dflash_attn_grid vt/test_dflash_attn_grid.cpp)
+vllm_cpp_add_test(test_dflash_attn_mask vt/test_dflash_attn_mask.cpp)
 vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_block_attn.cpp)
 # SPEC-DFLASH2 W2 (#1314): the DFlash2 grouped dynamic depthwise convolution,
 # gated against upstream's own sequential reference at block 5 (modulo arm), 8

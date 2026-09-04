@@ -1087,6 +1087,7 @@ add_library(vllm STATIC
   # Per-modality input-count limits and the refusal they carry
   # (ENG-MM-INPUT-PIPELINE L1, #607).
   src/vllm/multimodal/processing/context.cpp
+  src/vllm/multimodal/processing/processor.cpp
   src/vllm/multimodal/dots3_note_processor.cpp
   src/vllm/multimodal/mel_filter_bank.cpp
   # Pillow's BICUBIC resampler, which is NOT torchvision's and NOT a four-tap

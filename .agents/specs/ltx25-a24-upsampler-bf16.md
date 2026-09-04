@@ -259,7 +259,23 @@ the seam, as `Ltx2ConvVideoEncode`'s does — and round on entry, because upstre
 latent at that point came out of a bf16 DiT and is already bf16.
 
 **Two widths, refused in one place.** A third width arrives by refusal, not by
-silence, mirroring `RequireVaeDType`.
+silence, mirroring `RequireVaeDType`. The refusal has a case naming its own
+message — `"ltx2 upsampler: this stage serves"`, a token no other site in this
+tree emits — because wave 4 established that asserting a SHARED refusal string
+gates a different site.
+
+**And the storage claim is MEASURED, which it was not in this row's first
+version.** "Storage, not a flag" and "`WeightView` is a view and not a widened
+copy" are byte claims, and every gate this row shipped first was value-shaped:
+they read the width a stage reports and the bits its output carries. Both
+counter-examples were built and run in review and both were green (§ the review's
+two silent widenings, in `## Outcome`). `Ltx2UpsamplerStorage`
+(`ltx2_upsampler.h`) is the observable that closes them — the bytes
+`Volume::Alloc` really reserved, and the bytes `WeightView::operator[]` really
+reads through, the latter taken off the same member that call dispatches on.
+The render path drains it per call, and the gate compares TWO RUNS on the same
+input rather than quoting a number, which is the shape `Ltx2VaeWeights::Bytes()`
+already documents for the weight bag and which had no caller in this tree.
 
 ---
 
@@ -293,8 +309,21 @@ silence, mirroring `RequireVaeDType`.
    above it.
 4. **The runtime dtype on a production path**: a render counter that reports the
    width the upsampler actually computed at, checked non-zero-and-bf16.
-5. **Mutations**, each restored byte-for-byte: delete the production call site,
-   and flip each of R2/R4/R5/R7 in a scratch copy.
+5. **The STORAGE width, which 1-4 structurally cannot see.** Every one of them
+   is value-shaped. `Ltx2UpsamplerStorage` reports the bytes `Volume::Alloc`
+   really reserved and the bytes `WeightView::operator[]` really reads through,
+   and the gate has two halves: on the render path `bytes == elems * 2`, and in
+   the pipeline suite the bf16 arm is EXACTLY half the f32 arm's on the same
+   input, so no number is quoted.
+6. **The LOADED width of each upsampler checkpoint, separately.** There are two
+   loader call sites and one counter over a render reports whichever ran.
+   `Ltx2VaeWeights::Bytes()` is the tree's own measurement and had no caller.
+7. **The call count, exactly**, on a DFR render that reaches all three
+   production sites, so one site that stops running moves it.
+8. **The third-width refusal**, asserted on the token no other site emits.
+9. **Mutations**, each restored byte-for-byte: delete the production call site,
+   flip each of R2/R4/R5/R7 in a scratch copy, widen `Volume`'s buffers (MW1),
+   widen `WeightView` (MW3), and revert each loader call site alone (M9b).
 
 ## 7. Gates
 
@@ -317,6 +346,15 @@ python3 scripts/gen-ltx2-pipeline-goldens.py --ltx2 ~/_git/LTX-2 \
   --vllm-omni ~/_git/vllm-omni --out tests/vllm/models/ltx2_pipeline_goldens.inc
 git diff --stat -- tests/vllm/models/ltx2_pipeline_goldens.inc
 git diff --numstat -- tests/vllm/models/ltx2_pipeline_goldens.inc   # deletions must be 0
+
+# G3b — the STORAGE gate, which is a ratio and not a number. Both must red under
+#       MW1 (Volume sized by sizeof(float)) and MW3 (WeightView as an owned copy).
+./build/tests/test_ltx2_pipeline -tc="ltx2 the upsampler's bf16 arm is EXACTLY half*"
+./build/tests/test_ltx2_video -tc="ltx2 video: the latent upsampler COMPUTES*"
+
+# G3c — the TEMPORAL loader, which M9 could not see because it reverted both
+#       sites at once. Must red when only ltx2_video.cpp's temporal line goes f32.
+./build/tests/test_ltx2_video -tc="ltx2 video: DFR's temporal rounds DRIVE*"
 
 # G4 — the focused suites.
 ctest --test-dir build -R 'ltx2' --output-on-failure
@@ -361,12 +399,23 @@ python3 scripts/agent-pr-body.py --pr <N>
   arm is a residency row and not a dtype row.
 * **R6 is unmeasurable by any value gate at the pinned kernel width.** Mutation
   M10 removes the blur kernel's narrowing and 79 of 79 assertions stay green,
-  because at `kernel_size = 5` the narrowing moves no entry. The rule is
-  implemented and correct; what is owed is a gate that can see it, and the only
-  honest one is a fixture at a kernel size where the narrowing is lossy — which
-  upstream never constructs, since `SpatialRationalResampler` never overrides the
-  default. Tracked by [#2857](https://github.com/mudler/vllm.cpp/issues/2857) and
-  recorded here rather than left for a reviewer to find.
+  because at `kernel_size = 5` the narrowing moves no entry. That is confirmed
+  independently: the narrowed and f32 kernels differ in 0 elements at ks=5, and
+  the counts 0, 0, 0, 1, 57 at ks 3, 5, 7, 9, 11 match the shipped
+  `kLtx2UpsBf16BlurNarrowedEntries` exactly, so the probe can fail and does not.
+
+  **The reason first written here was wrong and the conclusion survives it.**
+  It said upstream "never constructs" a lossy kernel width. Upstream constructs
+  one fine: `BlurDownsample(dims=2, stride=2, kernel_size=9)` and `=11` both
+  build at the pin. What upstream never does is *reach* one through
+  `SpatialRationalResampler`, which does not override the default (:38) — and
+  that is a statement about the shipped path, not about what the class can hold.
+  The blocker is on the PORT side, and it is concrete: `BlurDownsample` here is
+  in an anonymous namespace with `kLtx2BlurKernelSize` hard-coded at its sole
+  call site, so no test can construct it at another width without a production
+  change. What is owed is that change plus a fixture at a lossy width. Tracked by
+  [#2857](https://github.com/mudler/vllm.cpp/issues/2857) and recorded here
+  rather than left for a reviewer to find.
 * **§A.7's rotted anchor** for this component (`:66-70`, should be `:108-112`).
   Operator-owned; recorded in §0.1, not edited.
 
@@ -386,14 +435,74 @@ as a pass, and it caught one of each.
 | M5 — R3, epsilon narrowed to bf16 | 79, **2 failed** | RED |
 | M6b — R7(b), the two roundings fused into one | 13, **1 failed** | RED |
 | M7 — R7(a), the statistics not narrowed | 13, **4 failed** | RED |
-| M8 — the three production call sites deleted | 4, **1 failed** | RED |
+| M8 — the three production call sites deleted TOGETHER | 4, **1 failed** | RED |
 | M9 — the loader reverted to f32 | 7, **2 failed** | RED |
 | **M6 — R7(b) fused, against the FIRST version of its case** | 4, **0 failed** | **GREEN** |
 | **M10 — R6, the blur kernel not narrowed** | 79, **0 failed** | **GREEN** |
+| **MW1 — the bf16 arm's buffers sized by `sizeof(float)`** | before: 9125, **0 failed**; after: **3 failed** | GREEN → **RED** |
+| **M9b — the TEMPORAL loader alone reverted to f32** | before: 5638, **0 failed**; after: **3 failed** | GREEN → **RED** |
+| **MW3 — `WeightView` as an owned f32 copy** | before: 9125, **0 failed**; after: **3 failed** | GREEN → **RED** |
+| **M8b — the call count off by one site** (observed, not injected) | **1 failed** | RED |
 
 **M5 reds on exactly 2 arms, which is what `kLtx2UpsBf16RuleCoverage` predicted
 for R3.** The coverage number is not decoration: it named the blast radius before
 the mutation was run.
+
+**THREE ROWS OF THAT TABLE ARE THE REVIEW'S, AND EACH WAS GREEN BEFORE THIS
+REPAIR.** The row's deliverable is a storage width and every gate it shipped
+first was value-shaped, so three separate widenings passed every one of them:
+
+* **MW1.** `Volume::Alloc` sizes by `sizeof(float)` on both arms, `Load` and
+  `Store` are always f32, and `Store` still rounds each stored value to bf16.
+  Every value, every golden and every reported `dtype` stays bit-identical —
+  `test_ltx2_pipeline` 69/69 with 4139 assertions and `test_ltx2_video` 116/116
+  with 4986, 9125 green — while the buffers hold twice the bytes. Against the
+  byte counters it now reds in three places, and the value counters beside them
+  stay green in the same run, which is the whole point:
+  `upsampler calls reporting a width other than bf16: 0 of 1`,
+  `upsampled latent values wider than bf16: 0 of 32`, and
+  `CHECK( trace.upsample_volume_bytes == trace.upsample_volume_elems * bf16_bytes )`
+  at `CHECK( 5024 == 2512 )`.
+* **M9b.** The row changes TWO loader call sites to `kBF16` and its own M9
+  reverted both. Reverting only the **temporal** one left `test_ltx2_video` at
+  116/116 and `test_ltx2_dfr` at 11/11, 5638 assertions green, because every
+  counter the observing fixture reads is fed by the SPATIAL bag. Half the row's
+  production change could be undone without a red. It now reds at
+  `CHECK( 693392 == 346696 )` on the temporal bag's own footprint.
+* **MW3.** `WeightView` replaced by an owned f32 vector materialised per
+  construction: bit-identical values, doubled and re-materialised memory, 4139
+  assertions green. It now reds at `CHECK( 1267504 == 633752 )`.
+
+  **The limit of that one is stated rather than left implicit.** `param_bytes`
+  is taken off `WeightView::read_width()`, which dispatches on the same member
+  `operator[]` reads, so a widened copy reports f32 and reds. A mutation that
+  widened the storage and *lied* in `read_width()` would not be caught, because
+  no observable in this process can distinguish an aliasing pointer from an
+  equal-valued copy. What is gated is the width the parameters are read through,
+  which is the claim the header makes.
+
+**M8 SAID MORE THAN IT MEASURED, and the correction is a call count.** The table
+read "the three production call sites deleted"; the mutation deleted them
+together, and a joint deletion cannot say that each site individually is
+reached. Deleting only sites 2 and 3 (`up_slots`, the DFR round) left the full
+suite green. The repair pins the count exactly on a DFR render, and the number
+was MEASURED rather than derived: the assertion was first written as
+`upsample_calls == 2` from a reading of the code and failed at
+`CHECK( 3 == 2 )`, then at two rounds `CHECK( 4 == 3 )`. A one-round DFR render
+reaches ALL THREE sites, so one subcase now pins every one of them and any single
+site that stops running moves the count. That failure is what the table calls M8b, and
+it is labelled "observed, not injected" because no site was deleted to produce
+it: the assertion was written with the wrong expectation and the render supplied
+the right one. A count that moves by exactly one per site is what makes a single
+site's absence visible, and that is the property the failure demonstrates.
+
+**M7's count differs by mutation SHAPE, and the difference is recorded rather
+than restated.** This spec says M7 reds 4. The review's isolation of R7(a) alone
+reds 3. Neither number is wrong: they are different mutations, since M7 flips
+R7(a) and R7(b) together where the isolation flips only R7(a). The review's own
+`narrow`-as-identity form does not compile at all — `-Werror=unused-variable` on
+`dtype` — so the shapes are not interchangeable. 4 is what this row measured on
+the mutation this row ran.
 
 **M6 is the failure this campaign has shipped once per wave, caught here.** The
 first version of the `upsample_video` case asserted only that the result reported
@@ -433,6 +542,12 @@ to the derived values. This is the fifth recorded instance in this tree of a lin
 anchor going stale within the change that moved it, and the reason the case exists
 is that it is the only thing that notices.
 
+**It happened a SECOND time inside the same pull request.** The review repair
+adds the loader-footprint block to `Generate` and shifted all fourteen again, by
+21 lines. The case caught it and printed the replacement, which is what makes a
+derived anchor list worth carrying — and it is the sixth instance, so the count
+is the finding rather than the incident.
+
 ### The two ltx2 suites that are red, and only one is this row's
 
 `ctest -R ltx2` after the fix: **13 of 13 targets built, 12 passed**, and the one
@@ -461,9 +576,14 @@ and a fixture at a wider `mid_channels` may need it.
   parameter bytes rather than refuse.
 * **`Volume` holds bytes, not narrowed floats.** An f32 buffer of bf16 values
   passes every value gate and moves twice the memory, which is the polarity
-  AGENTS.md says a token gate cannot see.
+  AGENTS.md says a token gate cannot see. That sentence was ARGUED and not
+  measured in this row's first version, and MW1 above is the build that proves
+  the argument was needed: it passed 9125 assertions. `Ltx2UpsamplerStorage`'s
+  `bytes / elems` is the measurement.
 * **`WeightView` is a view and not a widened copy.** Widening on load would put
   the bf16 arm back at the f32 arm's bytes, which is the whole thing A24 removes.
+  Gated by `Ltx2UpsamplerStorage::param_bytes`, with MW3 as the red-before and
+  the limit of that gate stated beside it.
 * **`SmallVar`'s scale is 2e-2** — the largest scale at which the chain is
   bit-exact and all four rules separate (§3.2's sweep).
 

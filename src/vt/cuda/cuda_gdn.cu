@@ -3262,15 +3262,6 @@ void KdaGatedDeltaRuleKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, cons
 // structured to map onto the FLA sub-ops (cumsum / scaled_dot_kkt+solve_tril+
 // wy / chunk_delta_h / chunk_fwd_o) so a future csrc/FLA drop-in is mechanical.
 
-bool ChunkedPrefillEnabled() {
-  // A/B toggle: default ON. VT_GDN_CHUNKED=0 falls back to the sequential scan.
-  // KERNEL-GDN-CHUNKED-MIRROR D3 lifted the read itself into the shared op layer
-  // (vt::GdnChunkedPrefillEnabled, src/vt/ops.cpp) so that CPU, ROCm and Vulkan
-  // join THIS flag rather than each gaining their own; the bespoke parse moved
-  // verbatim and this stays as its CUDA-local name.
-  return GdnChunkedPrefillEnabled();
-}
-
 // Step A — chunk_local_cumsum (fla/ops/cumsum.py): inclusive prefix sum of g
 // within each chunk, per (chunk, v-head). One block per (chunk, v-head).
 __global__ void GdnChunkCumsumKernel(float* gcum, const float* g, const int32_t* tok0a,

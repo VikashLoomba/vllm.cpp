@@ -4082,6 +4082,24 @@ That is a property of how the objective was WRITTEN, not a measure of how far
 the work has got, and it does not soften into "not yet done": the objective asks
 the faithful arm to reproduce the unfaithful one.
 
+**RE-TESTED 2026-09-04, AND THE POSITION HOLDS WITH ITS REASON CHANGED**
+([ARMTOKENS evidence](../../docs/bench-evidence/qwen4exp-gdn-chunked-token-ids-20260904.md),
+[#2858](https://github.com/mudler/vllm.cpp/issues/2858)). The sentence above
+rests on the CPU arm being the unfaithful one. **Since [#2612](https://github.com/mudler/vllm.cpp/issues/2612)
+it is not**: the CPU GDN prefill runs vLLM's chunked decomposition too, by
+default, and that is measured rather than assumed — `VT_GDN_CHUNKED` moves
+decoder layer 0's block output by `3.702e-04` on one binary, and the CPU arm
+lands `1.772e-05` from CUDA where the sequential arm sat `3.525e-04` away.
+**Both arms now mirror vLLM and they still emit the same two sequences, still
+5 of 8**, byte-for-byte what PREFILLDIV published. So the objective is
+unreachable for a stronger reason than the one written above: it is not that one
+arm is faithful and the other is not. It is that two arms running the same
+algorithm on the same weights, differing only in device arithmetic, do not agree
+on an argmax over near-ties — and with the Gated DeltaNet term spent, what
+carries the remaining 3 ids is the undiagnosed MoE residue, which improved
+nothing (`moe` `1.269e-04` -> `2.289e-04` from an input 11.6x closer). A fifth
+wave must not re-derive this either.
+
 **Why this section exists at all.** The *cause* was already recorded (§Wave
 PREFILLDIV, and the evidence file above). The two dead-end *routes* were not, and
 a search of `.agents/` and `docs/` for the measured `3 of 8` result returns one

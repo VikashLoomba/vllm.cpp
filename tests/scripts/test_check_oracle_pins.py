@@ -451,9 +451,13 @@ class ParityThroughMainTests(unittest.TestCase):
         # stem. `UNRECONCILED_SECONDARY` names a commit and a release the
         # authority never mentions, which is the ordinary state of the thirteen
         # secondary oracles, so a registry-wide version of this rule reports it
-        # and returns 1. Nothing else here can see that difference -- calling
-        # `check_registry` cannot, because `check_registry` never runs the
-        # parity rule at all.
+        # and returns 1. `check_registry` cannot be asked this question at
+        # all, because `check_registry` never runs the parity rule. The live
+        # `test_the_repository_registry_is_clean` does red under that same
+        # mutation -- 26 parity errors over the 13 real secondaries -- but its
+        # catch is incidental: it would evaporate if the registry ever held
+        # `vllm.md` alone, and it reads whatever the tree happens to hold, so
+        # it has no controlled fixture and cannot be the scoping test.
         self.assertEqual(
             self.run_main(
                 PARITY_RECORD, PARITY_SYNC, {"fixture": UNRECONCILED_SECONDARY}

@@ -177,11 +177,12 @@ synthetic record, so none of them depends on what the live pin happens to be:
     secondary oracle pinned to something the authority never names. Every other
     case calls the rule directly, which proves the rule works and never that
     anything runs it. Deleting the `check_parity_reconciliation` call from
-    `main` turns the first two red; widening it into a loop over every registry
-    file turns the third red. Both cases live here because both are properties
-    of `main` and of nothing else: `check_registry` never invokes the parity
-    rule, so a scoping test written against it cannot fail for the reason it
-    names.
+    `main` turns the second red, and only the second: the first asserts rc 0
+    and gets rc 0 whether the rule runs or not. Widening the call into a loop
+    over every registry file turns the third red. Both cases live here because
+    both are properties of `main` and of nothing else: `check_registry` never
+    invokes the parity rule, so a scoping test written against it cannot fail
+    for the reason it names.
 
 ## Gates
 
@@ -222,6 +223,13 @@ the work lands.
   establish: the 286-file measurement rules out a regex over prose, and not a
   rule over three named paths with a fixed extraction, which is what these
   surfaces are.
+- The same reachability hole one call site over. Deleting
+  `errors.extend(check_declarations(declarations, registry_ids))` from `main`
+  leaves all 42 tests in `tests/scripts/test_check_oracle_pins.py` green at
+  rc 0, so nothing proves `main` runs the declaration check either. It is
+  pre-existing and not introduced by this row; `ParityThroughMainTests` is the
+  pattern that closes it. Tracked by
+  [#2898](https://github.com/mudler/vllm.cpp/issues/2898).
 - The duplication itself. This change makes the copy checked; it does not
   remove it. #2829's preferred fix — the registry resolving `pin` for the
   primary oracle from the authority at read time — stays available and is

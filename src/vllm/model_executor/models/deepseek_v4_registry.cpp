@@ -242,6 +242,7 @@ const ModelFactory kDeepseekV4Factory{
     // the topology -- and the adapter above refuses by name every shape it
     // cannot serve, so the guard moves rather than disappearing.
     .consumes_multi_kv = true,
+    .consumes_device_token_ids = true,
 };
 
 }  // namespace

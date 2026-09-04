@@ -7108,6 +7108,56 @@ TEST_CASE("ltx2 video: the video VAE ENCODER computes at upstream's bfloat16") {
   CHECK(trace.vae_encode_not_bf16 == 0);
 }
 
+TEST_CASE("ltx2 video: the latent upsampler COMPUTES at bfloat16 on the render path") {
+  // A24 wave 5, row LTX25-A24-UPSAMPLER-BF16 (#2857). Upstream resolves ONE model
+  // dtype (`distilled.py:109`) and hands it to the latent upsampler at
+  // `:138-141`. The parity suite gates the ARITHMETIC against the executed
+  // module; this case gates the thing the parity suite structurally cannot see.
+  //
+  // WHY A RENDER AND NOT A UNIT TEST. `Ltx2LatentUpsample` constructed by hand
+  // proves the class narrows. It cannot prove that the ENGINE reaches the narrow
+  // path -- the loader could still widen the checkpoint, and every frame, digest
+  // and byte count downstream would be identical. AGENTS.md: "A unit test that
+  // constructs the type by hand proves that the class works, never that anything
+  // reaches it." So this drives `LoadVideoEngine` -> `Generate` on its default
+  // configuration through `upsampler_path`, which is the same entry a caller uses.
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["upsampler_path"] = ws.paths.upsampler;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  const vllm::multimodal::VideoResult result =
+      engine->Generate(FixtureGen(ws.root + "/ups_bf16"));
+  // A REAL two-stage render, so the upsampler is on the path that produced it
+  // rather than on one this case constructed for itself.
+  CHECK(result.width == 64);
+  CHECK(result.height == 64);
+  const auto* ltx2 = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+
+  // 1. SOMETHING RAN. Without this the two assertions below are satisfied by a
+  //    build that stopped calling the upsampler at all: zero wide calls and zero
+  //    wide values is what "never ran" looks like, and it reads as perfect.
+  INFO("upsampler calls on the render path: " << trace.upsample_calls);
+  REQUIRE(trace.upsample_calls > 0);
+
+  // 2. IT RAN AT UPSTREAM'S WIDTH, read off the latent the stage returned rather
+  //    than off the config that asked for it.
+  INFO("upsampler calls reporting a width other than bf16: " << trace.upsample_wide_calls
+                                                             << " of " << trace.upsample_calls);
+  CHECK(trace.upsample_wide_calls == 0);
+
+  // 3. AND THE VALUES AGREE WITH THE REPORT. A `dtype` field can be set
+  //    correctly by a path that computed wide; only the values can say whether
+  //    the arithmetic actually landed in bf16. This is the half that survives a
+  //    correct-looking field, and it is why both are here.
+  INFO("upsampled latent values wider than bf16: " << trace.upsample_not_bf16 << " of "
+                                                   << trace.upsample_values);
+  REQUIRE(trace.upsample_values > 0);
+  CHECK(trace.upsample_not_bf16 == 0);
+}
+
 TEST_CASE("ltx2 video: the prompt's conditioning goes through the CONNECTOR") {
   // The prompt path is a DIFFERENT caller of `RunConnector` from the
   // prompt-embeds path, so "the connector is wired" proved for one proves

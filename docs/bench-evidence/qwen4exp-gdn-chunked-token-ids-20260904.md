@@ -174,6 +174,42 @@ input (`L00 in`, `ahc.mix`, `ahc.inj`) that is bit-identical on all three arms.
 26 of 42 taps differ between the two CPU arms. The chunked CPU arm is therefore
 reached and computing, and explanation (b) of §4 is dead.
 
+### 5.1 `q`/`k`/`v` ARE bf16, and run 2 proves it without reading any source
+
+Run 1's summary printed `FLAG ROUTES ON CPU ... NO -- either the flag is read and
+ignored or q/k/v are not bf16`. **Both halves of that disjunction are false, and
+the line is superseded.** It is computed from the eight ids alone, which is a
+weaker instrument than the fingerprint, and it is committed in
+`run1-results.txt` where a reader could mistake it for the answer. It is not.
+
+The proof needs nothing but run 2's own numbers. `vt::GdnChunkedPrefillEnabled()`
+— the `VT_GDN_CHUNKED` read — has **exactly one consumer in the tree**:
+
+```c++
+// src/vt/ops.cpp:2218
+return q_dtype == DType::kBF16 && GdnChunkedPrefillEnabled();
+```
+
+If `q_dtype` were anything but bf16 the conjunction is false whatever the flag
+says, and the flag could not change one bit of output. It changed `L00 blk` by
+`3.702e-04` and 26 of 42 taps, on one binary by digest with `q`/`k`/`v` allocated
+identically. **Therefore `q_dtype == kBF16`, as a consequence of the measurement
+rather than an inference about it**, and the third possibility — that the arm is
+reached, the flag routes, and the two arms simply land on the same eight argmaxes
+— is what happened.
+
+Two further readings agree. The fingerprint prints the runtime dtype of every
+tap, and all 14 step-0 taps read `bf16` on all three arms. And statically,
+`GdnActDType()` (`qwen3_5.cpp:3584`) is bf16 unless `VT_GDN_BF16` starts with
+`0`, while `qwen4_exp_gguf_weights.cpp:206` hardcodes `torch_dtype = "bfloat16"`
+rather than reading it from the GGUF.
+
+**Run 1's `ARM ... DTYPE LINES: 0` field settled nothing and was never used.** It
+greps the server log for a dtype line, and no such line exists to find:
+`--verbose` prints request stages only, and neither branch of `cpu_ops.cpp:2136`
+logs. A probe that produced no lines at all is not a measurement of the dtype,
+and it is recorded here as a null probe so its zero cannot be read as one.
+
 **Two independent corroborations that this is the same experiment as
 PREFILLDIV.** The CPU-sequential `L00 blk` reads `1073.65489` and the CUDA one
 `1074.03345`; PREFILLDIV, on a different tree two days earlier, read
@@ -213,6 +249,18 @@ CPU arms, 2.320338e-02 between CPU and CUDA.
   it is the half the bf16 state snapshot lives in.
 - **The MoE residue is named, not diagnosed.** §5 shows it is now dominant. It
   does not say what it is. That is PREFILLDIV's open item and stays open.
+- **The recorded explanation for the 5-of-8 is confirmed, not revisited.** It is
+  tempting to read unchanged ids as "the divergence attributed to the algorithm
+  difference did not move when the algorithms were unified". The premise is false
+  here: it moved 19.9x at the block. What did not move is the argmax.
+  `.agents/specs/qwen4-exp-flash-next.md` already states the general form — token
+  agreement between our two arms "is not monotone in the distance between them,
+  because the decode is an argmax over near-ties", and a CPU-vs-CUDA
+  token-exactness gate "is not well posed for this architecture at this
+  precision". This run is a second, independent instance of exactly that, now in
+  the direction that spec had not observed: PREFILLDIV saw a 332x *closer* arm
+  agree on *fewer* ids; ARMTOKENS sees a 20x closer arm agree on the *same* ids.
+  Neither direction is monotone, which is the claim.
 - **Nothing is claimed about the other six published quants**, about
   `num_reqs > 1` (refused by name), or about ROCm, Vulkan and Tenstorrent — two
   of which still have no chunked arm.

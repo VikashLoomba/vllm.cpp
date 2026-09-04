@@ -57,6 +57,32 @@ evidence = .agents/upstream-sync.md
 """
 
 
+PARITY_RECORD = """# Fixture primary, paired with PARITY_SYNC
+
+```oracle-pin
+id = vllm
+role = primary
+upstream = https://github.com/vllm-project/vllm
+scope = everything vLLM implements
+pin = 1111111111111111111111111111111111111111
+pin_label = 9.9.9rc1.dev1
+pinned_on = 2026-09-04
+gateable = yes
+evidence = AGENTS.md
+```
+"""
+
+PARITY_SYNC = """# Fixture authority
+
+```parity-pin
+vllm_commit = 1111111111111111111111111111111111111111
+vllm_runtime_version = 9.9.9rc1.dev1+g1111111111
+vllm_distribution_version = 9.9.9rc1.dev1+g1111111111.precompiled
+flashinfer_version = 0.6.18
+```
+"""
+
+
 def record(text: str, name: str = "fixture") -> check_oracle_pins.Record | None:
     """Parse one fixture, returning None when the block will not parse."""
     return check_oracle_pins.parse_record(Path(f"{name}.md"), text, [])
@@ -226,6 +252,135 @@ class DeclaredOracleTests(unittest.TestCase):
             ),
             [],
         )
+
+
+class ParityReconciliationTests(unittest.TestCase):
+    """The vllm record's pin must agree with the AUTHORITY (#2829).
+
+    Every case pairs a synthetic authority with a synthetic record, so nothing
+    here moves when the real pin advances, and the expectation never comes from
+    the file under test.
+    """
+
+    def reconcile(self, record_text: str, sync_text: str) -> list[str]:
+        return check_oracle_pins.parity_errors(record_text, sync_text)
+
+    def test_agreeing_surfaces_reconcile(self) -> None:
+        self.assertEqual(self.reconcile(PARITY_RECORD, PARITY_SYNC), [])
+
+    def test_a_stale_pin_is_reported(self) -> None:
+        # THE #2829 SHAPE: the authority advanced and the record did not.
+        mutated = PARITY_RECORD.replace(
+            "pin = 1111111111111111111111111111111111111111",
+            "pin = 2222222222222222222222222222222222222222",
+        )
+        errs = self.reconcile(mutated, PARITY_SYNC)
+        self.assertTrue(any("vllm_commit" in e for e in errs), errs)
+
+    def test_a_stale_label_is_reported(self) -> None:
+        mutated = PARITY_RECORD.replace("pin_label = 9.9.9rc1.dev1", "pin_label = 9.8.0")
+        errs = self.reconcile(mutated, PARITY_SYNC)
+        self.assertTrue(any("pin_label" in e for e in errs), errs)
+
+    def test_a_truncated_label_is_reported(self) -> None:
+        # A PROPER PREFIX of the right label. `startswith` accepts this and the
+        # decomposition rule refuses it; that difference is the whole reason
+        # the rule is stated as equality against the public version.
+        mutated = PARITY_RECORD.replace("pin_label = 9.9.9rc1.dev1", "pin_label = 9.9.9rc1.dev")
+        errs = self.reconcile(mutated, PARITY_SYNC)
+        self.assertTrue(any("pin_label" in e for e in errs), errs)
+
+    def test_a_label_carrying_the_local_segment_is_reported(self) -> None:
+        # The other direction: the full runtime string is not the label either.
+        mutated = PARITY_RECORD.replace(
+            "pin_label = 9.9.9rc1.dev1", "pin_label = 9.9.9rc1.dev1+g1111111111"
+        )
+        errs = self.reconcile(mutated, PARITY_SYNC)
+        self.assertTrue(any("pin_label" in e for e in errs), errs)
+
+    def test_a_label_with_no_local_segment_in_the_authority_still_reconciles(self) -> None:
+        # A pin taken from a tagged build reports a bare public version, and
+        # the rule degrades to plain equality rather than going red on it.
+        sync = PARITY_SYNC.replace(
+            "vllm_runtime_version = 9.9.9rc1.dev1+g1111111111",
+            "vllm_runtime_version = 9.9.9rc1.dev1",
+        )
+        self.assertEqual(self.reconcile(PARITY_RECORD, sync), [])
+
+    def test_a_missing_authority_block_fails_closed(self) -> None:
+        # Not a skipped rule. A checker that stops checking when it cannot find
+        # its expectation is a mute switch.
+        errs = self.reconcile(PARITY_RECORD, "# the block was renamed\n")
+        self.assertTrue(any("parity-pin" in e for e in errs), errs)
+
+    def test_two_authority_blocks_fail_closed(self) -> None:
+        errs = self.reconcile(PARITY_RECORD, PARITY_SYNC + PARITY_SYNC)
+        self.assertTrue(any("exactly one" in e for e in errs), errs)
+
+    def test_an_unparsable_authority_line_is_reported(self) -> None:
+        sync = PARITY_SYNC.replace("flashinfer_version = 0.6.18", "flashinfer 0.6.18")
+        errs = self.reconcile(PARITY_RECORD, sync)
+        self.assertTrue(any("is not `key = value`" in e for e in errs), errs)
+
+    def test_an_unknown_authority_key_is_reported(self) -> None:
+        sync = PARITY_SYNC.replace("flashinfer_version = 0.6.18", "torch_version = 2.13.0")
+        errs = self.reconcile(PARITY_RECORD, sync)
+        self.assertTrue(any("torch_version" in e for e in errs), errs)
+
+    def test_a_duplicate_authority_key_is_reported(self) -> None:
+        sync = PARITY_SYNC.replace(
+            "flashinfer_version = 0.6.18",
+            "flashinfer_version = 0.6.18\nflashinfer_version = 0.6.15",
+        )
+        errs = self.reconcile(PARITY_RECORD, sync)
+        self.assertTrue(any("duplicate" in e for e in errs), errs)
+
+    def test_an_empty_authority_value_is_reported(self) -> None:
+        sync = PARITY_SYNC.replace(
+            "vllm_commit = 1111111111111111111111111111111111111111", "vllm_commit ="
+        )
+        errs = self.reconcile(PARITY_RECORD, sync)
+        self.assertTrue(any("vllm_commit" in e for e in errs), errs)
+
+    def test_an_unreadable_record_fails_closed(self) -> None:
+        errs = self.reconcile("# no oracle-pin block here\n", PARITY_SYNC)
+        self.assertTrue(any("unchecked" in e for e in errs), errs)
+
+    def test_the_rule_does_not_fire_on_a_secondary_oracle(self) -> None:
+        # THE SCOPING TEST. Every other oracle holds its pin only in its own
+        # file. `main` selects the record by filename stem, so a secondary
+        # oracle whose pin matches nothing in the authority is never compared:
+        # a registry-wide version of this rule would fail all of them.
+        errs = check_oracle_pins.check_registry(
+            {
+                Path("vllm.md"): GOOD_PRIMARY,
+                Path("fixture.md"): GOOD_SECONDARY,
+            },
+            ["vllm", "fixture"],
+        )
+        self.assertEqual(errs, [])
+        self.assertEqual(check_oracle_pins.ORACLES.name, "oracles")
+        self.assertFalse(
+            (check_oracle_pins.ORACLES / "fixture.md").exists(),
+            "the scoping claim is about the live registry, which holds no fixture",
+        )
+
+    def test_public_version_strips_only_the_local_segment(self) -> None:
+        cases = {
+            "0.28.1rc1.dev132+ge126687a9": "0.28.1rc1.dev132",
+            "0.28.1rc1.dev132+ge126687a9.precompiled": "0.28.1rc1.dev132",
+            "0.29.0": "0.29.0",
+        }
+        for given, expected in cases.items():
+            with self.subTest(given=given):
+                self.assertEqual(check_oracle_pins.public_version(given), expected)
+
+    def test_the_live_surfaces_agree(self) -> None:
+        # The reconciliation over the REAL two files, expectation from the
+        # authority and value from the record, neither one a literal here.
+        sync_text = check_oracle_pins.UPSTREAM_SYNC.read_text(encoding="utf-8")
+        record_text = (check_oracle_pins.ORACLES / "vllm.md").read_text(encoding="utf-8")
+        self.assertEqual(check_oracle_pins.parity_errors(record_text, sync_text), [])
 
 
 class LiveRegistryTests(unittest.TestCase):

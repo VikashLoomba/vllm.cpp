@@ -145,10 +145,14 @@ synthetic record, so none of them depends on what the live pin happens to be:
 7. two `parity-pin` blocks are reported;
 8. an unparsable line, an unknown key, a duplicate key and an empty value are
    each reported;
-9. a secondary oracle whose `pin` matches nothing in the authority produces no
-   reconciliation error — the scoping test;
-10. the live tree reconciles, through `main([])`, which is the existing
-    `LiveRegistryTests` and needs no new case.
+9. an authority whose `vllm_runtime_version` carries no local segment at all
+   still reconciles, which is the degenerate case the decomposition rule is
+   chosen for;
+10. a secondary oracle whose `pin` matches nothing in the authority produces no
+    reconciliation error — the scoping test;
+11. the live tree reconciles, both through `main([])` and through the
+    reconciliation alone over the two real files, with neither value written as
+    a literal in the test.
 
 ## Gates
 

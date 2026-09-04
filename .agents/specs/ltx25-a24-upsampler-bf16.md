@@ -442,6 +442,8 @@ as a pass, and it caught one of each.
 | **MW1 — the bf16 arm's buffers sized by `sizeof(float)`** | before: 9125, **0 failed**; after: **3 failed** | GREEN → **RED** |
 | **M9b — the TEMPORAL loader alone reverted to f32** | before: 5638, **0 failed**; after: **3 failed** | GREEN → **RED** |
 | **MW3 — `WeightView` as an owned f32 copy** | before: 9125, **0 failed**; after: **3 failed** | GREEN → **RED** |
+| **RATWIDE — `BlurDownsample`'s buffer alone widened to `sizeof(float)`** | before: 9164, **0 failed**; after: **1 failed** | GREEN → **RED** |
+| **MW3b — an owned f32 copy that also LIES in `read_width()`** | 9232, **0 failed** without the size assertion; **build fails** with it | GREEN → **BUILD RED** |
 | **M8b — the call count off by one site** (observed, not injected) | **1 failed** | RED |
 
 **M5 reds on exactly 2 arms, which is what `kLtx2UpsBf16RuleCoverage` predicted
@@ -473,13 +475,77 @@ first was value-shaped, so three separate widenings passed every one of them:
   construction: bit-identical values, doubled and re-materialised memory, 4139
   assertions green. It now reds at `CHECK( 1267504 == 633752 )`.
 
-  **The limit of that one is stated rather than left implicit.** `param_bytes`
-  is taken off `WeightView::read_width()`, which dispatches on the same member
-  `operator[]` reads, so a widened copy reports f32 and reds. A mutation that
-  widened the storage and *lied* in `read_width()` would not be caught, because
-  no observable in this process can distinguish an aliasing pointer from an
-  equal-valued copy. What is gated is the width the parameters are read through,
-  which is the claim the header makes.
+  **The limit of that one was stated with the wrong reason, and the reason is
+  what got fixed.** `param_bytes` is taken off `WeightView::read_width()`, which
+  dispatches on the same member `operator[]` reads, so a widened copy that
+  reports honestly reds. What the counter cannot see is a mutation that edits
+  BOTH lines — an owned f32 copy whose `read_width()` returns the bag's dtype —
+  and that is a limit of ONE instrument, not of this process. The first version
+  of this paragraph said the process had no observable at all, "because no
+  observable in this process can distinguish an aliasing pointer from an
+  equal-valued copy". That is false: an owned copy has storage, and storage is
+  bytes. The conclusion survived the reasoning, which is the same shape as R6's
+  correction above.
+
+  **So the shape the counter misses is closed by a size, and the size is
+  measured.** `ltx2_upsampler.cpp` now carries
+
+  ```cpp
+  static_assert(sizeof(WeightView) == 2 * sizeof(void*),
+                "WeightView must be a VIEW: two pointers and no owned storage");
+  ```
+
+  Mutation **MW3b** is the both-lines version: an owned `std::vector<float>`
+  materialised per construction plus `read_width()` returning `weights.dtype`.
+  With the assertion removed it builds and both suites are green — 71/4227 and
+  116/5005, every byte ratio intact. With the assertion present the build fails,
+  `ltx2_upsampler.cpp:208:34: error: static assertion failed: WeightView must be
+  a VIEW: two pointers and no owned storage`. Both halves were run; the green one
+  is what makes the assertion the thing that catches it rather than a second
+  opinion about the counter.
+
+**RATWIDE IS THE FOURTH ONE, AND IT SAYS THE BYTE GATE WAS SCOPED TO ONE ARM.**
+The counters above are correct and the case that read them ran the
+`PixelShuffle` arm alone. `ltx2_upsampler.cpp` has nine `Volume::Alloc` call
+sites; that arm reaches four, and the two byte cases in this tree together
+reached six. Three were unreachable from either fixture:
+
+* `BlurDownsample`'s output volume, reachable only through
+  `SpatialRationalResampler` at `den > 1` — and `Ltx2RationalForScale(2.0)` is
+  `{2, 1}`, so the stride-1 short circuit at `blur_downsample.py:36-37` returns
+  the input without allocating. Only scale 1.5 (`{3, 2}`) reaches it.
+* the `dims == 2` fold's per-frame `plane` and the `folded` output it is written
+  back into.
+
+Both fixtures pinned those arms off:
+`ltx2_pipeline_goldens.inc`'s `kLtx2UpsPixelShuffleRational = false` and the
+video fixture's `cfg.rational_resampler = false`. **The hole was executed rather
+than argued.** MUTATION RATWIDE widens ONLY `BlurDownsample`'s buffer to
+`sizeof(float)`, inside `Alloc` so the counter reports the widened size honestly
+and no value moves. Against the single-arm case it was fully green —
+`test_ltx2_pipeline` 71/71 with 4159 assertions and `test_ltx2_video` 116/116
+with 5005, 9164 green — while the site printed `RATWIDE-EXECUTED elems=3456
+bytes=13824`, four bytes per element where two is correct.
+
+The repair takes the ratio PER ARM over the three spatial arms, the temporal arm
+and the `dims == 2` fold. Re-running RATWIDE against it reds:
+
+```text
+test_ltx2_pipeline.cpp:2379: ERROR: CHECK( bf16_storage.bytes * 2 == f32_storage.bytes ) is NOT correct!
+  values: CHECK( 188064 == 174240 )
+  logged: upsampler storage arm = Rational1p5
+          upsampler volumes: f32 held 174240 bytes and bf16 held 94032, over 43560 elements each
+```
+
+Coverage was then measured rather than reasoned about, by giving `Alloc` an
+`int site = __builtin_LINE()` default argument — which resolves at the CALL site
+— and printing it. The repaired case alone reaches **all nine**: 228, 284, 438,
+472, 503, 543, 847, 871 and 885.
+
+**And the arm label had to be a `std::string`.** The first version passed
+`const char*`, and doctest's `INFO` stringifies a `char*` as a BOOL, so the
+failing arm printed as `upsampler storage arm = 1`. The name of the failing arm
+is the whole reason the message exists.
 
 **M8 SAID MORE THAN IT MEASURED, and the correction is a call count.** The table
 read "the three production call sites deleted"; the mutation deleted them
@@ -548,7 +614,25 @@ adds the loader-footprint block to `Generate` and shifted all fourteen again, by
 derived anchor list worth carrying — and it is the sixth instance, so the count
 is the finding rather than the incident.
 
-### The two ltx2 suites that are red, and only one is this row's
+**AND IT EXPLAINS THE `115 passed | 1 failed | 5005 assertions` NOBODY COULD
+PLACE.** That reading was recorded as unexplained and guessed at as parallel
+`ctest` flakiness. It is neither. `tests/CMakeLists.txt:367` defines
+`LTX2_VIDEO_SOURCE_PATH`, and `test_ltx2_video.cpp:1409` opens that file AT RUN
+TIME to derive the anchors it compares. So editing
+`src/vllm/multimodal/ltx2_video.cpp` **while the suite is running** shifts every
+derived anchor under the running binary and reds
+`test_ltx2_video.cpp:1473 CHECK( recorded == derived )` — reproduced
+byte-for-byte, including the 5005 total. A second case has the same exposure
+through `LTX2_DFR_HEADER_PATH` (`test_ltx2_video.cpp:2529`).
+
+**The operational consequence: never run these suites while a mutation is
+applied**, and rebuild after every restore. This row's own mutation cycle edits
+exactly those files, so a suite overlapping a mutation manufactures a red that
+belongs to the harness and not to the tree. A harness that restores the source
+without rebuilding is the same failure one step later: it runs a stale binary
+and reads its green as the restored tree's.
+
+### The one ltx2 suite that is red, and it is not this row's
 
 `ctest -R ltx2` after the fix: **13 of 13 targets built, 12 passed**, and the one
 failure is `test_ltx2_video_device_forward`, which is
@@ -579,7 +663,9 @@ and a fixture at a wider `mid_channels` may need it.
   AGENTS.md says a token gate cannot see. That sentence was ARGUED and not
   measured in this row's first version, and MW1 above is the build that proves
   the argument was needed: it passed 9125 assertions. `Ltx2UpsamplerStorage`'s
-  `bytes / elems` is the measurement.
+  `bytes / elems` is the measurement, and it is taken over the five arms that
+  together reach all nine `Volume::Alloc` call sites — see RATWIDE, which is the
+  build that proves one arm was not enough.
 * **`WeightView` is a view and not a widened copy.** Widening on load would put
   the bf16 arm back at the f32 arm's bytes, which is the whole thing A24 removes.
   Gated by `Ltx2UpsamplerStorage::param_bytes`, with MW3 as the red-before and

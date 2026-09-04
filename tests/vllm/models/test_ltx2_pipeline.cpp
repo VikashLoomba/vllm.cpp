@@ -2322,62 +2322,105 @@ TEST_CASE("ltx2 the upsampler's bf16 arm is EXACTLY half the f32 arm's bytes") {
   // and parameter reads the bag does not cover. A fixture size baked into an
   // expectation would have to be re-measured every time the fixture moved; a
   // ratio between two runs of the SAME config does not.
-  const vllm::Ltx2UpsamplerConfig config = ReducedUpsamplerConfig(
-      vllm_test::kLtx2UpsPixelShuffleRational, vllm_test::kLtx2UpsPixelShuffleScale,
-      "ltx2.ups.PixelShuffle.");
-  const vllm::Ltx2LatentVolume latent = ReducedUpsamplerLatent();
+  //
+  // WHY EVERY ARM AND NOT ONE. The first version of this case ran `PixelShuffle`
+  // alone, and one arm does not reach one file. `ltx2_upsampler.cpp` has nine
+  // `Volume::Alloc` call sites; `PixelShuffle` reaches four of them, and the two
+  // byte cases in this tree together reached six. `BlurDownsample`'s output
+  // volume is reachable only through `SpatialRationalResampler` at `den > 1`
+  // (`Ltx2RationalForScale(2.0)` is `{2, 1}`, so scale 2.0 short-circuits and
+  // only 1.5 reaches it), and the `dims == 2` fold's two volumes are reachable
+  // only at `dims == 2` -- and both fixtures pinned those arms off. That hole was
+  // not argued, it was executed: widening ONLY `BlurDownsample`'s buffer to
+  // `sizeof(float)`, done inside `Alloc` so the counter reports the widened size
+  // honestly and the values are untouched, left both suites green -- 71 cases /
+  // 4159 assertions and 116 / 5005 -- while the site ran at
+  // `elems=3456 bytes=13824`, four bytes per element where two is correct. So the
+  // ratio is taken PER ARM over every arm this file has a config for, and the
+  // arms together reach all nine sites.
+  // `tag` is a `std::string` and not a `const char*` on purpose: doctest's `INFO`
+  // stringifies a `char*` as a BOOL, so an arm label passed that way prints `1`
+  // and the failing arm is exactly the thing the message has to name.
+  auto measure = [](const std::string& tag, const vllm::Ltx2UpsamplerConfig& config,
+                    const vllm::Ltx2LatentVolume& latent) {
+    // Drain first. The accumulator is read-and-clear and every other case in this
+    // file calls the upsampler without draining, so a leftover would be charged to
+    // whichever arm ran next.
+    (void)vllm::Ltx2TakeUpsamplerStorage();
 
-  // Drain first. The accumulator is read-and-clear and every other case in this
-  // file calls the upsampler without draining, so a leftover would be charged to
-  // whichever arm ran next.
-  (void)vllm::Ltx2TakeUpsamplerStorage();
+    const ParamBag f32_bag = BuildUpsamplerParams(config);
+    const vllm::Ltx2LatentVolume f32_out =
+        vllm::Ltx2LatentUpsample(config, f32_bag.weights, latent);
+    const vllm::Ltx2UpsamplerStorage f32_storage = vllm::Ltx2TakeUpsamplerStorage();
 
-  const ParamBag f32_bag = BuildUpsamplerParams(config);
-  const vllm::Ltx2LatentVolume f32_out =
-      vllm::Ltx2LatentUpsample(config, f32_bag.weights, latent);
-  const vllm::Ltx2UpsamplerStorage f32_storage = vllm::Ltx2TakeUpsamplerStorage();
+    const ParamBag bf16_bag = BuildUpsamplerParamsBf16(config);
+    const vllm::Ltx2LatentVolume bf16_out =
+        vllm::Ltx2LatentUpsample(config, bf16_bag.weights, latent);
+    const vllm::Ltx2UpsamplerStorage bf16_storage = vllm::Ltx2TakeUpsamplerStorage();
 
-  const ParamBag bf16_bag = BuildUpsamplerParamsBf16(config);
-  const vllm::Ltx2LatentVolume bf16_out =
-      vllm::Ltx2LatentUpsample(config, bf16_bag.weights, latent);
-  const vllm::Ltx2UpsamplerStorage bf16_storage = vllm::Ltx2TakeUpsamplerStorage();
+    INFO("upsampler storage arm = ", tag);
 
-  // THE SAME WORK ON BOTH ARMS, or the ratio below compares two different runs.
-  CHECK(f32_out.dtype == vt::DType::kF32);
-  CHECK(bf16_out.dtype == vt::DType::kBF16);
-  CHECK(f32_out.data.size() == bf16_out.data.size());
-  REQUIRE(f32_storage.volumes > 0);
-  CHECK(bf16_storage.volumes == f32_storage.volumes);
-  REQUIRE(f32_storage.elems > 0);
-  CHECK(bf16_storage.elems == f32_storage.elems);
-  REQUIRE(f32_storage.param_views > 0);
-  CHECK(bf16_storage.param_views == f32_storage.param_views);
-  REQUIRE(f32_storage.param_elems > 0);
-  CHECK(bf16_storage.param_elems == f32_storage.param_elems);
+    // THE SAME WORK ON BOTH ARMS, or the ratio below compares two different runs.
+    CHECK(f32_out.dtype == vt::DType::kF32);
+    CHECK(bf16_out.dtype == vt::DType::kBF16);
+    CHECK(f32_out.data.size() == bf16_out.data.size());
+    REQUIRE(f32_storage.volumes > 0);
+    CHECK(bf16_storage.volumes == f32_storage.volumes);
+    REQUIRE(f32_storage.elems > 0);
+    CHECK(bf16_storage.elems == f32_storage.elems);
+    REQUIRE(f32_storage.param_views > 0);
+    CHECK(bf16_storage.param_views == f32_storage.param_views);
+    REQUIRE(f32_storage.param_elems > 0);
+    CHECK(bf16_storage.param_elems == f32_storage.param_elems);
 
-  // THE VOLUMES. Half, exactly, on identical element counts.
-  INFO("upsampler volumes: f32 held ", f32_storage.bytes, " bytes and bf16 held ",
-       bf16_storage.bytes, ", over ", f32_storage.elems, " elements each");
-  CHECK(bf16_storage.bytes * 2 == f32_storage.bytes);
+    // THE VOLUMES. Half, exactly, on identical element counts.
+    INFO("upsampler volumes: f32 held ", f32_storage.bytes, " bytes and bf16 held ",
+         bf16_storage.bytes, ", over ", f32_storage.elems, " elements each");
+    CHECK(bf16_storage.bytes * 2 == f32_storage.bytes);
 
-  // THE PARAMETERS, which is the separate claim that `WeightView` is a VIEW and
-  // not a widened copy. The review replaced it with an owned f32 vector
-  // materialised per construction: bit-identical values, doubled and
-  // re-materialised memory, 4139 assertions green. `param_bytes` is taken off the
-  // member `WeightView::operator[]` dispatches on, so a widened copy reports the
-  // width it reads THROUGH and this ratio breaks.
-  INFO("upsampler parameters: f32 read through ", f32_storage.param_bytes,
-       " bytes and bf16 read through ", bf16_storage.param_bytes, ", over ",
-       f32_storage.param_elems, " parameters each");
-  CHECK(bf16_storage.param_bytes * 2 == f32_storage.param_bytes);
+    // THE PARAMETERS, which is the separate claim that `WeightView` is a VIEW and
+    // not a widened copy. The review replaced it with an owned f32 vector
+    // materialised per construction: bit-identical values, doubled and
+    // re-materialised memory, 4139 assertions green. `param_bytes` is taken off the
+    // member `WeightView::operator[]` dispatches on, so a widened copy reports the
+    // width it reads THROUGH and this ratio breaks.
+    INFO("upsampler parameters: f32 read through ", f32_storage.param_bytes,
+         " bytes and bf16 read through ", bf16_storage.param_bytes, ", over ",
+         f32_storage.param_elems, " parameters each");
+    CHECK(bf16_storage.param_bytes * 2 == f32_storage.param_bytes);
 
-  // AND THE ACCUMULATOR REALLY CLEARS, so the two readings above are two
-  // measurements and not one measurement plus a running total.
-  const vllm::Ltx2UpsamplerStorage drained = vllm::Ltx2TakeUpsamplerStorage();
-  CHECK(drained.volumes == 0);
-  CHECK(drained.bytes == 0);
-  CHECK(drained.param_views == 0);
-  CHECK(drained.param_bytes == 0);
+    // AND THE ACCUMULATOR REALLY CLEARS, so the two readings above are two
+    // measurements and not one measurement plus a running total.
+    const vllm::Ltx2UpsamplerStorage drained = vllm::Ltx2TakeUpsamplerStorage();
+    CHECK(drained.volumes == 0);
+    CHECK(drained.bytes == 0);
+    CHECK(drained.param_views == 0);
+    CHECK(drained.param_bytes == 0);
+  };
+
+  // The three SPATIAL arms, taken from the same constants the golden cases use so
+  // the scales are the emitted ones and not a second opinion about them. Only
+  // `Rational1p5` has `den > 1`, and it is the one that reaches `BlurDownsample`.
+  measure("PixelShuffle",
+          ReducedUpsamplerConfig(vllm_test::kLtx2UpsPixelShuffleRational,
+                                 vllm_test::kLtx2UpsPixelShuffleScale, "ltx2.ups.PixelShuffle."),
+          ReducedUpsamplerLatent());
+  measure("Rational2",
+          ReducedUpsamplerConfig(vllm_test::kLtx2UpsRational2Rational,
+                                 vllm_test::kLtx2UpsRational2Scale, "ltx2.ups.Rational2."),
+          ReducedUpsamplerLatent());
+  measure("Rational1p5",
+          ReducedUpsamplerConfig(vllm_test::kLtx2UpsRational1p5Rational,
+                                 vllm_test::kLtx2UpsRational1p5Scale, "ltx2.ups.Rational1p5."),
+          ReducedUpsamplerLatent());
+
+  // The TEMPORAL arm, whose `PixelShuffle1d` and `DropFirstFrame` volumes no
+  // spatial arm allocates.
+  measure("Temporal", TemporalUpsamplerConfig("ltx2.ups.Temporal."), TemporalUpsamplerLatent());
+
+  // And the `dims == 2` fold, whose per-frame `plane` and the `folded` output it
+  // is written back into are the file's remaining two allocation sites.
+  measure("Dims2", Dims2UpsamplerConfig("ltx2.ups.Dims2."), Dims2UpsamplerLatent());
 }
 
 TEST_CASE("ltx2 the upsampler refuses a THIRD storage width by name") {

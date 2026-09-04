@@ -117,18 +117,27 @@
 //   f32   The CPU parity arm every committed golden was measured against, kept
 //         because the algorithm gate compares against upstream run in float32.
 //
-// The storage really is the width: `Volume` holds bytes at `dtype`, not an f32
-// buffer of narrowed values, and that sentence is MEASURED rather than asserted
-// -- `Ltx2UpsamplerStorage` below is the observable, because a build that keeps
-// every dtype field correct and sizes every buffer by `sizeof(float)` passes
-// every value gate and every dtype counter in this tree. Six rounding rules
-// separate the two arms and each
-// was measured against the executed module rather than read off it -- the
-// GroupNorm affine's single rounding, the f32 epsilon, SiLU's single rounding,
-// the residual add that rounds BEFORE the activation, the blur kernel's
-// registered buffer, and `PerChannelStatistics`' narrowed buffers and two
-// roundings. .agents/specs/ltx25-a24-upsampler-bf16.md section 3 tabulates them
-// with the alternative each rejects and a separating count.
+// The storage really is the width: every intermediate buffer holds bytes at
+// `dtype` rather than f32 bytes carrying narrowed values, and that sentence is
+// MEASURED rather than asserted -- `Ltx2UpsamplerStorage` below is the
+// observable, because a build that keeps every dtype field correct and sizes
+// every buffer by `sizeof(float)` passes every value gate and every dtype
+// counter in this tree.
+//
+// The measurement is taken PER ARM, because one arm does not reach one file: it
+// runs the three spatial arms, the temporal arm and the `dims == 2` fold, which
+// between them allocate every buffer this stage allocates. The spatial arm alone
+// reaches neither the anti-aliasing blur -- only a rational scale with `den > 1`
+// does -- nor the two buffers of the `dims == 2` fold, and a widening confined to
+// the blur was built and run green against a single-arm version of the gate.
+//
+// Six rounding rules separate the two arms, and each was measured against the
+// executed module rather than read off it -- the GroupNorm affine's single
+// rounding, the f32 epsilon, SiLU's single rounding, the residual add that
+// rounds BEFORE the activation, the blur kernel's registered buffer, and
+// `PerChannelStatistics`' narrowed buffers and two roundings.
+// .agents/specs/ltx25-a24-upsampler-bf16.md section 3 tabulates them with the
+// alternative each rejects and a separating count.
 //
 // The FP8 and NVFP4 arms are A22 and are refused by name. There is no CUDA arm:
 // this file has no queue and no `vt::` kernel seam, so a device arm is a

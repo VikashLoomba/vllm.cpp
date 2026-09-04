@@ -199,6 +199,16 @@ class WeightView {
   const std::vector<uint16_t>* bf16_ = nullptr;
 };
 
+// AND THE VIEW IS A VIEW BY CONSTRUCTION, not only by what it reports.
+// `RecordParamBytes` dispatches on `read_width()`, which reads the same member
+// `operator[]` reads -- so the counter catches a widened copy that reports
+// honestly, and a mutation that edited BOTH lines together would defeat it. That
+// is not a limit of this process, it is a limit of one instrument, and the shape
+// it misses is exactly the shape a size closes: an owned copy has storage, and
+// storage is bytes. Two pointers is what a view costs.
+static_assert(sizeof(WeightView) == 2 * sizeof(void*),
+              "WeightView must be a VIEW: two pointers and no owned storage");
+
 WeightView W(const Ltx2VaeWeights& weights, const std::string& name) {
   return WeightView(weights, name);
 }

@@ -2022,6 +2022,194 @@ def section_video_encoder(out) -> None:
     emit_f32(out, "kLtx2VideoEncCausalGolden", base.numpy())
 
 
+# Section 6-bf16 — VideoEncoder at the arm upstream actually runs (A24 wave 4,
+# row LTX25-A24-LEAVES-BF16, issue #2850).
+#
+# THE BLOCK LIST IS CHOSEN SO ONE RULE IS NOT MUTED. `SpaceToDepthDownsample`'s
+# skip is a group mean over `group_size = in_channels * prod(stride) //
+# out_channels` (sampling.py:23, 50-51), and a TWO-element mean is exact in any
+# order, so a fixture that only reaches `group_size == 2` gates that rule at zero.
+# Section 6a's blocks both land on 2. `compress_all_res` with multiplier 2 gives
+# `8 * 8 // 16 = 4`, which is where the rule is first-order.
+#
+# NO `attn` BLOCK, DELIBERATELY. At bf16 the VAE attention is served by FLASH and
+# is 37-38% of words from MATH (section 5e's header), so an attention block here
+# would drag that whole unresolved question into a case about three unrelated
+# rules. `AttnBlock3d` is SHARED with the decoder and is already gated by
+# section 5e; nothing about it is encoder-specific.
+VIDEO_ENC_BF16_BLOCKS = [
+    ("res_x", {"num_layers": 1}),
+    ("compress_all_res", {"multiplier": 2}),
+]
+VIDEO_ENC_BF16 = dict(
+    convolution_dimensions=3,
+    in_channels=3,
+    out_channels=8,
+    patch_size=2,
+)
+# 3 frames satisfies 1 + 2k for this block list's single temporal step.
+VIDEO_ENC_BF16_INPUT = (1, 3, 3, 8, 8)
+
+
+def section_video_encoder_bf16(out) -> None:
+    import torch
+
+    from ltx_core.model.video_vae import sampling as _vae_sampling
+    from ltx_core.model.video_vae import ops as _vae_ops
+    from ltx_core.model.video_vae.enums import LogVarianceType, NormLayerType, PaddingModeType
+    from ltx_core.model.video_vae.video_vae import VideoEncoder
+
+    def _fresh():
+        enc = VideoEncoder(
+            encoder_blocks=VIDEO_ENC_BF16_BLOCKS,
+            norm_layer=NormLayerType.PIXEL_NORM,
+            latent_log_var=LogVarianceType.UNIFORM,
+            encoder_spatial_padding_mode=PaddingModeType.ZEROS,
+            **VIDEO_ENC_BF16,
+        ).eval()
+        fill_from_stream(enc, prefix="ltx2.videoencbf16.")
+        return enc
+
+    enc_f32 = _fresh()
+    manifest = fill_from_stream(enc_f32, prefix="ltx2.videoencbf16.")
+    frames_f32 = make_input("ltx2.videoencbf16.input", VIDEO_ENC_BF16_INPUT, 1.0)
+
+    # THE GROUP SIZE IS ASSERTED, NOT ASSUMED. It is the whole reason this block
+    # list exists, and a later edit that changed a multiplier would otherwise mute
+    # section 4.1's rule in silence.
+    group_sizes = [
+        m.group_size for m in enc_f32.modules() if isinstance(m, _vae_sampling.SpaceToDepthDownsample)
+    ]
+    assert group_sizes and max(group_sizes) >= 4, (
+        f"this fixture must reach a group_size of at least 4 or the group-mean rule is "
+        f"gated at zero; it reaches {group_sizes}"
+    )
+
+    y_f32 = enc_f32(frames_f32)
+
+    enc = _fresh().to(torch.bfloat16)
+    frames = frames_f32.to(torch.bfloat16)
+    y = enc(frames)
+    assert y.dtype == torch.bfloat16, f"the bf16 arm returned {y.dtype}"
+
+    # HOW FAR THE bf16 ARM SITS FROM THE f32 ONE on the same fixture. The C++ side
+    # requires the port's bf16 output to be CLOSER to this golden than this
+    # distance, so "the port just ran the f32 arm" is a red rather than a pass.
+    arm_gap = float((y.float() - y_f32).abs().max())
+    assert arm_gap > 0, (
+        "the bf16 arm is bit-identical to the f32 arm on this fixture, so the golden "
+        "gates nothing"
+    )
+
+    # ── DEFECT A: the per-channel statistics kept f32 through `normalize`.
+    # This is what the port did before this row. ops.py:81-84 applies `.to(x)` to
+    # both registered buffers.
+    #
+    # THE f32 BUFFERS ARE CAPTURED BEFORE ANY CAST, and the first form of this
+    # probe was not. `.to(torch.bfloat16)` narrows a registered buffer IN PLACE,
+    # so a `.float()` taken after it returns the ALREADY-NARROWED value, both
+    # hypotheses become the same tensor and the probe reports a defect of exactly
+    # zero. This generator's own assert caught it. It is the same trap wave 3's
+    # implementer and BOTH its reviewers hit, recorded there under section 4.4.
+    _mean_f32 = enc_f32.per_channel_statistics.get_buffer("mean-of-means").clone().float()
+    _std_f32 = enc_f32.per_channel_statistics.get_buffer("std-of-means").clone().float()
+    assert _mean_f32.dtype == torch.float32 and _std_f32.dtype == torch.float32
+    # ...and the capture is only worth anything if the values are OFF the bf16
+    # grid. `param_values` draws them from the shared stream, so they are, but a
+    # later change to that rule could put them on it and mute this defect in
+    # silence.
+    _off_grid = int(((_mean_f32.bfloat16().float() != _mean_f32).sum()
+                     + (_std_f32.bfloat16().float() != _std_f32).sum()))
+    assert _off_grid > 0, (
+        "every per-channel statistic on this fixture is exactly representable in "
+        "bfloat16, so narrowing them is a no-op and this defect cannot separate"
+    )
+    _orig_norm = _vae_ops.PerChannelStatistics.normalize
+
+    def _bad_norm(self, x):
+        mean = _mean_f32.view(1, -1, 1, 1, 1)
+        std = _std_f32.view(1, -1, 1, 1, 1)
+        return ((x.float() - mean).to(x.dtype).float() / std).to(x.dtype)
+
+    _vae_ops.PerChannelStatistics.normalize = _bad_norm
+    try:
+        defect_stats = float((y.float() - _fresh().to(torch.bfloat16)(frames).float()).abs().max())
+    finally:
+        _vae_ops.PerChannelStatistics.normalize = _orig_norm
+
+    # ── DEFECT B: the group mean carried UNROUNDED across the skip add.
+    # The add's own width separates nothing at any scale; the rounding point is
+    # the STORE. This monkeypatch reproduces upstream's forward exactly except for
+    # that one point, so what it measures is the rounding and not the arithmetic.
+    _orig_s2d = _vae_sampling.SpaceToDepthDownsample.forward
+
+    def _bad_s2d(self, x, causal: bool = True):
+        from einops import rearrange
+
+        if self.stride[0] == 2:
+            x = torch.cat([x[:, :, :1, :, :], x], dim=2)
+        x_in = rearrange(
+            x, "b c (d p1) (h p2) (w p3) -> b (c p1 p2 p3) d h w",
+            p1=self.stride[0], p2=self.stride[1], p3=self.stride[2],
+        )
+        x_in = rearrange(x_in, "b (c g) d h w -> b c g d h w", g=self.group_size)
+        x_in = x_in.float().mean(dim=2)  # <-- the defect: no rounding here
+        x = self.conv(x, causal=causal)
+        x = rearrange(
+            x, "b c (d p1) (h p2) (w p3) -> b (c p1 p2 p3) d h w",
+            p1=self.stride[0], p2=self.stride[1], p3=self.stride[2],
+        )
+        return (x.float() + x_in).to(x.dtype)
+
+    _vae_sampling.SpaceToDepthDownsample.forward = _bad_s2d
+    try:
+        defect_mean = float((y.float() - _fresh().to(torch.bfloat16)(frames).float()).abs().max())
+    finally:
+        _vae_sampling.SpaceToDepthDownsample.forward = _orig_s2d
+
+    # The chain's response to ONE last bit, which is the irreducible term and is
+    # what justifies the ABSENCE of a value tolerance rather than standing in for
+    # one.
+    _d = _fresh().to(torch.bfloat16)
+    with torch.no_grad():
+        _flat = dict(_d.named_parameters())["conv_in.conv.weight"].reshape(-1)
+        _w = _flat[0].view(torch.int16).item()
+        _flat[0] = torch.tensor([_w + 1], dtype=torch.int16).view(torch.bfloat16)[0]
+    ulp_sensitivity = float((y.float() - _d(frames).float()).abs().max())
+
+    print(f"[bf16 encoder] arm gap {arm_gap:g}; defects: f32 statistics {defect_stats:g}, "
+          f"unrounded group mean {defect_mean:g}; one-ulp sensitivity {ulp_sensitivity:g}",
+          file=sys.stderr)
+    assert defect_stats > 0, "the f32-statistics defect moved nothing, so the case gates it at zero"
+    assert defect_mean > 0, "the unrounded-group-mean defect moved nothing, so the case gates it at zero"
+    assert ulp_sensitivity > 0, (
+        "the one-ulp sensitivity probe moved nothing, so it cannot support the claim "
+        "that this arm has an irreducible term"
+    )
+
+    out.write("// --- section 6e: the BF16 arm of VideoEncoder (A24 wave 4, #2850) ---\n")
+    emit_scalar(out, "kLtx2VideoEncBf16InC", VIDEO_ENC_BF16_INPUT[1])
+    emit_scalar(out, "kLtx2VideoEncBf16InT", VIDEO_ENC_BF16_INPUT[2])
+    emit_scalar(out, "kLtx2VideoEncBf16InH", VIDEO_ENC_BF16_INPUT[3])
+    emit_scalar(out, "kLtx2VideoEncBf16InW", VIDEO_ENC_BF16_INPUT[4])
+    emit_scalar(out, "kLtx2VideoEncBf16OutC", y.shape[1])
+    emit_scalar(out, "kLtx2VideoEncBf16OutT", y.shape[2])
+    emit_scalar(out, "kLtx2VideoEncBf16OutH", y.shape[3])
+    emit_scalar(out, "kLtx2VideoEncBf16OutW", y.shape[4])
+    emit_scalar(out, "kLtx2VideoEncBf16GroupSize", max(group_sizes))
+    out.write("inline constexpr double kLtx2VideoEncBf16ArmGap = "
+              + _cxx_float(arm_gap, 9) + ";\n")
+    out.write("inline constexpr double kLtx2VideoEncBf16DefectStats = "
+              + _cxx_float(defect_stats, 9) + ";\n")
+    out.write("inline constexpr double kLtx2VideoEncBf16DefectGroupMean = "
+              + _cxx_float(defect_mean, 9) + ";\n")
+    out.write("inline constexpr double kLtx2VideoEncBf16UlpSensitivity = "
+              + _cxx_float(ulp_sensitivity, 9) + ";\n\n")
+    emit_manifest(out, "kLtx2VideoEncBf16Param", manifest)
+    emit_f32(out, "kLtx2VideoEncBf16Golden", y.float().numpy())
+
+
+
 def section_audio_encoder(out) -> None:
     from ltx_core.model.audio_vae.attention import AttentionType
     from ltx_core.model.audio_vae.audio_vae import AudioEncoder
@@ -2528,6 +2716,7 @@ def main() -> int:
         section_video_vae_bf16_kernels(out)
         section_conv_video_decoder_bf16_shallow(out)
         section_video_encoder(out)
+        section_video_encoder_bf16(out)
         section_audio_encoder(out)
         section_audio_mel(out)
         section_conditioning(out)

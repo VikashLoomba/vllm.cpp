@@ -49,22 +49,47 @@
 //    stride is applied, so the output frame count is
 //    `(T + k_t - 1 - k_t) / stride + 1`.
 //
-// ─── DTYPE: f32, AND IT IS NO LONGER OWED "WITH THE DECODER'S" ──────────────
-// f32 throughout, where upstream runs the encoder in the CHECKPOINT's dtype --
-// it is `ImageConditioner`'s VideoEncoder and upstream constructs it with the one
-// pipeline dtype (distilled.py:120-122). No gate here can catch a dtype that is
-// merely too WIDE, because the generator casts every upstream parameter to f32
-// and the oracle therefore runs f32 too.
+// ─── DTYPE: f32 AND bf16, WHICH IS THE ONE UPSTREAM RUNS ────────────────────
+// Upstream resolves ONE pipeline dtype -- `self.dtype = torch.bfloat16`
+// (distilled.py:109) -- and `ImageConditioner` is constructed with it at
+// `:120-125`, which builds this encoder with it (utils/blocks.py:985-986). A24
+// wave 4 (row LTX25-A24-LEAVES-BF16, issue #2850) landed that arm. The f32 arm
+// stays because it is the parity reference every committed golden is measured
+// against; `Ltx2ConvVideoEncode`'s ENTRY refuses a third width by name -- with a
+// message of its own rather than `RequireVaeDType`'s shared one, because
+// `VaeStore::Alloc` emits that same text further down and a gate asserting it
+// cannot tell the two sites apart. The FP8 and NVFP4 arms are A22.
 //
-// THIS BLOCK USED TO SAY "the production arm is owed with the decoder's", AND
-// THAT SENTENCE IS NOW FALSE. A24 wave 3 (row LTX25-A24-VIDEO-VAE-BF16, issue
-// #2786) landed the DECODER's bf16 arm and deliberately did not land this one:
-// the encoder is a separate route with a separate weights bag, the render loads
-// it through its own `Ltx2LoadVaeWeights` call at the f32 default, and the two
-// halves share one kernel table whose `dtype` parameter lets them differ. The
-// encoder's bf16 arm is owed by NAME under `## Owed` in
-// .agents/specs/ltx25-a24-video-vae-bf16.md, with its own upstream anchors, and
-// not by a cross-reference to a row that has already shipped.
+// THE ENTRY NARROWING IS NOT WHERE THE DECODER'S IS, and the difference is
+// load-bearing rather than incidental. `ConvVideoDecoder.forward` casts its
+// latent to the weights' dtype on entry (conv_video_decoder.py:283-284). This
+// module's `forward` casts NOTHING (video_vae.py:264-336): the pixels arrive
+// already bf16, because `load_image_and_preprocess(..., dtype=dtype, ...)` builds
+// them at the pipeline dtype and hands them straight to `video_encoder(image)`
+// (utils/helpers.py:285-294). So the port rounds once at the boundary, through
+// `VaeStore::Upload`, before any arithmetic.
+//
+// THREE RULES ARE THIS MODULE'S OWN and none of them transferred from wave 3.
+// Each was EXECUTED against the pinned modules with the rejected hypothesis
+// emitted beside upstream's answer; the tables are in
+// .agents/specs/ltx25-a24-leaves-bf16.md section 4.
+//  * `SpaceToDepthDownsample`'s group mean is a WIDENED accumulate with one
+//    rounding on the store (sampling.py:50-51). A sequential bf16 accumulate is
+//    72-145 of 256 wrong at group_size 4 and 8; at group_size 2 NOTHING
+//    separates, because a two-element mean is exact in any order.
+//  * The skip ADD separates nothing at any scale down to 2^-14 -- but carrying
+//    the group mean UNROUNDED across it is 18-24% of the block. The rounding
+//    point is the store, not the operator.
+//  * `PerChannelStatistics.normalize` narrows BOTH registered buffers before the
+//    subtract and the divide (ops.py:81-84). Keeping them f32, which is what this
+//    port did until wave 4, is 39-47% of the returned latent.
+//
+// NO GATE OVER THE LATENT'S VALUES CAN SEE ANY OF THIS. `Ltx2LatentVolume::data`
+// is a `std::vector<float>` on either arm, and the goldens the generator emits
+// run f32 on both sides because `fill_from_stream` casts every upstream
+// parameter to f32. The width is gated on the RENDER path instead, by
+// `vae_encode_not_bf16` / `vae_encode_in_not_bf16`
+// (multimodal/ltx2_video.cpp, `encode_conditioning_image`).
 #pragma once
 
 #include <cstdint>

@@ -124,7 +124,7 @@ std::vector<int32_t> ApplyPromptReplacements(
     }
 
     // Matches are EXCLUSIVE: the next search for EVERY rule starts past this
-    // match, which is upstream's `prev_end_idx` (`:809`, `:888`).
+    // match, which is upstream's `prev_end_idx` (`:811`, `:889`).
     prev_end = best_start + static_cast<int>(u.target.size());
     ++next[static_cast<std::size_t>(best_rule)];
   }

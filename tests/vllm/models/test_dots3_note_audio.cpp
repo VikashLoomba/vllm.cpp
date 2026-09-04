@@ -3267,7 +3267,7 @@ TEST_CASE("dots3-note W8a: an item the prompt has no target for is REFUSED BY NA
   // The one outcome that produces a fluent WRONG answer: the encoder never runs
   // for the dropped item, the placeholder run is never written, and the prompt
   // reads as if the user had not sent that media. Upstream reaches the same
-  // conclusion through `_all_items_found` (`processor.py:930-941` @
+  // conclusion through `_all_items_found` (`processor.py:896-903` @
   // `9035151d6`).
   const std::vector<std::int32_t> one_target{
       dots3_tiny::kImgStartId, dots3_tiny::kImgPadId, dots3_tiny::kImgEndId};

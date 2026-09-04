@@ -7275,8 +7275,9 @@ targets. Both dots3-note rules are REPLACE with a non-empty three-id target, and
 on that subset the planner reduces exactly to: repeatedly find, for each
 modality queue that still has items, the FIRST occurrence of its target at or
 after `prev_end_idx`; apply the earliest match, breaking a tie by the modality's
-position in the list (`min(..., key=lambda item: (item[1], _next_priority(...)))`,
-`:875-879`); set `prev_end_idx` to that match's end. `ApplyPromptReplacements`
+position in the list (`min(..., key=lambda item: (item[1], _next_priority(item[0])))`
+at `:871-874`, over the queue priority `_next_priority` returns at `:794-797`);
+set `prev_end_idx` to that match's end. `ApplyPromptReplacements`
 (`src/vllm/multimodal/processing/processor.cpp`) is that reduction, and the
 narrowing is recorded in the header rather than implied: an INSERT-mode rule and
 an empty target are refused BY NAME, because a port that silently treated them
@@ -7300,7 +7301,7 @@ upstream's:
 What is NOT relaxed is the item count. If a rule's items are not all consumed by
 the end of the pass, `ApplyPromptReplacements` throws BY NAME with the modality,
 the count found and the count expected. Upstream reaches the same conclusion
-through `_all_items_found` (`processing/processor.py:930-941`); dropping an item
+through `_all_items_found` (`processing/processor.py:896-903`); dropping an item
 silently is the one outcome that produces a fluent wrong answer.
 
 #### 4.18.4 The ORDER of `mm_features` is load-bearing, and it is the stream's
@@ -7380,8 +7381,15 @@ byte-for-byte with both binaries re-hashed. Numbers are in §4.18.9.
 | M1 | keep only the FIRST feature in the seam's span loop | the three W8a served cases |
 | M2 | restore the sequential two-pass expansion (each rule applied on its own, against the ORIGINAL ids) | the mixed served case |
 | M3 | delete the entry-point route, so `MakeDots3NoteChatSeam` is never reached | every served case in the suite |
-| M4 | make `MakeTokenTripleReplacement` key on the PAD id alone instead of the target triple | the unit case that types a bare pad id into the text |
-| M5 | emit spans per MODALITY instead of in stream order | the mixed served case's span assertions |
+| M4 | make `MakeTokenTripleReplacement` key on the PAD id alone instead of the target triple, in its COHERENT form: `target = {pad_id}` **together with** `full = n pads` and `embed_offset = 0`, so the rule still describes one self-consistent replacement | the unit case that types a bare pad id into the text |
+| M5 | emit spans per MODALITY instead of in stream order, in the CHAT SEAM's span loop | the mixed served case's span assertions |
+
+Two of those rows name a PLACEMENT or a FORM, and both do so because the row
+does not reproduce without it. M4's half-form — retarget to `{pad_id}` while
+LEAVING the `[start] + pads + [end]` content — is a different and far more
+destructive mutation, because the replacement then no longer describes what it
+replaces; it is not what the recorded row measured. M5's placement is the
+subject of §4.18.9's correction below.
 
 #### 4.18.9 Evidence
 
@@ -7467,11 +7475,47 @@ That is a stronger red than the one #2860 predicted, and it also shows the
 single-modality cases survive M2 (27 of 28 pass): chaining is only wrong when
 more than ONE rule runs, which is exactly §4.18.1's claim.
 
-**M5 AS FIRST WRITTEN DID NOT RED, and it was an inert mutation rather than a
-gate hole.** It sorted the spans ASCENDING by modality name, and `"audio" <
-"image"` is already the stream order on every case in the suite, so the sort
-was a no-op. Recorded because a mutation that never applies reads exactly like
-a mutation the tests survived. M5b sorts DESCENDING and reorders for real.
+**The M5 correction below and the MN1 paragraph at the end carry a SECOND
+measurement, taken while repairing this slice's fresh review and not by the wave
+itself.** It ran in its own `/dev/shm` build tree configured
+`-DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_BUILD_EXAMPLES=OFF -DVLLM_CPP_SERVER=OFF
+-DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`, which is why its green
+`test_dots3_note_audio` hashes `54fc6dc7…` where the wave's, built with the
+server on, hashes `ea48d56c…`. The CASE and ASSERTION counts agree on both — 28
+/ 4206 — and that is the axis the mutations are read on; the hashes are there
+only to prove that each mutated binary really differed and that the tree came
+back. The served suite needs the server and was not rebuilt for these two, so
+every served-suite number in this section stays the wave's.
+
+**M5 AS FIRST WRITTEN DID NOT RED, and the inertness is a property of WHERE it
+was placed, not of the fixture data.** It sorted the spans ASCENDING by modality
+name inside the CHAT SEAM's span loop. The reason first recorded here — that
+`"audio" < "image"` is already the stream order on every case in the suite, so
+the sort was a no-op — **is false. The fresh review of this slice found it
+false, and the numbers below are the repair's own re-measurement.** Place the
+identical ascending sort one level down, on the `applied` vector inside
+`ApplyPromptReplacements` itself, and the applier suite goes RED:
+`test_dots3_note_audio` **27 / 4186 passed, 1 case and 20 assertions failed**,
+against the green `28 / 4206`, with the binary changed (`2d6a1709…` against the
+green `54fc6dc7…`) and restored to `54fc6dc7…` byte for byte afterwards. The 20
+split across the two subcases the old sentence overlooks, both of which put a
+modality out of stream order on purpose:
+
+| Subcase | assertions | failed | what it reads |
+|---|---|---|---|
+| "image FIRST, so the rule order and the stream order disagree" | 26 | **7** | the image span is at offset 1 and the audio span at 7, so the sort inverts them: `CHECK( 7 == 1 )` on the first offset, and `CHECK( 14 <= 1 )` on the ascending-and-disjoint check |
+| "two images and two audios, INTERLEAVED" | 51 | **13** | the same inversion, and it crosses the item indices too: `CHECK( item_index 1 == 0 )`, plus `CHECK( 30 <= 1 )` |
+
+Both subcases call `ApplyPromptReplacements` DIRECTLY, so the seam-level loop M5
+mutated is downstream of them and neither can reach it. What M5 as first written
+measured was therefore its own placement and not the suite's coverage, and the
+distinction is the whole point of recording an inert mutation: a mutation that
+never applies reads exactly like a mutation the tests survived, and the reason
+given for the reading is what the next reader uses to decide whether a similar
+mutation is worth running. A reason that says "the data cannot discriminate"
+retires the question; the true reason — "this instrument was placed downstream
+of the cases that discriminate" — does not. M5b sorts DESCENDING at the seam and
+reorders for real.
 
 **M5b reds only the DIRECT span assertions; the served request still answers
 200.** At two items in one step the window `[0, 16)` covers the whole prompt, so
@@ -7482,6 +7526,27 @@ LATENT at this size and the only thing gating it is the explicit
 Said plainly because the alternative is a reader assuming the served path
 proves it: it does not, and a chunked-prefill step or a third item is where it
 would start to.
+
+**ONE PORTED GUARANTEE IN THIS SLICE IS UNMEASURED, AND IT IS THE TIE-BREAK.**
+`processor.h`'s "a tie goes to the rule that appears EARLIER in `updates`" is a
+faithful port — upstream keys the choice on `(match, _next_priority(queue))`
+(`processing/processor.py:871-874` @ `9035151d6`) — but nothing here detects its
+inversion. MN1, from the fresh review of this slice and re-run by the repair:
+turn `at < best_start` into `at <= best_start` at
+`src/vllm/multimodal/processing/processor.cpp:101`, so the LAST rule wins a tie
+instead of the first. The build succeeds, the binary changes (`29f9d378…`
+against the green `54fc6dc7…`, restored byte for byte after), and
+`test_dots3_note_audio` stays **28 / 4206 fully green**; the review measured the
+served suite green under it too. **No gate is manufactured for it, because the
+case is unreachable rather than untested**: dots3-note's two rules have DISTINCT
+`[start, pad, end]` targets, and one id cannot be both start ids, so
+`at == best_start` cannot occur at this modality set. The independence reference
+cannot close it either — it shares the tie-break polarity by construction, which
+is the shared-helper failure mode this row keeps naming. What is recorded is the
+obligation this transfers: a THIRD modality whose target shares a first id with
+another's, or any rule set with two rules on the same target, makes the tie
+reachable and would otherwise inherit an unmeasured guarantee. The change that
+adds one owes the first case that can reach the tie.
 
 ---
 
@@ -8144,6 +8209,20 @@ Carried openly under option B (§6.4), not waived:
   [#2814](https://github.com/mudler/vllm.cpp/issues/2814) tracks it as shared
   work. W7c-1 narrowed this row's container message to say so, so a reader is
   no longer told that a `.mp3` is waiting on a dots3-note brick. Owner: #2814.
+- **The `include/vllm.h` MULTIMODAL REQUEST PATH — and this one is NOT owed to
+  this row either.** W8a made ONE dots3-note request carry two `mm_features`,
+  and it made none of that reachable from the C ABI. There is no `vllm_mm_*`
+  symbol, and the header says so twice in contract language
+  (`include/vllm.h:204-216`, `:288-293`): an `image_url` or `input_audio` part
+  handed to `vllm_chat` is dropped and the request is answered as text. It left
+  this row because it cannot be a dots3-note brick — `Qwen3VLForConditionalGeneration`
+  reaches its tower through `handle_chat_completions` too, so a path that served
+  only dots3-note would be a per-model ABI — and because the change owns two
+  tree-wide surfaces this row does not: `scripts/abi-capability-allowlist.txt`
+  and `scripts/check-surface-coverage.py`. It is therefore a tree-wide row of
+  its own rather than a W8 slice, and W8a's pull request deliberately carries no
+  closing keyword for it. Owner:
+  [#2862](https://github.com/mudler/vllm.cpp/issues/2862).
 - **`vt::Conv2d` has no CUDA provider, and W7a's stem composition is the
   exception that records it.** `src/vt/cpu/cpu_conv2d.cpp:111` is the only
   `RegisterOp(OpId::kConv2d, ...)` in the tree, so the shared 2-D convolution

@@ -185,7 +185,7 @@ std::map<std::string, std::optional<int>> Dots3NoteChatSupportedMmLimits(
 // (spec §4.18.1).
 //
 // The split is upstream's own. `_get_prompt_updates` computes each item's
-// replacement CONTENT (`common/processor.py:741-748` for image, `:768-776` for
+// replacement CONTENT (`common/processor.py:740-747` for image, `:768-776` for
 // audio) and hands the whole list to `apply_token_matches`, which is the only
 // thing that decides WHERE anything lands
 // (`processing/processor.py:944-957`). So each `Prepare*` below produces the

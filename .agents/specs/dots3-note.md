@@ -5427,7 +5427,7 @@ a config it still refuses by name.
 |---|---|---|
 | ~~audio longer than `chunk_seconds` (60 s = 960000 samples)~~ | **LIFTED by W7b (§4.15)** | was `Dots3NoteAudioProcessor`; the segment loop replaced it, and what stands in its place is the §4.15.3 geometry refusal |
 | any container but PCM16 mono RIFF/WAVE | **W7c** | the route, before decode |
-| any sampling rate but `audio_config.sampling_rate` (16000) | **W7c** | the route, before the front end |
+| ~~any sampling rate but `audio_config.sampling_rate` (16000)~~ | **LIFTED by W7c-2 (§4.17)** | was `Dots3NoteAudioProcessor::ProcessWaveform`; `ResampleAudioScipy` stands in its place, and what is refused there now is upstream's own `pyav` arm |
 | `use_causal == true` | unshipped arm | `ParseDots3NoteAudioParams`, at INSTALL |
 | `use_conv1d_stem` (`use_conv2d_stem == false`) | unshipped arm | same |
 | `use_latent_input == true` | unshipped arm | same |
@@ -6524,6 +6524,692 @@ the tree was rebuilt and both binaries hashed again: `1814f302…` and
 would mean the restore was not byte-for-byte.
 
 
+### 4.17 W7c-2 RESAMPLES a non-16 kHz WAV, by upstream's own scipy arm
+
+**Issue: [#2828](https://github.com/mudler/vllm.cpp/issues/2828). Brick: W7c-2,
+the SAMPLE-RATE half of W7c.** W7c-1 (§4.16) served a multi-channel WAV and was
+an exact mirror of a two-line reduction. This half cannot be, and the two were
+split so that this one does not borrow that one's credibility.
+
+Before this slice, a PCM16 WAV whose `fmt ` chunk named any rate other than
+`audio_config.sampling_rate` was refused with HTTP 400 by
+`Dots3NoteAudioProcessor::ProcessWaveform`. After it, the waveform is resampled
+to the checkpoint's rate and served, and what the tower sees is
+`scipy.signal.resample_poly` at its own defaults over the gcd-reduced ratio.
+
+#### 4.17.1 Why this is a RECORDED DIVERGENCE and not a mirror
+
+Upstream's chain at `9035151d6`, read in `~/_git/vllm`
+(`git rev-parse 9035151d6` = `9035151d6c9fb726181469f9e6aa9ccbf9a5dacb`;
+`git rev-parse HEAD` = `5559679229bc961848b121ccdeaa8fa5d79bec98`, the parity
+pin, which carries no `dots3_note` at all):
+
+| Stage | What runs | `file:line@9035151d6` |
+|---|---|---|
+| the model selects the target rate | `MultiModalDataParser(target_sr=..., target_channels=1)` | `vllm/models/dots3_note/common/processor.py:523-525` |
+| the parser resamples | `self._audio_resampler.resample(...)` | `vllm/multimodal/parse.py:695` |
+| the resampler's DEFAULT method | `method: Literal["pyav", "scipy", "soxr"] = "pyav"` | `vllm/multimodal/audio.py:283`, dispatch at `:305-316` |
+| what `pyav` is | `av.AudioResampler` — **libswresample** through PyAV/FFmpeg | `vllm/multimodal/audio.py:174-229` |
+
+**libswresample is not bit-identical to itself.** #2828 measured this, and this
+slice REPRODUCED it rather than relaying it — ffmpeg 6.1.1-3ubuntu5, one binary,
+one input, differing only in CPU dispatch:
+
+```text
+ffmpeg -i in.wav -af aresample=16000 -c:a pcm_f32le a.wav
+ffmpeg -cpuflags 0 -i in.wav -af aresample=16000 -c:a pcm_f32le b.wav
+```
+
+| Run | `identical` | differing samples | worst \|delta\| |
+|---|---|---|---|
+| #2828's | False | 24691 / 32000 | 9.686e-08 |
+| this slice's, on its own 2 s three-tone probe | **False** | **19846 / 32000** | **2.980e-07** |
+
+The counts differ because the probe signals do; the fact does not, and it is the
+fact the decision rests on.
+
+A bit-exact gate against upstream's default is therefore impossible **in
+principle** and not merely inconvenient. Two further facts point the same way:
+its option defaults come from an unpinned linked binary (`av` appears at the pin
+only in `requirements/test/cpu.txt`, a TEST lockfile, and PyAV bundles its own
+FFmpeg), and the `cutoff` swr auto-resolves is not readable from outside the
+source.
+
+**This is the opposite of W6c's precedent, and W6c argues for the split rather
+than against it.** PIL's bicubic WAS portable because `Resample.c` is ~200 lines
+of documented filter maths over a fixed-point intermediate with exactly one
+answer, and §4.13 gated it at 0 of 255 worst absolute difference. libswresample
+is float, SIMD-dispatched and option-defaulted. W6c argues FOR porting a
+documented filter and AGAINST pretending swresample is one.
+
+#### 4.17.2 What is implemented instead, and why that is still upstream
+
+**`resample_audio_scipy`** (`vllm/multimodal/audio.py:232-250 @ 9035151d6`).
+This is not an invented divergence. It is **another arm of upstream's own
+switch**, and vLLM already ships that arm in production for another model:
+`vllm/model_executor/models/phi4mm.py:580 @ 9035151d6` passes
+`audio_resample_method="scipy"`. The `pyav` default is refused here
+permanently, for the reason above, and the refusal names it.
+
+**The distance from the real default is measured and recorded here so nobody
+re-derives it — AND SO THAT NOBODY QUOTES IT WITHOUT ITS PROBE.** #2828 records
+scipy at 51.36 dB from libswresample, soxr at 46.59 and torchaudio at 26.72, on
+"band-limited content". This slice re-measured all three against ffmpeg 6.1.1 at
+44100 -> 16000, interior only (2000 samples trimmed from each end), and the
+ordering holds — but **only on content that reaches the OUTPUT Nyquist**, and
+that qualifier is load-bearing:
+
+| Probe (2 s at 44100) | scipy | soxr | torchaudio |
+|---|---|---|---|
+| 0 -> 7500 Hz sweep | **51.78 dB** | 44.63 | 29.02 |
+| noise band-limited to 7500 Hz | **37.47 dB** | 28.19 | 27.08 |
+| noise band-limited to 4000 Hz | 61.22 | **96.45** | 62.84 |
+| three tones at 440 / 1234 / 3000 Hz | 62.72 | **93.84** | 70.12 |
+
+The first row reproduces #2828's three numbers to within about 2 dB, so
+"band-limited content" there means content that FILLS the band up to the new
+Nyquist, not content sitting well below it. **On content well below the
+transition band the ordering INVERTS and soxr wins by 30 dB**, because a
+resampler's transition band cannot matter where there is no energy in it. A
+speech encoder sees the first kind. Quoting 51.36 without the probe would make a
+signal-dependent measurement read as a property of the algorithms.
+
+**Do NOT reuse `Ltx2ResampleWaveform`**
+(`src/vllm/model_executor/models/ltx2_audio_vae.cpp:1151`, landed by
+[#2583](https://github.com/mudler/vllm.cpp/issues/2583)). It is a genuine
+polyphase resampler and it is the tempting reuse. It is ~25 dB FURTHER from this
+oracle on exactly the content a speech encoder sees, because torchaudio's
+defaults are a short kernel (`lowpass_filter_width=6`, a Hann window) against
+swr's 32-tap kaiser-9. **This slice measured that gap rather than repeating it:
+22.8 dB on the 0 -> 7500 Hz sweep (51.78 against 29.02) and 10.4 dB on
+band-limited noise**, which is #2828's ~25 dB confirmed. Reaching for it would
+trade a 51.78 dB answer for a 29.02 dB one and would look like a simplification.
+It is not one, and this paragraph exists so the next reader does not make it.
+
+**And the same caveat applies in the other direction.** On the three-tone probe
+torchaudio scores 70.12 dB and BEATS scipy, because the short kernel's poor
+transition band never gets exercised. A reviewer who reaches for
+`Ltx2ResampleWaveform` and validates it on a low-frequency tone will find it
+excellent. The table above is why that would be the wrong probe.
+
+#### 4.17.3 The algorithm, stated exactly, and VERIFIED against scipy's source
+
+A divergence has to name what it does. `resample_poly(x, up, down)` at defaults,
+read in the installed **scipy 1.17.1**
+(`scipy/signal/_signaltools.py::resample_poly`), not transcribed from the issue:
+
+1. `up = target_sr // gcd`, `down = orig_sr // gcd` — upstream's own reduction
+   (`audio.py:244-249`). `resample_poly` then reduces AGAIN by
+   `math.gcd(up, down)`, which is a no-op on an already reduced pair.
+2. `n_out = ceil(n_in * up / down)`, written upstream as
+   `n_out = n_in * up; n_out = n_out // down + bool(n_out % down)`.
+3. `max_rate = max(up, down)`; `f_c = 1 / max_rate`; `half_len = 10 * max_rate`;
+   `h = firwin(2 * half_len + 1, f_c, window=("kaiser", 5.0))`.
+4. `h *= up`.
+5. `n_pre_pad = down - (half_len % down)`;
+   `n_pre_remove = (half_len + n_pre_pad) // down`; `n_post_pad` is grown until
+   `_output_len(len(h) + n_pre_pad + n_post_pad, n_in, up, down) >= n_out +
+   n_pre_remove`, where `_output_len(lh, n, up, down) = ((n-1)*up + lh - 1)
+   // down + 1`. `h` is zero-padded on both sides by those amounts.
+6. `y = upfirdn(h, x, up, down)[n_pre_remove : n_pre_remove + n_out]`.
+
+`firwin` at these arguments (`scipy/signal/_fir_filter_design.py::firwin`,
+`fs=None -> 2`, `nyq = 1`, `pass_zero=True`, `scale=True`) reduces to a single
+low-pass band `[0, f_c]`, `pass_nyquist` false, so with
+`alpha = half_len` and `m = arange(numtaps) - alpha`:
+
+```text
+h[i] = f_c * sinc(f_c * m[i]) * kaiser(numtaps, 5.0)[i],  then h /= sum(h)
+```
+
+The `scale` step's `scale_frequency` is `0.0` because the first band's left edge
+is 0, so `c = cos(0) = 1` and the normalizer is the plain sum. The window is
+`scipy.signal.windows.kaiser(numtaps, 5.0, sym=True)`, which is
+`i0(beta * sqrt(1 - ((n - alpha)/alpha)^2)) / i0(beta)`.
+
+`upfirdn(h, x, up, down)` is the decimation by `down` of the convolution of `h`
+with `x` zero-stuffed by `up`, so
+
+```text
+y[i] = sum_j h[i*down - j*up] * x[j]   over every j with 0 <= i*down - j*up < len(h)
+```
+
+which the port evaluates over `j` in `[ceil((i*down - len(h) + 1)/up),
+floor(i*down/up)]` — about `len(h)/up` terms — rather than over the whole
+filter.
+
+**This transcription was CHECKED against scipy rather than trusted.** A
+standalone reimplementation of exactly the six steps above, with `i0` as its own
+power series `sum_k (x^2/4)^k / (k!)^2`, was run against
+`scipy.signal.resample_poly` on `float64` random input for all four rate pairs
+this slice gates. Worst `|ours - scipy|` was **6.7e-16 to 1.3e-15** in `double`,
+and **0.0** after narrowing both sides to `float32`, at signal scales of 1.8 to
+4.1. That is what makes the C++ below a port and not a guess, and the script
+that measured it is committed as `scripts/gen-dots3-resample-golden.py`.
+
+#### 4.17.4 The type the arithmetic is done in
+
+`ResampleAudioScipy` takes `float` samples, **designs the filter and accumulates
+the convolution in `double`, and narrows once to `float`** at the store.
+
+Upstream's arm narrows earlier: `resample_poly` does `h = xp.asarray(h,
+dtype=x.dtype)` BEFORE `h *= up`, so a `float32` input — which is what
+`soundfile.read(dtype="float32")` hands it — gets a `float32` filter and a
+`float32` accumulation. This port deliberately does not mirror that, and the
+reason is that mirroring it is not reproducible: a `float32` accumulation over
+the ~56 taps each output sample touches at 44100 -> 16000 depends on summation
+order and on whether the compiler contracts a multiply-add, neither of which is
+fixed across the platforms this tree builds on. The `double` arm is order-stable
+to ~1e-16 relative, which is invisible after the narrowing store.
+
+So the claim this slice makes is bounded, and it is this: **the port equals
+`scipy.signal.resample_poly` on a `float64` input, narrowed to `float32`, within
+a measured tolerance.** It does NOT claim bit-identity with scipy's own
+`float32` arm, and it does not claim anything at all about libswresample beyond
+the probe-qualified distances recorded in §4.17.2.
+
+**SAY HOW BIG THAT GAP IS, because it is LARGER THAN THE GATE'S OWN TOLERANCE.**
+A reader who is told only that bit-identity is not claimed will infer the
+difference sits inside `kResampleTol`. It does not.
+`|scipy's real float32 arm − the committed float64 golden|`, both narrowed to
+`float32`, measured on scipy 1.17.1 / numpy 2.3.5:
+
+| Case | \|f32 arm − golden\| | against `kResampleTol` = 1.2e-7 |
+|---|---|---|
+| `Wav44100` | 2.384e-07 | **over** |
+| `Wav48000` | 2.384e-07 | **over** |
+| `Wav22050` | 1.788e-07 | **over** |
+| `Wav8000` | 1.192e-07 | under, by 0.7% |
+| `Alias44100` | 1.788e-07 | **over** |
+
+So "just mirror the cast" is not a free repair: narrowing the arithmetic to
+`float32` the way `resample_poly` does REDS this gate on four of the five
+goldens, and it would red it for the reason §4.17.4 gives rather than for a
+defect. Anyone who reaches for that change has to regenerate the goldens from
+the `float32` arm in the same commit.
+
+**A PARTIAL mirror is worse than either, and it stays green.** Narrowing only
+the taps to `float` and leaving the accumulation in `double` moves the answer
+5.96e-08 on four cases and 2.98e-08 on `Alias44100` — under the tolerance
+everywhere, so the gate would accept it silently. That is not an argument for
+the tolerance being loose. It is what "the gate is a BOUND, not an equality"
+means: 1.2e-7 is two `float` ulps at the fixtures' peak, and every arithmetic
+that lands inside it is a legitimate one. The defects the gate exists to catch
+are orders above it, and §4.17.11's difference table is what says so.
+
+#### 4.17.5 The seam, and why it is opted into PER MODEL
+
+`vllm::multimodal::ResampleAudioScipy` is a shared seam in new files
+(`include/vllm/multimodal/audio_resample.h`,
+`src/vllm/multimodal/audio_resample.cpp`), beside `audio_processor.cpp` rather
+than inside it. **Exactly one caller opts in**: `Dots3NoteAudioProcessor::
+ProcessWaveform`.
+
+**A blanket lift would be wrong, because five rows refuse a rate mismatch and
+they are not all the same policy.** Parakeet's refusal is upstream-faithful —
+`feature_extraction_parakeet.py` raises rather than resampling — while dots3's
+upstream resamples. `audio_processor.cpp`'s Whisper/Voxtral refusal
+(`:214-221`) is UNTOUCHED here, and so is `parakeet_audio_processor.cpp`. One
+row, one model's policy; each of the others lifts its own refusal when someone
+reads its own upstream.
+
+**It goes in `ProcessWaveform` and not in `RouteDots3NoteAudioWav`,** even
+though upstream resamples in the data parser and not in the processor, because
+`ProcessWaveform` is the function that is HANDED a rate and refuses on it. Its
+refusal is the one that has to invert. Putting the resample at the route would
+leave `ProcessWaveform(x, n, 22050)` still throwing, and a caller reaching the
+processor directly — which the front-end suite does — would still be refused.
+
+#### 4.17.6 One correctness defect the lift CREATES, and closes in the same change
+
+`RouteDots3NoteAudioWav` keys the encoder cache on
+`proc.HashAudio(decoded.samples, n)`, over the RAW waveform. While every served
+rate was 16000 that key was unambiguous. It stops being unambiguous the moment
+two rates are served: a file carrying `N` PCM16 samples at 16000 Hz and a file
+carrying **the identical `N` samples** at 44100 Hz decode to identical `float`
+buffers, hash identically, and must produce DIFFERENT features. `mm_hash` is a
+CROSS-REQUEST key — `EncoderCacheManager::cached_` is keyed on it and
+`scheduler.cpp:511-590` reuses a hit — so the second request is handed the
+first's embeddings.
+
+**Be exact about what that costs, because the obvious phrasing overstates it.**
+A collision needs identical raw buffers, and identical buffers at different
+rates cannot resample to the same row count, so the observable failure is a
+wrong-length splice rather than a quiet substitution. The key is wrong either
+way, and a key that is only accidentally caught downstream is not a key.
+
+`Dots3NoteAudioProcessor::HashAudio` therefore gains a three-argument overload
+taking the request's `sample_rate`, which hashes the RESAMPLED waveform — the
+buffer the tower actually consumes. That makes two requests that resample to the
+same waveform share a cache entry, which is correct, and two requests that do
+not, not. The two-argument overload stays for the existing callers. The gate is
+a direct assertion that the two files above hash differently, and it is proved
+RED by handing the three-argument form the raw buffer.
+
+#### 4.17.7 The gate: a CONSISTENCY gate against a stated algorithm
+
+§6.4 option B holds, and this slice's gate is the shape
+[#2583](https://github.com/mudler/vllm.cpp/issues/2583) established for exactly
+this situation. scipy stands to the vLLM pin as torchaudio stands to the `ltx-2`
+pin there: `resample_audio_scipy` is vLLM's OWN code, so the precedent
+transfers.
+
+**Say plainly what it is.** This gate establishes that the port computes
+`scipy.signal.resample_poly` at scipy's defaults. It does NOT establish parity
+with upstream's `pyav` default, which §4.17.1 shows cannot be gated by anyone,
+and it does not establish that scipy's answer is the one dots3-note was trained
+against. What is claimable is that the port implements an arm vLLM ships, and
+that it implements it correctly.
+
+Committed goldens, generated by `scripts/gen-dots3-resample-golden.py` against
+scipy 1.17.1 into `tests/vllm/models/dots3_note_resample_golden.h`, for the four
+rate pairs the issue names — 44100, 48000, 22050 and 8000 -> 16000 — plus a
+FIFTH case at 44100 -> 16000 on a signal carrying a tone ABOVE the 8 kHz output
+Nyquist, which is the only content that can separate a real anti-alias filter
+from picking samples.
+
+**A tolerance alone gates nothing here**, because a resampler that returns its
+input, or returns zeros, passes one. Four assertions per case, and each names
+the defect it excludes:
+
+| Assertion | What it excludes |
+|---|---|
+| `out.size() == ceil(n * target / orig)` | returning the input unresampled; an off-by-one in `n_out` |
+| `max abs(out) > lo` for a stated `lo` | returning zeros, or a filter whose normalization collapsed |
+| `max abs(out - golden) <= tol`, `tol` ~ 2x the measured float floor | every value defect, including the `n_pre_remove` centring |
+| `max abs(golden - naive) > sep`, `naive` computed IN THE TEST | that the tolerance above is DISCRIMINATING at all: on the alias case a nearest-sample decimation is far from the golden, and the margin is printed |
+
+`ref_resample` is a FOURTH reference namespace under W7a's existing run-time
+enumeration instrument, not a second instrument: W7b added `ref_chunks` the same
+way, and reference code the instrument does not read is reference code whose
+`std::`-only independence nothing measures. Its `kDistinctQualifiedNames` and
+`kQualifiedNameOccurrences` are the instrument's own output and are recorded in
+§4.17.9 by the implementation commit.
+
+#### 4.17.8 Reachability — TWO refusal cases INVERT
+
+The production entry point is unchanged: `ApiServer::handle_chat_completions`
+-> `InstallMultiModalChatSeam` -> `MakeDots3NoteChatSeam` ->
+`RouteDots3NoteAudioWav` -> `Dots3NoteAudioProcessor::ProcessWaveform`. The
+smallest failing tests already exist and assert the OPPOSITE of what this slice
+makes true. That true-before / false-after is the ownership test:
+
+- `tests/vllm/entrypoints/openai/test_api_server_dots3_mm_forward.cpp:1397`,
+  *"a 22050 Hz WAV names the resampler refusal and W7c-2"*, which checks
+  `status == 400`;
+- `tests/vllm/models/test_dots3_note_audio.cpp:820`, *"a rate that is not
+  `audio_config.sampling_rate` names W7c"*, which checks the throw's message.
+
+**Both anchors had MOVED from the numbers #2828 records** (`:1389` and `:818`),
+by 8 and 2 lines, because W7c-1 landed between the issue being written and this
+slice starting. They are measured at this head, and this row has had anchors go
+stale inside a single pull request before.
+
+The served replacement does not stop at HTTP 200. The 44.1 kHz fixture is
+22050 samples, so `ceil(22050 * 160 / 441)` is exactly 8000 — the same length as
+the mono clip every other audio case serves, and therefore the same 7-token
+placeholder span. **That token count is the assertion that a no-op resample
+cannot survive**: an unresampled 22050-sample waveform expands
+`ceil(22050 / 1280)` = 18 placeholders, not 7. It is checked, and it is
+independent of the resampler's values.
+
+Then the equality: the 44.1 kHz request's first-token logprobs against the same
+audio resampled offline and served at 16 kHz, and — the assertion that makes
+that one load-bearing — DIFFERING from the same 22050 samples served
+mislabelled as 16 kHz.
+
+#### 4.17.9 The mutations
+
+Each applied to the tracked source, rebuilt, run, and restored byte-for-byte,
+with the binary sha256 AND the case counts recorded, because on this row a
+failed build has twice read as a pass:
+
+| # | Mutation | What a green here would mean |
+|---|---|---|
+| M1 | return the input unresampled | the gate cannot tell a resample from a pass-through |
+| M2 | return zeros of the right length | the gate is a shape check wearing a tolerance |
+| M3 | drop the anti-alias filter — decimate by picking samples | the gate cannot see aliasing, only interpolation |
+| M4 | off-by-one the `n_pre_remove` centring | the gate cannot see a one-sample phase shift |
+| M5 | delete the production call site — the resample in `ProcessWaveform` back to the throw | the served suite measures a function, not a capability |
+| M6 | hash the RAW waveform in the three-argument `HashAudio` | §4.17.6's cache collision is back and nothing sees it |
+| M7 | the ROUTE reverts to the two-argument `HashAudio` | the overload computes the right key and nothing asks for it |
+| M8 | the route hands the RAW buffer over as the resample "answer" (PR #2842 F2) | the shared-buffer argument is trusted and never checked |
+| M9 | `kMaxUpsampleRatio` is widened past the attack (PR #2842 F2) | the output bound is decorative |
+| M10 | delete the production call site — the resample in `ProcessWaveform` | the served suite measures a function, not a capability |
+| M11 | the route stops handing the buffer over, so it resamples TWICE (PR #2842 F2) | *expected GREEN* — see §4.17.14 |
+
+The measured table is §4.17.11, written by the implementation commit. It is not
+in this spec commit, because a result written before it is measured is the
+defect this protocol exists to prevent.
+
+#### 4.17.10 What is still refused, and to whom it is owed
+
+The refusal stays at the same call path as the route, for the reason W7a
+recorded and W7b and W7c-1 repeated: an `InstallMultiModalChatSeam` throw is
+HTTP 400 for one request, while the same throw from inside `encode_mm` sets
+`AsyncLLM`'s errored latch and turns every later request, TEXT ones included,
+into a 500.
+
+| Refused | Owed to | Where |
+|---|---|---|
+| any container but RIFF/WAVE PCM16 | **NOT this row.** The shared codec brick, [#2814](https://github.com/mudler/vllm.cpp/issues/2814) | `mm_chat_dots3note.cpp`, the decode `catch` |
+| non-16-bit PCM, a non-PCM `fmt`, a zero channel count, a malformed chunk walk | this row | `audio_processor.cpp`, `ParseWavPcm16` |
+| a non-positive sample rate | this row | `ResampleAudioScipy` |
+| a reduced ratio whose `max(up, down)` exceeds `kMaxPolyphaseRate` | this row, and it is a **DIVERGENCE** — see below | `ResampleAudioScipy` |
+| a reduced `up/down` above `kMaxUpsampleRatio` | this row, and it is a **DIVERGENCE** — see below | `ResampleAudioScipy` |
+| `use_causal`, `use_conv1d_stem` (`use_conv2d_stem = false`), `use_latent_input`, `merge_factor != 1`, a non-`dots` `encoder_type` | this row, unchanged by this slice | `Dots3NoteAudioRefusal` |
+| upstream's `pyav`/libswresample arm, permanently | nobody — §4.17.1 is the reason, and it does not expire | this section |
+
+**The ratio bound is a deliberate divergence and is recorded as one.** The
+filter is `20 * max(up, down) + 1` taps, and `max(up, down)` is set by the
+REQUEST, because a WAV's `fmt ` chunk names its own rate. A request declaring
+999983 Hz reduces to `max(up, down) = 999983` and asks this process for a
+20-million-tap filter and 20 million Bessel evaluations before any audio is
+touched. Upstream has no such guard and would do the same thing; upstream is
+also not the surface this refusal protects. `kMaxPolyphaseRate = 100000` caps
+the design at ~2M taps / ~16 MB, and every real rate reduces far below it
+(44100 -> 441, 48000 -> 3, 22050 -> 441, 8000 -> 2; even a coprime 44101 Hz
+gives 44101). The refusal names the bound, the reason, and that upstream has
+none. It is gated in both directions: a rate just past it refuses, and 44.1 kHz
+serves.
+
+**The filter bound is not an output bound, and the gap was a denial of service
+(finding F2 of the fresh review of [PR #2842](https://github.com/mudler/vllm.cpp/pull/2842)).** `up` is
+`target_sr / gcd`, so on a 16 kHz target it can never exceed 16000. A `fmt `
+chunk declaring 1 Hz therefore reduces to `up/down = 16000/1`: `max(up, down)`
+is 16000, it sails under the 100000 filter bound, it designs a cheap filter —
+and then it asks for sixteen thousand output samples per input sample. Measured
+against `libvllm.a` at `0c440b6c3`:
+
+| `orig_sr` | `n_in` | verdict | `n_out` | wall |
+|---|---|---|---|---|
+| 1 | 20000 | ACCEPTED | 320000000 (1220.7 MB) | 2.301 s |
+| 2 | 40000 | ACCEPTED | 320000000 (1220.7 MB) | 2.439 s |
+| 999983 | 1000 | REFUSED (`kMaxPolyphaseRate`) | — | — |
+
+Under `ulimit -v 900000` the 1 Hz call threw `std::bad_alloc`, which is a bare
+`std::exception` and NOT `InputValidationError`, so the server answered **HTTP
+500 for a property of the REQUEST** — exactly what the table above and the
+route's own comment say must not happen. `ParseWavPcm16` applies no rate floor
+and W7b lifted the length ceiling, so nothing upstream of the seam bounded it.
+Before W7c-2 the path did not exist, because every rate but 16000 was a 400: the
+guard closes a regression W7c-2 introduced.
+
+**The second bound is on the RATIO, and it has to be.** `up` alone cannot
+separate the two cases: a coprime 44101 Hz is a DOWNsample this seam serves, and
+gates that it serves, and it also reduces to `up = 16000`. `up/down` separates
+them completely — 0.363 against 16000. Bounding the ratio also never refuses a
+long clip, because it bounds the output as a multiple of an input the client
+already paid to upload, rather than as an absolute length.
+
+`kMaxUpsampleRatio = 8` is **four times the largest ratio this row serves**. The
+highest real upsample into 16 kHz is telephony's `8000 -> 16000 = 2`; 11025
+gives 1.451, and every rate at or above the target gives less than 1. The bound
+admits any source rate down to 2000 Hz on a 16 kHz target and an 8 kHz source on
+a 48 kHz one, and it caps the seam's allocation at 32 bytes per input sample. It
+is gated in both directions ONE HERTZ APART, at the unit seam and over HTTP:
+2000 Hz reduces to 8/1 and serves, 1999 Hz is coprime with 16000, reduces to
+16000/1999 = 8.004, and refuses. The served case also asserts the body does NOT
+name §4.15.3's chunk refusal, which is what separates "refused" from "refused
+after allocating 16000000 samples" — that is precisely what the RED-before did.
+
+
+#### 4.17.11 The gate, measured
+
+**These are W7c-2's LANDING numbers, at `0c440b6c3`.** §4.17.14 carries the ones
+after #2842's repair; both are kept, because a mutation table whose arms were
+measured against a different binary from its baseline is not a mutation table.
+
+Built in `/dev/shm` at `-DVLLM_CPP_SERVER=ON -DVLLM_CPP_BUILD_TESTS=ON
+-DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`, GCC, `-j 2`. Two suites, by
+their real target names:
+
+| Suite | Cases | Assertions |
+|---|---|---|
+| `test_dots3_note_audio` | **24 / 24 passed** | **3992 / 3992** |
+| `test_openai_api_server_dots3_mm_forward` | **28 / 28 passed** | **16374 / 16374** |
+
+`test_dots3_note_audio` sha256
+`db03ea5e790307297836827d6b0ce41fd0b095e70f8981100f87ab9ae9d58c8e`;
+`test_openai_api_server_dots3_mm_forward` sha256
+`e0158068e12a18708b6cd4978eb2d6c25ed86cddaea26c6624f1ffcf45b4a157`.
+
+**Both shas moved twice during the slice, and the whole sweep was re-run each
+time rather than patched.** Once when §4.17.13's two outside controls were added
+to the served case, and once when `ResampleAudioScipyOutputLength` was deleted
+for being reachable only from a test. A mutation table whose arms were measured
+against a different binary from its baseline is not a mutation table.
+
+**The port reproduces scipy BIT FOR BIT on four of the five golden cases.**
+
+| Case | Conversion | `n_in` -> `n_out` | peak | worst \|ours - scipy\| |
+|---|---|---|---|---|
+| `Wav44100` | 44100 -> 16000 | 441 -> 160 | 0.98991 | **0** |
+| `Wav48000` | 48000 -> 16000 | 480 -> 160 | 0.98984 | **0** |
+| `Wav22050` | 22050 -> 16000 | 220 -> 160 | 0.98989 | **0** |
+| `Wav8000` | 8000 -> 16000 | 80 -> 160 | 0.99038 | **0** |
+| `Alias44100` | 44100 -> 16000 | 441 -> 160 | 0.50021 | **8.31e-18** |
+
+Worst against `ref_resample`, the independent second transcription, is
+**2.95e-08** — half a `float` ulp, so the two disagree only in the narrowing
+store.
+
+**THE TOLERANCE IS NOT TWO TIMES THAT FLOOR, AND SAYING WHY IS THE POINT.**
+"~2x the measured float floor" would be 1.7e-17, and gating there would be
+gating on a coincidence of rounding rather than on a bound: the port and scipy
+agree to ~1e-15 in DOUBLE, and everything after that is one narrowing store
+whose granularity is a `float` ulp. A legitimate platform difference — another
+libm's `sin` by one ulp in the filter taps, or a contracted multiply-add in the
+convolution — moves the double answer by ~1e-16 relative, which usually narrows
+to the same `float` and can narrow to the adjacent one. **The gate is therefore
+TWO FLOAT ULPS at the fixtures' peak of ~0.99, which is 1.2e-7**, and every
+defect it exists to catch is orders above it.
+
+**The difference assertion, which is what makes that tolerance mean anything.**
+A nearest-sample decimation computed in the test sits this far from the golden:
+
+| Case | nearest-sample vs golden | against a tolerance of |
+|---|---|---|
+| `Wav44100` | 0.0538 | 1.2e-7 |
+| `Wav48000` | 0.0530 | 1.2e-7 |
+| `Wav22050` | 0.1480 | 1.2e-7 |
+| `Wav8000` | 0.3495 | 1.2e-7 |
+| `Alias44100` | 0.4568 | 1.2e-7 |
+
+**The generator's own agreement, which is what makes the C++ a port.** The six
+steps written a second time in plain Python, with `i0` as its own power series,
+against `scipy.signal.resample_poly` itself: worst 6.11e-15 in `double` over the
+five cases, and **0.0** after narrowing both sides to `float32` on four of them
+(2.75e-18 on `Alias44100`). scipy 1.17.1, numpy 2.3.5.
+
+**The independence instrument's counts, from its own reading of the file.**
+
+| Namespace | Distinct | Occurrences | Scopes |
+|---|---|---|---|
+| `ref_front` | 11 | 71 | `std` |
+| `ref_tower` | 6 | 53 | `std` |
+| `ref_chunks` | 2 | 25 | `std` |
+| `ref_resample` | **5** | **63** | **`std`** |
+
+`ref_resample` reaches exactly two transcendentals, `std::sin` and `std::sqrt`,
+beside `std::int64_t` (39), `std::size_t` (14) and `std::vector` (8). The
+instrument's own standing pp-number gate is unchanged and still green.
+
+**The front end's own numbers.** At 22050 -> 16000 the front end's mel is
+BIT-IDENTICAL to the mel of the same waveform pre-resampled and handed in at
+16000: **0 of 1600 values differ**. The resample itself is 2.98e-08 from
+`ref_resample` there.
+
+**The served case's numbers.**
+
+| Comparison | Worst first-token logprob gap |
+|---|---|
+| 44.1 kHz vs its OWN offline resample, through a PCM16 container | 0.00957 |
+| 44.1 kHz vs the NATIVE 16 kHz recording of the same signal | **0.00705** |
+| 44.1 kHz vs SILENCE | 0.2488 |
+| 44.1 kHz vs a DIFFERENT clip | 0.2605 |
+
+The second row is the one worth reading twice: the resampled 44.1 kHz clip lands
+CLOSER to a native 16 kHz recording of the same continuous signal than to its own
+offline resample, because the offline arm pays a PCM16 quantization the served
+arm does not.
+
+#### 4.17.12 The RED before, verbatim, and one defect it found
+
+With `src/` changed and the tests still asserting the refusals, the front-end
+suite read **21 cases / 20 passed / 1 failed, 3914 assertions / 4 failed**:
+
+```text
+test_dots3_note_audio.cpp:827: ERROR: CHECK( msg.find("22050") != std::string::npos ) is NOT correct!
+  values: CHECK( 18446744073709551615 != 18446744073709551615 )
+```
+
+with `W7c-2`, `RESAMPLING IS NOT PORTED` and `libswresample` failing the same
+way: the throw those four asserted on no longer happens.
+
+The served suite read **27 cases / 26 passed / 1 failed, 16344 assertions /
+5 failed**, and it did NOT read what a correct implementation would have made it
+read:
+
+```text
+test_api_server_dots3_mm_forward.cpp:1403: ERROR: CHECK( r.status == 400 ) is NOT correct!
+  values: CHECK( 500 == 400 )
+  logged: body: {"error":{"code":500,"message":"WhisperAudioProcessor: resample
+  deferred; provide audio at cfg.sampling_rate (16 kHz)","param":null,
+  "type":"InternalServerError"}}
+```
+
+**That 500 is a real defect the served inversion found, and a unit test on the
+resampler could not have.** `ProcessWaveform` rebound the sample pointer and the
+length after resampling and left `sample_rate` at the REQUEST's value, so the
+resampled buffer was still described as 22050 Hz when it reached
+`WhisperAudioProcessor::ProcessWaveform` — which this drives once per chunk, and
+which carries its OWN rate refusal for the Whisper/Voxtral row
+(`audio_processor.cpp:214-221`). That refusal is a bare `runtime_error`, so the
+server answered HTTP 500 rather than 400. Before W7c-2 the missing assignment was
+unreachable, because the refusal above it guaranteed the two rates were equal.
+The three variables that describe a waveform now move together.
+
+#### 4.17.13 The mutation table, measured
+
+Each mutation applied to the tracked source, rebuilt, run, and restored. The
+harness asserts that the mutation APPLIED and that the build SUCCEEDED before it
+reads any result, and records the binary sha256 for every arm, because on this
+row a failed build has twice read as a pass.
+
+| # | Mutation | `test_dots3_note_audio` | `test_openai_api_server_dots3_mm_forward` |
+|---|---|---|---|
+| — | baseline | 24 / 3992 pass | 28 / 16374 pass |
+| M1 | return the input unresampled | **2 cases / 5 FAILED**, `kw.num_samples == kAudioSamples` | **2 cases / 3 FAILED**, `t22 == t16 - 2` |
+| M2 | return zeros of the right length | **2 cases / 16 FAILED**, `worst <= kResampleTol` | **1 case / 2 FAILED**, `gap_native < 5e-2` |
+| M3 | drop the anti-alias filter, decimate by picking samples | **2 cases / 11 FAILED**, `worst <= kResampleTol` | **1 case / 1 FAILED**, `gap_native < 5e-2` |
+| M4 | off-by-one the `n_pre_remove` centring | **2 cases / 11 FAILED**, `worst <= kResampleTol` | 28 / 16374 pass |
+| M5 | delete the production call site | **1 case FAILED**, the subcase THREW | **2 cases / 2 FAILED**, `r.status == 200` |
+| M6 | hash the RAW waveform in the 3-argument `HashAudio` | **1 case / 1 FAILED**, `at_target != at_44100` | **1 case / 1 FAILED**, `at16.status == 200` |
+| M7 | the ROUTE reverts to the 2-argument `HashAudio` | 24 / 3992 pass | **1 case / 1 FAILED**, `at16.status == 200` |
+
+Binary sha256 prefixes, none equal to the baseline's on the suite the mutation
+can reach: M1 `4bf541b1…` / `ce779bdf…`; M2 `e0dffd57…` / `86f2713b…`; M3
+`6f709b05…` / `62557952…`; M4 `28ac7a83…` / `64ed66d4…`; M5 `a8e5ca14…` /
+`95fa8d03…`; M6 `0af5171a…` / `49c69922…`; M7 `dab4a93c…` / `995f33b5…`.
+Fourteen distinct values, none equal to the baseline's `db03ea5e…` /
+`e0158068…`.
+
+**M4 is the one the served suite cannot see, and that is stated rather than
+hidden.** A one-sample phase shift moves the front-end comparison by far more
+than 1.2e-7 and moves the served answer by less than the 5e-2 the native-clip
+control allows. The value gate is the front-end suite's; the served suite gates
+that the capability is REACHED and that it is not dead or aliased.
+
+**M2 and M3 first read GREEN on the served suite, and that finding changed the
+test rather than the report.** Its value assertion compared the request against
+an offline reference computed with the SAME production code, so both sides moved
+together — a shared-helper consistency check wearing a correctness gate. Two
+controls now come from outside the resample path: a WAV of literal silence,
+which is never resampled at all, and the natively-16 kHz fixture, which is the
+same continuous signal from the same closed form. §4.17.11 carries their
+numbers.
+
+**M7 is the reachability line for §4.17.6, and it works for a reason worth
+recording.** Reverting the ROUTE to the two-argument hash leaves the front-end
+suite fully green — the overload still computes the right key, it is simply not
+asked for — and reds only the suite that enters through
+`ApiServer::handle_chat_completions`. It reds there because the inverted subcase
+serves the SAME 8000-frame buffer at 22050 Hz and then at 16000 Hz on ONE
+harness, so the collision §4.17.6 describes is a live cross-request cache hit and
+not a hypothetical.
+
+**Restored byte-for-byte, and verified at the BINARY.** After the last mutation
+the tree was rebuilt and both binaries hashed again: `db03ea5e…` and
+`e0158068…`, identical to the baseline row, with both suites green at 24 / 3992
+and 28 / 16374.
+
+
+#### 4.17.14 The PR #2842 fresh-review repair, measured
+
+Two fresh-review findings, repaired on `row/MODEL-MM-DOTS3-NOTE-W7C2` on top of
+`0c440b6c3`. Same recipe as §4.17.11 — `/dev/shm`, `-DVLLM_CPP_SERVER=ON
+-DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`, GCC,
+`-j 2` — on a DIFFERENT host and build directory, so the baseline shas below are
+not §4.17.11's even though the source is byte-identical. This build is not
+byte-reproducible across checkouts and never claimed to be; what a sha proves
+here is that two arms of THIS sweep are different binaries.
+
+| Arm | `test_dots3_note_audio` | `test_openai_api_server_dots3_mm_forward` |
+|---|---|---|
+| baseline, `0c440b6c3` | `b181a5dd…` 24 / 3992 pass | `8c117844…` 28 / 16374 pass |
+| **RED**, the new cases only | `356e5b48…` **23 / 24 cases, 13 of 4008 FAILED** | `213f7c9e…` **27 / 28 cases, 6 of 16385 FAILED** |
+| **GREEN**, repaired | `5c583c69…` 24 / 4014 pass | `99485ce5…` 28 / 16385 pass |
+
+**What the RED said, which is the whole finding.** The served 1 Hz request DID
+answer 400 — for the wrong reason and far too late. Its body was §4.15.3's
+`this request's 16000000 samples need 1000 chunks`, which is thrown AFTER the
+resample: the process had already built the sixteen-million-sample buffer that
+the finding is about. The subcase's `r.body.find("chunks") == npos` assertion is
+the one that separates "refused" from "refused after allocating", and it is the
+assertion the fix turns.
+
+| # | Mutation | `test_dots3_note_audio` | `test_openai_api_server_dots3_mm_forward` |
+|---|---|---|---|
+| M6 | hash the RAW waveform in the 3-argument `HashAudio` | `64adbaf0…` **1 case / 1 FAILED** | `1664dcff…` **1 case / 1 FAILED** |
+| M7 | the ROUTE reverts to the 2-argument `HashAudio` | `19be9058…` 24 / 4014 pass | `8725ae62…` **1 case / 1 FAILED** |
+| M8 | the route hands the RAW buffer over as the "answer" | `d6fdd6d5…` 24 / 4014 pass | `76fc721f…` **1 case / 1 FAILED** |
+| M9 | `kMaxUpsampleRatio` widened to 100000 | `4793b85a…` **1 case / 13 FAILED** | `957f3d2e…` **1 case / 6 FAILED** |
+| M10 | delete the production resample call site | `843fb58d…` **1 case FAILED** (it THREW) | `3fd981db…` **2 cases / 2 FAILED** |
+| M11 | the route stops handing the buffer over | `fb5b254c…` 24 / 4014 pass | `b0dc8199…` 28 / 16385 pass |
+
+Twelve distinct shas, none equal to the green row's `5c583c69…` / `99485ce5…`.
+M10's unit arm is the doctest shape where a THROWN case reports zero failed
+assertions and one failed case, so the case count is what reads it; `rc` was 1.
+
+**M11 IS GREEN ON PURPOSE, and saying so is the point.** Resampling once instead
+of twice is behaviour-preserving: the same key, the same features, the same
+answer. No test can see it, and inventing an instrument that counts resamples
+would be another `ResampleAudioScipyOutputLength` — a symbol reachable only from
+a test. What IS gated is the hazard the shared buffer introduces, which is a
+caller handing over the WRONG buffer: M8 covers that, and the unit subcase
+asserts that handing the buffer over and rebuilding it produce the same key.
+M6 and M7 confirm §4.17.6's contract survived the change.
+
+**Restored byte-for-byte, and verified at the BINARY.** After the last mutation
+the tree was rebuilt and both binaries hashed again:
+`5c583c698f9a54f09fd40b66300bad6129ed96b50e8f10097089e5d7aa6d2e7d` and
+`99485ce5ca1ceff1600f31029349fb9af7abd5125bc0a4b0233508c911e2d887`, identical to
+the green row, with both suites at 24 / 4014 and 28 / 16385.
+
+**RE-MEASURED AFTER MERGING `origin/main` `73db7a8a3`, because a merge can
+falsify prose the code still supports.** Both binaries moved — main brought other
+changes into `libvllm.a` — and both suites are green at the same counts:
+`test_dots3_note_audio` `e034b19f…` 24 / 4014, and
+`test_openai_api_server_dots3_mm_forward` `3fd8caced…` 28 / 16385. The mutation
+sweep above ran on the PRE-merge binaries, which is why its baseline row names
+`5c583c69…` / `99485ce5…` and not these.
+
+**`test_parakeet_audio_processor` is untouched and stays 6 / 41054.** Parakeet's
+rate refusal is upstream-faithful — `feature_extraction_parakeet.py` raises
+rather than resampling — and neither finding reaches it.
+
+
 ## 5. Gates
 
 **Correctness first, and the gate form is chosen by measurement, not in advance**
@@ -7120,29 +7806,36 @@ Carried openly under option B (§6.4), not waived:
   needs a decision about WHICH of upstream's two numbers is the placeholder
   count. Owner: this row. Tracked in this section rather than as an issue, per
   AGENTS.md's "an issue you do not fix in the same flow has to say who owns it".
-- **W7c-2 — every audio SAMPLING RATE but `audio_config.sampling_rate`.**
-  W7c-1 ([#2813](https://github.com/mudler/vllm.cpp/issues/2813), §4.16) took
-  the CHANNELS half: a multi-channel PCM16 WAV already at the target rate is now
-  served, mean-reduced exactly as upstream's `load_audio(..., mono=True)` does
-  (`vllm/multimodal/media/audio.py:207-208`, `:220` @ `9035151d6`). What is
-  still owed is the RATE. Upstream resamples in the data parser —
-  `MultiModalDataParser(target_sr=..., target_channels=1)`,
-  `vllm/models/dots3_note/common/processor.py:523-525` @ `9035151d6` — which
-  reaches `resample_audio_pyav`, **libswresample through PyAV/FFmpeg**
-  (`vllm/multimodal/audio.py:174-229`). Its decode side is soundfile/libsndfile
-  with a PyAV fallback (`media/audio.py:29-32`, `:24-27`), so what it accepts is
-  what libsndfile and FFmpeg open, and **not** "whatever `librosa` can open":
-  `librosa` is never imported anywhere under `vllm/` at that SHA, and its three
-  mentions are comments (§4.16.4). This port REFUSES a rate that is not
-  `audio_config.sampling_rate`, at the ROUTE, naming W7c-2 so an operator learns
-  which brick owes it rather than reading the audio-track A1 row's "resample
-  deferred" message about a different model (`audio_processor.cpp:214-221`).
-  Rate conversion is still numerically delicate, but it is no longer a port from
-  nothing: [#2583](https://github.com/mudler/vllm.cpp/issues/2583) landed
-  `Ltx2ResampleWaveform`
-  (`src/vllm/model_executor/models/ltx2_audio_vae.cpp:1151`), so what W7c-2 owes
-  is a decision about which resampler upstream's PyAV arm is being mirrored by,
-  and its tolerance, against a seam that exists. Owner: this row, W7c-2.
+- **W7c-2 LANDED, and what is left owed here is upstream's `pyav` arm, which
+  nobody can gate.** ([#2828](https://github.com/mudler/vllm.cpp/issues/2828),
+  §4.17.) A PCM16 WAV at any sampling rate is now SERVED: `ResampleAudioScipy`
+  converts it to `audio_config.sampling_rate` before the front end, mirroring
+  `resample_audio_scipy` (`vllm/multimodal/audio.py:232-250` @ `9035151d6`),
+  which is an arm of upstream's own `AudioResampler` switch and which vLLM
+  already ships in production for another model
+  (`vllm/model_executor/models/phi4mm.py:580`). What stays REFUSED, permanently
+  and by name, is upstream's DEFAULT `pyav` arm — libswresample, which is not
+  bit-identical to itself across CPU dispatch on one binary and one input
+  (ffmpeg 6.1.1: 24691 of 32000 samples differ, worst 9.686e-08), whose option
+  defaults come from an unpinned linked binary, and whose auto-resolved `cutoff`
+  is unreadable from outside the source. That refusal does not expire when
+  somebody works harder; §4.17.1 is the reason. The recorded distance between
+  the two, re-measured by this slice rather than relayed and reported WITH ITS
+  PROBE, because the ordering is signal-dependent: on a 0 -> 7500 Hz sweep at
+  44100 -> 16000 scipy is 51.78 dB from swresample's answer, soxr 44.63 and
+  torchaudio 29.02, which reproduces #2828's 51.36 / 46.59 / 26.72 to about
+  2 dB. On content well below the new Nyquist all three are good and soxr wins
+  by 30 dB, so the number means nothing without the signal it was measured on
+  (§4.17.2).
+  `Ltx2ResampleWaveform` ([#2583](https://github.com/mudler/vllm.cpp/issues/2583),
+  `src/vllm/model_executor/models/ltx2_audio_vae.cpp:1151`) is deliberately NOT
+  reused: it is a real polyphase resampler, and it is ~25 dB FURTHER from this
+  oracle on the band-limited content a speech encoder sees, because torchaudio's
+  defaults are a short Hann kernel against swr's 32-tap kaiser-9. One further
+  thing is owed and is a DIVERGENCE rather than a gap: `ResampleAudioScipy`
+  refuses a reduced ratio whose `max(up, down)` exceeds `kMaxPolyphaseRate`
+  (100000), because the filter is `20 * max(up, down) + 1` taps and the rate is
+  named by the REQUEST. Upstream has no such guard. Owner: this row.
 - **Every audio CONTAINER but RIFF/WAVE PCM16 — and this one is NOT owed to
   this row.** `mp3`, `flac`, `ogg` and anything else an `input_audio.format` may
   name need a demuxer this tree does not vendor. Five surfaces already refuse
@@ -8014,5 +8707,28 @@ off-by-one slice, a reversed concatenation, an untruncated short chunk, a mask
 taken from the padded length — are gated as row counts and boundary rows at a
 geometry chosen so none of them can alias: three chunks, the last one short.
 
-**Next dispatchable: W7c for the rest of the audio front end, W8 for video
-and the MM ABI, or W9 for the quantized arms.**
+**W7c-1 — LANDED, and a multi-channel WAV is served.**
+([#2813](https://github.com/mudler/vllm.cpp/issues/2813), evidence §4.16.)
+`DecodeWavPcm16MeanToMono` sits beside `DecodeWavPcm16Mono` over one shared
+`ParseWavPcm16` walk, so the channels are mean-reduced exactly as upstream's
+`load_audio(..., mono=True)` reduces them. The mean is exact in `int32` and
+bit-identical to upstream's `float32` mean for every power-of-two channel count
+**up to 512**, a bound that is provable and TIGHT.
+
+**W7c-2 — LANDED, and the WAV no longer has to be 16 kHz.**
+([#2828](https://github.com/mudler/vllm.cpp/issues/2828), evidence §4.17.)
+`ResampleAudioScipy` converts a PCM16 WAV at any rate to
+`audio_config.sampling_rate` before the front end. It is a **recorded
+divergence, and the first one on this row**: upstream's default resampler is
+libswresample through PyAV, which is not bit-identical to itself across CPU
+dispatch on one binary and one input, so no bit-exact gate against it can exist.
+What is implemented is `resample_audio_scipy`, ANOTHER ARM OF UPSTREAM'S OWN
+SWITCH, which vLLM ships in production for phi4mm. The gate is a CONSISTENCY
+gate against `scipy.signal.resample_poly` at its defaults, with committed
+goldens for four rate pairs and an aliasing fifth, and §4.17.7 states in its own
+words what that does and does not establish. A FOURTH reference namespace,
+`ref_resample`, came with it, under W7a's existing enumeration instrument rather
+than a second one.
+
+**Next dispatchable: W8 for video and the MM ABI, or W9 for the quantized
+arms.**

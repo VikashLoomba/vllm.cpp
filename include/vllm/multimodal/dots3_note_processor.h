@@ -165,7 +165,8 @@ class Dots3NoteImageProcessor {
 // WHAT THIS CLASS ADDS ON TOP: the `chunk_seconds` SEGMENT LOOP (W7b, #2797,
 // `audio.py:193-218`), `pad_or_trim` to `chunk_samples` per segment, the
 // `ceil(num_samples / token_stride)` token count, the VALID mel-frame count the
-// tower's temporal mask needs, and the refusals W7c and §4.15.3 own.
+// tower's temporal mask needs, the SAMPLE-RATE conversion (W7c-2, #2828, through
+// the shared `ResampleAudioScipy` seam), and the refusal §4.15.3 owns.
 struct Dots3NoteAudioProcessorConfig {
   // False when `config.json` carries no `audio_config`. Upstream builds no
   // `Dots3NoteAudioModel` in that case (`multimodal.py:119-126` @ `9035151d6`).
@@ -307,8 +308,15 @@ class Dots3NoteAudioProcessor {
   // segment at a time. One pass over the whole waveform would use one max for
   // every chunk and shift the quietest bands of the quietest chunk.
   //
+  // RESAMPLES a `sample_rate` that is not `cfg.sampling_rate` (W7c-2, #2828)
+  // through `vllm::multimodal::ResampleAudioScipy`, which is upstream's own
+  // `"scipy"` `AudioResampler` arm and NOT its `"pyav"` default; that choice is
+  // a recorded divergence and the seam header carries the reason. At the target
+  // rate the call returns its input unchanged, so nothing at 16 kHz moves.
+  //
   // REFUSES BY NAME, before any arithmetic:
-  //   * `sample_rate != cfg.sampling_rate` -> W7c (no resampler is ported)
+  //   * a non-positive rate, or a reduced polyphase ratio past
+  //     `kMaxPolyphaseRate` (from inside the resample seam)
   //   * more than one chunk on a config whose `chunk_samples` is not a whole
   //     number of `token_stride`s. That is the ONE thing segmentation cannot
   //     make safe: the tower produces `sum_i ceil(seg_i / stride)` rows
@@ -320,8 +328,16 @@ class Dots3NoteAudioProcessor {
   //     either way, because a one-segment sum is `ceil(n / stride)` on both
   //     sides — which is why this is a per-request refusal and not an
   //     install-time one.
+  //
+  // HANDS BACK THE RESAMPLED BUFFER when `resampled_out` is not null, so that a
+  // caller which also needs the encoder-cache key does not pay for the resample
+  // a second time (PR #2842 F2). It is left EMPTY when no resample happened, which
+  // is exactly the case in which the caller's own pointer is already the
+  // waveform the tower consumed. Nothing about the returned `AudioKwargs`
+  // depends on the argument.
   AudioKwargs ProcessWaveform(const float* samples, int64_t num_samples,
-                              int sample_rate) const;
+                              int sample_rate,
+                              std::vector<float>* resampled_out = nullptr) const;
 
   // `ceil(num_samples / token_stride)`, exposed because the chat seam needs the
   // placeholder count and the encoder needs the row count and they must be the
@@ -339,6 +355,32 @@ class Dots3NoteAudioProcessor {
   int64_t NumAudioTokens(int64_t num_samples) const;
 
   std::string HashAudio(const float* samples, int64_t num_samples) const;
+
+  // The encoder-cache key for a request that names its OWN sample rate
+  // (W7c-2, #2828). It hashes the RESAMPLED waveform, which is what the tower
+  // consumes.
+  //
+  // THE TWO-ARGUMENT FORM IS NOT SAFE FOR A MULTI-RATE CALLER, and W7c-2
+  // created that hazard by serving more than one rate. A file carrying N PCM16
+  // samples at 16000 Hz and a file carrying the identical N samples at
+  // 44100 Hz decode to identical float buffers and hash identically under it,
+  // while their features differ. `mm_hash` is a cross-request encoder-cache key
+  // (`EncoderCacheManager::cached_`), so that is a hit that serves the wrong
+  // audio. Every caller that has a request rate in hand must use this overload;
+  // the two-argument one stays for the callers that are single-rate by
+  // construction.
+  //
+  // `resampled` IS AN ANSWER, NOT A HINT: when it is not null it must be the
+  // buffer `ProcessWaveform` filled for THIS waveform and THIS rate, and it is
+  // hashed as-is. `RouteDots3NoteAudioWav` passes it because it has just called
+  // `ProcessWaveform`, and that is what makes the served path resample ONCE
+  // rather than twice — the second resample was a 1220.7 MB allocation on the
+  // request measured in §4.17.10. A caller that does not hold the buffer passes
+  // nothing and this resamples for itself, which is the only behaviour that
+  // ever existed and is what the unit suite drives.
+  std::string HashAudio(const float* samples, int64_t num_samples,
+                        int sample_rate,
+                        const std::vector<float>* resampled = nullptr) const;
 
  private:
   Dots3NoteAudioProcessorConfig cfg_;

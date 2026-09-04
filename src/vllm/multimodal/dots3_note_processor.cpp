@@ -16,6 +16,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/multimodal/audio_resample.h"
 #include "vllm/multimodal/hasher.h"
 #include "vllm/multimodal/mel_filter_bank.h"
 #include "vllm/v1/engine/validation_error.h"
@@ -488,8 +489,10 @@ Dots3NoteAudioProcessor::SegmentWaveform(int64_t num_samples) const {
   //
   // Upstream steps in SECONDS and multiplies by the module constant
   // SAMPLE_RATE (`audio.py:15`), not by `self.sampling_rate`; the two are the
-  // same 16000 wherever this port runs, because a rate that is not
-  // `audio_config.sampling_rate` is refused to W7c before this is reached. The
+  // same 16000 wherever this port runs. Before W7c-2 (#2828) that held because a
+  // rate that was not `audio_config.sampling_rate` was REFUSED before this was
+  // reached; it now holds because such a rate is RESAMPLED to it, which is the
+  // stronger of the two reasons and reaches this function the same way. The
   // stride is written in SAMPLES here so the loop cannot overflow a second
   // count on a long recording.
   std::vector<AudioChunk> out;
@@ -512,28 +515,56 @@ Dots3NoteAudioProcessor::SegmentWaveform(int64_t num_samples) const {
 }
 
 AudioKwargs Dots3NoteAudioProcessor::ProcessWaveform(
-    const float* samples, int64_t num_samples, int sample_rate) const {
+    const float* samples, int64_t num_samples, int sample_rate,
+    std::vector<float>* resampled_out) const {
+  // W7c-2 (#2828): a rate that is not `audio_config.sampling_rate` is
+  // RESAMPLED, not refused. Upstream resamples in its data parser
+  // (`MultiModalDataParser(target_sr=..., target_channels=1)`,
+  // `vllm/models/dots3_note/common/processor.py:523-525` @ `9035151d6` ->
+  // `vllm/multimodal/parse.py:695`), and this is the function that is handed a
+  // rate, so this is where the conversion goes.
+  //
+  // `ResampleAudioScipy` is upstream's `"scipy"` arm and NOT its `"pyav"`
+  // default, and that is a recorded DIVERGENCE rather than an oversight:
+  // libswresample is not bit-identical to itself across CPU dispatch on one
+  // binary and one input, so no bit-exact gate against the default can exist.
+  // vLLM ships the scipy arm in production for another model
+  // (`vllm/model_executor/models/phi4mm.py:580`). See the seam header and
+  // `.agents/specs/dots3-note.md` §4.17.
+  //
+  // THIS IS THE PRODUCTION CALL SITE the reachability mutation deletes. The
+  // guard below is upstream's own `if orig_sr_int == target_sr_int: return
+  // audio` (`audio.py:241-242`) hoisted to the caller, and `ResampleAudioScipy`
+  // repeats it internally rather than trusting it, so a 16 kHz waveform cannot
+  // move by a bit whichever way it arrives.
+  //
+  // THE THREE VARIABLES DESCRIBING THE WAVEFORM MOVE TOGETHER, and `sample_rate`
+  // is one of them. Rebinding the pointer and the length while leaving the rate
+  // at the request's value left the resampled buffer described as 22050 Hz, and
+  // `WhisperAudioProcessor::ProcessWaveform` — which this drives once per chunk
+  // and which carries its OWN rate refusal for the Whisper/Voxtral row
+  // (`audio_processor.cpp:214-221`) — threw a bare `runtime_error`. That is
+  // HTTP 500, not 400: the served suite read `500 == 400` before this line was
+  // written. Before W7c-2 the assignment was unreachable, because the refusal
+  // above it guaranteed the two rates were already equal.
+  //
+  // THE BUFFER IS HANDED BACK when the caller asked for it (PR #2842 F2). The
+  // route needs the SAME resampled waveform for the encoder-cache key, and
+  // before this it got it by resampling a second time — 1220.7 MB twice on the
+  // request measured in spec §4.17.10. `resampled_out` is used as the local,
+  // so there is one buffer and no copy, and it stays empty at the target rate
+  // because then the caller's own pointer already is the consumed waveform.
+  std::vector<float> owned;
+  std::vector<float>& resampled = resampled_out != nullptr ? *resampled_out : owned;
+  resampled.clear();
   if (sample_rate != cfg_.sampling_rate) {
-    // `InputValidationError`, so the server answers HTTP 400: the RATE is a
-    // property of the request, and `ApiServer::handle_chat_completions` maps a
-    // bare `runtime_error` to 500. Upstream's own mapping is `ValueError` ->
-    // `BadRequestError` (serve/utils/error_response.py:62-65).
-    throw v1::InputValidationError(
-        "dots3-note audio processor: the request carries audio at " +
-        std::to_string(sample_rate) + " Hz and this checkpoint's "
-        "`audio_config.sampling_rate` is " +
-        std::to_string(cfg_.sampling_rate) +
-        " Hz. RESAMPLING IS NOT PORTED and is owed to W7c-2: upstream "
-        "resamples in its data parser (MultiModalDataParser(target_sr=...), "
-        "vllm/models/dots3_note/common/processor.py:523-525 @ 9035151d6), "
-        "which reaches `resample_audio_pyav` — libswresample through "
-        "PyAV/FFmpeg (vllm/multimodal/audio.py:174-229 @ 9035151d6). NOT "
-        "librosa: no vLLM decode or resample path imports it. Rate conversion "
-        "is numerically delicate and this port has not chosen its tolerance "
-        "yet. Refused by name rather than fed to a front end that would "
-        "produce correctly-shaped wrong features. See "
-        ".agents/specs/dots3-note.md `## Owed` (W7c-2) and §4.16.");
+    resampled = ResampleAudioScipy(samples, num_samples, sample_rate,
+                                   cfg_.sampling_rate);
+    samples = resampled.data();
+    num_samples = static_cast<int64_t>(resampled.size());
+    sample_rate = cfg_.sampling_rate;
   }
+
   if (num_samples <= 0) {
     throw v1::InputValidationError(
         "dots3-note audio processor: the request carries an empty waveform");
@@ -621,6 +652,50 @@ AudioKwargs Dots3NoteAudioProcessor::ProcessWaveform(
 std::string Dots3NoteAudioProcessor::HashAudio(const float* samples,
                                                int64_t num_samples) const {
   return front_end_->HashAudio(samples, num_samples);
+}
+
+std::string Dots3NoteAudioProcessor::HashAudio(
+    const float* samples, int64_t num_samples, int sample_rate,
+    const std::vector<float>* resampled) const {
+  // W7c-2 (#2828) CREATED the defect this closes, and closes it in the same
+  // change. While every served rate was `audio_config.sampling_rate` the raw
+  // waveform was an unambiguous encoder-cache key. It stops being one the
+  // moment two rates are served: a file carrying N PCM16 samples at 16000 Hz
+  // and a file carrying THE IDENTICAL N SAMPLES at 44100 Hz decode to identical
+  // float buffers, hash identically under the two-argument form, and must
+  // produce different features. `mm_hash` is a CROSS-REQUEST key —
+  // `EncoderCacheManager::cached_` is keyed on it and `scheduler.cpp:511-590`
+  // reuses a hit — so the second request would be handed the first's
+  // embeddings.
+  //
+  // BE EXACT ABOUT WHAT THAT COSTS, because the two also differ in RESAMPLED
+  // LENGTH: a collision needs identical raw buffers, and identical buffers at
+  // different rates cannot resample to the same row count. So the observable
+  // failure is a wrong-length splice rather than a quiet substitution. Either
+  // way the key is wrong, and a key that is only accidentally caught downstream
+  // is not a key.
+  //
+  // The key is therefore the RESAMPLED waveform — the buffer the tower actually
+  // consumes. That also makes two requests that resample to the same waveform
+  // share a cache entry, which is correct, and it is why this hashes the output
+  // rather than merely mixing the rate into the input.
+  if (sample_rate == cfg_.sampling_rate) {
+    return front_end_->HashAudio(samples, num_samples);
+  }
+  // RESAMPLE ONCE (PR #2842 F2). `RouteDots3NoteAudioWav` has just driven
+  // `ProcessWaveform` over this same waveform and this same rate, so it already
+  // holds the buffer this would otherwise rebuild; on the request measured in
+  // spec §4.17.10 that rebuild was a second 1220.7 MB allocation, doubling the
+  // cost of a 40 KB upload. The argument is the answer and not a hint: it is
+  // hashed as-is. A caller that does not hold it passes nothing and this
+  // resamples for itself, which is the only behaviour that ever existed.
+  if (resampled != nullptr) {
+    return front_end_->HashAudio(resampled->data(),
+                                 static_cast<int64_t>(resampled->size()));
+  }
+  const std::vector<float> own =
+      ResampleAudioScipy(samples, num_samples, sample_rate, cfg_.sampling_rate);
+  return front_end_->HashAudio(own.data(), static_cast<int64_t>(own.size()));
 }
 
 }  // namespace vllm::multimodal

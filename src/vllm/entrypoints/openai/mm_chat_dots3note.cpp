@@ -208,8 +208,10 @@ multimodal::MultiModalInputs RouteDots3NoteImageRgb(
 // name; what this adds is WHO OWES IT, so an operator learns that rather than
 // only what failed.
 //
-// W7c-1 (#2813) NARROWED it. It used to say a multi-channel WAV was owed to
-// W7c; any channel count is now served, mean-reduced as upstream reduces. And
+// W7c-1 (#2813) and W7c-2 (#2828) NARROWED it, twice. It used to say a
+// multi-channel WAV was owed to W7c and then that a non-16 kHz one was; any
+// channel count is now served, mean-reduced as upstream reduces, and any
+// sampling rate is served, resampled as upstream's own scipy arm resamples. And
 // the container arm left this row entirely: it needs a demuxer this tree does
 // not vendor, five surfaces refuse compressed media for that same missing
 // brick, and #2814 owns it. The refusal stays at the SEAM and stays the SAME
@@ -247,26 +249,44 @@ multimodal::MultiModalInputs RouteDots3NoteAudioWav(
         "dots3-note one. Any CHANNEL count is served since W7c-1 (#2813): the "
         "channels are mean-reduced to mono, as upstream's "
         "`load_audio(..., mono=True)` does "
-        "(vllm/multimodal/media/audio.py:207-208, :220 @ 9035151d6). A "
-        "sampling rate other than `audio_config.sampling_rate` is refused "
-        "separately, by the front end, and is owed to W7c-2. See "
-        ".agents/specs/dots3-note.md §4.16 and issue #2813.");
+        "(vllm/multimodal/media/audio.py:207-208, :220 @ 9035151d6). Any "
+        "SAMPLING RATE is served since W7c-2 (#2828): the waveform is "
+        "resampled to `audio_config.sampling_rate` by upstream's own `scipy` "
+        "AudioResampler arm (resample_audio_scipy, "
+        "vllm/multimodal/audio.py:232-250 @ 9035151d6), NOT its `pyav` "
+        "default, which is libswresample and is not bit-identical to itself "
+        "across CPU dispatch. See .agents/specs/dots3-note.md §4.16 and §4.17, "
+        "and issues #2813 and #2828.");
   }
 
-  // The front end refuses a wrong rate (W7c-2) BY NAME, and — since W7b (#2797)
-  // lifted the `chunk_seconds` ceiling — a waveform past ONE chunk on a
+  // Since W7c-2 (#2828) the front end RESAMPLES a rate that is not
+  // `audio_config.sampling_rate` rather than refusing it, through upstream's
+  // own `"scipy"` `AudioResampler` arm (spec §4.17). What it still refuses BY
+  // NAME is a non-positive rate; a reduced polyphase ratio past
+  // `kMaxPolyphaseRate`, which is a recorded divergence because the rate is
+  // named by the request and upstream has no such guard; and — since W7b
+  // (#2797) lifted the `chunk_seconds` ceiling — a waveform past ONE chunk on a
   // checkpoint whose `chunk_samples` is not a whole number of `token_stride`s,
   // where upstream's own per-segment row sum and its prompt-side
-  // `ceil(total / stride)` disagree (spec §4.15.3). Both messages name the
+  // `ceil(total / stride)` disagree (spec §4.15.3). Every message names the
   // reason and the numbers.
   //
   // THIS IS THE FRONT END AND NOT THE ENGINE LOOP, and that is the point of
   // refusing here: `InputValidationError` becomes HTTP 400 for THIS request,
   // where the same throw from inside `encode_mm` would set `AsyncLLM`'s errored
   // latch and 500 every later request, text ones included.
+  //
+  // ONE RESAMPLE PER REQUEST, NOT TWO (PR #2842 F2). The mm-hash below needs the
+  // SAME resampled waveform, and before this it got it by calling
+  // `ResampleAudioScipy` a second time over the same input: on the 1 Hz request
+  // measured in spec §4.17.10 that was 1220.7 MB twice for a 40 KB upload.
+  // `ProcessWaveform` fills `resampled` when it resamples and leaves it empty
+  // when it does not, and the hash below is handed the buffer rather than the
+  // rate to redo it from.
+  std::vector<float> resampled;
   multimodal::AudioKwargs kw = proc.ProcessWaveform(
       decoded.samples.data(), static_cast<int64_t>(decoded.samples.size()),
-      decoded.sampling_rate);
+      decoded.sampling_rate, &resampled);
 
   std::vector<std::array<int, 2>> placeholders;
   std::vector<int32_t> expanded = multimodal::ExpandAudioPlaceholders(
@@ -280,11 +300,22 @@ multimodal::MultiModalInputs RouteDots3NoteAudioWav(
     spec.modality = "audio";
     spec.offset = placeholders[0][0];
     spec.length = placeholders[0][1];
-    // The mm-hash is over the RAW waveform, before feature extraction, exactly
-    // as the image hash is over the raw pixels — so the encoder cache keys on
-    // what the request carried rather than on what the front end derived.
-    spec.mm_hash = proc.HashAudio(
-        decoded.samples.data(), static_cast<int64_t>(decoded.samples.size()));
+    // The mm-hash is over the WAVEFORM, before feature extraction, exactly as
+    // the image hash is over the raw pixels — so the encoder cache keys on
+    // audio rather than on what the front end derived from it.
+    //
+    // W7c-2 (#2828) PASSES THE REQUEST'S OWN RATE, and that is a correctness
+    // requirement rather than a refinement. Two requests whose raw buffers are
+    // identical and whose declared rates are not produce DIFFERENT features
+    // since W7c-2, and `mm_hash` is a CROSS-REQUEST encoder-cache key, so a key
+    // over the raw buffer alone would hand the second one the first one's
+    // encoding. The three-argument overload hashes the RESAMPLED waveform,
+    // which separates those two and also lets two requests that resample to the
+    // same audio share one entry.
+    spec.mm_hash = proc.HashAudio(decoded.samples.data(),
+                                  static_cast<int64_t>(decoded.samples.size()),
+                                  decoded.sampling_rate,
+                                  resampled.empty() ? nullptr : &resampled);
     spec.audio_data = std::make_shared<multimodal::AudioKwargs>(std::move(kw));
     out.mm_features.push_back(std::move(spec));
   }

@@ -49,9 +49,13 @@ it in, and the chain is read at the base commit rather than assumed:
 4. Both shipped families contain **zero** `mutex`, `lock_guard`, `unique_lock`
    and `scoped_lock` occurrences: `minimax_music3_speech.cpp` and
    `indextts2.cpp`.
-5. The C ABI reaches the same object by a second door. `vllm_synthesize`
-   (`include/vllm.h:1375`) takes an engine handle, so a client with two threads
-   and one handle is the same defect with no HTTP server in the picture.
+5. **The C ABI is the one caller that got it right, and its doc comment is the
+   third written contract.** `include/vllm.h:1370` promises "Serialized per
+   engine handle", and `src/capi/vllm_c.cpp:1915` delivers it: the handle owns a
+   `std::mutex` (`:1790`) and `vllm_synthesize` holds it across the call. So the
+   guarantee exists in a WRAPPER around the seam, for one of the seam's callers.
+   The HTTP route has no such wrapper, and there is nothing to tell the next
+   entry point that it needs one.
 
 **The contract is written down, and it is written down in the wrong place.**
 `include/vllm/multimodal/speech_engine.h:157-158` says of `Synthesize`:
@@ -86,9 +90,18 @@ than a parallel path — every family present and future is serialised by
 construction, and a family cannot forget, because there is no longer a virtual
 for it to override without the lock.
 
-It also covers **both** doors. A lock added to `handle_audio_speech` would leave
-`vllm_synthesize` unprotected; a lock on the engine covers the C ABI, the HTTP
-route, and `examples/` alike.
+**Why the seam and not the route.** A lock in `handle_audio_speech` would close
+the one door that is open today and teach nothing. The C ABI shows why that is
+not enough: it already holds a per-handle mutex around the same call
+(`vllm_c.cpp:1790,1915`), so the tree has TWO callers with opposite dispositions
+and no seam saying which is right. Moving the lock into `Synthesize` makes the
+guarantee the seam's rather than each caller's, and a future entry point cannot
+be added without it because there is no longer a virtual to override.
+
+The C ABI's own mutex becomes redundant. It is LEFT IN PLACE: it is nested
+strictly inside the new one, always in that order, so it cannot deadlock, and
+removing it is a change to a second file that this row's gate does not cover.
+`## Owed` names it.
 
 The lock is a plain `std::mutex` held for the whole synthesis. A Music3 run is
 minutes long, so the second request waits minutes. That is the correct
@@ -158,3 +171,6 @@ part an overlap counter cannot see.
 - `music3_profile.h`'s single-threaded contract is now true because one caller
   is serialised, not because the table is safe. A second bracketing caller would
   break it again, and nothing enforces that.
+- `vllm_speech_engine::mutex` (`src/capi/vllm_c.cpp:1790,1915`) is now redundant
+  with the seam's lock. Harmless and strictly nested, so it is left rather than
+  removed in a change whose gate does not reach that file.

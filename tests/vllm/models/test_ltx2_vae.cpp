@@ -1740,23 +1740,30 @@ TEST_CASE("ltx2 vae: the dtype refusals this arm adds are REACHED, not merely wr
         doctest::Contains("only the CPU arm serves it"), std::runtime_error);
   }
 
-  SUBCASE("the ENCODER refuses a bf16 bag by name, and at its own entry") {
-    // Added by the review: the encoder allocates every volume `kF32` while
-    // `Param` returns whatever the bag stores, so a bf16 bag would have been read
-    // as f32 words. It did terminate before this refusal existed -- on a
-    // `weights.Get` several hundred lines downstream that reported a MISSING
-    // PARAMETER -- which is why the message is asserted and not only the throw.
+  SUBCASE("the ENCODER refuses a THIRD storage width by name, at its own entry") {
+    // WAVE 3'S REFUSAL HERE IS GONE, AND THAT IS THIS ROW'S DELIVERABLE.
+    // This subcase used to assert "the encoder is still the f32 port". A24 wave 4
+    // (row LTX25-A24-LEAVES-BF16, #2850) landed the arm that refusal stood in
+    // for, so asserting it now would gate the absence of the feature. What
+    // survives -- and what wave 3's fresh review actually asked for, that a
+    // refusal nothing executes is a comment -- is that a width NEITHER arm serves
+    // still stops here, by name, at the entry rather than several hundred lines
+    // downstream on a `weights.Get` reporting a missing parameter.
+    //
+    // FP8 and NVFP4 are A22. The encoder shares `RequireVaeDType` with the
+    // decode, so the message is the decode's; what this asserts is that the
+    // ENCODER'S entry reaches it.
     vllm::Ltx2ConvVideoEncoderConfig enc;
     enc.prefix = "ltx2.videoenc.";
     enc.in_channels = 3;
     enc.out_channels = 4;
     enc.patch_size = 2;
     const std::vector<float> frames(static_cast<size_t>(enc.in_channels * 1 * 8 * 8), 0.0f);
-    vllm::Ltx2VaeWeights bf16;
-    bf16.dtype = vt::DType::kBF16;
+    vllm::Ltx2VaeWeights wrong;
+    wrong.dtype = vt::DType::kF16;
     CHECK_THROWS_WITH_AS(
-        vllm::Ltx2ConvVideoEncode(enc, bf16, frames, enc.in_channels, 1, 8, 8, nullptr),
-        doctest::Contains("the encoder is still the f32 port"), std::runtime_error);
+        vllm::Ltx2ConvVideoEncode(enc, wrong, frames, enc.in_channels, 1, 8, 8, nullptr),
+        doctest::Contains("the decode serves f32"), std::runtime_error);
   }
 }
 

@@ -475,7 +475,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 605 607 1239 1335 1431 1447 1582 1586 1711 1789 1907 1949 1991 1993
+// 605 607 1239 1335 1431 1447 1582 1586 1719 1797 1915 1957 1999 2001
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -1639,9 +1639,9 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     // while every digest, absmax, frame byte and determinism check on this path
     // stays green.
     //
-    // The ENCODER below deliberately keeps the f32 default. It is a separate port
-    // with its own route and its own weights bag, it is still f32 in this tree,
-    // and its bf16 arm is owed by name in the row's spec.
+    // The ENCODER below asks for the SAME width, and it is a separate call
+    // because it is a separate port with its own route and its own weights bag.
+    // A24 wave 4 (#2850) landed its arm; wave 3 recorded it owed here.
     im.video_weights =
         Ltx2LoadVaeWeights(f, Ltx2VideoVaeDecoderKeyRules(), vt::DType::kBF16);
 
@@ -1654,7 +1654,15 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     // configurator, same weights.
     if (Ltx2CheckpointHasVideoEncoder(f.Names())) {
       im.video_encoder_cfg = Ltx2ParseConvVideoEncoderConfig(vae_config);
-      im.video_encoder_weights = Ltx2LoadVaeWeights(f, Ltx2VideoVaeEncoderKeyRules());
+      // A24 wave 4 (#2850): THE PRODUCTION WIRING, and it is the single site the
+      // reachability mutation deletes. `ImageConditioner` builds the encoder at
+      // the pipeline dtype (distilled.py:120-125, utils/blocks.py:985-986), so
+      // the bag it is fed is bf16. Removing this argument leaves every value
+      // gate in `test_ltx2_vae` green and reds the render-path dtype case, which
+      // is the polarity that makes that case measure a capability rather than a
+      // class.
+      im.video_encoder_weights =
+          Ltx2LoadVaeWeights(f, Ltx2VideoVaeEncoderKeyRules(), vt::DType::kBF16);
       im.has_video_encoder = true;
 
       // The encoder's LATENT WIDTH against the DiT's input, asserted rather

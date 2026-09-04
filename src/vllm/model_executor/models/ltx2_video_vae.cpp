@@ -2156,10 +2156,17 @@ Ltx2LatentVolume Ltx2ConvVideoEncode(const Ltx2ConvVideoEncoderConfig& config,
   VT_CHECK(x.channels >= latent_channels,
            "ltx2 video encoder: conv_out emitted fewer channels than the latent width");
 
-  const std::vector<float>& std_of_means = weights.Get(p + "per_channel_statistics.std-of-means");
-  const std::vector<float>& mean_of_means = weights.Get(p + "per_channel_statistics.mean-of-means");
-  VT_CHECK(static_cast<int64_t>(std_of_means.size()) == latent_channels &&
-               static_cast<int64_t>(mean_of_means.size()) == latent_channels,
+  // READ THROUGH `Param`, WHICH IS ARM-AWARE, and that is what implements the
+  // `.to(x)` upstream applies to both registered buffers (ops.py:81-84). On the
+  // bf16 arm the bag already holds the narrowed words, exactly as
+  // `module.to(torch.bfloat16)` narrows a registered buffer in place, so reading
+  // one back IS the narrowing. `weights.Get` would have thrown here on a bf16
+  // bag -- which is the accidental refusal wave 3 recorded, in a message naming
+  // neither this encoder nor the dtype.
+  const VaeParam std_of_means = Param(weights, p + "per_channel_statistics.std-of-means");
+  const VaeParam mean_of_means = Param(weights, p + "per_channel_statistics.mean-of-means");
+  VT_CHECK(static_cast<int64_t>(std_of_means.count) == latent_channels &&
+               static_cast<int64_t>(mean_of_means.count) == latent_channels,
            "ltx2 video encoder: per-channel statistics must have one value per latent channel");
 
   Ltx2LatentVolume out;
@@ -2191,15 +2198,15 @@ Ltx2LatentVolume Ltx2ConvVideoEncode(const Ltx2ConvVideoEncoderConfig& config,
   // `std::vector<float>` on either arm, so the widening below is the one upstream
   // does when the bf16 latent leaves the module -- not a second arithmetic path,
   // because every value is already on the arm's grid when it gets here.
-  const auto Narrow = [dt](float v) {
+  const auto Round = [dt](float v) {
     return dt == vt::DType::kBF16 ? vt::BF16ToF32(vt::F32ToBF16(v)) : v;
   };
   for (int64_t c = 0; c < latent_channels; ++c) {
-    const float mean = Narrow(mean_of_means[static_cast<size_t>(c)]);
-    const float denom = Narrow(std_of_means[static_cast<size_t>(c)]);
+    const float mean = LoadElem(mean_of_means.data, static_cast<size_t>(c), mean_of_means.dtype);
+    const float denom = LoadElem(std_of_means.data, static_cast<size_t>(c), std_of_means.dtype);
     for (int64_t i = 0; i < elems; ++i) {
       const float v = LoadElem(x.data.ptr(), static_cast<size_t>(c * elems + i), dt);
-      out.data[static_cast<size_t>(c * elems + i)] = Narrow(Narrow(v - mean) / denom);
+      out.data[static_cast<size_t>(c * elems + i)] = Round(Round(v - mean) / denom);
     }
   }
   return out;

@@ -131,19 +131,21 @@ recorded here with the evidence; absence from this table means unmeasured, never
 unsupported. One row per measurement, appended by the change that made it.
 
 **AT THE CURRENT PIN THIS TABLE IS EMPTY, and that is the honest reading of it.**
-The one row below was measured at the PRIOR pin `5559679229`: its evidence file
-records `SETUPTOOLS_SCM_PRETEND_VERSION=0.26.0.dev0+g5559679229` at `:246`,
-`vllm.__version__ = 0.26.0.dev0+g5559679229` at `:249` and the same string in the
-engine banner at `:340`. It is kept, with its pin column added, because it is a
-real measurement of a real board and deleting it would destroy evidence — but it
-does not answer "does a gate model run at `e126687a9a`" on any device. Nothing in
-this file does. `thor:gpu0` is deliberately NOT added: the run that put the pin
+Both rows below were measured at the PRIOR pin `5559679229`: the first row's
+evidence file records `SETUPTOOLS_SCM_PRETEND_VERSION=0.26.0.dev0+g5559679229` at
+`:246`, `vllm.__version__ = 0.26.0.dev0+g5559679229` at `:249` and the same string
+in the engine banner at `:340`; the second row's records
+`VLLM_VERSION = 0.26.0.dev0+g5559679229` in its build-identity block. They are
+kept, with their pin column, because they are real measurements of a real board
+and deleting them would destroy evidence — but they do not answer "does a gate
+model run at `e126687a9a`" on any device. Nothing in this file does. `thor:gpu0` is deliberately NOT added: the run that put the pin
 here served `facebook/opt-125m`, which is not a gate model, and adding it would
 make the table say the thing the pin advance did not buy.
 
 | device | arch | pin measured at | measured | builds | runs a gate model | evidence |
 |---|---|---|---|---|---|---|
 | `strix:gpu0` | `gfx1151` (RDNA 3.5, Radeon 8060S, ROCm 7.2.4) | **`5559679229`, the PRIOR pin** | 2026-09-03 | yes | yes — Qwen3.8-27B Q4_K_M GGUF, 6 prompts x 48 greedy tokens, reproducible | [`oracle-vllm-gfx1151-20260903.md`](../../docs/bench-evidence/oracle-vllm-gfx1151-20260903.md) |
+| `strix:gpu0` | `gfx1151` (RDNA 3.5, Radeon 8060S, ROCm 7.2.4) | **`5559679229`, the PRIOR pin** | 2026-09-03 | yes | yes — and SCORED a gate: `prompt_logprobs` teacher-forcing over 6 x 48 steps, both configurations, negative control discriminating at 21.24 nats | [`q4km-neartie-vllm-oracle-20260903.md`](../../docs/bench-evidence/q4km-neartie-vllm-oracle-20260903.md) |
 
 **A residual this table exists to hold, and does not yet close.** Every checker
 reads the `gateable` field, not the prose above it, and no field names the device
@@ -160,6 +162,20 @@ their absences presents as a device failure rather than as a provisioning gap:
 decides whether the platform is ROCm by importing it, so without it vLLM falls
 back to `UnspecifiedPlatform` on a fully working ROCm box. The evidence file
 carries the exact message each one produces.
+
+**The oracle is not self-consistent on this device, and the gate a reader picks
+decides the answer.** Its two supported configurations are each byte-identical
+to their own repeat and still disagree with each other: 2 of 6 prompts
+free-running, and teacher-forced each one diverges from its *own* recorded
+decode, 3 of 288 under compiled and 6 of 288 under eager. That floor is a
+property of the oracle on this board, not of anything measured against it, so a
+score of 0 divergences here is below the instrument's own floor and must be read
+with it. `AGENTS.md` §Gates admits an explicitly ratified distributional gate
+when an oracle's greedy decode is non-deterministic; that precondition is now
+MEASURED for the primary oracle, and the ratification for the Q4_K_M ROCm arm is
+still open under [#2534](https://github.com/mudler/vllm.cpp/issues/2534).
+Measured by [#2809](https://github.com/mudler/vllm.cpp/issues/2809):
+[`q4km-neartie-vllm-oracle-20260903.md`](../../docs/bench-evidence/q4km-neartie-vllm-oracle-20260903.md).
 
 **No `HSA_OVERRIDE_GFX_VERSION` was set for that measurement**, and none may be
 set for another. That knob makes the runtime report a different device, and a

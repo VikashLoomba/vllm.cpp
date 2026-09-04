@@ -453,6 +453,58 @@ struct Served {
   }
 };
 
+
+// ── W8a (#2860): looking at the `mm_features` a request actually produces ───
+//
+// THE PRODUCTION FACTORY, resolved through the same registry
+// `InstallMultiModalChatSeam` calls (`mm_chat_registry.h`
+// ::MultiModalChatRegistry::MakeSeam), so what these cases inspect is the seam
+// the server installs and never a hand-built twin. The served cases below still
+// go through `handle_chat_completions`; this is only how a test reads the
+// placeholder SPANS, which no HTTP response carries.
+oai::MultiModalChatSeam SeamFor(const TinyCheckpoint& ckpt,
+                                const vllm::MultiModalConfig& mm_cfg) {
+  oai::MultiModalChatContext ctx;
+  ctx.architecture = kDots3Arch;
+  ctx.model_dir = ckpt.dir();
+  ctx.config_path = ckpt.config_path();
+  ctx.served_model_name = "tiny-dots3-note";
+  ctx.tokenizer = &Fixture();
+  ctx.prompt_fn = &ConcatChatPrompt;
+  ctx.codec = RawRgbCodec();
+  ctx.mm_config = &mm_cfg;
+  return oai::MultiModalChatRegistry::MakeSeam(ctx);
+}
+
+oai::ChatContentPart ImagePart(int variant) {
+  oai::ChatContentPart part;
+  part.type = "image_url";
+  part.url = ImageDataUri(variant);
+  return part;
+}
+
+oai::ChatContentPart AudioPart(int variant) {
+  oai::ChatContentPart part;
+  part.type = "input_audio";
+  part.audio_data = EncodeBase64(dots3_tiny::FixtureAudioWav(variant));
+  part.audio_format = "wav";
+  return part;
+}
+
+oai::ChatContentPart TextPart(std::string text) {
+  oai::ChatContentPart part;
+  part.type = "text";
+  part.text = std::move(text);
+  return part;
+}
+
+std::vector<ChatMessage> OneUserMessage(std::vector<oai::ChatContentPart> parts) {
+  ChatMessage m;
+  m.role = "user";
+  m.content_parts = std::move(parts);
+  return {m};
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1130,31 +1182,102 @@ TEST_CASE("dots3-note W6a: an architecture with no registered seam REFUSES the i
 //    stated as a number — and VIDEO and AUDIO are ABSENT from the map, which
 //    `context.py:414-415` reads as unsupported.
 // ---------------------------------------------------------------------------
-TEST_CASE("dots3-note W6a: the chat seam declares ONE image, and refuses a second") {
+// W8a (#2860): this case INVERTED. Until W8a the seam located exactly ONE
+// image part and declared `{"image": 1}`, so a second image was refused at
+// STEP 0 — the honest answer while the seam could only build one feature, and
+// the #686 defect if it had answered 200 and dropped it. The one-pass applier
+// consumes one item per target occurrence, so the ceiling is now upstream's own
+// 512 (`common/processor.py:530` @ `9035151d6`) and both images are SERVED.
+TEST_CASE("dots3-note W8a: TWO images in one request are both served, and the answer is neither one's") {
   Served s;
   MmServerHarness h(s.config, *s.model, Fixture());
   std::ostringstream log;
   REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
           oai::MultiModalChatInstall::kInstalled);
 
-  const json two = {
-      {"model", "test-model"},
-      {"messages",
-       json::array({{{"role", "user"},
-                     {"content",
-                      json::array({{{"type", "image_url"},
-                                    {"image_url", {{"url", ImageDataUri(0)}}}},
-                                   {{"type", "image_url"},
-                                    {"image_url", {{"url", ImageDataUri(1)}}}},
-                                   {{"type", "text"}, {"text", "hello"}}})}}})},
-      {"max_completion_tokens", 2},
-      {"temperature", 0.0}};
+  const auto two_body = [](int max_tokens, bool logprobs) {
+    json body = {
+        {"model", "test-model"},
+        {"messages",
+         json::array({{{"role", "user"},
+                       {"content",
+                        json::array({{{"type", "image_url"},
+                                      {"image_url", {{"url", ImageDataUri(0)}}}},
+                                     {{"type", "image_url"},
+                                      {"image_url", {{"url", ImageDataUri(1)}}}},
+                                     {{"type", "text"}, {"text", "hello"}}})}}})},
+        {"max_completion_tokens", max_tokens},
+        {"temperature", 0.0}};
+    if (logprobs) {
+      body["logprobs"] = true;
+      body["top_logprobs"] = 3;
+    }
+    return body;
+  };
+
   const ApiServer::DispatchResult r =
-      h.server.handle_chat_completions(two.dump());
+      h.server.handle_chat_completions(two_body(/*max_tokens=*/2, false).dump());
   INFO("body: ", r.body);
-  // 200 here would be the #686 defect: the second image dropped without a word.
-  CHECK(r.status == 400);
-  CHECK(r.body.find("image") != std::string::npos);
+  REQUIRE(r.status == 200);
+  const json j = json::parse(r.body);
+  CHECK(j.at("usage").at("completion_tokens") == 2);
+  // TWO expanded runs plus the one text token. Dropping the second image lands
+  // 2 + kExpectedImageTokens short.
+  CHECK(j.at("usage").at("prompt_tokens") ==
+        2 * (2 + dots3_tiny::kExpectedImageTokens) + 1);
+
+  // Two features, in stream order, DISJOINT, and each holding its own pixels.
+  {
+    vllm::MultiModalConfig mm_cfg;
+    const oai::MultiModalChatSeam seam = SeamFor(s.ckpt, mm_cfg);
+    const std::optional<vllm::multimodal::MultiModalInputs> in = seam.chat_fn(
+        OneUserMessage({ImagePart(0), ImagePart(1), TextPart("hello")}));
+    REQUIRE(in.has_value());
+    REQUIRE(in->mm_features.size() == 2u);
+    CHECK(in->mm_features[0].modality == "image");
+    CHECK(in->mm_features[1].modality == "image");
+    CHECK(in->mm_features[0].offset + in->mm_features[0].length <=
+          in->mm_features[1].offset);
+    // Two DIFFERENT images, so two DIFFERENT encoder-cache keys. Equal hashes
+    // here would make the scheduler run one tower call and hand its rows to
+    // both spans.
+    CHECK(in->mm_features[0].mm_hash != in->mm_features[1].mm_hash);
+  }
+
+  // THE LOAD-BEARING ASSERTION. Both counts above pass on a seam that expands
+  // the second placeholder with the FIRST image's features.
+  const auto logprobs_of = [](const json& body) {
+    Served ss;
+    MmServerHarness hh(ss.config, *ss.model, Fixture());
+    std::ostringstream l;
+    REQUIRE(hh.install(kDots3Arch, true, ss.ckpt, l) ==
+            oai::MultiModalChatInstall::kInstalled);
+    const ApiServer::DispatchResult rr =
+        hh.server.handle_chat_completions(body.dump());
+    INFO("body: ", rr.body);
+    REQUIRE(rr.status == 200);
+    const json jj = json::parse(rr.body);
+    std::vector<double> out;
+    for (const json& t :
+         jj.at("choices")[0].at("logprobs").at("content")[0].at("top_logprobs")) {
+      out.push_back(t.at("logprob").get<double>());
+    }
+    return out;
+  };
+  // The SAME image twice, against the two DIFFERENT ones. Both requests carry
+  // two features at the same two spans and the same prompt length; only the
+  // second image's pixels differ.
+  json same_twice = two_body(1, true);
+  same_twice["messages"][0]["content"][1]["image_url"]["url"] = ImageDataUri(0);
+  const std::vector<double> a = logprobs_of(two_body(1, true));
+  const std::vector<double> b = logprobs_of(same_twice);
+  REQUIRE(a.size() == b.size());
+  REQUIRE(!a.empty());
+  double worst = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i)
+    worst = std::max(worst, std::fabs(a[i] - b[i]));
+  MESSAGE("the SECOND image moves the first token's logprobs by up to " << worst);
+  CHECK(worst > 1e-4);
 }
 
 // ---------------------------------------------------------------------------
@@ -1314,27 +1437,78 @@ TEST_CASE("dots3-note W7a: two DIFFERENT waveforms give two different forwards")
   CHECK(worst > 1e-4);
 }
 
-TEST_CASE("dots3-note W7a: the chat seam declares ONE audio, and refuses a second") {
+// W8a (#2860): this case INVERTED too, for the reason its image twin did. The
+// declared ceiling is now upstream's 128 (`common/processor.py:533` @
+// `9035151d6`) and a second audio part is SERVED.
+TEST_CASE("dots3-note W8a: TWO audio parts in one request are both served, and the answer is neither one's") {
   Served s(AudioSpec());
   MmServerHarness h(s.config, *s.model, Fixture());
   std::ostringstream log;
   REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
           oai::MultiModalChatInstall::kInstalled);
 
-  json body = ChatBodyAudio(/*max_tokens=*/1, 0, false);
-  // A SECOND audio part in the same message.
-  body["messages"][0]["content"].push_back(
-      {{"type", "input_audio"},
-       {"input_audio",
-        {{"data", EncodeBase64(dots3_tiny::FixtureAudioWav(1))},
-         {"format", "wav"}}}});
+  const auto two_body = [](int max_tokens, bool logprobs, int second_variant) {
+    json body = ChatBodyAudio(max_tokens, 0, logprobs);
+    body["messages"][0]["content"].push_back(
+        {{"type", "input_audio"},
+         {"input_audio",
+          {{"data", EncodeBase64(dots3_tiny::FixtureAudioWav(second_variant))},
+           {"format", "wav"}}}});
+    return body;
+  };
+
   const ApiServer::DispatchResult r =
-      h.server.handle_chat_completions(body.dump());
+      h.server.handle_chat_completions(two_body(1, false, 1).dump());
   INFO("body: ", r.body);
-  CHECK(r.status == 400);
-  // Upstream's own message shape (`context.py:414-415`), with the seam's own
-  // ceiling of 1 — a user `--limit-mm-per-prompt` can only LOWER it.
-  CHECK(r.body.find("At most 1 audio(s)") != std::string::npos);
+  REQUIRE(r.status == 200);
+  const json j = json::parse(r.body);
+  CHECK(j.at("usage").at("prompt_tokens") ==
+        2 * (2 + dots3_tiny::kAudioTokens) + 1);
+
+  {
+    vllm::MultiModalConfig mm_cfg;
+    const oai::MultiModalChatSeam seam = SeamFor(s.ckpt, mm_cfg);
+    const std::optional<vllm::multimodal::MultiModalInputs> in = seam.chat_fn(
+        OneUserMessage({AudioPart(0), TextPart("hello"), AudioPart(1)}));
+    REQUIRE(in.has_value());
+    REQUIRE(in->mm_features.size() == 2u);
+    CHECK(in->mm_features[0].modality == "audio");
+    CHECK(in->mm_features[1].modality == "audio");
+    CHECK(in->mm_features[0].offset + in->mm_features[0].length <=
+          in->mm_features[1].offset);
+    CHECK(in->mm_features[0].mm_hash != in->mm_features[1].mm_hash);
+  }
+
+  const auto logprobs_of = [](const json& body) {
+    Served ss(AudioSpec());
+    MmServerHarness hh(ss.config, *ss.model, Fixture());
+    std::ostringstream l;
+    REQUIRE(hh.install(kDots3Arch, true, ss.ckpt, l) ==
+            oai::MultiModalChatInstall::kInstalled);
+    const ApiServer::DispatchResult rr =
+        hh.server.handle_chat_completions(body.dump());
+    INFO("body: ", rr.body);
+    REQUIRE(rr.status == 200);
+    const json jj = json::parse(rr.body);
+    std::vector<double> out;
+    for (const json& t :
+         jj.at("choices")[0].at("logprobs").at("content")[0].at("top_logprobs")) {
+      out.push_back(t.at("logprob").get<double>());
+    }
+    return out;
+  };
+  // THE LOAD-BEARING ASSERTION: the two waveforms have the SAME length, so both
+  // requests expand to the same two seven-token spans and report the same
+  // counts. Only the second clip's samples differ.
+  const std::vector<double> a = logprobs_of(two_body(1, true, 1));
+  const std::vector<double> b = logprobs_of(two_body(1, true, 0));
+  REQUIRE(a.size() == b.size());
+  REQUIRE(!a.empty());
+  double worst = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i)
+    worst = std::max(worst, std::fabs(a[i] - b[i]));
+  MESSAGE("the SECOND waveform moves the first token's logprobs by up to " << worst);
+  CHECK(worst > 1e-4);
 }
 
 TEST_CASE("dots3-note W7a: a checkpoint with NO audio_config refuses the audio part by name") {
@@ -1605,27 +1779,159 @@ TEST_CASE("dots3-note W7c-1: a STEREO WAV at 16 kHz is SERVED, and its answer is
   // M2 in spec 4.16.7 mutates the production divide instead.
 }
 
-TEST_CASE("dots3-note W7a: an image and an audio part in ONE request refuse BY NAME, to W8") {
+// ---------------------------------------------------------------------------
+// 12. W8a (#2860): THE FIRST REQUEST IN THIS REPOSITORY TO CARRY TWO FEATURES.
+//
+//     This case INVERTED. Until W8a it asserted HTTP 400 and "BOTH an image",
+//     because the two expanders each rebuild the whole id vector and running
+//     them in sequence measures the second one's offsets against the first
+//     one's UN-expanded input (spec §4.18.1). The seam now applies every
+//     modality's `[start, pad, end]` target in ONE pass, upstream's own shape
+//     (`vllm/multimodal/processing/processor.py:944-957` @ `9035151d6`), and
+//     the request is SERVED.
+//
+//     THE LOAD-BEARING ASSERTION IS THE LOGPROBS, not the status. A seam that
+//     expanded the audio and silently dropped the image answers 200 with the
+//     right `completion_tokens`, and a seam that got the image's OFFSET wrong
+//     by the audio's expansion answers 200 with the right `prompt_tokens` too:
+//     the counts still balance and the runner's `n_rows == n_masked` still
+//     holds. What neither survives is producing the same first-token
+//     distribution as the image-only request AND the audio-only one.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W8a: an image and an audio part in ONE request are BOTH served, and the answer is neither one's") {
   Served s(AudioSpec());
   MmServerHarness h(s.config, *s.model, Fixture());
   std::ostringstream log;
   REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
           oai::MultiModalChatInstall::kInstalled);
 
-  json body = ChatBodyAudio(/*max_tokens=*/1, 0, false);
-  body["messages"][0]["content"].push_back(
-      {{"type", "image_url"}, {"image_url", {{"url", ImageDataUri(0)}}}});
+  const auto mixed_body = [](int max_tokens, bool logprobs) {
+    json body = ChatBodyAudio(max_tokens, 0, logprobs);
+    body["messages"][0]["content"].push_back(
+        {{"type", "image_url"}, {"image_url", {{"url", ImageDataUri(0)}}}});
+    return body;
+  };
+
   const ApiServer::DispatchResult r =
-      h.server.handle_chat_completions(body.dump());
+      h.server.handle_chat_completions(mixed_body(/*max_tokens=*/1, false).dump());
   INFO("body: ", r.body);
-  CHECK(r.status == 400);
-  CHECK(r.body.find("BOTH an image") != std::string::npos);
-  CHECK(r.body.find("W8") != std::string::npos);
-  // Each on its OWN is still served — the refusal is about the COMBINATION.
+  REQUIRE(r.status == 200);
+  const json j = json::parse(r.body);
+  CHECK(j.at("object") == "chat.completion");
+  // The prompt the engine ran is BOTH expansions over ONE id stream:
+  // `<|audio_comp_start|>` + kAudioTokens pads + `<|audio_comp_end|>` +
+  // "hello" + `<|img|>` + kExpectedImageTokens pads + `<|endofimg|>`.
+  // Expanding one and dropping the other lands 2 + N + 1 short.
+  CHECK(j.at("usage").at("prompt_tokens") ==
+        2 + dots3_tiny::kAudioTokens + 1 + 2 + dots3_tiny::kExpectedImageTokens);
+
+  // ── the two SPANS, read off the production seam ──────────────────────────
+  //
+  // No HTTP response carries `mm_features`, and the assertion that the two
+  // spans do NOT OVERLAP is the one that separates a correct one-pass
+  // expansion from a chained two-pass one. `GetMmFeaturesInWindow`
+  // (`utils.cpp:9-50`) is a pair of binary searches over `offset`, so the
+  // ASCENDING order is a precondition of the scheduler and the runner both.
+  {
+    vllm::MultiModalConfig mm_cfg;
+    const oai::MultiModalChatSeam seam = SeamFor(s.ckpt, mm_cfg);
+    const std::optional<vllm::multimodal::MultiModalInputs> in =
+        seam.chat_fn(OneUserMessage({AudioPart(0), TextPart("hello"), ImagePart(0)}));
+    REQUIRE(in.has_value());
+    REQUIRE(in->mm_features.size() == 2u);
+    // Stream order, not modality order: the audio part is written first.
+    CHECK(in->mm_features[0].modality == "audio");
+    CHECK(in->mm_features[1].modality == "image");
+    CHECK(in->mm_features[0].length == dots3_tiny::kAudioTokens);
+    CHECK(in->mm_features[1].length == dots3_tiny::kExpectedImageTokens);
+    MESSAGE("spans: audio [" << in->mm_features[0].offset << ", "
+                             << in->mm_features[0].offset +
+                                    in->mm_features[0].length
+                             << ") image [" << in->mm_features[1].offset << ", "
+                             << in->mm_features[1].offset +
+                                    in->mm_features[1].length << ")");
+    // ASCENDING and DISJOINT. A chained two-pass expansion reports the image at
+    // offset 5 where it is at 11 — inside the audio span.
+    CHECK(in->mm_features[0].offset < in->mm_features[1].offset);
+    CHECK(in->mm_features[0].offset + in->mm_features[0].length <=
+          in->mm_features[1].offset);
+    // Each span lies inside the expanded prompt and holds only pad ids.
+    for (const vllm::multimodal::MultiModalFeatureSpec& f : in->mm_features) {
+      REQUIRE(f.offset >= 0);
+      REQUIRE(f.offset + f.length <=
+              static_cast<int>(in->prompt_token_ids.size()));
+      const int32_t pad = f.modality == "audio" ? dots3_tiny::kAudPadId
+                                                : dots3_tiny::kImgPadId;
+      int wrong = 0;
+      for (int t = f.offset; t < f.offset + f.length; ++t)
+        if (in->prompt_token_ids[static_cast<std::size_t>(t)] != pad) ++wrong;
+      CHECK(wrong == 0);
+    }
+    // And the two carry the DATA of their own modality, so nothing was routed
+    // through the other tower.
+    CHECK(in->mm_features[0].audio_data != nullptr);
+    CHECK(in->mm_features[0].data == nullptr);
+    CHECK(in->mm_features[1].data != nullptr);
+    CHECK(in->mm_features[1].audio_data == nullptr);
+  }
+
+  // ── THE LOAD-BEARING ASSERTION ───────────────────────────────────────────
+  const auto logprobs_of = [](const json& body) {
+    Served ss(AudioSpec());
+    MmServerHarness hh(ss.config, *ss.model, Fixture());
+    std::ostringstream l;
+    REQUIRE(hh.install(kDots3Arch, true, ss.ckpt, l) ==
+            oai::MultiModalChatInstall::kInstalled);
+    const ApiServer::DispatchResult rr =
+        hh.server.handle_chat_completions(body.dump());
+    INFO("body: ", rr.body);
+    REQUIRE(rr.status == 200);
+    const json jj = json::parse(rr.body);
+    std::vector<double> out;
+    for (const json& t :
+         jj.at("choices")[0].at("logprobs").at("content")[0].at("top_logprobs")) {
+      out.push_back(t.at("logprob").get<double>());
+    }
+    return out;
+  };
+  const std::vector<double> mixed = logprobs_of(mixed_body(1, true));
+  const std::vector<double> audio_only = logprobs_of(ChatBodyAudio(1, 0, true));
+  const std::vector<double> image_only = logprobs_of(ChatBody(1, 0, true));
+  REQUIRE(!mixed.empty());
+  REQUIRE(mixed.size() == audio_only.size());
+  REQUIRE(mixed.size() == image_only.size());
+  const auto worst = [](const std::vector<double>& a,
+                        const std::vector<double>& b) {
+    double w = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i)
+      w = std::max(w, std::fabs(a[i] - b[i]));
+    return w;
+  };
+  MESSAGE("mixed vs audio-only: " << worst(mixed, audio_only)
+                                  << ", mixed vs image-only: "
+                                  << worst(mixed, image_only));
+  // Dropping the IMAGE would make this the audio-only answer.
+  CHECK(worst(mixed, audio_only) > 1e-4);
+  // Dropping the AUDIO would make it the image-only answer.
+  CHECK(worst(mixed, image_only) > 1e-4);
+
+  // Each on its OWN is still served, unchanged by the widening.
   CHECK(h.server.handle_chat_completions(ChatBodyAudio(1, 0, false).dump())
             .status == 200);
   CHECK(h.server.handle_chat_completions(ChatBody(1, 0, false).dump()).status ==
         200);
+
+  // VIDEO is still refused, and the refusal is byte-for-byte the one this seam
+  // produced before W8a: `Dots3NoteChatSupportedMmLimits` leaves the modality
+  // ABSENT, which `context.py:414-415` reads as limit 0.
+  json with_video = ChatBody(1, 0, false);
+  with_video["messages"][0]["content"].push_back(
+      {{"type", "video_url"}, {"video_url", {{"url", ImageDataUri(0)}}}});
+  const ApiServer::DispatchResult v =
+      h.server.handle_chat_completions(with_video.dump());
+  INFO("video body: ", v.body);
+  CHECK(v.status == 400);
+  CHECK(v.body.find("At most 0 video(s)") != std::string::npos);
 }
 
 TEST_CASE("dots3-note W7a: an audio checkpoint whose arms are OWED refuses at INSTALL") {

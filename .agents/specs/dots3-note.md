@@ -6873,10 +6873,10 @@ failed build has twice read as a pass:
 | M5 | delete the production call site — the resample in `ProcessWaveform` back to the throw | the served suite measures a function, not a capability |
 | M6 | hash the RAW waveform in the three-argument `HashAudio` | §4.17.6's cache collision is back and nothing sees it |
 | M7 | the ROUTE reverts to the two-argument `HashAudio` | the overload computes the right key and nothing asks for it |
-| M8 | the route hands the RAW buffer over as the resample "answer" (#2842) | the shared-buffer argument is trusted and never checked |
-| M9 | `kMaxUpsampleRatio` is widened past the attack (#2842) | the output bound is decorative |
+| M8 | the route hands the RAW buffer over as the resample "answer" (PR #2842 F2) | the shared-buffer argument is trusted and never checked |
+| M9 | `kMaxUpsampleRatio` is widened past the attack (PR #2842 F2) | the output bound is decorative |
 | M10 | delete the production call site — the resample in `ProcessWaveform` | the served suite measures a function, not a capability |
-| M11 | the route stops handing the buffer over, so it resamples TWICE (#2842) | *expected GREEN* — see §4.17.14 |
+| M11 | the route stops handing the buffer over, so it resamples TWICE (PR #2842 F2) | *expected GREEN* — see §4.17.14 |
 
 The measured table is §4.17.11, written by the implementation commit. It is not
 in this spec commit, because a result written before it is measured is the
@@ -6914,7 +6914,7 @@ none. It is gated in both directions: a rate just past it refuses, and 44.1 kHz
 serves.
 
 **The filter bound is not an output bound, and the gap was a denial of service
-([#2842](https://github.com/mudler/vllm.cpp/issues/2842) F2).** `up` is
+(finding F2 of the fresh review of [PR #2842](https://github.com/mudler/vllm.cpp/pull/2842)).** `up` is
 `target_sr / gcd`, so on a 16 kHz target it can never exceed 16000. A `fmt `
 chunk declaring 1 Hz therefore reduces to `up/down = 16000/1`: `max(up, down)`
 is 16000, it sails under the 100000 filter bound, it designs a cheap filter —
@@ -7145,7 +7145,7 @@ the tree was rebuilt and both binaries hashed again: `db03ea5e…` and
 and 28 / 16374.
 
 
-#### 4.17.14 The #2842 repair, measured
+#### 4.17.14 The PR #2842 fresh-review repair, measured
 
 Two fresh-review findings, repaired on `row/MODEL-MM-DOTS3-NOTE-W7C2` on top of
 `0c440b6c3`. Same recipe as §4.17.11 — `/dev/shm`, `-DVLLM_CPP_SERVER=ON

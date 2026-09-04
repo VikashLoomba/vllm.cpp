@@ -548,7 +548,7 @@ AudioKwargs Dots3NoteAudioProcessor::ProcessWaveform(
   // written. Before W7c-2 the assignment was unreachable, because the refusal
   // above it guaranteed the two rates were already equal.
   //
-  // THE BUFFER IS HANDED BACK when the caller asked for it (#2842 F2). The
+  // THE BUFFER IS HANDED BACK when the caller asked for it (PR #2842 F2). The
   // route needs the SAME resampled waveform for the encoder-cache key, and
   // before this it got it by resampling a second time — 1220.7 MB twice on the
   // request measured in spec §4.17.10. `resampled_out` is used as the local,
@@ -682,7 +682,7 @@ std::string Dots3NoteAudioProcessor::HashAudio(
   if (sample_rate == cfg_.sampling_rate) {
     return front_end_->HashAudio(samples, num_samples);
   }
-  // RESAMPLE ONCE (#2842 F2). `RouteDots3NoteAudioWav` has just driven
+  // RESAMPLE ONCE (PR #2842 F2). `RouteDots3NoteAudioWav` has just driven
   // `ProcessWaveform` over this same waveform and this same rate, so it already
   // holds the buffer this would otherwise rebuild; on the request measured in
   // spec §4.17.10 that rebuild was a second 1220.7 MB allocation, doubling the

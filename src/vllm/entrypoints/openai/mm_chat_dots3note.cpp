@@ -276,7 +276,7 @@ multimodal::MultiModalInputs RouteDots3NoteAudioWav(
   // where the same throw from inside `encode_mm` would set `AsyncLLM`'s errored
   // latch and 500 every later request, text ones included.
   //
-  // ONE RESAMPLE PER REQUEST, NOT TWO (#2842 F2). The mm-hash below needs the
+  // ONE RESAMPLE PER REQUEST, NOT TWO (PR #2842 F2). The mm-hash below needs the
   // SAME resampled waveform, and before this it got it by calling
   // `ResampleAudioScipy` a second time over the same input: on the 1 Hz request
   // measured in spec §4.17.10 that was 1220.7 MB twice for a 40 KB upload.

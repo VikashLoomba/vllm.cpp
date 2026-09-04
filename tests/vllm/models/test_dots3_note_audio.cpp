@@ -1086,7 +1086,7 @@ TEST_CASE("dots3-note W7c-2: the front end RESAMPLES a wrong rate, and W7b MOVED
   }
 
   SUBCASE("...and the served path builds that key from ONE resample, not two") {
-    // #2842 F2. `RouteDots3NoteAudioWav` drove `ProcessWaveform` and then the
+    // PR #2842 F2. `RouteDots3NoteAudioWav` drove `ProcessWaveform` and then the
     // three-argument `HashAudio`, and each of them resampled: the 1 Hz request
     // in spec §4.17.10 allocated 1220.7 MB TWICE for a 40 KB upload. The route
     // now hands the buffer over. What has to hold is that handing it over and

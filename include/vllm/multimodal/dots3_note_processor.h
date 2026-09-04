@@ -331,7 +331,7 @@ class Dots3NoteAudioProcessor {
   //
   // HANDS BACK THE RESAMPLED BUFFER when `resampled_out` is not null, so that a
   // caller which also needs the encoder-cache key does not pay for the resample
-  // a second time (#2842 F2). It is left EMPTY when no resample happened, which
+  // a second time (PR #2842 F2). It is left EMPTY when no resample happened, which
   // is exactly the case in which the caller's own pointer is already the
   // waveform the tower consumed. Nothing about the returned `AudioKwargs`
   // depends on the argument.

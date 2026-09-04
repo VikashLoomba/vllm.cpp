@@ -141,7 +141,7 @@ void ValidateRates(int orig_sr, int target_sr) {
         ".agents/specs/dots3-note.md §4.17.10. Every ordinary rate reduces far "
         "below the bound (44100 -> 441, 48000 -> 3, 22050 -> 441, 8000 -> 2).");
   }
-  // THE BOUND ABOVE IS ON THE FILTER AND NOT ON THE OUTPUT (#2842). `up` is
+  // THE BOUND ABOVE IS ON THE FILTER AND NOT ON THE OUTPUT (PR #2842 F2). `up` is
   // `target_sr / gcd` and can never exceed `target_sr`, so a LOW `orig_sr`
   // gives a SMALL `max(up, down)` and a HUGE `up/down`: 1 -> 16000 reduces to
   // 16000/1, passes the check above, and then asks for 16000 output samples

@@ -52,7 +52,7 @@ namespace vllm::multimodal {
 // 44101 Hz gives 44101.
 inline constexpr int kMaxPolyphaseRate = 100000;
 
-// THE FILTER BOUND IS NOT AN OUTPUT BOUND, and #2842 found the gap. `up` is
+// THE FILTER BOUND IS NOT AN OUTPUT BOUND, and PR #2842's fresh review found the gap. `up` is
 // `target_sr / gcd`, so on a 16 kHz target it can never exceed 16000: a `fmt `
 // chunk declaring 1 Hz reduces to `up/down = 16000/1`, sails under
 // `kMaxPolyphaseRate`, designs a cheap filter — and then asks for SIXTEEN

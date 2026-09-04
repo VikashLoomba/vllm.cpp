@@ -1424,7 +1424,7 @@ TEST_CASE("dots3-note W7c-1+W7c-2: the container refusal is NOT this row's, and 
     CHECK(t22 == t16 - 2);
   }
   SUBCASE("a PATHOLOGICAL low rate is refused BEFORE it allocates, and it is a 400") {
-    // #2842 F2. `kMaxPolyphaseRate` bounds `max(up, down)` -- the FILTER -- and
+    // PR #2842 F2. `kMaxPolyphaseRate` bounds `max(up, down)` -- the FILTER -- and
     // NOT the output length, and the two come apart at a LOW `orig_sr`. `up` is
     // `target_sr / gcd` and can never exceed 16000 here, so a `fmt ` chunk
     // declaring 1 Hz reduces to 16000/1: it passes the filter bound and asks

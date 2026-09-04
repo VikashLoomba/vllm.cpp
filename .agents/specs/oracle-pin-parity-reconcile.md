@@ -1,0 +1,197 @@
+# ORACLE-PIN-PARITY-RECONCILE — one pin, two files, and an assertion that says which one is right
+
+Issue: [#2829](https://github.com/mudler/vllm.cpp/issues/2829)
+Row: `-` (no row owns it; `.agents/specs/upstream-pin-advance-e126687.md`
+lists it under `## Owed`, and that entry stays there because it is the record
+that the sync cycle owed this work)
+Prior art: [#520](https://github.com/mudler/vllm.cpp/issues/520) and
+[`bench-oracle-pin-reconcile.md`](bench-oracle-pin-reconcile.md), where a
+duplicate of this same value drifted and the harness spent 17 days *refusing*
+the oracle the record required; [#647](https://github.com/mudler/vllm.cpp/issues/647),
+which built the oracle registry this change extends.
+
+## Scope
+
+**In scope.** One rule, added to `scripts/check-oracle-pins.py`: the vLLM
+oracle record's `pin` and `pin_label` must agree with the ` ```parity-pin `
+block in `.agents/upstream-sync.md`, which is the authority.
+
+| surface | block | role | read by |
+|---|---|---|---|
+| `.agents/upstream-sync.md` | ` ```parity-pin ` | **authority** | `tools/bench/serve_low_common.py:read_parity_pin`, then `tools/bench/online_gate.py`, which refuses a mismatched oracle before any measurement |
+| `.agents/oracles/vllm.md` | ` ```oracle-pin ` | copy | `scripts/check-oracle-pins.py` |
+
+**Out of scope, deliberately.**
+
+- **Deleting the copy.** That is the fix #2829 prefers and it is not available
+  here. `pin` and `pin_label` are `REQUIRED_KEYS` of every oracle record, and
+  `pin` is *load-bearing* in `check_record`: `gateable = yes` is refused when
+  `pin == "UNPINNED"`. Removing the two keys from `vllm.md` alone would need a
+  per-id exemption inside the shape rules that hold for the other thirteen
+  oracles, and it would take the offline literal away from a registry whose
+  whole point is that it can be read without a network. This change makes the
+  copy *checked*, and #2829's better fix stays available on top of it.
+- **Every other oracle.** `transformers`, `sglang`, `llama-cpp`, `ltx-2` and
+  the rest hold their pin *only* in their own file. There is no `parity-pin`
+  counterpart to reconcile them against, so applying this rule to them would
+  fail all thirteen for being correct. AGENTS.md: a gate that fires on ordinary
+  work is the defect, not the discipline. The reconciliation is scoped to
+  `.agents/oracles/vllm.md` by filename stem.
+- **Whether the pin exists upstream.** The checker stays network-free. This
+  change compares two files in this tree and nothing else.
+- **The prose surfaces.** Named below rather than covered.
+
+## The third, fourth and fifth surfaces, named
+
+The abbreviated revision and the release label also appear in prose, in three
+public projections:
+
+| file:line (at `c05d43299`) | text |
+|---|---|
+| `.agents/NOW.md:25` | ``Pin: vLLM `e126687a9a` (0.28.1rc1.dev132) since`` |
+| `docs/FEATURES.md:14` | ``Reference versions: vLLM 0.28.1rc1.dev132 (`e126687a9a`, the parity pin since`` |
+| `docs/benchmarks/how-we-measure.md:21` | ``**Oracle pin.** vLLM 0.28.1rc1.dev132 (`e126687a9a`) since 2026-09-03`` |
+
+**They are not gated by this change, and the reason is not that they were
+missed.** They carry no delimited block, they carry an *abbreviated* revision
+whose length is not fixed, and they are sentences whose wording is free. A regex
+over prose would have to be loose enough to find them and would then also match
+the dozens of `.agents/sync/` and `.agents/specs/` files that name a *prior* pin
+on purpose, which is a true historical fact this repository refuses to rewrite
+(`bench-oracle-pin-reconcile.md` §"Out of scope"). Three of those files already
+exist for `5559679229` and `e24d1b24`. So the gate would fire on correct work
+on the day it landed.
+
+They are listed under `## Owed` below so that a later change can decide to
+structure them rather than rediscover them.
+
+## Design
+
+`scripts/check-oracle-pins.py` gains one authority reader and one rule.
+
+1. `read_parity_pin(path, errors) -> dict[str, str] | None` parses the single
+   ` ```parity-pin ` block out of `.agents/upstream-sync.md`, using the same
+   shape rules `tools/bench/serve_low_common.py` applies: exactly one block,
+   `key = value` lines only, no unknown key, no duplicate key, no empty value.
+   It **fails closed** — a missing, unreadable, absent, duplicated or
+   unparsable block is an error, never a skipped rule. A rule that silently
+   stops checking when it cannot find its expectation is a mute switch.
+2. `check_parity_reconciliation(record, parity, errors)` compares the vLLM
+   record against that dict:
+   - `pin` must **equal** `vllm_commit`, exactly.
+   - `pin_label` must **equal** the *public* part of `vllm_runtime_version`,
+     that is the segment before the first `+`.
+3. `main` calls both, selecting the record by filename stem `vllm.md`, and
+   reports through the same error list as every other rule, so one red is one
+   `oracle-pins FAILED` with rc 1.
+
+**The expectation comes from the authority, never from the file under test.**
+An anchor checker that reads its expectation out of the same file it checks is
+a tautology and has shipped here before. `parity` is read from
+`.agents/upstream-sync.md`; the value under test is read from
+`.agents/oracles/vllm.md`; nothing crosses.
+
+### The `pin_label` rule, and why it is equality and not a prefix
+
+Today the two strings are `pin_label = 0.28.1rc1.dev132` and
+`vllm_runtime_version = 0.28.1rc1.dev132+ge126687a9`. They are not equal, so a
+rule is a choice and this spec states it.
+
+**The rule is: `pin_label == vllm_runtime_version.partition("+")[0]`.** That is
+exact equality after a *defined decomposition*, not a substring test. The `+…`
+tail is the PEP 440 local version segment, which setuptools-scm appends as
+`+g<sha>`; the part before it is the public version, which is what a release
+label is. The distinction matters because a substring or `startswith` rule would
+accept `pin_label = 0.28.1rc1.dev13` — a truncated, wrong label that is
+nonetheless a prefix — and would accept `0.28` as well. The decomposition rule
+refuses both, and it still accepts a future pin taken from a build with no local
+segment at all, where `partition` returns the whole string and the rule degrades
+to plain equality.
+
+**Considered and declined:** also asserting that the `+g<sha>` segment prefixes
+`vllm_commit`. It is true today (`e126687a9` prefixes
+`e126687a9a828d…`) and it is `assert_oracle_commit`'s job against a *live*
+runtime. As a static rule it would have to be conditional on the segment being
+present, because a pin taken from a tagged release reports a bare `0.29.0` and
+would go red while being correct. A conditional rule that is inert on the shape
+it exists for is not worth the line, so this change does not add it. Named here
+so the next reader knows it was a decision.
+
+## Risks
+
+| risk | disposition |
+|---|---|
+| The rule fires on the thirteen other oracles | Scoped by filename stem to `vllm.md`. Tested: a synthetic registry of a secondary oracle with a `pin` that matches nothing produces zero reconciliation errors |
+| The rule silently stops checking when `upstream-sync.md` moves or its block is renamed | Fails closed. A missing record, a missing block, two blocks, or an unparsable line are each an error with its own message. Tested in both directions |
+| The rule reads its expectation from the file it checks | Structurally impossible: `check_parity_reconciliation` takes the parity dict as a parameter and never opens a file |
+| It blesses the duplication the checker's docstring warns against | Acknowledged in the docstring itself, which this change rewrites rather than leaves contradicting the code. The docstring now says the copy is checked *and* that removing it is still the better fix, and names #2829 |
+| The `pin_label` rule accepts a wrong label | The decomposition rule refuses every proper prefix. Tested with `0.28.1rc1.dev13` |
+| The self-test corpus no longer covers every rule | A second fixture corpus, `PARITY_FIXTURES`, is swept in both directions by `--self-test` alongside the existing one |
+
+## Tests
+
+`tests/scripts/test_check_oracle_pins.py` gains a `ParityReconciliationTests`
+class. Every case is a mutation performed against a synthetic authority and a
+synthetic record, so none of them depends on what the live pin happens to be:
+
+1. the true pair reconciles with zero errors;
+2. a `pin` that names the prior revision is reported;
+3. a `pin_label` that names the prior release is reported;
+4. a `pin_label` that is a proper prefix of the right one is reported — this is
+   the case a substring rule would have accepted;
+5. a `pin_label` equal to the *full* runtime string, local segment included, is
+   reported;
+6. a missing `parity-pin` block is reported;
+7. two `parity-pin` blocks are reported;
+8. an unparsable line, an unknown key, a duplicate key and an empty value are
+   each reported;
+9. a secondary oracle whose `pin` matches nothing in the authority produces no
+   reconciliation error — the scoping test;
+10. the live tree reconciles, through `main([])`, which is the existing
+    `LiveRegistryTests` and needs no new case.
+
+## Gates
+
+```sh
+python3 scripts/check-oracle-pins.py
+python3 scripts/check-oracle-pins.py --self-test
+python3 -m unittest tests.scripts.test_check_oracle_pins -v
+python3 -m unittest tests.tools.test_oracle_pin
+scripts/agent-preflight.sh
+```
+
+No build. This change touches one checker, one test module and this spec; it
+compiles nothing and it runs on no device.
+
+## Evidence
+
+Red-before, green-after, and the restored tree, recorded in `## Outcome` when
+the work lands.
+
+## Stop conditions
+
+- Stop and return `NEEDS_DECISION` if closing the duplication properly — the
+  registry deriving `pin` from the authority at read time — turns out to be
+  reachable without a per-id exemption. That is the fix #2829 prefers.
+- Stop if the reconciliation cannot be made to go red by a mutation. A checker
+  that cannot fail is a mute switch and must not be reported as a gate.
+- Do not edit the pin values in `.agents/upstream-sync.md`. Another wave owns
+  that file's content, and this change reads it and never writes it.
+
+## Owed
+
+- The three prose surfaces named in §"The third, fourth and fifth surfaces":
+  `.agents/NOW.md`, `docs/FEATURES.md` and `docs/benchmarks/how-we-measure.md`
+  restate the abbreviated pin and the release label, and nothing checks them
+  either. A change that wants to gate them has to give them a delimited shape
+  first, because a regex over prose cannot tell the current pin from a
+  deliberate historical mention.
+- The duplication itself. This change makes the copy checked; it does not
+  remove it. #2829's preferred fix — the registry resolving `pin` for the
+  primary oracle from the authority at read time — stays available and is
+  strictly better than an assertion.
+
+## Now
+
+No row. This spec exists because a semantic checker change needs one, and it is
+committed before the implementation.

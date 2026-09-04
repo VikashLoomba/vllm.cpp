@@ -2910,6 +2910,39 @@ vllm::Ltx2ConvVideoEncoderConfig ReducedVideoEncoderConfigB() {
   return cfg;
 }
 
+// The reduced VideoEncoder arm the BF16 golden was taken on (A24 wave 4, #2850,
+// generator section 6e).
+//
+// IT IS NOT ARM A, AND THE DIFFERENCE IS THE WHOLE POINT.
+// `SpaceToDepthDownsample`'s skip is a group mean over
+// `group_size = in_channels * prod(stride) / out_channels`, and a TWO-element
+// mean is exact in any order -- so at `group_size == 2` the rounding rule this
+// row measured is gated at zero. Arm A's two `*_res` blocks both land on 2.
+// `compress_all_res` with multiplier 2 gives `8 * 8 / 16 = 4`, which is where the
+// rule is first-order. The generator asserts the reached group size and refuses
+// to emit otherwise.
+//
+// NO `attn` BLOCK, DELIBERATELY. At bf16 the VAE attention is served by FLASH and
+// is 37-38% of words from MATH, which wave 3 recorded as an open question; a
+// block here would drag it into a case about three unrelated rules.
+// `AttnBlock3d` is SHARED with the decoder and is gated by the decoder's own
+// bf16 case.
+vllm::Ltx2ConvVideoEncoderConfig ReducedVideoEncoderConfigBf16() {
+  vllm::Ltx2ConvVideoEncoderConfig cfg;
+  cfg.in_channels = 3;
+  cfg.out_channels = 8;
+  cfg.patch_size = 2;
+  cfg.norm_layer = vllm::Ltx2NormLayer::kPixelNorm;
+  cfg.latent_log_var = vllm::Ltx2LogVarianceType::kUniform;
+  cfg.spatial_padding_mode = vllm::Ltx2PaddingMode::kZeros;
+  cfg.encoder_blocks = {
+      {"res_x", 1, 0},
+      {"compress_all_res", 1, 2},
+  };
+  cfg.prefix = "ltx2.videoencbf16.";
+  return cfg;
+}
+
 // Build the VideoEncoder's parameters in upstream state_dict ORDER
 // (video_vae.py:194-262): per_channel_statistics, conv_in, the FORWARD block
 // walk, conv_norm_out (GroupNorm arm only), conv_out. PixelNorm carries no
@@ -3105,6 +3138,124 @@ ParamBag BuildAudioEncoderParams(const vllm::Ltx2AudioEncoderConfig& cfg) {
 }
 
 }  // namespace
+
+TEST_CASE("ltx2 vae: the video ENCODER's BF16 arm matches upstream ltx_core") {
+  // A24 wave 4, row LTX25-A24-LEAVES-BF16, issue #2850.
+  //
+  // THE ARM UPSTREAM ACTUALLY RUNS. `distilled.py:109` resolves ONE pipeline
+  // dtype and `:120-125` hands it to `ImageConditioner`, which builds this
+  // encoder with it (utils/blocks.py:985-986). The f32 cases below are the parity
+  // REFERENCE and this is the shipping arithmetic. It exists because nothing else
+  // can gate the VALUES: the generator casts every upstream parameter to f32, so
+  // the f32 oracle makes a dtype comparison vacuous by construction, and the
+  // engine-level `vae_encode_not_bf16` counter proves the WIDTH and says nothing
+  // about what was computed.
+  //
+  // THREE RULES RIDE ON THIS GOLDEN and each was EXECUTED against the pinned
+  // modules with its rejected hypothesis emitted beside upstream's answer:
+  //   * the `SpaceToDepthDownsample` group mean widens internally and rounds only
+  //     the OUTPUT (0 of 256 for an f32 and an f64 accumulator, 72-145 of 256 for
+  //     a sequential bf16 one at group_size 4 and 8);
+  //   * that rounding must happen BEFORE the skip add -- carrying the mean in f32
+  //     across it is 45-61 of 256, while the add's own width separates NOTHING at
+  //     2^0, 2^-7 or 2^-14;
+  //   * `per_channel_statistics.normalize` narrows BOTH registered buffers before
+  //     the subtract and the divide (129-136 of 288 at C=16 and 889-931 of 2304
+  //     at C=128 with them kept f32, which is what this port had).
+  const vllm::Ltx2ConvVideoEncoderConfig cfg = ReducedVideoEncoderConfigBf16();
+  ParamBag bag = BuildVideoEncoderParams(cfg);
+  CheckManifest(bag, vllm_test::kLtx2VideoEncBf16ParamNames,
+                vllm_test::kLtx2VideoEncBf16ParamCounts,
+                std::size(vllm_test::kLtx2VideoEncBf16ParamNames));
+  const vllm::Ltx2VaeWeights bf16 = NarrowToBf16(bag.weights);
+  // THE BAG IS HALF THE BYTES, measured on the same input rather than quoted.
+  // This is the storage half: an arm that computed in bf16 and kept f32
+  // parameters would pass every value check below and move twice the bytes.
+  CHECK(bf16.Bytes() * 2 == bag.weights.Bytes());
+  CHECK(bf16.tensors.empty());
+
+  const int64_t c = vllm_test::kLtx2VideoEncBf16InC;
+  const int64_t t = vllm_test::kLtx2VideoEncBf16InT;
+  const int64_t h = vllm_test::kLtx2VideoEncBf16InH;
+  const int64_t w = vllm_test::kLtx2VideoEncBf16InW;
+  const std::vector<float> frames = Ltx2Input("ltx2.videoencbf16.input", c * t * h * w, 1.0);
+
+  int64_t cropped = -1;
+  const vllm::Ltx2LatentVolume latent =
+      vllm::Ltx2ConvVideoEncode(cfg, bf16, frames, c, t, h, w, &cropped);
+  CHECK(cropped == 0);
+  CHECK(latent.channels == vllm_test::kLtx2VideoEncBf16OutC);
+  CHECK(latent.frames == vllm_test::kLtx2VideoEncBf16OutT);
+  CHECK(latent.height == vllm_test::kLtx2VideoEncBf16OutH);
+  CHECK(latent.width == vllm_test::kLtx2VideoEncBf16OutW);
+  // The fixture reaches the group size the rule needs. Asserted on BOTH sides:
+  // the generator refuses to emit below 4, and this pins the value the C++ blocks
+  // above produce, so an edit to either list that muted the rule reds here.
+  CHECK(vllm_test::kLtx2VideoEncBf16GroupSize >= 4);
+
+  // EVERY RETURNED VALUE SURVIVES A bf16 ROUND TRIP. The latent is a
+  // `std::vector<float>` on either arm, so this is the only thing in this case
+  // that can see the WIDTH; the f32 arm on this same fixture fails it on most of
+  // the stream.
+  int64_t wider = 0;
+  for (const float v : latent.data) {
+    if (vt::BF16ToF32(vt::F32ToBF16(v)) != v) ++wider;
+  }
+  INFO("bf16 encode values wider than bf16: " << wider << " of " << latent.data.size());
+  REQUIRE(!latent.data.empty());
+  CHECK(wider == 0);
+
+  // ── AND THE VALUES ARE HELD BIT-EXACT, WHICH IS NOT THE DECODER'S SHAPE ────
+  //
+  // Wave 3's deep decoder case is held to a BAND, because thirteen convolutions
+  // compound `cpu_conv3d`'s disagreement with torch's blocked reduction order and
+  // the band is the chain's own one-ulp response. THAT SHAPE DOES NOT WORK HERE
+  // AND THE MEASUREMENT SAYS SO: on this fixture the one-ulp sensitivity is
+  // `kLtx2VideoEncBf16UlpSensitivity` and BOTH defect distances are BELOW it, so
+  // a band wide enough to admit an honest port would admit both defects too --
+  // a floor below the real count is a mute switch.
+  //
+  // So this case is held BIT-EXACT instead, which is available because the
+  // fixture is three convolutions deep rather than thirteen. Bit-exactness
+  // separates any defect that moves any word, which is what the two `> 0`
+  // assertions below then make a statement rather than a hope.
+  REQUIRE(latent.data.size() == std::size(vllm_test::kLtx2VideoEncBf16Golden));
+  int64_t differing = 0;
+  double err = 0.0;
+  for (size_t i = 0; i < latent.data.size(); ++i) {
+    const float want = vllm_test::kLtx2VideoEncBf16Golden[i];
+    if (latent.data[i] != want) ++differing;
+    err = std::max(err, std::abs(static_cast<double>(latent.data[i]) - want));
+  }
+  INFO("BF16 video encoder: " << differing << " of " << latent.data.size()
+                              << " words differ, max|diff| = " << err
+                              << "; one-ulp sensitivity "
+                              << vllm_test::kLtx2VideoEncBf16UlpSensitivity
+                              << "; the two upstream arms are "
+                              << vllm_test::kLtx2VideoEncBf16ArmGap
+                              << " apart; defect distances: f32 statistics "
+                              << vllm_test::kLtx2VideoEncBf16DefectStats
+                              << ", unrounded group mean "
+                              << vllm_test::kLtx2VideoEncBf16DefectGroupMean);
+  CHECK(differing == 0);
+
+  // 1. BOTH DEFECTS REACH THIS FIXTURE'S OUTPUT, so bit-exactness separates them
+  //    rather than merely being satisfiable. The generator asserts the same two
+  //    against upstream and refuses to emit a zero.
+  CHECK(vllm_test::kLtx2VideoEncBf16DefectStats > 0.0);
+  CHECK(vllm_test::kLtx2VideoEncBf16DefectGroupMean > 0.0);
+  // 2. AND A BAND COULD NOT HAVE SEEN EITHER. This is the measurement that
+  //    justifies the bit-exact shape above instead of wave 3's band, and it is
+  //    asserted rather than described so it cannot quietly stop being true.
+  CHECK(vllm_test::kLtx2VideoEncBf16DefectStats <
+        vllm_test::kLtx2VideoEncBf16UlpSensitivity);
+  CHECK(vllm_test::kLtx2VideoEncBf16DefectGroupMean <
+        vllm_test::kLtx2VideoEncBf16UlpSensitivity);
+  // 3. The two upstream arms are far apart on this fixture, so "the port quietly
+  //    ran the f32 path" is a red rather than a hypothetical.
+  CHECK(vllm_test::kLtx2VideoEncBf16ArmGap >
+        vllm_test::kLtx2VideoEncBf16UlpSensitivity);
+}
 
 TEST_CASE("ltx2 vae: the video ENCODER (*_res family) matches upstream ltx_core") {
   const vllm::Ltx2ConvVideoEncoderConfig cfg = ReducedVideoEncoderConfigA();

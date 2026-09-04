@@ -7059,6 +7059,55 @@ TEST_CASE("ltx2 video: the VAE DECODE runs at upstream's dtype") {
   CHECK(fox.trace.vae_decode_not_bf16 == 0);
 }
 
+// A24 wave 4 (#2850). The DECODER's width above; this is the ENCODER's, and it
+// is a separate case rather than two more lines in that one because it enters
+// the engine by a different request: the decoder runs on every render and the
+// encoder only when a conditioning image is supplied.
+TEST_CASE("ltx2 video: the video VAE ENCODER computes at upstream's bfloat16") {
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/p_encdtype");
+  gen.first_frame_ppm = ConditioningPpm(20, 28, 7);
+  // crf 0 because an LTX-2.5 checkpoint otherwise resolves 18 and the H.264
+  // round trip is refused by name here. The CRF is not what this case measures.
+  gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+  const vllm::multimodal::VideoResult result = engine->Generate(gen);
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+  REQUIRE(trace.completed);
+  REQUIRE(result.frame_count > 0);
+
+  // 1. THE ENCODER'S INPUT CARRIES SUB-BF16 DETAIL, measured rather than
+  //    assumed. Without this the next check goes quietly green on any fixture
+  //    whose pixels happen to land on bf16 grid points, which is exactly the
+  //    hole A24 sat in for the whole tree. `Ltx2LoadImageAndPreprocess` produces
+  //    this stream in the same render, so it is LIVE rather than an argument
+  //    about one.
+  //
+  //    THE FLOOR IS "MOST OF THE STREAM", not a small absolute count: a floor
+  //    below the real number is a mute switch. The measured value is printed
+  //    beside it so a reader can see the headroom.
+  INFO("pixels into the encode, wider than bf16: "
+       << trace.vae_encode_in_not_bf16 << " of " << trace.vae_encode_in_values);
+  REQUIRE(trace.vae_encode_in_values > 0);
+  CHECK(trace.vae_encode_in_not_bf16 > trace.vae_encode_in_values / 2);
+
+  // 2. AND THE ENCODE ITSELF PRODUCES ONLY bf16-REPRESENTABLE LATENTS.
+  //
+  //    NOTHING ELSE ON THIS PATH CAN SEE THAT. The latent is a
+  //    `std::vector<float>` on either arm and every digest, absmax and token
+  //    count downstream is computed over that same container, identical in shape
+  //    whichever width filled it. AGENTS.md names the blind spot exactly -- "a
+  //    token gate cannot detect a dtype that is too wide."
+  INFO("VAE encode output, wider than bf16: " << trace.vae_encode_not_bf16 << " of "
+                                              << trace.vae_encode_values);
+  REQUIRE(trace.vae_encode_values > 0);
+  CHECK(trace.vae_encode_not_bf16 == 0);
+}
+
 TEST_CASE("ltx2 video: the prompt's conditioning goes through the CONNECTOR") {
   // The prompt path is a DIFFERENT caller of `RunConnector` from the
   // prompt-embeds path, so "the connector is wired" proved for one proves

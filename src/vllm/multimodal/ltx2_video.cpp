@@ -4024,6 +4024,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       const Ltx2LatentVolume encoded = Ltx2ConvVideoEncode(
           im.video_encoder_cfg, im.video_encoder_weights, pixels,
           im.video_encoder_cfg.in_channels, /*frame_count=*/1, phase_h, phase_w, &cropped);
+      // A24 wave 4 (#2850): the encoder's INPUT and OUTPUT widths, on a
+      // production route. Summed over images. See `Ltx2ConditioningTrace` for
+      // why both halves are needed and why nothing else here can see either.
+      im.trace.vae_encode_in_not_bf16 += CountWiderThanBf16(pixels);
+      im.trace.vae_encode_in_values += static_cast<int64_t>(pixels.size());
+      im.trace.vae_encode_not_bf16 += CountWiderThanBf16(encoded.data);
+      im.trace.vae_encode_values += static_cast<int64_t>(encoded.data.size());
       if (encoded.frames != 1) {
         Fail("the video VAE encoder returned " + std::to_string(encoded.frames) +
              " latent frames for a single image; both arms of "

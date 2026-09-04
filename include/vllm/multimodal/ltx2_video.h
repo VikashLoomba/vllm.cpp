@@ -714,6 +714,32 @@ struct Ltx2ConditioningTrace {
   // which no pixel quantization touches.
   uint64_t vae_latent_digest = 0;
   double vae_latent_absmax = 0.0;
+  // A24 wave 4 (#2850): THE ENCODER'S OWN WIDTH, on the production route into
+  // `Ltx2ConvVideoEncode`. The pair is the same instrument as the decoder's two
+  // above and it is here for the same reason: the latent is a
+  // `std::vector<float>` on either arm, so nothing else on this path can see
+  // which width computed it. AGENTS.md: "A token gate cannot detect a dtype that
+  // is too wide."
+  //
+  // SAMPLED IN `encode_conditioning_image`, which is one of the encoder's two
+  // production call sites and the direct mirror of upstream's
+  // `combined_image_conditionings` (utils/helpers.py:285-294). The retake route
+  // shares one `Ltx2ConvVideoEncode` with it, so the arithmetic is gated once;
+  // that route's own coverage is owed by name in the row's spec.
+  //
+  // `_in_` is the ENCODER'S INPUT and it is what stops the output count from
+  // being vacuous. `Ltx2LoadImageAndPreprocess` produces f32 pixels here where
+  // upstream's `load_image_and_preprocess(..., dtype=bfloat16)` produces bf16
+  // ones, so the input is a LIVE wide stream on this fixture and the port
+  // narrows it once at the boundary. A fixture that stopped carrying sub-bf16
+  // detail would make the output count read zero for an uninteresting reason,
+  // and the case that asserts the input is wide reds instead of muting.
+  //
+  // Summed over IMAGES, because a request may carry more than one conditioning
+  // image and a counter taken on the last would report the last image's width as
+  // the render's.
+  int64_t vae_encode_not_bf16 = 0, vae_encode_values = 0;
+  int64_t vae_encode_in_not_bf16 = 0, vae_encode_in_values = 0;
   // ── the IMAGE conditioning (row LTX25-IMAGE-COND, issue #644) ────────────
   //
   // Zero everywhere when the request carried no image. `image_tokens` is how

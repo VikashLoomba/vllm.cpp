@@ -1771,8 +1771,14 @@ Volume Patchify(const Volume& in, int64_t patch) {
   out.t = in.t;
   out.h = in.h / patch;
   out.w = in.w / patch;
-  out.data.Alloc(nullptr, static_cast<size_t>(out.channels * out.spatial()),
-                 vt::DType::kF32);
+  // A24 wave 4 (#2850): the WIDTH FOLLOWS THE INPUT. `patchify` (ops.py:6-32) is
+  // a `rearrange` and computes nothing, so this moves elements at whatever width
+  // the volume holds and a bf16 -> f32 -> bf16 round trip through
+  // `LoadElem`/`StoreElem` is exact by construction. There is no rounding rule
+  // here and no probe can separate one; the row's spec §4.5 says so rather than
+  // leaving the absence of a measurement to look like an omission.
+  out.data.Like(in.data, static_cast<size_t>(out.channels * out.spatial()));
+  const vt::DType dt = in.data.dtype();
   for (int64_t c = 0; c < in.channels; ++c) {
     for (int64_t ri = 0; ri < patch; ++ri) {
       for (int64_t qi = 0; qi < patch; ++qi) {
@@ -1780,8 +1786,11 @@ Volume Patchify(const Volume& in, int64_t patch) {
         for (int64_t f = 0; f < out.t; ++f) {
           for (int64_t hi = 0; hi < out.h; ++hi) {
             for (int64_t wi = 0; wi < out.w; ++wi) {
-              out.data.Host()[out.At(dst_c, f, hi, wi)] =
-                  in.data.Host()[in.At(c, f, hi * patch + qi, wi * patch + ri)];
+              StoreElem(out.data.ptr(), static_cast<size_t>(out.At(dst_c, f, hi, wi)),
+                        LoadElem(in.data.ptr(),
+                                 static_cast<size_t>(in.At(c, f, hi * patch + qi, wi * patch + ri)),
+                                 dt),
+                        dt);
             }
           }
         }
@@ -1802,8 +1811,11 @@ Volume SpaceToDepthFold(const Volume& in, int64_t st, int64_t sh, int64_t sw) {
   out.t = in.t / st;
   out.h = in.h / sh;
   out.w = in.w / sw;
-  out.data.Alloc(nullptr, static_cast<size_t>(out.channels * out.spatial()),
-                 vt::DType::kF32);
+  // A24 wave 4 (#2850): pure movement at the input's width, exactly as
+  // `Patchify` above and for the same reason (sampling.py:43-49, 55-61 are both
+  // `rearrange`).
+  out.data.Like(in.data, static_cast<size_t>(out.channels * out.spatial()));
+  const vt::DType dt = in.data.dtype();
   for (int64_t c = 0; c < in.channels; ++c) {
     for (int64_t p1 = 0; p1 < st; ++p1) {
       for (int64_t p2 = 0; p2 < sh; ++p2) {
@@ -1812,8 +1824,12 @@ Volume SpaceToDepthFold(const Volume& in, int64_t st, int64_t sh, int64_t sw) {
           for (int64_t ti = 0; ti < out.t; ++ti) {
             for (int64_t hi = 0; hi < out.h; ++hi) {
               for (int64_t wi = 0; wi < out.w; ++wi) {
-                out.data.Host()[out.At(dst_c, ti, hi, wi)] =
-                    in.data.Host()[in.At(c, ti * st + p1, hi * sh + p2, wi * sw + p3)];
+                StoreElem(
+                    out.data.ptr(), static_cast<size_t>(out.At(dst_c, ti, hi, wi)),
+                    LoadElem(in.data.ptr(),
+                             static_cast<size_t>(in.At(c, ti * st + p1, hi * sh + p2, wi * sw + p3)),
+                             dt),
+                    dt);
               }
             }
           }
@@ -1847,17 +1863,19 @@ Volume SpaceToDepthDownsample(const VideoConvSpec& spec, const Ltx2VaeWeights& w
            "by out_channels (sampling.py:23)");
   const int64_t group_size = folded / out_channels;
 
+  const vt::DType dt = x.data.dtype();
   Volume grown = x;
   if (st == 2) {
     grown.t = x.t + 1;
-    grown.data.Alloc(nullptr, static_cast<size_t>(grown.channels * grown.spatial()),
-                     vt::DType::kF32);
+    grown.data.Like(x.data, static_cast<size_t>(grown.channels * grown.spatial()));
     for (int64_t c = 0; c < grown.channels; ++c) {
       for (int64_t ti = 0; ti < grown.t; ++ti) {
         const int64_t src_t = ti == 0 ? 0 : ti - 1;
         for (int64_t hi = 0; hi < grown.h; ++hi) {
           for (int64_t wi = 0; wi < grown.w; ++wi) {
-            grown.data.Host()[grown.At(c, ti, hi, wi)] = x.data.Host()[x.At(c, src_t, hi, wi)];
+            // `torch.cat` moves elements; it does not compute (sampling.py:39-40).
+            StoreElem(grown.data.ptr(), static_cast<size_t>(grown.At(c, ti, hi, wi)),
+                      LoadElem(x.data.ptr(), static_cast<size_t>(x.At(c, src_t, hi, wi)), dt), dt);
           }
         }
       }
@@ -1871,17 +1889,36 @@ Volume SpaceToDepthDownsample(const VideoConvSpec& spec, const Ltx2VaeWeights& w
   skip.t = folded_in.t;
   skip.h = folded_in.h;
   skip.w = folded_in.w;
-  skip.data.Alloc(nullptr, static_cast<size_t>(skip.channels * skip.spatial()),
-                  vt::DType::kF32);
+  skip.data.Like(folded_in.data, static_cast<size_t>(skip.channels * skip.spatial()));
   const int64_t n = skip.spatial();
   for (int64_t c = 0; c < out_channels; ++c) {
     for (int64_t i = 0; i < n; ++i) {
-      // f32: upstream's group mean runs in the activation dtype.
+      // A24 wave 4 (#2850): A WIDENED ACCUMULATE WITH EXACTLY ONE ROUNDING, AND
+      // THE ROUNDING IS THE STORE.
+      //
+      // `torch.mean` on a bf16 tensor does not accumulate in bf16; it widens
+      // internally and rounds only the output. MEASURED against upstream's own
+      // `.mean(dim=2)` (sampling.py:47-49) at two scales: an f32 accumulator and
+      // an f64 one are each 0 of 256, while a sequential bf16 accumulate is 72 to
+      // 145 of 256 at group_size 4 and 8. `separating = 1` -- f32 and f64 are
+      // indistinguishable here and this port claims no gate on the width.
+      //
+      // AT group_size == 2 NOTHING SEPARATES, because a two-element mean is exact
+      // in any order. A fixture that only reaches that width is a mute switch for
+      // this rule, which is why the row's bf16 golden uses a block list whose
+      // group_size is 4.
+      //
+      // THE `StoreElem` IS NOT BOOKKEEPING. Carrying this result unrounded into
+      // the add below is 45 to 61 of 256 wrong -- 18 to 24% of the block -- while
+      // the add's OWN width separates nothing at any scale down to 2^-14. The
+      // rounding point is the store, not the operator, and that is per-SITE.
       float acc = 0.0f;
       for (int64_t g = 0; g < group_size; ++g) {
-        acc += folded_in.data.Host()[static_cast<size_t>((c * group_size + g) * n + i)];
+        acc += LoadElem(folded_in.data.ptr(), static_cast<size_t>((c * group_size + g) * n + i),
+                        dt);
       }
-      skip.data.Host()[static_cast<size_t>(c * n + i)] = acc / static_cast<float>(group_size);
+      StoreElem(skip.data.ptr(), static_cast<size_t>(c * n + i),
+                acc / static_cast<float>(group_size), dt);
     }
   }
 
@@ -1894,7 +1931,14 @@ Volume SpaceToDepthDownsample(const VideoConvSpec& spec, const Ltx2VaeWeights& w
   Volume out = SpaceToDepthFold(convolved, st, sh, sw);
   VT_CHECK(out.data.size() == skip.data.size(),
            "ltx2 video encoder: SpaceToDepthDownsample skip and conv shapes must match");
-  for (size_t i = 0; i < out.data.size(); ++i) out.data.Host()[i] += skip.data.Host()[i];
+  // `x = x + x_in` (sampling.py:63). Both operands are already on the arm's grid,
+  // so the add has ONE rounding wherever it is evaluated -- measured, and it
+  // separates NOTHING at 2^0, 2^-7 or 2^-14 against either an f32 or an f64
+  // evaluation. Reported as a negative rather than as a confirmation.
+  for (size_t i = 0; i < out.data.size(); ++i) {
+    StoreElem(out.data.ptr(), i,
+              LoadElem(out.data.ptr(), i, dt) + LoadElem(skip.data.ptr(), i, dt), dt);
+  }
   return out;
 }
 
@@ -1955,21 +1999,14 @@ Ltx2LatentVolume Ltx2ConvVideoEncode(const Ltx2ConvVideoEncoderConfig& config,
                                      const std::vector<float>& frames, int64_t channels,
                                      int64_t frame_count, int64_t height, int64_t width,
                                      int64_t* out_cropped_frames) {
-  // THE ENCODER IS STILL THE f32 PORT, and it says so HERE rather than by
-  // accident several hundred lines downstream. Every volume below is allocated
-  // `vt::DType::kF32` while `Param(weights, ...)` hands back whatever the bag
-  // stores, and `ApplyNorm`/`Linear3d`/`ApplyAdaLn`/`FeedSpatialNoise` take ONE
-  // dtype for the activation and the weight together -- so a bf16 bag would be
-  // read as f32 words. It does terminate today, because a `weights.Get(...)` on
-  // the per-channel statistics throws "missing parameter" on a bf16 bag, but a
-  // refusal that fires by accident, in a message naming neither this encoder nor
-  // the dtype it was handed, is not a refusal. A24 wave 3 (#2786) ports the
-  // DECODE; the encoder's bf16 arm is owed -- see `## Owed` in
-  // .agents/specs/ltx25-a24-video-vae-bf16.md.
-  VT_CHECK(weights.dtype == vt::DType::kF32,
-           std::string("ltx2 video encoder: the encoder is still the f32 port; its bf16 arm is "
-                       "owed (#2786 `## Owed`). It was handed ") +
-               vt::Name(weights.dtype));
+  // A24 wave 4 (#2850) TURNED THIS REFUSAL INTO AN ARM. Wave 3 wrote it knowing
+  // this row would replace it: upstream resolves ONE pipeline dtype
+  // (`distilled.py:109`) and hands it to `ImageConditioner` at `:120-125`, which
+  // builds this encoder with it (`utils/blocks.py:985-986`). The f32 arm stays,
+  // because it is the parity reference every committed golden is measured
+  // against; the FP8 and NVFP4 arms are A22 and `RequireVaeDType` still refuses a
+  // third width by name so one cannot arrive by silence.
+  RequireVaeDType(weights.dtype);
   VT_CHECK(channels == config.in_channels,
            "ltx2 video encoder: input channel count does not match in_channels");
   VT_CHECK(static_cast<int64_t>(frames.size()) == channels * frame_count * height * width,
@@ -2011,15 +2048,33 @@ Ltx2LatentVolume Ltx2ConvVideoEncode(const Ltx2ConvVideoEncoderConfig& config,
   x.t = kept;
   x.h = height;
   x.w = width;
-  x.data.Alloc(nullptr, static_cast<size_t>(x.channels * x.spatial()), vt::DType::kF32);
+  // THE ONE NARROWING, AND IT SITS WHERE UPSTREAM PUTS IT.
+  //
+  // The encoder's construction is the OPPOSITE of the decoder's and the
+  // difference is load-bearing. `ConvVideoDecoder.forward` casts its latent to
+  // the weights' dtype on entry (conv_video_decoder.py:283-284). `VideoEncoder.
+  // forward` casts NOTHING (video_vae.py:264-336): the pixels are already bf16
+  // when they arrive, because `load_image_and_preprocess(..., dtype=dtype, ...)`
+  // builds them at the pipeline dtype and hands them straight to
+  // `video_encoder(image)` (utils/helpers.py:285-294). So the rounding happens at
+  // the boundary, once, before any arithmetic -- which is what `Upload` is.
+  //
+  // The crop is a GATHER, so the frames are staged compactly first rather than
+  // written through `HostBegin()`, which is the f32-only accessor and throws on a
+  // bf16 store. Staging is a copy this function already made, at a different
+  // place; it is not a second arithmetic path.
+  const size_t elems_x = static_cast<size_t>(x.channels * x.spatial());
+  std::vector<float> staged(elems_x);
   for (int64_t c = 0; c < channels; ++c) {
     for (int64_t f = 0; f < kept; ++f) {
       const size_t src = static_cast<size_t>((c * frame_count + f) * height * width);
       std::copy(frames.begin() + static_cast<ptrdiff_t>(src),
                 frames.begin() + static_cast<ptrdiff_t>(src + static_cast<size_t>(height * width)),
-                x.data.HostBegin() + static_cast<ptrdiff_t>(x.At(c, f, 0, 0)));
+                staged.begin() + static_cast<ptrdiff_t>(x.At(c, f, 0, 0)));
     }
   }
+  x.data.Alloc(nullptr, elems_x, weights.dtype);
+  x.data.Upload(staged.data());
 
   // --- patchify -> conv_in (video_vae.py:291-292) ---
   x = Patchify(x, config.patch_size);
@@ -2115,14 +2170,36 @@ Ltx2LatentVolume Ltx2ConvVideoEncode(const Ltx2ConvVideoEncoderConfig& config,
   out.width = x.w;
   out.data.resize(static_cast<size_t>(out.elems()));
   const int64_t elems = x.spatial();
-  // f32: the encoder's normalize is the decoder de-normalize run backwards, and
-  // upstream computes it in the activation dtype on both sides.
+  const vt::DType dt = x.data.dtype();
+  // A24 wave 4 (#2850): THE STATISTICS NARROW BEFORE THE ARITHMETIC, AND THAT IS
+  // 39-47% OF THIS LOOP'S OUTPUT.
+  //
+  // `PerChannelStatistics.normalize` applies `.to(x)` to BOTH registered buffers
+  // (ops.py:81-84), so at bf16 the two statistics round first and the subtract
+  // and the divide then round in turn. Wave 3 measured `un_normalize`, which is
+  // a multiply and an add; this is a subtract and a divide, and it was RE-RUN
+  // rather than inherited -- five components in A24 have now produced five
+  // different rules and none has yet transferred.
+  //
+  // MEASURED on [1, C, 2, 3, 3] at two scales, against upstream's own
+  // `normalize` with the f32 buffers captured BEFORE `.to(bfloat16)`: keeping the
+  // statistics f32 -- which is what this loop did until this row -- is 129 to 136
+  // of 288 at C=16 and 889 to 931 of 2304 at C=128. A single fused f32 expression
+  // is a third answer and is also wrong. `separating = 2`.
+  //
+  // NO TOKEN GATE CAN SEE THIS. `Ltx2LatentVolume::data` is a
+  // `std::vector<float>` on either arm, so the widening below is the one upstream
+  // does when the bf16 latent leaves the module -- not a second arithmetic path,
+  // because every value is already on the arm's grid when it gets here.
+  const auto Narrow = [dt](float v) {
+    return dt == vt::DType::kBF16 ? vt::BF16ToF32(vt::F32ToBF16(v)) : v;
+  };
   for (int64_t c = 0; c < latent_channels; ++c) {
-    const float mean = mean_of_means[static_cast<size_t>(c)];
-    const float denom = std_of_means[static_cast<size_t>(c)];
+    const float mean = Narrow(mean_of_means[static_cast<size_t>(c)]);
+    const float denom = Narrow(std_of_means[static_cast<size_t>(c)]);
     for (int64_t i = 0; i < elems; ++i) {
-      out.data[static_cast<size_t>(c * elems + i)] =
-          (x.data.Host()[static_cast<size_t>(c * elems + i)] - mean) / denom;
+      const float v = LoadElem(x.data.ptr(), static_cast<size_t>(c * elems + i), dt);
+      out.data[static_cast<size_t>(c * elems + i)] = Narrow(Narrow(v - mean) / denom);
     }
   }
   return out;

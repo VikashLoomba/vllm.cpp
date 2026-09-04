@@ -6235,6 +6235,54 @@ inline constexpr float kLtx2VideoEncCausalGolden[] = {
     -0.220072761f, -0.209537283f, 0.112118676f, 0.710037708f, -0.134408429f, -0.276275754f,
 };
 
+// --- section 6e: the BF16 arm of VideoEncoder (A24 wave 4, #2850) ---
+inline constexpr int64_t kLtx2VideoEncBf16InC = 3;
+inline constexpr int64_t kLtx2VideoEncBf16InT = 3;
+inline constexpr int64_t kLtx2VideoEncBf16InH = 8;
+inline constexpr int64_t kLtx2VideoEncBf16InW = 8;
+inline constexpr int64_t kLtx2VideoEncBf16OutC = 8;
+inline constexpr int64_t kLtx2VideoEncBf16OutT = 2;
+inline constexpr int64_t kLtx2VideoEncBf16OutH = 2;
+inline constexpr int64_t kLtx2VideoEncBf16OutW = 2;
+inline constexpr int64_t kLtx2VideoEncBf16GroupSize = 4;
+inline constexpr double kLtx2VideoEncBf16ArmGap = 0.00980377197;
+inline constexpr double kLtx2VideoEncBf16DefectStats = 0.00390625;
+inline constexpr double kLtx2VideoEncBf16DefectGroupMean = 0.00390625;
+inline constexpr double kLtx2VideoEncBf16UlpSensitivity = 0.0078125;
+
+inline constexpr const char* kLtx2VideoEncBf16ParamNames[] = {
+    "ltx2.videoencbf16.per_channel_statistics.std-of-means",
+    "ltx2.videoencbf16.per_channel_statistics.mean-of-means",
+    "ltx2.videoencbf16.conv_in.conv.weight",
+    "ltx2.videoencbf16.conv_in.conv.bias",
+    "ltx2.videoencbf16.down_blocks.0.res_blocks.0.conv1.conv.weight",
+    "ltx2.videoencbf16.down_blocks.0.res_blocks.0.conv1.conv.bias",
+    "ltx2.videoencbf16.down_blocks.0.res_blocks.0.conv2.conv.weight",
+    "ltx2.videoencbf16.down_blocks.0.res_blocks.0.conv2.conv.bias",
+    "ltx2.videoencbf16.down_blocks.1.conv.conv.weight",
+    "ltx2.videoencbf16.down_blocks.1.conv.conv.bias",
+    "ltx2.videoencbf16.conv_out.conv.weight",
+    "ltx2.videoencbf16.conv_out.conv.bias",
+};
+inline constexpr int64_t kLtx2VideoEncBf16ParamCounts[] = {
+    8, 8, 2592, 8, 1728, 8, 1728, 8, 432, 2,
+    3888, 9,
+};
+
+inline constexpr float kLtx2VideoEncBf16Golden[] = {
+    0.19921875f, 0.37109375f, -0.091796875f, -0.139648438f, 0.263671875f, 0.0434570312f,
+    -0.153320312f, -0.141601562f, -0.112304688f, 0.1640625f, -0.119628906f, -0.322265625f,
+    0.068359375f, 0.139648438f, -0.113769531f, -0.271484375f, 0.102050781f, -0.185546875f,
+    -0.39453125f, 0.158203125f, -0.104003906f, -0.231445312f, -0.130859375f, 0.25390625f,
+    -0.34765625f, -0.6328125f, -0.0698242188f, 0.00543212891f, -0.141601562f, -0.59765625f,
+    -0.114257812f, -0.0417480469f, 0.66015625f, 0.0471191406f, -0.380859375f, -0.7265625f,
+    0.8046875f, -0.15234375f, -0.48828125f, -0.82421875f, 0.12890625f, 0.59765625f,
+    0.173828125f, 0.9609375f, -0.0659179688f, 0.86328125f, 0.0130615234f, 1.0234375f,
+    -1.0703125f, 0.0854492188f, -0.8828125f, -0.58984375f, -1.015625f, -0.2734375f,
+    -0.90234375f, -0.9375f, 0.515625f, 1.484375f, -0.451171875f, -0.578125f,
+    0.5234375f, 1.3515625f, -0.380859375f, -0.6484375f,
+};
+
 // --- section 7a: AudioEncoder with attention (audio_vae.py:60-246) ---
 inline constexpr int64_t kLtx2AudioEncInC = 2;
 inline constexpr int64_t kLtx2AudioEncInT = 8;

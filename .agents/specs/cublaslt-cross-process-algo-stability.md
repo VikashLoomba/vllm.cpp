@@ -54,6 +54,15 @@ chain runs into a closed CUDA library. What is anchorable, and what is not:
 |---|---|---|
 | The selection call | `cublasLtMatmulAlgoGetHeuristic`, reached from `src/vt/cuda/cuda_matmul.cu` at the three bf16/f32 sites and the two fp8 sites | the function whose determinism is in question |
 | The diagnostic we read | `src/vt/cuda/gemm_algo_log.h` and `MaybeLogGemmAlgo` at `src/vt/cuda/cuda_matmul.cu:248` | our own mirror of what upstream logs under `CUBLASLT_LOG_LEVEL` and torch `_scaled_mm` verbose; we have no torch, so this flag is the equivalent |
+| The premise being tested | `src/vt/cuda/gemm_plan_cache.h:22`, `src/vt/cuda/fp8_plan_cache.h:17` | the claim, in our own words, that the measurement checks |
+| The pinned oracle | [`.agents/upstream-sync.md`](../upstream-sync.md) | the revision any later vLLM-side comparison must be taken at |
+
+**The vLLM-side half is NOT claimed here and is owed.** Whether the pinned
+oracle re-resolves the same heuristic per process, and with what result, has not
+been measured, and this spec does not assert it. Reading torch's caching as an
+answer would be reasoning about the executing chain from its documentation
+rather than from a trace, which is what
+[`.agents/porting.md`](../porting.md) refuses. `## Owed` names it.
 
 ### `VT_GEMM_ALGO_LOG` has SIX emit sites and only ONE of them is a selection
 
@@ -79,15 +88,6 @@ processes whose candidate lists came back in a different order then report
 `UNSTABLE`: the verdict that, per the table below, turns this row into a
 benchmark-validity repair and licenses the persistent cuBLASLt cache #2750 says
 must be built ONLY in its case 4.
-| The premise being tested | `src/vt/cuda/gemm_plan_cache.h:22`, `src/vt/cuda/fp8_plan_cache.h:17` | the claim, in our own words, that the measurement checks |
-| The pinned oracle | [`.agents/upstream-sync.md`](../upstream-sync.md) | the revision any later vLLM-side comparison must be taken at |
-
-**The vLLM-side half is NOT claimed here and is owed.** Whether the pinned
-oracle re-resolves the same heuristic per process, and with what result, has not
-been measured, and this spec does not assert it. Reading torch's caching as an
-answer would be reasoning about the executing chain from its documentation
-rather than from a trace, which is what
-[`.agents/porting.md`](../porting.md) refuses. `## Owed` names it.
 
 ## Our baseline
 

@@ -29,13 +29,16 @@ import contextlib
 import copy
 import io
 import json
+import inspect
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
 import unittest
 from unittest import mock
+from typing import Sequence
 
 import tools.bench.gemm_tactic_draw_survey as survey
 
@@ -1178,6 +1181,225 @@ class DrawResumeTest(unittest.TestCase):
             self.assertEqual(cache.read_bytes(), before)
 
 
+class FrozenControlJoinTest(unittest.TestCase):
+    """The control has to answer for THE LEGS THAT CONTRIBUTED, one by one.
+
+    `frozen_control_state` used to compare two counts: how many legs the ledger
+    held, and how many passing control records existed anywhere under `score/`.
+    Six passing records satisfied six ledger legs even when all six described
+    ONE arm and the other arm had none -- so an arm whose legs were never
+    checked read as checked, which is the docstring's own question answered
+    wrongly. The shell driver writes one record per leg it ran and cannot
+    produce that state today, so this is a claim the function made rather than a
+    bug anyone has seen; the repair is to make the claim true instead of
+    narrowing it.
+    """
+
+    def evidence_with_controls_for(self, tmp: str, arms: Sequence[str]) -> pathlib.Path:
+        evidence = pathlib.Path(tmp) / "ev"
+        quiet_main([
+            "draw", "--evidence", str(evidence), "--bench", "/bin/true",
+            "--model", "/nonexistent", "--draws", "2", "--dry-run",
+        ])
+        ledger = evidence / "score" / "legs.jsonl"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        rows = []
+        for arm, base in (("draw00", 100.0), ("draw01", 100.5)):
+            for index in range(1, 4):
+                rows.append(json.dumps({"arm": arm, "boot_id": "b", "rc": 0,
+                                        "total_token_throughput": base + index * 0.01}))
+        ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        # SIX passing records, placed wherever the caller says. The COUNT is
+        # always right; only the join can tell the two placements apart.
+        for arm in arms:
+            for index in range(1, 4):
+                home = evidence / "score" / f"{arm}-{index}"
+                home.mkdir(parents=True, exist_ok=True)
+                (home / "frozen.json").write_text(
+                    json.dumps({"leg": f"{arm}-{index}", "frozen": True,
+                                "why": "frozen: tuned=0 loaded=8"}),
+                    encoding="utf-8",
+                )
+        return evidence
+
+    def test_six_controls_for_one_arm_do_not_answer_for_two(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # Both blocks land under draw00, so the total is six either way.
+            evidence = self.evidence_with_controls_for(tmp, ["draw00", "draw00x"])
+            code, report = reduce_evidence(
+                evidence, metric="total_token_throughput", ratification_bar=1.02
+            )
+            self.assertEqual(code, EXIT_LEG_NOT_FROZEN)
+            self.assertEqual(report["frozen_leg_control"]["state"], "REFUSED")
+            self.assertIn("draw01", report["frozen_leg_control"]["reason"])
+            self.assertEqual(report["issue_2751_speed"]["verdict"], "REFUSED")
+
+    def test_the_same_six_controls_spread_over_both_arms_pass(self) -> None:
+        # THE CONTROL, and the count is identical: six records, six legs. Only
+        # which arm they name differs.
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = self.evidence_with_controls_for(tmp, ["draw00", "draw01"])
+            code, report = reduce_evidence(
+                evidence, metric="total_token_throughput", ratification_bar=1.02
+            )
+            self.assertEqual(code, EXIT_OK)
+            self.assertEqual(report["frozen_leg_control"]["state"], "PASS")
+
+    def test_a_failing_record_still_refuses_by_name(self) -> None:
+        # The pre-existing polarity must survive the join.
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = self.evidence_with_controls_for(tmp, ["draw00", "draw01"])
+            record = evidence / "score" / "draw01-2" / "frozen.json"
+            record.write_text(
+                json.dumps({"leg": "draw01-2", "frozen": False,
+                            "why": "re-tuned: tuned=8"}),
+                encoding="utf-8",
+            )
+            code, report = reduce_evidence(
+                evidence, metric="total_token_throughput", ratification_bar=1.02
+            )
+            self.assertEqual(code, EXIT_LEG_NOT_FROZEN)
+            self.assertIn("draw01-2", report["frozen_leg_control"]["reason"])
+
+class NonPositiveLegTest(unittest.TestCase):
+    """A draw the ceiling CANNOT SEE still moved the ratio.
+
+    `within` is `None` when a draw's minimum leg is `<= 0`, and a `None` is
+    dropped before the ceiling and the pooled floor are computed. The draw's
+    own mean is not dropped, so the wildest draw in the run was exempt from
+    both guards while still deciding which draw was worst. That is the same
+    failure the ceiling was added for, reached by the other door.
+
+    A `0.0` leg is not hypothetical here: `parse_bench_report` reads the metric
+    out of a bench report, and a leg whose run produced no tokens records the
+    field as zero rather than omitting it.
+    """
+
+    # From the second-round review, verbatim. Before the repair this returned
+    # ABOVE_BAR at ratio 1.999 while reporting a worst within-draw spread of
+    # 1.001 -- a figure computed from `d0` alone, with `d1` silently absent.
+    COUNTEREXAMPLE = {"d0": [100.0, 100.1, 100.05], "d1": [0.0, 300.0, 300.0]}
+
+    def test_a_draw_with_a_zero_leg_is_incomparable_not_above_the_bar(self) -> None:
+        verdict = speed_spread(self.COUNTEREXAMPLE)
+        self.assertEqual(verdict["verdict"], "INCOMPARABLE")
+        self.assertIn("d1", verdict["reason"])
+
+    def test_the_reported_spread_says_which_draws_it_left_out(self) -> None:
+        # The number that made the old verdict readable as a measurement. Both
+        # spread figures are pooled over the draws that HAVE a spread, so a
+        # report that does not name the others quotes 1.001 as this run's noise
+        # when it is `d0`'s alone.
+        verdict = speed_spread(self.COUNTEREXAMPLE)
+        self.assertEqual(verdict["draws_without_a_spread"], ["d1"])
+
+    def test_a_run_every_draw_of_which_has_a_spread_leaves_none_out(self) -> None:
+        verdict = speed_spread(
+            {"d0": [100.0, 100.1, 100.05], "d1": [299.9, 300.0, 300.0]}
+        )
+        self.assertEqual(verdict["draws_without_a_spread"], [])
+
+    def test_a_negative_leg_is_refused_the_same_way(self) -> None:
+        verdict = speed_spread(
+            {"d0": [100.0, 100.1, 100.05], "d1": [-1.0, 300.0, 300.0]}
+        )
+        self.assertEqual(verdict["verdict"], "INCOMPARABLE")
+
+    def test_the_same_draws_with_a_positive_minimum_still_answer(self) -> None:
+        # THE CONTROL. Without it the refusal above would also pass on a
+        # predicate that calls every run INCOMPARABLE.
+        verdict = speed_spread(
+            {"d0": [100.0, 100.1, 100.05], "d1": [299.9, 300.0, 300.0]}
+        )
+        self.assertEqual(verdict["verdict"], "ABOVE_BAR")
+
+class NoiseCeilingDefaultTest(unittest.TestCase):
+    """The ceiling THE LEASE RUN ACTUALLY USES, not the one a unit call passes.
+
+    `speed_spread` takes the ceiling as a keyword, and its own default was the
+    only copy under test. Two more copies existed: `reduce_evidence`'s keyword
+    default, and the `reduce` subparser's `--noise-ceiling` default -- and the
+    subparser's is the one the spec's published gate command exercises, because
+    that command passes no `--noise-ceiling` at all. Widening either of those
+    two to 1.5 left the whole suite green, so the constant governing the real
+    run was the unasserted one and the three could drift apart in silence.
+
+    The fixture below is built so the ceiling BITES: at 1.02x it refuses the run
+    and at any wider value it returns a verdict. Recording the number is not
+    enough -- a report can carry a ceiling that decided nothing.
+    """
+
+    # d0's own repeats span 1.03x, which is over the ceiling and under the
+    # mutation. d1 is quiet, so the pooled floor cannot hide the gap either:
+    # at 1.5x this fixture reads ABOVE_BAR rather than INCOMPARABLE.
+    LEDGER = (("draw00", (100.0, 103.0, 101.0)), ("draw01", (105.0, 105.1, 105.05)))
+
+    def evidence_with_a_noisy_draw(self, tmp: str) -> pathlib.Path:
+        evidence = pathlib.Path(tmp) / "ev"
+        quiet_main([
+            "draw", "--evidence", str(evidence), "--bench", "/bin/true",
+            "--model", "/nonexistent", "--draws", "2", "--dry-run",
+        ])
+        ledger = evidence / "score" / "legs.jsonl"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        rows = []
+        for arm, values in self.LEDGER:
+            for index, value in enumerate(values, start=1):
+                rows.append(json.dumps({"arm": arm, "boot_id": "b", "rc": 0,
+                                        "total_token_throughput": value}))
+                home = evidence / "score" / f"{arm}-{index}"
+                home.mkdir(parents=True, exist_ok=True)
+                (home / "frozen.json").write_text(
+                    json.dumps({"leg": f"{arm}-{index}", "frozen": True,
+                                "why": "frozen: tuned=0 loaded=8"}),
+                    encoding="utf-8",
+                )
+        ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        return evidence
+
+    def test_the_published_reduce_command_runs_at_the_ceiling_it_declares(self) -> None:
+        # THE CLI, END TO END, WITH NO `--noise-ceiling` -- which is the shape
+        # `.agents/specs/nvfp4-persistent-plan-cache.md` publishes as the gate
+        # command. A test that calls `speed_spread` directly cannot see this
+        # copy of the number, and that is exactly how it drifted.
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = self.evidence_with_a_noisy_draw(tmp)
+            out = pathlib.Path(tmp) / "report.json"
+            quiet_main(["reduce", "--evidence", str(evidence), "--out", str(out)])
+            report = json.loads(out.read_text(encoding="utf-8"))
+            speed = report["issue_2751_speed"]
+            self.assertEqual(speed["noise_ceiling"], 1.02)
+            self.assertEqual(speed["verdict"], "INCOMPARABLE")
+            self.assertIn("noise ceiling", speed["reason"])
+
+    def test_reduce_evidence_called_without_a_ceiling_uses_the_same_number(self) -> None:
+        # The middle copy. `main` always passes `--noise-ceiling` through, so
+        # `reduce_evidence`'s own default is invisible to the CLI test above and
+        # needs its own caller.
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = self.evidence_with_a_noisy_draw(tmp)
+            _, report = reduce_evidence(
+                evidence, metric="total_token_throughput", ratification_bar=1.02
+            )
+            speed = report["issue_2751_speed"]
+            self.assertEqual(speed["noise_ceiling"], 1.02)
+            self.assertEqual(speed["verdict"], "INCOMPARABLE")
+
+    def test_speed_spread_called_without_a_ceiling_uses_the_same_number(self) -> None:
+        # The third copy, and the only one the suite already covered.
+        verdict = speed_spread(dict(self.LEDGER), ratification_bar=1.02)
+        self.assertEqual(verdict["noise_ceiling"], 1.02)
+        self.assertEqual(verdict["verdict"], "INCOMPARABLE")
+
+    def test_a_wider_ceiling_would_change_this_fixture_s_verdict(self) -> None:
+        # THE FIXTURE'S OWN CONTROL. Without it the three cases above would pass
+        # on a run the ceiling never decided, and the mutation they exist to
+        # catch would be invisible to them too.
+        verdict = speed_spread(
+            dict(self.LEDGER), ratification_bar=1.02, noise_ceiling=1.5
+        )
+        self.assertEqual(verdict["verdict"], "ABOVE_BAR")
+
 class ShellDriverTest(unittest.TestCase):
     """The lease-side driver, on a host with no device and no toolkit.
 
@@ -1341,6 +1563,130 @@ class ShellDriverTest(unittest.TestCase):
             )
             self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
             self.assertIn("skipping", done.stdout)
+
+    # --- the driver's own constants and flags, which no Python test can see ---
+    #
+    # THE PYTHON SIDE IS WELL GATED AND THE SHELL DELIVERY WAS NOT. `--mirror`
+    # and `--score-reps` are arguments the driver PASSES; deleting either from
+    # this script left all 100 tests of the previous revision green, and the
+    # consequence is only visible on a lease. That is the shape
+    # AGENTS.md "Nothing lands dead" names: a gate that stays green without the
+    # call site measures a class, not a capability.
+
+    def recording_bench(self, root: pathlib.Path, share: pathlib.Path,
+                        witness: pathlib.Path, src: pathlib.Path) -> None:
+        """Replace the fake bench with one that says WHEN it was called.
+
+        It emits the module's own `--dry-run` instrument fixture, so the draw
+        phase gets output its real preconditions accept, and it appends one
+        witness line per invocation recording what the SHARE held at that
+        moment. That timestamp is the whole point: mirroring at the end of the
+        phase and mirroring after each draw are indistinguishable once the
+        phase has returned.
+        """
+
+        binary = root / "bin" / "vllm-bench"
+        binary.write_text(
+            "#!/usr/bin/env python3\n"
+            "import importlib.util, json, os, pathlib, sys\n"
+            f"spec = importlib.util.spec_from_file_location('s', {str(src / 'tools' / 'bench' / 'gemm_tactic_draw_survey.py')!r})\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            f"witness = pathlib.Path({str(witness)!r})\n"
+            f"share = pathlib.Path({str(share)!r})\n"
+            "n = len(witness.read_text().splitlines()) if witness.exists() else 0\n"
+            "with witness.open('a') as fh:\n"
+            "    fh.write('call=%d draw00=%s draw01=%s\\n' % (\n"
+            "        n + 1,\n"
+            "        (share / 'draws' / 'draw00' / 'record.json').is_file(),\n"
+            "        (share / 'draws' / 'draw01' / 'record.json').is_file()))\n"
+            "cache = pathlib.Path(os.environ['VT_FP4_AUTOTUNE_CACHE_PATH'])\n"
+            "cache.parent.mkdir(parents=True, exist_ok=True)\n"
+            "cache.write_text(json.dumps({'_metadata': {'call': n + 1}, 'plans': []}) + '\\n')\n"
+            "cfg = {'num_prompts': 4, 'input_len': 8, 'output_len': 4}\n"
+            "out, err, rc = mod.synthetic_draw_output(n, cfg)\n"
+            "sys.stdout.write(out)\n"
+            "sys.stderr.write(err)\n"
+            "raise SystemExit(rc)\n",
+            encoding="utf-8",
+        )
+        binary.chmod(0o755)
+
+    def test_the_draw_phase_mirrors_each_draw_as_it_lands(self) -> None:
+        # `--mirror` makes the JUDGE copy the evidence root to the share after
+        # every draw. Without it the share gets the draws only when the phase
+        # returns, and a crash inside a phase that is hours of model loads --
+        # on a box that has gone down four times in one session (#545) --
+        # loses every completed draw. The driver's `mirror_out` after the phase
+        # hides that completely once the phase has ended, so the assertion has
+        # to be made from INSIDE the phase: at the third draw's invocation, the
+        # second draw must already be on the share.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, share = self.fake_tree(tmp)
+            # The pre-seeded draw is a RESUME fixture. This case needs the draw
+            # phase to run, so both copies of it go.
+            shutil.rmtree(share / "draws")
+            shutil.rmtree(root / "evidence" / "draws")
+            witness = pathlib.Path(tmp) / "witness"
+            self.recording_bench(root, share, witness, pathlib.Path(tmp) / "src")
+            done = self.run_driver(
+                "--phase", "draw", "--evidence", str(share), "--draws", "3",
+                "--model", tmp, "--local-root", str(root), "--num-prompts", "4",
+                "--input-len", "8", "--output-len", "4", "--concurrency", "1",
+                "--seed", "0", "--max-num-batched-tokens", "64",
+            )
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            lines = witness.read_text(encoding="utf-8").splitlines()
+            # One preflight draw plus two the loop still owed: the loop replays
+            # draw00 from its `DONE` file rather than running it again.
+            self.assertEqual(len(lines), 3, lines)
+            self.assertIn("draw01=True", lines[2], lines)
+            # THE CONTROL. Without it this would also pass on a driver that
+            # mirrored the whole share before the phase started, which is not
+            # per-draw mirroring and does not survive a crash any better.
+            self.assertIn("draw01=False", lines[1], lines)
+
+    def test_every_draw_invocation_hands_the_judge_the_share_to_mirror_to(self) -> None:
+        # The preflight's `--mirror` cannot be caught behaviourally: it draws
+        # once and `mirror_out` runs on the very next line, so deleting it
+        # changes nothing observable. It is still the same obligation -- a
+        # preflight that dies mid-draw should leave its evidence on the share --
+        # and this states the rule over EVERY `draw` invocation rather than
+        # transcribing either line.
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        commands, current = [], None
+        for line in text.splitlines():
+            if current is not None:
+                current.append(line)
+            elif '"$SURVEY" draw' in line:
+                current = [line]
+            if current is not None and not line.rstrip().endswith("\\"):
+                commands.append(" ".join(current))
+                current = None
+        self.assertEqual(len(commands), 2, commands)
+        for command in commands:
+            self.assertIn('--mirror "$EV_SHARE"', command, command)
+
+    def test_the_driver_scores_enough_legs_for_a_verdict_to_exist(self) -> None:
+        # `--score-reps` decides how many legs each draw gets, and
+        # `speed_spread` returns INCOMPARABLE below its `min_legs`. A driver
+        # that ships fewer buys a whole GPU lease and returns no verdict at all.
+        # The bound is READ FROM THE PREDICATE rather than written twice, so
+        # raising `min_legs` reddens here instead of being discovered on a lease.
+        min_legs = inspect.signature(survey.speed_spread).parameters["min_legs"].default
+        with tempfile.TemporaryDirectory() as tmp:
+            root, share = self.fake_tree(tmp)
+            done = self.run_driver(
+                "--phase", "build", "--evidence", str(share),
+                "--model", tmp, "--local-root", str(root),
+            )
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            # The PROVENANCE the driver writes carries the value it will run at,
+            # which is the driver's default when no `--score-reps` is given.
+            provenance = (root / "evidence" / "PROVENANCE").read_text(encoding="utf-8")
+            match = re.search(r"score_reps=(\d+)", provenance)
+            self.assertIsNotNone(match, provenance)
+            self.assertGreaterEqual(int(match.group(1)), min_legs, provenance)
 
     def test_a_refused_reduce_does_not_mark_the_phase_complete(self) -> None:
         # Same polarity as the resume cases: a marker that a FAILED phase writes

@@ -694,11 +694,28 @@ refuses across a boot change.
 | `EQUIVALENT` | best/worst draw ratio does not exceed the POOLED within-draw repeat spread | **#2751 closes as "no divergence warranted"**, which is the outcome the issue names first; the persistent cache alone is the right answer and #2752 unblocks |
 | `SEPARATED_BELOW_BAR` | ratio exceeds the pooled within-draw spread but is under **1.02x** | the draws differ and the difference is not worth a divergence from the mirror; #2751 records the number and closes without a selector; #2752 stays blocked, because "which draw" is no longer arbitrary |
 | `ABOVE_BAR` | ratio >= **1.02x** | #2751 escalates for **developer ratification** of one of the two options it names; no selector is written before that answer |
-| `INCOMPARABLE` | fewer than **three** legs on some draw, a non-positive mean, or ANY draw's own repeat spread over the **1.02x noise ceiling** | no number; the sequence is repeated |
+| `INCOMPARABLE` | fewer than **three** legs on some draw, a non-positive mean or leg, or ANY draw's own repeat spread over the **1.02x noise ceiling** | no number; the sequence is repeated |
+
+**A noisier run reads more favourably, and the ceiling is what bounds that.**
+The first two rows are decided against the run's OWN pooled repeat spread, so
+the same draw-to-draw gap can land in either. A 1.9% gap reads `EQUIVALENT` --
+closing #2751 and shipping `draw00` -- when the pooled repeat spread is also
+1.9%, and `SEPARATED_BELOW_BAR` -- shipping nothing -- when the repeats are
+clean at 0.05%. That polarity is intended: a gap a run cannot distinguish from
+its own noise is not a gap that run measured. It is also why the ceiling is not
+optional. Because no draw may carry a spread over 1.02x, the pooled floor can
+never exceed 2%, so noise can only ever swallow a gap that was already under the
+ratification bar. A gap worth diverging for cannot be bought with a bad run.
 
 **The noise floor is pooled, and a restless run is repeated rather than called
-equivalent.** Two rules, and the second one is why `--score-reps` is 3 above:
+equivalent.** Three rules, and the LAST one is why `--score-reps` is 3 above:
 
+- **Every draw must HAVE a spread.** A draw whose minimum leg is not positive
+  has no defined repeat spread, and a leg records zero rather than nothing when
+  its run produced no tokens. Both rules below read a per-draw spread, so such a
+  draw would be exempt from each of them while its own depressed mean still
+  decided which draw was worst -- the wildest draw in the run being the one
+  neither guard could see. It is refused by name instead.
 - **The ceiling.** If any single draw's own repeat spread exceeds 1.02x, the
   verdict is `INCOMPARABLE` and the run is repeated. Without it, one restless
   draw sets the floor for every other draw, and a draw-to-draw gap larger than

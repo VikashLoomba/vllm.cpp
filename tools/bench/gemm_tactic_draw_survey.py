@@ -136,6 +136,27 @@ EXIT_ARM_MIXED = 81            # one evidence root holds both tactic-set arms
 
 
 # ---------------------------------------------------------------------------
+# The two thresholds the speed half is judged against, ONE DEFINITION EACH.
+#
+# Both are 1.02 and they mean different things, which is written out at length
+# in `speed_spread` and in `.agents/specs/nvfp4-persistent-plan-cache.md` W3-F.
+# They are two constants rather than one alias BECAUSE they share a value: the
+# spec says moving one must not move the other, and a single name would make
+# that impossible to obey.
+#
+# THE POINT OF NAMING THEM IS THAT THE VALUE HAD THREE COPIES. `speed_spread`'s
+# keyword default was the only one under test, while `reduce_evidence`'s default
+# and the `reduce` subparser's `--noise-ceiling` default carried their own
+# literals -- and the subparser's is the copy the spec's published gate command
+# actually runs at, because that command passes no `--noise-ceiling`. Widening
+# either of the other two left the whole suite green, so the number governing a
+# lease was the one nothing asserted. A literal written once cannot drift from
+# itself.
+DEFAULT_RATIFICATION_BAR = 1.02
+DEFAULT_NOISE_CEILING = 1.02
+
+
+# ---------------------------------------------------------------------------
 # Parsing. Every regex below is deliberately UNANCHORED.
 # A `^`-anchored grep over this tree's logs has already failed on lines a
 # harness had prefixed with a timestamp or an ANSI colour reset, and an anchored
@@ -656,8 +677,8 @@ def selection_time_spread(draws: Mapping[str, Mapping[str, Any]]) -> dict[str, A
 def speed_spread(
     per_draw: Mapping[str, Sequence[float]],
     *,
-    ratification_bar: float = 1.02,
-    noise_ceiling: float = 1.02,
+    ratification_bar: float = DEFAULT_RATIFICATION_BAR,
+    noise_ceiling: float = DEFAULT_NOISE_CEILING,
     min_legs: int = 3,
 ) -> dict[str, Any]:
     """#2751, speed half: is the draw-to-draw spread bigger than the harness noise?
@@ -684,7 +705,11 @@ def speed_spread(
         difference, not an estimate of anything, and the first revision of this
         harness took the run's floor from such a figure at the spec's own
         `--score-reps 2`.
-    2.  `noise_ceiling` refuses the run outright when ANY draw's own repeat
+    2.  A draw whose own spread is UNDEFINED -- a non-positive leg, which is
+        what a leg that produced no tokens records -- is refused by name. Both
+        rules below read a per-draw spread, and a draw missing from that
+        population is exempt from both while its mean still decides the ratio.
+    3.  `noise_ceiling` refuses the run outright when ANY draw's own repeat
         spread exceeds it. Without that, one restless draw sets a floor that
         certifies every other draw as equivalent -- and `EQUIVALENT` is the
         verdict that closes #2751 as "no divergence warranted" and unblocks
@@ -722,6 +747,17 @@ def speed_spread(
         label: (max(v) - min(v)) / min(v) if len(v) >= 2 and min(v) > 0 else None
         for label, v in usable.items()
     }
+    # A DRAW WHOSE SPREAD IS `None` IS EXEMPT FROM BOTH GUARDS BELOW AND STILL
+    # MOVES THE RATIO, so it is refused by name rather than dropped. `within` is
+    # `None` when the draw's minimum leg is not positive, and a zero is what a
+    # leg records when its run produced no tokens: `parse_bench_report` reads
+    # the field rather than omitting it. Dropped, such a draw took no part in
+    # the ceiling and no part in the pooled floor while its own depressed mean
+    # decided which draw was worst -- so the wildest draw in the run was the one
+    # neither guard could see, and the reported spread described the others.
+    unspreadable = sorted(
+        label for label in labels if usable[label] and within[label] is None
+    )
     within_values = sorted(w for w in within.values() if w is not None)
     worst_within = within_values[-1] if within_values else None
     pooled_within = statistics.median(within_values) if within_values else None
@@ -744,6 +780,16 @@ def speed_spread(
             "their own repeat spread is one difference rather than an estimate "
             "and a draw-to-draw gap cannot be distinguished from it. Three legs "
             "per draw is the minimum this predicate accepts"
+        )
+    elif unspreadable:
+        verdict = "INCOMPARABLE"
+        reason = (
+            f"{', '.join(unspreadable)}: a scored draw carries a non-positive "
+            "leg, so its own repeat spread is undefined. It cannot be measured "
+            "against the noise ceiling or contribute to the pooled floor, and a "
+            "run judged with that draw exempt would quote a spread over the "
+            "OTHER draws while this one set the ratio. Read the leg's own log: "
+            "a zero is a leg that produced no tokens, not a slow one"
         )
     elif ratio is None:
         verdict, reason = "INCOMPARABLE", "a scored draw has a non-positive mean"
@@ -794,6 +840,10 @@ def speed_spread(
         "pooled_within_draw_spread": (
             None if pooled_within is None else 1.0 + pooled_within
         ),
+        # BOTH SPREADS ABOVE ARE POOLED OVER THIS LIST'S COMPLEMENT. Reporting
+        # them without saying so is how a figure measured over one of two draws
+        # reads as the run's own noise.
+        "draws_without_a_spread": unspreadable,
         "legs_per_draw": {label: len(v) for label, v in usable.items()},
         "means": means,
     }
@@ -1323,7 +1373,7 @@ def read_frozen_controls(evidence: pathlib.Path) -> list[dict[str, Any]]:
 
 
 def frozen_control_state(
-    controls: Sequence[Mapping[str, Any]], legs_in_ledger: int
+    controls: Sequence[Mapping[str, Any]], legs_by_arm: Mapping[str, int]
 ) -> dict[str, Any]:
     """Did EVERY leg that contributed a number pass the frozen control?
 
@@ -1332,10 +1382,34 @@ def frozen_control_state(
     nobody checked. Either way the scoring phase is N MORE DRAWS wearing the
     label of a replay, and its numbers are attributed to the arm they were asked
     about rather than to the map they actually ran.
+
+    THE SECOND CHECK IS A JOIN AND NOT A COUNT. `check-frozen --record` writes
+    `score/<arm>-<n>/frozen.json` and labels it `<arm>-<n>`, so a control record
+    says which arm it answers for. Comparing totals instead -- N passing records
+    against N ledger legs -- lets a record for one arm satisfy a leg of another,
+    and an arm whose legs were never checked then reads as checked. The single
+    writer this driver has cannot produce that state today, so this is a claim
+    the function was making rather than a failure anyone has seen; it is cheaper
+    to make the claim true than to weaken it, and the polarity is fail-closed
+    either way.
     """
 
     passing = [c for c in controls if c.get("frozen") is True]
     failing = [c for c in controls if c.get("frozen") is not True]
+    legs_in_ledger = sum(legs_by_arm.values())
+
+    def arm_of(control: Mapping[str, Any]) -> str:
+        return str(control.get("leg", "?")).rsplit("-", 1)[0]
+
+    passing_by_arm: dict[str, int] = {}
+    for control in passing:
+        passing_by_arm[arm_of(control)] = passing_by_arm.get(arm_of(control), 0) + 1
+    short = sorted(
+        f"{arm} ({passing_by_arm.get(arm, 0)} of {count})"
+        for arm, count in legs_by_arm.items()
+        if passing_by_arm.get(arm, 0) < count
+    )
+
     state = "PASS"
     reason = f"all {legs_in_ledger} scored leg(s) replayed a frozen map"
     if failing:
@@ -1344,18 +1418,20 @@ def frozen_control_state(
             f"{len(failing)} scoring leg(s) failed the frozen control: "
             + "; ".join(f"{c.get('leg', '?')}: {c.get('why', '?')}" for c in failing)
         )
-    elif len(passing) < legs_in_ledger:
+    elif short:
         state = "REFUSED"
         reason = (
-            f"{legs_in_ledger} leg(s) contributed a number and only "
-            f"{len(passing)} carry a frozen-control record. A leg whose control "
-            "was never recorded measured a plan map nobody checked"
+            "these arm(s) contributed numbers from legs that carry no passing "
+            "frozen-control record: " + "; ".join(short) + ". A leg whose "
+            "control was never recorded measured a plan map nobody checked"
         )
     return {
         "state": state,
         "reason": reason,
         "legs_in_ledger": legs_in_ledger,
+        "legs_by_arm": dict(sorted(legs_by_arm.items())),
         "legs_with_a_passing_control": len(passing),
+        "passing_controls_by_arm": dict(sorted(passing_by_arm.items())),
         "records": [dict(c) for c in controls],
     }
 
@@ -1365,7 +1441,7 @@ def reduce_evidence(
     *,
     metric: str,
     ratification_bar: float,
-    noise_ceiling: float = 1.02,
+    noise_ceiling: float = DEFAULT_NOISE_CEILING,
 ) -> tuple[int, dict[str, Any]]:
     records = read_draw_records(evidence)
     code, problems = check_draw_preconditions(records)
@@ -1420,8 +1496,8 @@ def reduce_evidence(
         # all -- which is what it had before, because the file this used to read
         # (`score/frozen-checks.json`) had no writer anywhere in the tree.
         controls = read_frozen_controls(evidence)
-        legs_in_ledger = sum(len(values) for values in per_draw.values())
-        report["frozen_leg_control"] = frozen_control_state(controls, legs_in_ledger)
+        legs_by_arm = {arm: len(values) for arm, values in per_draw.items()}
+        report["frozen_leg_control"] = frozen_control_state(controls, legs_by_arm)
         if report["frozen_leg_control"]["state"] != "PASS":
             report["issue_2751_speed"] = {
                 "verdict": "REFUSED",
@@ -1520,8 +1596,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     reduce_p = sub.add_parser("reduce", help="judge a complete evidence directory")
     reduce_p.add_argument("--evidence", required=True, type=pathlib.Path)
     reduce_p.add_argument("--metric", default="total_token_throughput")
-    reduce_p.add_argument("--ratification-bar", type=float, default=1.02)
-    reduce_p.add_argument("--noise-ceiling", type=float, default=1.02,
+    reduce_p.add_argument("--ratification-bar", type=float,
+                          default=DEFAULT_RATIFICATION_BAR)
+    reduce_p.add_argument("--noise-ceiling", type=float,
+                          default=DEFAULT_NOISE_CEILING,
                           help="the widest WITHIN-draw repeat spread a run may "
                                "carry and still be judged. Its own parameter, "
                                "deliberately not the ratification bar: they "

@@ -1171,6 +1171,13 @@ The near-tie tool uses one request at a time, so its strict input capture must
 use `--per-prompt`. Each tool writes a provenance JSON file beside its NumPy
 outputs. `--provenance-out PATH` writes an identical additional copy. Strict
 captures refuse existing outputs and mismatched or incomplete evidence.
+Output and provenance paths cannot overwrite capture inputs, including symbolic
+links and hardlinks to those inputs.
+
+`sampling_normalized` records the supplied `SamplingParams` after constructor
+normalization. vLLM resolves engine requests on a clone. `sampling_resolved`
+remains null, and `sampling_resolution` records that observation limit.
+Teacher-forcing sampling carries the same qualification.
 
 Legacy Qwen3 distributional calls remain usable, including captures without
 complete provenance and near-tie inputs without manifests. Their manifests

@@ -31,6 +31,7 @@ import hashlib
 import io
 import math
 from pathlib import Path
+import re
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -77,14 +78,26 @@ def validate_capture(context, capture, inputs):
                    and capture.get("deterministic") is True
                    and isinstance(capture.get("repetitions"), int) and capture["repetitions"] >= 10,
                    "near-tie input is not a deterministic strict capture")
-    for key in ("prompts_sha256", "sampling", "sampling_resolved", "execution_mode", "batching"):
+    for key in ("provenance_status", "resolved_model_identity", "prompts_sha256", "sampling",
+                "sampling_normalized", "sampling_resolved", "sampling_resolution", "execution_mode", "batching"):
         common.require(capture.get(key) == context[key], f"capture {key} differs")
     for key in ("requested", "resolved"):
         common.require(capture.get("cache", {}).get(key) == context["cache"][key], f"capture cache {key} differs")
-    for key in ("requested_revision", "identity", "files"):
+    for key in ("requested_revision", "identity", "files", "missing"):
         common.require(capture.get("model", {}).get(key) == context["model"][key], f"capture model {key} differs")
-    for key in ("requested_revision", "package_files"):
+    for key in ("requested_revision", "package_files", "missing", "version"):
         common.require(capture.get("runtime", {}).get(key) == context["runtime"][key], f"capture oracle {key} differs")
+    runtime = capture["runtime"]
+    revision = runtime.get("revision")
+    verification = runtime.get("revision_verification")
+    valid_revision = verification == "clean_git_source" and common.full_revision(revision)
+    if verification == "installed_version_vcs_prefix":
+        # A captured installed revision keeps its observed prefix, independently
+        # checked against the current verified full revision and package bytes.
+        match = re.search(r"(?:\+|\.)g([0-9a-f]{7,40})(?:[.+-]|$)", str(runtime.get("version")))
+        valid_revision = match is not None and revision == match.group(1)
+    common.require(valid_revision and context["runtime"]["requested_revision"].startswith(revision),
+                   "capture observed oracle revision is missing, unverified, or differs")
     for key, field in (("wheel", "sha256"), ("image", "digest")):
         common.require(capture.get("runtime", {}).get(key, {}).get(field) == context["runtime"][key][field],
                        f"capture oracle {key} differs")
@@ -145,7 +158,7 @@ def main():
         common.require(all(token >= 0 for token in tokens), "prompt contains a negative token", "STRUCTURE_MISMATCH")
         prefixes.append(tokens)
     sp_args = {"temperature": 0.0, "max_tokens": 1, "prompt_logprobs": args.topk, "seed": args.seed or 0}
-    context["teacher_forcing_sampling"] = common.sampling_record(SamplingParams(**sp_args))
+    common.record_sampling(context, SamplingParams(**sp_args), key="teacher_forcing_sampling")
     reference = []
     gap_mnats = np.zeros((N, T), dtype="<i4")
     deterministic = True
@@ -187,7 +200,10 @@ def main():
         buffer = io.BytesIO()
         np.save(buffer, array, allow_pickle=False)
         payloads[name] = buffer.getvalue()
-    common.publish(directory, payloads, context, "neartie-provenance.json", args.provenance_out)
+    protected = common.capture_input_paths(args, vllm, context, __file__)
+    protected.update(directory / name for name in inputs)
+    common.publish(directory, payloads, context, "neartie-provenance.json", args.provenance_out,
+                   protected_inputs=protected)
     print(f"wrote {directory}; teacher forcing uses OUR exact prefix; output_sha256={context['output_sha256']}")
 
 

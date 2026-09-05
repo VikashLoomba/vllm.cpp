@@ -89,6 +89,11 @@ def file_record(path):
     return {"sha256": sha256(path), "size": Path(path).stat().st_size}
 
 
+def file_identity(path):
+    stat = Path(path).stat()
+    return stat.st_dev, stat.st_ino
+
+
 def check_prompts(script_path, prompts):
     root = Path(script_path).resolve().parents[1]
     sources = {}
@@ -352,7 +357,7 @@ def confirm_inputs(args, module, context, script_path, prompts):
 
 
 def sampling_record(params):
-    """Record resolved defaults, including vLLM's seed=-1 normalization."""
+    """Serialize the supplied sampling object without claiming engine resolution."""
     def encode(value):
         if value is None or isinstance(value, (str, bool, int, float)):
             return value
@@ -368,12 +373,36 @@ def sampling_record(params):
     return {name: encode(value) for name, value in values.items()}
 
 
-def record_sampling(context, params):
-    context["sampling_resolved"] = sampling_record(params)
-    context["sampling"] = {name: getattr(params, name) for name in ("temperature", "max_tokens", "seed")}
+def record_sampling(context, params, key="sampling"):
+    context[key + "_normalized"] = sampling_record(params)
+    context[key + "_resolved"] = None
+    # Pinned vLLM v1/engine/input_processor.py:356,364-369 resolves a clone.
+    # Reading the supplied object after generate() cannot observe that request.
+    context[key + "_resolution"] = {
+        "status": "unobserved",
+        "limit": "vLLM resolves a cloned request using generation config and tokenizer; "
+                 "the engine-resolved values are not observed.",
+    }
+    context[key] = {name: getattr(params, name) for name in ("temperature", "max_tokens", "seed")}
 
 
-def publish(directory, payloads, provenance, manifest_name, external=None):
+def capture_input_paths(args, module, context, script_path):
+    """Name the files used to verify this capture before publication."""
+    model_root = Path(context["model"]["path"])
+    paths = {model_root / name for name in context["model"]["files"]}
+    paths.update(model_root / ".cache/huggingface/download" / (name + ".metadata")
+                 for name in context["model"]["files"])
+    filename = getattr(module, "__file__", None)
+    if filename:
+        package_root = Path(filename).resolve().parent.parent
+        paths.update(package_root / name for name in context["runtime"]["package_files"])
+    project_root = Path(script_path).resolve().parents[1]
+    paths.update(project_root / name for name in context["scripts"])
+    paths.update(Path(path) for path in (args.vllm_wheel, args.runtime_manifest) if path)
+    return paths
+
+
+def publish(directory, payloads, provenance, manifest_name, external=None, *, protected_inputs=()):
     """Publish validated results; legacy callers retain their overwrite contract."""
     directory = Path(directory).resolve()
     provenance["outputs"] = {name: {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
@@ -387,8 +416,12 @@ def publish(directory, payloads, provenance, manifest_name, external=None):
         require(path not in targets or path == directory / manifest_name, "provenance path overlaps an output")
         targets[path] = manifest
     legacy = provenance["regime"] == "legacy_distributional"
+    # stat follows symbolic links and identifies hardlinks to the same input.
+    protected = {file_identity(path) for path in protected_inputs if Path(path).exists()}
     backups = {}
     for target in targets:
+        require(not target.exists() or file_identity(target) not in protected,
+                f"publication path overlaps an input: {target}")
         require(legacy or not target.exists(), f"refusing to overwrite {target}")
         if target.exists():
             backups[target] = target.read_bytes()

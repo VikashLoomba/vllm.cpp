@@ -2,6 +2,7 @@
 """Real NumPy output checks with a controlled fake vLLM, never a GPU oracle."""
 
 import json
+import os
 from pathlib import Path
 import shutil
 import unittest
@@ -501,6 +502,130 @@ class CaptureOutputTests(CaptureFixture):
         self.assertEqual((self.out / "our_ids.i32").read_bytes(), original)
         self.assertTrue(output.samefile(self.out / "our_ids.i32"))
         self.assertFalse((self.out / "neartie_gap_mnats.npy").exists())
+
+    def test_legacy_publication_protects_selected_distribution_metadata(self):
+        self.prepare_legacy_neartie()
+        # Discover metadata on another sys.path entry, with no RECORD file.
+        # CPython Distribution.metadata tries METADATA, PKG-INFO, then egg-info.
+        site = self.root / "metadata-site"
+        site.mkdir()
+        self.env["PYTHONPATH"] = str(site) + os.pathsep + self.env["PYTHONPATH"]
+        for layout in ("dist-info", "egg-info-directory", "egg-info-file", "empty-metadata"):
+            metadata_root = site / ("vllm-unrelated-build.dist-info" if layout == "dist-info"
+                                    else "vllm.egg-info")
+            if layout == "egg-info-file":
+                source = metadata_root
+            else:
+                metadata_root.mkdir()
+                source = metadata_root / ("METADATA" if layout == "dist-info" else "PKG-INFO")
+            source.write_text("Name: vllm\nVersion: controlled-test-fixture\n")
+            sources = [source]
+            if layout == "empty-metadata":
+                empty = metadata_root / "METADATA"
+                empty.write_bytes(b"")
+                sources.append(empty)
+            for near in (False, True):
+                for consumed in sources:
+                    for alias in ("direct", "symlink", "hardlink"):
+                        with self.subTest(layout=layout, near=near, input=consumed.name, alias=alias):
+                            destination = consumed if alias == "direct" else self.root / "metadata-alias.json"
+                            if alias == "symlink":
+                                destination.symlink_to(consumed)
+                            elif alias == "hardlink":
+                                destination.hardlink_to(consumed)
+                            try:
+                                self.assert_publication_refused(
+                                    [*self.args(near), "--runs", "1", "--provenance-out", str(destination)],
+                                    near=near, protected=tuple(sources))
+                            finally:
+                                if alias != "direct":
+                                    destination.unlink()
+            if metadata_root.is_dir():
+                shutil.rmtree(metadata_root)
+            else:
+                metadata_root.unlink()
+
+    def test_legacy_publication_refuses_aliases_between_output_destinations(self):
+        self.prepare_legacy_neartie()
+        for near in (False, True):
+            names = (("our_ids.npy", "neartie_gap_mnats.npy", "neartie-provenance.json") if near else
+                     ("greedy_ids.npy", "greedy_dist.npy", "oracle-provenance.json"))
+            # Every pair of payload, default manifest, and additional manifest.
+            outputs = [*(self.out / name for name in names), self.root / "additional.json"]
+            for left in range(len(outputs)):
+                for right in range(left + 1, len(outputs)):
+                    source, destination = outputs[left], outputs[right]
+                    for alias in ("direct", "symlink", "hardlink", "dangling-symlink"):
+                        if alias == "direct" and right != 3:
+                            continue  # CLI payload names are fixed and distinct.
+                        if alias == "direct" and left == 2:
+                            continue  # Explicit default manifest is a valid single target.
+                        with self.subTest(near=near, source=source.name, target=destination.name, alias=alias):
+                            originals = {p: p.read_bytes() for p in self.out.iterdir()}
+                            try:
+                                source.write_bytes(b"previous output")
+                                destination.unlink(missing_ok=True)
+                                external = source if alias == "direct" else outputs[-1]
+                                if alias in ("symlink", "dangling-symlink"):
+                                    destination.symlink_to(source)
+                                    if alias == "dangling-symlink":
+                                        source.unlink()
+                                elif alias == "hardlink":
+                                    destination.hardlink_to(source)
+                                # A dangling link has no bytes to snapshot; record its target.
+                                before = {p: (p.readlink() if p.is_symlink() else p.read_bytes())
+                                          for p in [*self.out.iterdir(), *([destination] if right == 3 and alias != "direct" else [])]}
+                                result = self.run_script([*self.args(near), "--runs", "1", "--provenance-out", str(external)], near=near)
+                                self.assertNotEqual(result.returncode, 0, result.stdout)
+                                self.assertIn("ARTIFACT_MISMATCH", result.stderr)
+                                self.assertEqual(set(self.out.iterdir()), {p for p in before if p.parent == self.out})
+                                for path, value in before.items():
+                                    self.assertEqual(path.readlink() if path.is_symlink() else path.read_bytes(), value)
+                                if external not in before:
+                                    self.assertFalse(external.exists())
+                            finally:
+                                # Unlink aliases before restoring any bytes, including red runs.
+                                for path in [*self.out.iterdir(), outputs[-1]]:
+                                    path.unlink(missing_ok=True)
+                                for path, data in originals.items():
+                                    path.write_bytes(data)
+
+    def test_legacy_explicit_default_manifest_and_replacement_keep_valid_hashes(self):
+        self.prepare_legacy_neartie()
+        for near in (False, True):
+            manifest = self.out / ("neartie-provenance.json" if near else "oracle-provenance.json")
+            for repeat in range(2):
+                result = self.run_script([*self.args(near), "--runs", "1", "--provenance-out", str(manifest)], near=near)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                provenance = json.loads(manifest.read_text())
+                for name, record in provenance["outputs"].items():
+                    self.assertEqual(sha(self.out / name), record["sha256"])
+                    self.assertEqual((self.out / name).stat().st_size, record["size"])
+
+
+    def test_legacy_capture_records_and_rechecks_consumed_distribution_metadata(self):
+        self.prepare_legacy_neartie()
+        metadata = self.source / "vllm-0.28.1.dist-info/METADATA"
+        metadata.parent.mkdir()
+        metadata.write_text("Name: vllm\nVersion: controlled-test-fixture\n")
+        for near in (False, True):
+            manifest = self.out / ("neartie-provenance.json" if near else "oracle-provenance.json")
+            result = self.run_script([*self.args(near), "--runs", "1"], near=near)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            runtime = json.loads(manifest.read_text())["runtime"]
+            self.assertEqual(runtime.get("distribution_metadata"), {
+                str(metadata): {"sha256": sha(metadata), "size": metadata.stat().st_size}})
+            before = {p: p.read_bytes() for p in self.out.iterdir()}
+            original = metadata.read_bytes()
+            try:
+                result = self.run_script([*self.args(near), "--runs", "1"], near=near,
+                                         env={"FAKE_MUTATE_INPUT": str(metadata)})
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("runtime identity changed during capture", result.stderr)
+                self.assertEqual({p: p.read_bytes() for p in self.out.iterdir()}, before)
+            finally:
+                metadata.write_bytes(original)
+
 
 
 if __name__ == "__main__":

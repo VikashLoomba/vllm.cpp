@@ -209,6 +209,26 @@ def model_identity(args):
     return result
 
 
+def distribution_metadata_files(distribution):
+    """Record the filesystem metadata read by Python's selected distribution."""
+    # CPython importlib.metadata: Distribution.version reads metadata, whose
+    # read_text calls try METADATA, PKG-INFO, then an old egg-info file.
+    # PathDistribution joins those names to _path, not to the package root or
+    # a guessed version directory. RECORD need not exist.
+    root = getattr(distribution, "_path", None)
+    if not isinstance(distribution, importlib.metadata.PathDistribution) or not isinstance(root, Path):
+        return {}
+    records = {}
+    for name in ("METADATA", "PKG-INFO", ""):
+        path = root / name
+        consumed = distribution.read_text(name)
+        if consumed is not None:
+            records[str(path.absolute())] = file_record(path)
+        if consumed:
+            break
+    return records
+
+
 def runtime_identity(module, args, strict):
     missing = []
     requested = args.vllm_revision
@@ -226,6 +246,7 @@ def runtime_identity(module, args, strict):
     if not files:
         missing.append("imported package bytes")
     version = getattr(module, "__version__", None)
+    metadata_files = {}
     revision, verification, source_root = None, None, None
     if package:
         def git(*argv):
@@ -248,6 +269,7 @@ def runtime_identity(module, args, strict):
             distribution = None
         if distribution:
             require(str(distribution.version) == str(version), "imported and installed vLLM versions differ")
+            metadata_files = distribution_metadata_files(distribution)
     prefix_match = re.search(r"(?:\+|\.)g([0-9a-f]{7,40})(?:[.+-]|$)", str(version))
     prefix = prefix_match.group(1) if prefix_match else None
     if revision and prefix:
@@ -301,7 +323,8 @@ def runtime_identity(module, args, strict):
     return {"version": version, "revision": revision, "requested_revision": requested,
             "revision_verification": verification,
             "revision_limit": "An installed +g suffix verifies only the recorded VCS prefix; the full requested SHA is separate.",
-            "source_root": source_root, "package_files": files, "wheel": wheel, "image": image,
+            "source_root": source_root, "package_files": files, "distribution_metadata": metadata_files,
+            "wheel": wheel, "image": image,
             "launcher_manifest_sha256": manifest_hash, "missing": missing}
 
 
@@ -396,6 +419,7 @@ def capture_input_paths(args, module, context, script_path):
     if filename:
         package_root = Path(filename).resolve().parent.parent
         paths.update(package_root / name for name in context["runtime"]["package_files"])
+    paths.update(Path(path) for path in context["runtime"]["distribution_metadata"])
     project_root = Path(script_path).resolve().parents[1]
     paths.update(project_root / name for name in context["scripts"])
     paths.update(Path(path) for path in (args.vllm_wheel, args.runtime_manifest) if path)
@@ -412,14 +436,25 @@ def publish(directory, payloads, provenance, manifest_name, external=None, *, pr
     targets = {directory / name: data for name, data in payloads.items()}
     targets[directory / manifest_name] = manifest
     if external:
-        path = Path(external).resolve()
+        path = Path(external).absolute()
+        # Preserve the final name so an alias to another manifest stays a
+        # distinct target. An explicit default name still publishes once.
+        path = path.parent.resolve() / path.name
         require(path not in targets or path == directory / manifest_name, "provenance path overlaps an output")
         targets[path] = manifest
     legacy = provenance["regime"] == "legacy_distributional"
     # stat follows symbolic links and identifies hardlinks to the same input.
     protected = {file_identity(path) for path in protected_inputs if Path(path).exists()}
     backups = {}
+    resolved_targets, output_identities = set(), set()
     for target in targets:
+        resolved = target.resolve()
+        require(resolved not in resolved_targets, f"publication paths alias an output: {target}")
+        resolved_targets.add(resolved)
+        if target.exists():
+            inode = file_identity(target)
+            require(inode not in output_identities, f"publication paths alias an output: {target}")
+            output_identities.add(inode)
         require(not target.exists() or file_identity(target) not in protected,
                 f"publication path overlaps an input: {target}")
         require(legacy or not target.exists(), f"refusing to overwrite {target}")

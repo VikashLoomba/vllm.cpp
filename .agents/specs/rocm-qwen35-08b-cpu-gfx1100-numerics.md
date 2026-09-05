@@ -12,8 +12,10 @@ Active primary oracle pin: vLLM
 
 ## Now
 
-`PENDING`. This repaired spec is the only completed deliverable in this commit.
-Implementation cannot start until a fresh reviewer passes this immutable spec.
+`PENDING`. The amended spec passed fresh review before capture-tool implementation.
+The Python capture tools now implement the provenance and deterministic publication
+contract. Fresh implementation review and operator verification remain required.
+The C++ characterization probes and real-runtime acceptance remain `PENDING`.
 Results cannot be accepted until both correctness prerequisites pass:
 
 1. Issue #2772 and PR #2856 own the default-on ROCm `wvSplitK` sacred-anchor
@@ -312,10 +314,9 @@ modes, but this spec alone does not authorize new permanent goldens.
 
 ## Required capture-tool implementation
 
-The current `scripts/qwen3-oracle-capture.py` and
-`scripts/qwen3-neartie-gap.py` hard-code `enforce_eager=True` and expose no
-cache-dtype argument. Before active-pin capture, add reviewed options equivalent
-to:
+`scripts/qwen3-oracle-capture.py` and `scripts/qwen3-neartie-gap.py` expose the
+capture interface below. Their CPU fixtures exercise provenance, refusal, and
+NumPy serialization. Active-pin ROCm capture and acceptance remain pending.
 
 ```text
 --kv-cache-dtype {auto,bfloat16,fp8_e4m3}
@@ -414,8 +415,9 @@ the eight-token characterization files as sacred-gate goldens.
 
 ## Tests and review mutations
 
-The later implementation starts with focused tests that fail because the four
-state rows and capture options are absent. It must test row shape/dtype,
+The capture-tool slice used failing CLI and publication tests before implementation.
+The later state implementation starts with focused tests that fail because the four
+state rows are absent. It must test row shape/dtype,
 nonmonotonic and negative slot mappings, inactive-capacity exclusion, stored
 BF16 widening, post-quantization FP8 dequantization, persistent GDN prefill and
 decode state, incomplete-step refusal, comparator structural refusals and
@@ -430,9 +432,9 @@ cache-store operator, inject a reference-tier hit, remove the production entry
 point, and force eager oracle mode. Each focused test must fail for the intended
 reason and the reviewer must restore the tree byte for byte.
 
-This spec repair changes no runtime behavior. `IMP-TEST-FIRST` and
-`IMP-MUTATE` are future implementation/review gates, not evidence claimed by
-this commit.
+The spec-only repair changed no runtime behavior. The capture-tool slice exercises
+`IMP-TEST-FIRST` and `IMP-MUTATE` with CPU fixtures. State probes and real-runtime
+gates remain future work.
 
 ## Gate order
 
@@ -453,8 +455,8 @@ The later implementation must satisfy, in order:
     zero reference-tier hits.
 12. The operator independently reruns focused, full, oracle, and hardware gates.
 
-No GPU result, oracle result, model execution, runtime mutation, or
-implementation test is claimed by this spec-only repair.
+The capture-tool slice claims CPU fixture tests and mutations only. It claims no
+GPU result, oracle result, model execution, or numerical runtime mutation.
 
 ## Evidence required
 
@@ -517,8 +519,8 @@ push, open, or merge that pull request.
   `dense_attn::AttnBlock`. This tracked exception records existing debt. It
   does not waive or satisfy the shared-seam requirement. Wiring needs its own
   reviewed spec and implementation, outside #2773's instrumentation scope.
-- A fresh reviewer owes this repaired spec a verdict.
-- A fresh implementer owes the capture options, state probes, tests, comparator,
+- The amended spec passed fresh review before capture-tool implementation.
+- A fresh implementer owes the state probes, tests, comparator,
   and provider checks after the prerequisites pass.
 - A fresh implementation reviewer owes static review and every mutation.
 - The operator owes the independent controlled and gfx1100 gates.

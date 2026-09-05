@@ -326,6 +326,8 @@ to:
 --model-revision REV
 --vllm-revision REV
 --provenance-out PATH
+--vllm-wheel PATH
+--runtime-manifest PATH
 ```
 
 `production` must instantiate vLLM without `enforce_eager=True`; eager is a
@@ -341,6 +343,8 @@ issue-evidence directory instead of the committed golden directory. The second
 sets `EngineParams::kv_cache_dtype` and prints requested, resolved, and physical
 dtype. These commands describe the intended interface and data flow after
 those changes. They are future commands and will fail today:
+The launcher must first supply the inspected `VLLM_WHEEL` and
+`ORACLE_RUNTIME_MANIFEST` paths. Missing values keep capture pending.
 
 ```sh
 VLLM_PIN=e126687a9a828d513c01a07cd69f025f27d63280
@@ -353,6 +357,7 @@ for mode in auto bfloat16 fp8_e4m3; do
   "${VLLM_ORACLE}" scripts/qwen3-oracle-capture.py \
     --model "${MODEL}" --model-revision "${MODEL_REV}" \
     --vllm-revision "${VLLM_PIN}" \
+    --vllm-wheel "${VLLM_WHEEL}" --runtime-manifest "${ORACLE_RUNTIME_MANIFEST}" \
     --kv-cache-dtype "${mode}" --execution-mode production --seed 0 \
     --max-tokens 16 --runs 10 --per-prompt --out-dir "${GOLDEN_DIR}" \
     --provenance-out "evidence/2773/oracle-${mode}.json"
@@ -363,6 +368,7 @@ for mode in auto bfloat16 fp8_e4m3; do
   "${VLLM_ORACLE}" scripts/qwen3-neartie-gap.py \
     --model "${MODEL}" --model-revision "${MODEL_REV}" \
     --vllm-revision "${VLLM_PIN}" \
+    --vllm-wheel "${VLLM_WHEEL}" --runtime-manifest "${ORACLE_RUNTIME_MANIFEST}" \
     --kv-cache-dtype "${mode}" --execution-mode production --seed 0 \
     --max-tokens 16 --topk 20 --golden-dir "${GOLDEN_DIR}" \
     --provenance-out "evidence/2773/neartie-${mode}.json"
@@ -374,7 +380,32 @@ done
 
 The tools must refuse when their `PROMPTS` lists differ from each other or from
 `tests/parity/test_qwen35_paged_engine.cpp::Prompts`. Record exact as-run
-commands. Do not create a golden unless all 10 repeats are deterministic.
+commands. Do not publish a Qwen3.5 sacred candidate unless at least 10 repeats
+are deterministic. Select this regime from the artifact's verified
+`config.json`, including its architecture, model type, and nested text model
+type. Any Qwen3.5 indicator selects the strict regime. Require the runtime's
+resolved model identity to agree. A missing or inconsistent identity refuses
+publication. No command-line option can downgrade this regime.
+
+Legacy distributional captures retain their existing caller contracts outside
+Qwen3.5. Their manifests identify the legacy regime, including observed
+nondeterminism and missing provenance. They cannot supply a Qwen3.5 near-tie
+capture. The near-tie tool validates regime, model and oracle identity, cache
+mode, execution mode, prompts, sampling, token count, and input hashes before
+using a Qwen3.5 capture. Existing legacy captures without manifests remain
+usable only outside the strict regime.
+
+Strict capture requires `--vllm-wheel` and `--runtime-manifest`. The launcher
+manifest supplies `vllm_revision`, `wheel_sha256`, and `image_digest`, whose
+value is an immutable `sha256:` digest. Hash the wheel archive and compare its
+package members with the imported package bytes. Independently verify the
+imported source or installed VCS revision against the requested revision.
+Record the actual source/package hashes and every model artifact hash.
+Reject any revision or hash disagreement. Record image identity as an external
+launcher attestation with its verification limit. Do not claim that the Python
+process independently measured its container image. Missing wheel, image,
+source, or artifact identity prevents strict publication. These metadata checks
+do not prove runtime gateability, model correctness, or GPU execution.
 
 The internal CPU/ROCm state characterization remains eight output tokens as
 specified under `Workload and backend identity`. The permanent sacred-gate

@@ -167,7 +167,8 @@ def main():
         buffer = io.BytesIO()
         np.save(buffer, array, allow_pickle=False)
         payloads[name] = buffer.getvalue()
-    common.publish(out_dir, payloads, context, "oracle-provenance.json", args.provenance_out)
+    common.publish(out_dir, payloads, context, "oracle-provenance.json", args.provenance_out,
+                   protected_inputs=common.capture_input_paths(args, vllm, context, __file__))
     print(f"wrote {out_dir}; deterministic={bool(deterministic)}; output_sha256={context['output_sha256']}")
 
 

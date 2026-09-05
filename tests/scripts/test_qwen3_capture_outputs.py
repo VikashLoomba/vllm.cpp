@@ -77,10 +77,11 @@ class CaptureOutputTests(CaptureFixture):
         np.testing.assert_array_equal(ids[:, -1], -1)
         np.testing.assert_array_equal(dist[:, -1, :], -1)
 
-    def test_resolved_sampling_records_the_upstream_seed_sentinel(self):
+    def test_normalized_sampling_records_the_upstream_seed_sentinel(self):
         provenance = self.capture("--seed", "-1")
         self.assertIsNone(provenance["sampling"]["seed"])
-        self.assertIsNone(provenance["sampling_resolved"]["seed"])
+        self.assertIsNone(provenance["sampling_normalized"]["seed"])
+        self.assertIsNone(provenance["sampling_resolved"])
         self.assertEqual(provenance["arguments"]["seed"], -1)
 
     def test_legacy_replacement_and_manifestless_teacher_forcing_remain_usable(self):
@@ -144,7 +145,8 @@ class CaptureOutputTests(CaptureFixture):
         original = package.read_text()
         metadata = self.source / "vllm-0.28.1.dist-info/METADATA"
         metadata.parent.mkdir()
-        for prefix, accepted in ((self.revision[:9], True), ("0" * 9, False)):
+        for prefix, accepted in ((self.revision[:7], True), (self.revision[:9], True),
+                                 (self.revision, True), ("0" * 9, False)):
             version = "0.28.1rc1.dev132+g" + prefix
             package.write_text(original.replace("controlled-test-fixture", version))
             metadata.write_text(f"Name: vllm\nVersion: {version}\n")
@@ -159,6 +161,26 @@ class CaptureOutputTests(CaptureFixture):
                 self.assertEqual(provenance["runtime"]["revision"], prefix)
                 self.assertEqual(provenance["runtime"]["revision_verification"],
                                  "installed_version_vcs_prefix")
+                np.load(self.out / "greedy_ids.npy", allow_pickle=False).tofile(self.out / "our_ids.i32")
+                result = self.run_script(near=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                near = json.loads((self.out / "neartie-provenance.json").read_text())
+                self.assertEqual(near["runtime"]["revision"], prefix)
+                for name in ("our_ids.npy", "neartie_gap_mnats.npy", "neartie-provenance.json"):
+                    (self.out / name).unlink()
+                # The same verified bytes can be captured from clean source,
+                # then consumed from an installed wheel with a shorter prefix.
+                provenance["runtime"].update(revision=self.revision,
+                                             revision_verification="clean_git_source")
+                (self.out / "oracle-provenance.json").write_text(json.dumps(provenance))
+                result = self.run_script(near=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                for name in ("our_ids.npy", "neartie_gap_mnats.npy", "neartie-provenance.json"):
+                    (self.out / name).unlink()
+                provenance["runtime"].update(revision=self.revision[:8],
+                                             revision_verification="installed_version_vcs_prefix")
+                (self.out / "oracle-provenance.json").write_text(json.dumps(provenance))
+                self.assert_publication_refused(self.args(True), near=True)
                 shutil.rmtree(self.out)
             else:
                 self.assert_refused(self.run_script(), "ARTIFACT_MISMATCH")
@@ -281,6 +303,204 @@ class CaptureOutputTests(CaptureFixture):
         result = self.run_script(near=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("ARTIFACT_MISMATCH", result.stderr)
+
+    def assert_publication_refused(self, args, *, near=False, protected=(), external=None):
+        before = {p.name: p.read_bytes() for p in self.out.iterdir()} if self.out.exists() else {}
+        originals = {p: p.read_bytes() for p in protected}
+        result = self.run_script(args, near=near)
+        try:
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("ARTIFACT_MISMATCH", result.stderr)
+            self.assertEqual({p: p.read_bytes() for p in protected}, originals)
+            self.assertEqual({p.name: p.read_bytes() for p in self.out.iterdir()}
+                             if self.out.exists() else {}, before)
+            if external:
+                self.assertFalse(external.exists())
+        finally:
+            # Keep red runs and independent mutations isolated between cases.
+            for path, data in originals.items():
+                path.write_bytes(data)
+            if self.out.exists():
+                for path in self.out.iterdir():
+                    if path.name not in before:
+                        path.unlink()
+                for name, data in before.items():
+                    (self.out / name).write_bytes(data)
+            if external:
+                external.unlink(missing_ok=True)
+
+    def test_sampling_records_constructor_state_without_claiming_request_resolution(self):
+        capture = self.capture("--seed", "-1")
+        self.assertIsNone(capture["sampling_normalized"]["seed"])
+        self.assertIsNone(capture["sampling_resolved"])
+        self.assertEqual(capture["sampling_resolution"]["status"], "unobserved")
+        self.assertIn("clone", capture["sampling_resolution"]["limit"])
+        np.load(self.out / "greedy_ids.npy", allow_pickle=False).tofile(self.out / "our_ids.i32")
+        result = self.run_script([*self.args(True), "--seed", "-1"], near=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        near = json.loads((self.out / "neartie-provenance.json").read_text())
+        self.assertEqual(near["sampling_normalized"], capture["sampling_normalized"])
+        for key in ("sampling", "teacher_forcing_sampling"):
+            self.assertIsNone(near[key + "_resolved"])
+            self.assertEqual(near[key + "_resolution"]["status"], "unobserved")
+            self.assertIn("clone", near[key + "_resolution"]["limit"])
+        self.assertEqual(near["teacher_forcing_sampling_normalized"]["prompt_logprobs"], 20)
+
+    def test_neartie_refuses_changed_constructor_sampling_state(self):
+        self.prepare_neartie()
+        path = self.out / "oracle-provenance.json"
+        capture = json.loads(path.read_text())
+        # A differing field outside the three-item summary must also refuse.
+        capture["sampling_normalized"] = {**capture.get("sampling_normalized", {}), "ignore_eos": True}
+        path.write_text(json.dumps(capture))
+        result = self.run_script(near=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("ARTIFACT_MISMATCH", result.stderr)
+        self.assertFalse((self.out / "neartie_gap_mnats.npy").exists())
+
+    def test_neartie_requires_complete_observed_capture_identity(self):
+        self.prepare_neartie()
+        path = self.out / "oracle-provenance.json"
+        original = path.read_text()
+        changes = (("provenance_status", "incomplete"), ("provenance_status", None),
+                   ("model.missing", ["artifact revision: config.json"]), ("model.missing", None),
+                   ("runtime.missing", ["observed source or installed VCS revision"]),
+                   ("runtime.missing", None), ("runtime.revision", "b" * 40),
+                   ("runtime.revision", None), ("runtime.revision", self.revision[:6]),
+                   ("runtime.revision_verification", None),
+                   ("runtime.revision_verification", "unverified"),
+                   ("runtime.revision_verification", "installed_version_vcs_prefix"),
+                   ("runtime.version", None), ("runtime.version", "different-runtime-version"),
+                   ("resolved_model_identity", None),
+                   ("resolved_model_identity.model_type", "qwen3"),
+                   ("resolved_model_identity.architectures", ["Qwen3ForCausalLM"]),
+                   ("resolved_model_identity.text_model_type", "qwen3"))
+        external = self.root / "near.json"
+        for key, value in changes:
+            with self.subTest(key=key, value=value):
+                data = json.loads(original)
+                target = data
+                parts = key.split(".")
+                for part in parts[:-1]:
+                    target = target[part]
+                if value is None:
+                    del target[parts[-1]]
+                else:
+                    target[parts[-1]] = value
+                path.write_text(json.dumps(data))
+                self.assert_publication_refused([*self.args(True), "--provenance-out", str(external)],
+                                                near=True, external=external)
+        path.write_text(original)
+
+    def prepare_legacy_neartie(self):
+        (self.model / "config.json").write_text(json.dumps({
+            "model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]}))
+        self.write_metadata()
+        result = self.run_script(["--model", str(self.model), "--out-dir", str(self.out),
+                                  "--max-tokens", "2", "--runs", "1", "--per-prompt"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        np.load(self.out / "greedy_ids.npy", allow_pickle=False).tofile(self.out / "our_ids.i32")
+        # Legacy teacher forcing needs neither the manifest nor distribution.
+        for name in ("oracle-provenance.json", "greedy_dist.npy"):
+            (self.out / name).unlink()
+
+    def test_legacy_neartie_provenance_preserves_every_input_and_alias(self):
+        self.prepare_legacy_neartie()
+        for source in sorted(self.out.iterdir()):
+            for alias in (False, True):
+                with self.subTest(source=source.name, alias=alias):
+                    destination = self.root / "input-link" if alias else source
+                    if alias:
+                        destination.symlink_to(source)
+                    try:
+                        self.assert_publication_refused(["--model", str(self.model), "--golden-dir", str(self.out),
+                                                         "--max-tokens", "2", "--provenance-out", str(destination)],
+                                                        near=True)
+                    finally:
+                        if alias:
+                            destination.unlink()
+
+    def test_legacy_publication_preserves_capture_inputs(self):
+        (self.model / "config.json").write_text(json.dumps({
+            "model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]}))
+        self.write_metadata()
+        inputs = [self.model / "config.json", self.model / "model.safetensors",
+                  self.model / ".cache/huggingface/download/config.json.metadata",
+                  self.wheel, self.runtime_manifest, self.source / "vllm/__init__.py",
+                  *(self.project / "scripts" / name for name in
+                    ("qwen3-oracle-capture.py", "qwen3-neartie-gap.py", "qwen3_oracle_common.py")),
+                  self.project / "tests/parity/test_qwen35_paged_engine.cpp"]
+        for near in (False, True):
+            if near:
+                self.prepare_legacy_neartie()
+            for source in inputs:
+                for alias in (False, True):
+                    with self.subTest(near=near, source=source, alias=alias):
+                        destination = self.root / "input-link" if alias else source
+                        if alias:
+                            destination.symlink_to(source)
+                        try:
+                            self.assert_publication_refused([*self.args(near), "--runs", "1", "--provenance-out",
+                                                             str(destination)], near=near, protected=(source,))
+                        finally:
+                            if alias:
+                                destination.unlink()
+
+    def test_legacy_output_symlink_cannot_overwrite_an_input(self):
+        self.prepare_legacy_neartie()
+        original = (self.out / "our_ids.i32").read_bytes()
+        output = self.out / "our_ids.npy"
+        output.symlink_to(self.out / "our_ids.i32")
+        result = self.run_script(["--model", str(self.model), "--golden-dir", str(self.out),
+                                  "--max-tokens", "2"], near=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("ARTIFACT_MISMATCH", result.stderr)
+        self.assertEqual((self.out / "our_ids.i32").read_bytes(), original)
+        self.assertTrue(output.is_symlink())
+        self.assertFalse((self.out / "neartie_gap_mnats.npy").exists())
+
+    def test_legacy_neartie_protects_symlinked_inputs(self):
+        self.prepare_legacy_neartie()
+        local_ids = self.out / "our_ids.i32"
+        actual_ids = self.root / "actual_ids.i32"
+        local_ids.rename(actual_ids)
+        local_ids.symlink_to(actual_ids)
+        self.assert_publication_refused(["--model", str(self.model), "--golden-dir", str(self.out),
+                                         "--max-tokens", "2", "--provenance-out", str(actual_ids)],
+                                        near=True, protected=(actual_ids,))
+
+    def test_legacy_provenance_preserves_hardlinked_inputs(self):
+        self.prepare_legacy_neartie()
+        sources = [self.model / "config.json", self.model / "model.safetensors",
+                   self.model / ".cache/huggingface/download/config.json.metadata",
+                   self.wheel, self.runtime_manifest, self.source / "vllm/__init__.py",
+                   *(self.project / "scripts" / name for name in
+                     ("qwen3-oracle-capture.py", "qwen3-neartie-gap.py", "qwen3_oracle_common.py")),
+                   self.project / "tests/parity/test_qwen35_paged_engine.cpp"]
+        for near in (False, True):
+            inputs = sources + (list(self.out.iterdir()) if near else [])
+            for source in inputs:
+                with self.subTest(near=near, source=source):
+                    destination = self.root / "hardlink-manifest.json"
+                    destination.hardlink_to(source)
+                    try:
+                        self.assert_publication_refused([*self.args(near), "--runs", "1", "--provenance-out",
+                                                         str(destination)], near=near, protected=(source,))
+                    finally:
+                        destination.unlink()
+
+    def test_legacy_output_hardlink_cannot_overwrite_an_input(self):
+        self.prepare_legacy_neartie()
+        original = (self.out / "our_ids.i32").read_bytes()
+        output = self.out / "our_ids.npy"
+        output.hardlink_to(self.out / "our_ids.i32")
+        result = self.run_script(["--model", str(self.model), "--golden-dir", str(self.out),
+                                  "--max-tokens", "2"], near=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("ARTIFACT_MISMATCH", result.stderr)
+        self.assertEqual((self.out / "our_ids.i32").read_bytes(), original)
+        self.assertTrue(output.samefile(self.out / "our_ids.i32"))
+        self.assertFalse((self.out / "neartie_gap_mnats.npy").exists())
 
 
 if __name__ == "__main__":

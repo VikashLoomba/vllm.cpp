@@ -13,6 +13,7 @@ cannot be tripped by the harness's own process tree.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import pathlib
 import re
@@ -92,6 +93,7 @@ class CpuX86FloorHarnessTests(unittest.TestCase):
         argv: list[str] | None = None,
         cpu_rows: list[str] | None = None,
         real_cpu: bool = False,
+        observe_ancestry: bool = False,
         **env: str,
     ) -> subprocess.CompletedProcess[str]:
         base = {
@@ -116,8 +118,24 @@ class CpuX86FloorHarnessTests(unittest.TestCase):
             # call sites, the contention decisions, and the engines stay real.
             rows = cpu_rows or self.cpu_series([1000] * 10, [20, 0, 0, 80, 0, 0, 0, 0, 0, 0])
             reader = self.tmp / "cpu-reader.py"
+            ancestry = ""
+            if observe_ancestry:
+                # Observe live ancestors while the production sampler reads,
+                # not before Bash can replace the copied-name fixture.
+                ancestry = (
+                    "import json, os\n"
+                    "chain = []\n"
+                    "pid = os.getppid()\n"
+                    "while pid > 1:\n"
+                    "    stat = pathlib.Path(f'/proc/{pid}/stat').read_text()\n"
+                    "    comm = pathlib.Path(f'/proc/{pid}/comm').read_text().strip()\n"
+                    "    chain.append([pid, comm])\n"
+                    "    pid = int(stat.rsplit(') ', 1)[1].split()[1])\n"
+                    f"with pathlib.Path({str(self.tmp / 'cpu-ancestors.jsonl')!r}).open('a') as log:\n"
+                    "    log.write(json.dumps(chain) + '\\n')\n"
+                )
             reader.write_text(
-                "import pathlib\n"
+                "import pathlib\n" + ancestry +
                 f"rows = {rows!r}\n"
                 f"state = pathlib.Path({str(self.tmp / 'cpu-index')!r})\n"
                 "i = int(state.read_text()) if state.exists() else 0\n"
@@ -204,6 +222,21 @@ class CpuX86FloorHarnessTests(unittest.TestCase):
                 self.assertIn("busy=100%", got.stdout)
                 self.assertNotIn(" START ", got.stdout)
                 self.assertIn("INVALID_CPU_SAMPLE", got.stderr)
+
+    def test_nonaggregate_cpu_labels_are_refused_at_either_endpoint(self) -> None:
+        for label in ("cpu0", "intr"):
+            for endpoint in (0, 1):
+                with self.subTest(label=label, endpoint=endpoint):
+                    (self.tmp / "cpu-index").unlink(missing_ok=True)
+                    rows = self.cpu_series([100] * 10,
+                                           [20, 0, 0, 80, 0, 0, 0, 0, 0, 0])
+                    rows[endpoint] = rows[endpoint].replace("cpu ", label + " ", 1)
+                    got = self.run_harness(self.tmp / "nonaggregate", cpu_rows=rows,
+                                           QUIET_BUSY="100", WAIT_TIMEOUT="0")
+                    self.assertEqual(got.returncode, 4, got.stdout + got.stderr)
+                    self.assertIn("NO_QUIET_WINDOW", got.stdout)
+                    self.assertIn("INVALID_CPU_SAMPLE", got.stderr)
+                    self.assertNotIn(" START ", got.stdout)
 
     def test_decimal_counters_and_own_time_subtraction(self) -> None:
         rows = self.cpu_series([8] * 10, [50, 0, 0, 50, 0, 0, 0, 0, 0, 0])
@@ -327,12 +360,21 @@ class CpuX86FloorHarnessTests(unittest.TestCase):
         probe = self.unique_copy("bash", "vfloorgate")
         got = self.run_harness(
             self.tmp / "evi",
-            argv=[str(probe), "-c", 'bash "$0"', str(SCRIPT)],
+            # A command after bash prevents tail-exec from erasing this
+            # named ancestor. Propagate the actual harness exit status.
+            argv=[str(probe), "-c", 'bash "$0"; result=$?; exit "$result"', str(SCRIPT)],
+            observe_ancestry=True,
             BUILDERS=probe.name,
             WAIT_TIMEOUT="10",
         )
         self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
         self.assertIn("SERIES_DONE", got.stdout)
+        snapshots = [json.loads(line) for line in
+                     (self.tmp / "cpu-ancestors.jsonl").read_text().splitlines()]
+        self.assertGreaterEqual(len(snapshots), 2)
+        for chain in snapshots:
+            self.assertIn(probe.name, [comm for _, comm in chain],
+                          f"named fixture absent from live sampler ancestry: {chain}")
 
     def test_the_quiet_gate_still_sees_a_foreign_process_of_the_same_shape(self) -> None:
         """The exclusion must be our own tree, not "never count anything"."""

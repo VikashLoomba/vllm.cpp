@@ -112,3 +112,24 @@ percent because this repair changes sampling, not the accepted contention.
 The five-second sample window and one-hour wait remain unchanged. Skipping
 the gate and clamping broken ratios were rejected because neither repairs
 the sampled counters. No CPU speed measurement or historical number changed.
+
+## Review repair: observable fixtures
+
+The fresh review of `d9de7fec8` found two test gaps for #2448. Removing the
+own-tree builder exclusion did not fail its test because Bash replaced the
+copied-name ancestor with the final command. Removing the aggregate CPU label
+guard also passed because invalid fixtures lacked valid numeric `cpu0` rows.
+
+Change only the production-entry tests. Record real process ancestry at each
+synthetic CPU-read boundary. First assert that the named ancestor remains
+present, then prevent the fixture's tail-exec optimization. Retain the child
+status and the real builder filter. Verify own and foreign fixtures together.
+Add before- and after-endpoint cases with valid counters and nonaggregate
+labels. Require invalid-sample diagnostics and refusal at the entry point.
+
+Capture the missing-ancestor assertion before the fixture repair. For label
+cases, capture failure against a scratch copy without the production label
+guard. Neither change modifies the production shell. Mutations must detect
+removed own-tree exclusion, restored tail-exec, and removed label validation.
+Restore scratch bytes after every mutation. Run the focused suite and one
+full preflight on the final immutable head, then obtain fresh scoped review.

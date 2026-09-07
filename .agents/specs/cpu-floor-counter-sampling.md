@@ -61,6 +61,12 @@ sampler or either call site. Independently test mismatched-read regression,
 large exact counter differences, guest denominator, idle and iowait semantics,
 steal, invalid samples, own-time subtraction, and foreign builder refusal.
 Keep a real `/proc/stat` smoke case without retries until green.
+Two concurrent foreign-process fixtures reproduced an additional collision:
+both saw `builders=2` because their process names were identical. Give each
+fixture a distinct process name within Linux's 15-character comm limit.
+Test two live fixture processes together and retain the real builder filter.
+This isolates synthetic test neighbors. It does not exclude production
+neighbors or relax a contention assertion.
 
 Capture red before implementation. Run
 `python3 tests/scripts/test_cpu_x86_llamacpp_floor.py` for focused green.

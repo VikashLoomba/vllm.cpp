@@ -76,7 +76,7 @@ against their recorded transformers revision until each vLLM comparison runs.
 ### Configuration and memory formats
 
 The upstream config resolves `mlp_layer_types` from `first_k_dense_replace`
-when the explicit layout is absent, at line 181. Its default is 0, at line 43.
+when the explicit layout is absent, at line 181. Its default is 0, at line 42.
 The old campaign's hardcoded-three transformers observation does not define
 this vLLM behavior. Compare the checkpoint's resolved layout before porting.
 
@@ -84,11 +84,11 @@ Lines 114 and 128 reject disabled indexer layer normalization, compression,
 tail selection, and unsupported mHC normalization options. Preserve the five
 failure cases in `tests/transformers_utils/test_config.py:54`.
 
-`Glm5NextMoE` defaults `apply_routed_scale_to_output=False`, at model line 159.
+`Glm5NextMoE` defaults `apply_routed_scale_to_output=False`, at model line 158.
 Its factory receives `routed_scaling_factor`, at line 239. Follow the factory
 and selected quantization method before claiming the scale's executed placement.
 `Glm5NextMLP` uses `MergedColumnParallelLinear` and the optional
-`SiluAndMulWithClamp`, at lines 118 and 139.
+`SiluAndMulWithClamp`, at lines 116 and 139.
 
 The decoder constructs MLA with `quant_config=None`, at model line 330,
 because the checkpoint stores those projections in bf16. The indexer stores

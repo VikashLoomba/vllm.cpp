@@ -121,6 +121,30 @@ generation timestamps. Retain whole-process measurements with explicit labels.
 GPU activity percentages do not measure occupancy or prove a numeric bound
 on host stalls. Kernel traces, not byte shares, determine kernel time shares.
 
+### Run switch pairs without a new trace
+
+An explicit `--phase switches` runs the existing 12 unprofiled legs from a
+verified build state. This phase uses the same manifest, image, binary,
+library, model, lease, and tuning guards as `measure`. It reuses the existing
+alternating pair loop and result fold. It omits only the two baseline profiler
+legs. The default `measure` phase continues to capture those traces first.
+
+The operator reports that the unprofiled 64-token control completed. A
+kernel-only control also completed, but its profiler reported swapped
+timestamps. Issue [#3040](https://github.com/mudler/vllm.cpp/issues/3040)
+owns the trace-validity gap. Switch results make no trace timing claim.
+The new phase writes `trace-status.json` with `trace_run=false` and a
+`PENDING` status naming #3040. It never labels an omitted trace successful.
+The carried token gate remains `FAIL`, and warm output equality remains
+`PENDING` under the existing CLI limitation.
+
+The switches phase requires `--state` and never rebuilds or alters the
+manifest. Existing trace directories do not block this phase. Existing
+switch-leg directories still refuse reuse through the existing directory
+creation guard. Runtime fault handling belongs to #3039 and does not change
+in this slice. Actual CLI tests prove phase selection, identity rejection,
+all 12 alternating legs, isolated tuning, and the pending trace label.
+
 ## Tests and gates
 
 The implementer first proves harness validation rejects missing files, wrong
@@ -327,6 +351,9 @@ byte-identical after the pass. The final immutable
 head's preflight result and any skips belong to the implementing handoff.
 
 ## Owed
+
+Issue [#3040](https://github.com/mudler/vllm.cpp/issues/3040) owns valid
+profiler timestamps and the resulting kernel-time attribution.
 
 The product fixes in #3016, #3017, and #3018 stay on their owning rows.
 This issue does not close until the clock window and paired trace obligations

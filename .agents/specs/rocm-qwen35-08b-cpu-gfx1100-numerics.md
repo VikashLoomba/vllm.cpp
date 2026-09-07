@@ -23,17 +23,30 @@ Results cannot be accepted until both correctness prerequisites pass:
    `488`), while `VT_ROCM_SKINNY=0` passed. The operator reran PR #2856 at
    `f06619e4c213e3de28359ee10995e682e8c06932`: CPU mode 2/2, prerequisites
    77/77/77/86, `wvSplitK` 79796/79796, and sacred 137/137 with 15 strict, one
-   tied, maximum gap zero, and zero divergence. PR #2856 is still open and the
-   contributor lacks merge authority. This prerequisite remains `PENDING`
-   until a maintainer lands it and the unchanged default gate passes on the
-   implementation base. Disabling skinny GEMM is diagnostic only.
-2. The configured source and runnable ROCm wrapper are still at historical
-   vLLM `5559679229bc961848b121ccdeaa8fa5d79bec98`. The active source object is
-   available for read-only inspection, but no runnable active-pin ROCm runtime
-   has been supplied or proved. Issue #2794 records repository pin-validation
-   context; #2773 itself owns the cache-matched active-pin Qwen3.5-0.8B captures.
-   Active-pin capture and token revalidation remain `PENDING` until that runtime
-   exists and runs the model under the GPU mutex.
+   tied, maximum gap zero, and zero divergence. PR #2856 landed on `main` as
+   `d6c63e15ae6825f94dc18769163cfe7b037e7954`. The landing requirement is
+   satisfied. The unchanged default gate on implementation base
+   `f98b638673b4d2edc0250eec56d229357ea38ab1` remains `PENDING`.
+   The earlier runtime results use the historical oracle pin.
+   Disabling skinny GEMM is diagnostic only.
+2. A separate active-pin ROCm runtime ran the pinned Qwen3.5-0.8B model on
+   gfx1100 under the GPU mutex on 7 September 2026 UTC. The operator used
+   reviewed capture head `c75173f921cdd344e33ad06260ca181d63b198b5` in production
+   mode with `auto` resolving to `bfloat16`. All 16 prompts produced 16 tokens
+   in each of 10 identical repeats. This proves active-pin runtime execution
+   for that arm. It does not prove physical cache storage or C++ token
+   acceptance. The configured historical wrapper remains a separate runtime.
+   Issue #2794 records repository pin-validation context. Issue #2773 owns
+   the remaining cache-matched captures, teacher-forced gaps, and end-to-end
+   acceptance, which remain `PENDING`.
+
+The operator's runtime command, mutex identity, and exit 0 are recorded in
+`.cache/gfx1100-resume-20260906/active-pin-install/capture-auto-run.json`.
+The capture's aggregate output SHA256 is
+`bd4f8f8d1961b34f374e9d6a8b8adae88f99a92010142b046c73e5419603bd8a`.
+Its greedy tokens differ from the current historical golden at prompt index 7
+and token indices 8 to 15. Teacher-forced adjudication remains `PENDING`. No permanent
+golden changes in this capture-tool slice.
 
 Do not create characterization goldens from a known-regressed local default or
 from the historical oracle revision.
@@ -510,10 +523,11 @@ push, open, or merge that pull request.
 
 ## Owed
 
-- A maintainer owes the merge decision for reviewed PR #2856; #2772 remains
-  pending until it lands.
-- #2773 owes the runnable active-pin Qwen3.5-0.8B ROCm captures, even though
-  #2794 supplies repository sync context.
+- PR #2856 landed as `d6c63e15ae6825f94dc18769163cfe7b037e7954`. The operator
+  owes the unchanged default gate on this implementation base.
+- #2773 owes the remaining cache-matched active-pin Qwen3.5-0.8B ROCm captures,
+  teacher-forced gaps, and C++ token acceptance. The production `auto` capture
+  proves runtime execution only. Issue #2794 supplies repository sync context.
 - [#2923](https://github.com/mudler/vllm.cpp/issues/2923), owned by
   `BACKEND-ROCM`, owes routing Qwen3.5 paged attention through
   `dense_attn::AttnBlock`. This tracked exception records existing debt. It

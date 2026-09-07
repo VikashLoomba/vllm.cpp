@@ -68,7 +68,7 @@ correctness result. A fresh reviewer checks the immutable change before landing.
 
 ### Collect new paired traces
 
-### Stop a live process when it reports a GPU fault
+#### Stop a live process when it reports a GPU fault
 
 Issue [#3039](https://github.com/mudler/vllm.cpp/issues/3039) tracks delayed
 fault handling in lease `43c3e415-e8e5-4918-ab42-b4d9c3dcab29`. The process
@@ -95,7 +95,7 @@ stdout and stderr, and nonmatching pre-existing logs and command metadata.
 Mutate the live scan, its call site, and evidence preservation. Run the
 combined focused suites and full preflight on the final immutable commit.
 
-### Build and measure
+#### Build and measure
 
 Use `strix:gpu0` through a bounded `rc run`. The operator owns the lease.
 Build from clean, asserted sources in unique worker-local directories. Use
@@ -297,6 +297,34 @@ Local evidence: `/tmp/strix-clock-window-red.log`,
 `/tmp/strix-clock-window-historical-committed.log`. These are reproduction
 outputs, not replacements for the committed raw records. The final immutable
 head's full preflight remains PENDING until reported in the handoff.
+
+### Live fault-stop repair evidence
+
+Spec commit `bbc43c44f` precedes the #3039 runtime repair. The initial CPU
+reproduction exited 1 with four timeout errors across the CLI and fragmented
+stdout and stderr cases. Each writer emitted a fatal diagnostic and stayed
+alive. Cleanup ran only after the three-second test timeout.
+
+The repair opens independent readers at each capture's current end before
+launching the child. It scans new bytes during the existing polling loop and
+after the exit poll, with 64 KiB reads and a 64-byte boundary suffix. It reads
+only a snapshot of the file size per poll. Metadata and earlier capture bytes
+remain outside the scan. Detection uses the existing named-container cleanup.
+The measurement `finally` path preserves stderr, command metadata, clock
+samples, and partial profiler evidence without recording a successful trace.
+
+`python3 -m unittest tests.tools.test_strix_kernel_trace tests.tools.test_strix_clock_windows`
+passed 32 tests. Real CPU fault writers are rejected before the tests'
+2.5-second bound, with a three-second timeout configured. Cleanup commands
+are simulated in these CPU tests, so they establish neither GPU recovery nor
+real Podman cleanup latency. No GPU run was used for this repair.
+
+Local evidence resides in `/tmp/strix-fault-stop-red.log`,
+`/tmp/strix-fault-stop-green.log`, and `/tmp/strix-fault-stop-mutations.log`.
+All 52 mutations were detected: the earlier 43 guarantees and nine live-scan,
+capture-boundary, and evidence-preservation changes. The runtime remained
+byte-identical after the pass. The final immutable
+head's preflight result and any skips belong to the implementing handoff.
 
 ## Owed
 

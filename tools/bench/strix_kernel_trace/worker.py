@@ -151,6 +151,22 @@ def inspect_image(manifest):
     return image, env
 
 
+def check_live_faults(captures):
+    """Scan new child output, retaining diagnostic fragments across reads."""
+    for capture in captures:
+        reader = capture["reader"]
+        end = os.fstat(reader.fileno()).st_size
+        while reader.tell() < end:
+            chunk = reader.read(min(65536, end - reader.tell()))
+            if not chunk:
+                break
+            text = capture["tail"] + chunk
+            match = re.search(rb"GPU Hang|Memory access fault|HW Exception", text)
+            if match:
+                raise ValueError(f"fatal GPU diagnostic in {reader.name}: {match.group().decode()}")
+            capture["tail"] = text[-64:]
+
+
 def managed_run(argv, *, stdout, stderr, timeout, output_dir=None, max_bytes=536870912):
     """Stop the named container on every exit, including timeout and output growth.
 
@@ -159,21 +175,32 @@ def managed_run(argv, *, stdout, stderr, timeout, output_dir=None, max_bytes=536
     """
     name = argv[argv.index("--name") + 1]
     process = None
+    captures = []
     started = time.monotonic()
     try:
+        for stream in (stdout, stderr):
+            if isinstance(getattr(stream, "name", None), (str, os.PathLike)):
+                stream.flush()
+                reader = Path(stream.name).open("rb")
+                reader.seek(0, os.SEEK_END)
+                captures.append({"reader": reader, "tail": b""})
         process = subprocess.Popen(argv, stdout=stdout, stderr=stderr, stdin=subprocess.DEVNULL)
         while True:
             if output_dir is not None:
                 size = sum(p.stat().st_size for p in Path(output_dir).rglob("*") if p.is_file() and not p.is_symlink())
                 if size > max_bytes:
                     raise ValueError(f"aggregate output exceeds {max_bytes} bytes")
+            check_live_faults(captures)
             status = process.poll()
             if status is not None:
+                check_live_faults(captures)
                 return subprocess.CompletedProcess(argv, status)
             if time.monotonic() - started >= timeout:
                 raise subprocess.TimeoutExpired(argv, timeout)
             time.sleep(0.1)
     finally:
+        for capture in captures:
+            capture["reader"].close()
         failures = []
         for cleanup in (["stop", "--ignore", "--time", "2", name], ["rm", "--force", "--ignore", name]):
             try:

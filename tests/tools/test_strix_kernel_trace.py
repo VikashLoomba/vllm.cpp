@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -126,6 +127,57 @@ class EvidenceTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
+    def test_managed_live_fault_and_capture_boundaries(self):
+        for stream_name, diagnostic in (("stderr", "GPU Hang"), ("stdout", "Memory access fault"),
+                                        ("stderr", "HW Exception")):
+            with self.subTest(stream=stream_name, diagnostic=diagnostic), tempfile.TemporaryDirectory() as tmp:
+                folder = Path(tmp)
+                argv = trace.container({"image": "test"}, folder, "app", [])
+                payload = ("import sys,time; stream=sys." + stream_name + "; "
+                           + ("stream.write('x' * 65532); " if diagnostic == "GPU Hang" else "")
+                           + "stream.write(" + repr(diagnostic[:4]) + "); stream.flush(); time.sleep(.15); "
+                           + "stream.write(" + repr(diagnostic[4:]) + "); stream.flush(); time.sleep(60)")
+                real_popen = subprocess.Popen
+                def launch(*args, **kwargs):
+                    return real_popen([sys.executable, "-c", payload], **kwargs)
+                with (folder / "stdout").open("wb") as stdout, (folder / "stderr").open("wb") as stderr, mock.patch.object(subprocess, "Popen", side_effect=launch), mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as cleanup:
+                    started = time.monotonic()
+                    with self.assertRaisesRegex(ValueError, "fatal GPU diagnostic"):
+                        trace.managed_run(argv, stdout=stdout, stderr=stderr, timeout=3, output_dir=folder)
+                    self.assertLess(time.monotonic() - started, 2.5)
+                self.assertIn(diagnostic, (folder / stream_name).read_text())
+                self.assertEqual([c.args[0][len(trace.PODMAN)] for c in cleanup.call_args_list], ["stop", "rm"])
+                self.assertTrue(all(c.args[0][-1] == argv[argv.index("--name") + 1] for c in cleanup.call_args_list))
+
+    def test_managed_ignores_old_logs_and_command_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            argv = trace.container({"image": "test"}, folder, "app", ["GPU Hang"])
+            (folder / "command.json").write_text(json.dumps(argv))
+            (folder / "other-stderr").write_text("HW Exception")
+            real_popen = subprocess.Popen
+            def launch(*args, **kwargs):
+                return real_popen([sys.executable, "-c", "print('healthy')"], **kwargs)
+            with (folder / "combined").open("w") as stdout, mock.patch.object(subprocess, "Popen", side_effect=launch), mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)):
+                stdout.write("old GPU Hang\n" + json.dumps(argv) + "\n")
+                stdout.flush()
+                result = trace.managed_run(argv, stdout=stdout, stderr=subprocess.STDOUT, timeout=3, output_dir=folder)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("healthy", (folder / "combined").read_text())
+
+    def test_managed_checks_fault_written_during_exit_poll(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            argv = trace.container({"image": "test"}, folder, "app", [])
+            with (folder / "stdout").open("wb") as stdout, (folder / "stderr").open("wb") as stderr, mock.patch.object(subprocess, "Popen") as popen, mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)):
+                def exited():
+                    stderr.write(b"GPU Hang\n")
+                    stderr.flush()
+                    return 0
+                popen.return_value.poll.side_effect = exited
+                with self.assertRaisesRegex(ValueError, "fatal GPU diagnostic"):
+                    trace.managed_run(argv, stdout=stdout, stderr=stderr, timeout=3, output_dir=folder)
+
     def test_managed_command_cleanup_and_limits(self):
         for mode in ("success", "failure", "timeout", "output", "trace", "aggregate"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
@@ -190,6 +242,7 @@ class CommandTests(unittest.TestCase):
         self.bad_output = False
         self.fallback = False
         self.excess_output = False
+        self.fatal_output = False
         self.commands = []
 
     def invoke(self, phase="measure", tuning=None, lease=None):
@@ -261,11 +314,16 @@ class CommandTests(unittest.TestCase):
             if "managed_run" in namespace:
                 original = namespace["managed_run"]
                 def managed(argv, **kwargs):
-                    if self.excess_output:
+                    if self.excess_output or self.fatal_output:
+                        payload = "import sys,time; sys.stdout.write('x'*8192); sys.stdout.flush(); time.sleep(60)"
+                        if self.fatal_output:
+                            payload = ("import sys,time; from pathlib import Path; "
+                                       + "Path(" + repr(str(self.local / "trace-vllmcpp/trace-evidence")) + ").write_text('partial trace'); "
+                                       + "sys.stderr.write('HW Exception by GPU node-1 reason :GPU Hang\\n'); sys.stderr.flush(); time.sleep(60)")
                         def launch(*args, **options):
-                            return real_popen([sys.executable, "-c", "import sys,time; sys.stdout.write('x'*8192); sys.stdout.flush(); time.sleep(60)"], **options)
+                            return real_popen([sys.executable, "-c", payload], **options)
                         with mock.patch.object(subprocess, "Popen", side_effect=launch):
-                            return original(argv, **dict(kwargs, max_bytes=4096, timeout=2))
+                            return original(argv, **dict(kwargs, max_bytes=4096, timeout=3))
                     with mock.patch.object(subprocess, "Popen") as popen:
                         execute(argv, **{k: v for k, v in kwargs.items() if k in ("stdout", "stderr")})
                         popen.return_value.poll.return_value = 0
@@ -404,6 +462,22 @@ class CommandTests(unittest.TestCase):
         self.fallback = True
         with self.assertRaisesRegex(ValueError, "leg .* failed"):
             self.invoke()
+
+    def test_cli_stops_live_gpu_fault_and_preserves_evidence(self):
+        self.fatal_output = True
+        started = time.monotonic()
+        with self.assertRaisesRegex(ValueError, "fatal GPU diagnostic"):
+            self.invoke()
+        self.assertLess(time.monotonic() - started, 2.5)
+        captured = self.root / "output/trace-vllmcpp"
+        self.assertIn("GPU Hang", (captured / "stderr").read_text())
+        self.assertEqual((captured / "trace-evidence").read_text(), "partial trace")
+        argv = json.loads((captured / "command.json").read_text())["argv"]
+        name = argv[argv.index("--name") + 1]
+        self.assertEqual([c[len(trace.PODMAN)] for c in self.commands], ["stop", "rm"])
+        self.assertTrue(all(c[-1] == name for c in self.commands))
+        self.assertFalse((self.root / "output/trace-status.json").exists())
+        self.assertFalse((self.root / "output/paired-result.json").exists())
 
 
 if __name__ == "__main__":

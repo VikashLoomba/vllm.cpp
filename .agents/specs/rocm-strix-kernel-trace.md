@@ -68,6 +68,35 @@ correctness result. A fresh reviewer checks the immutable change before landing.
 
 ### Collect new paired traces
 
+### Stop a live process when it reports a GPU fault
+
+Issue [#3039](https://github.com/mudler/vllm.cpp/issues/3039) tracks delayed
+fault handling in lease `43c3e415-e8e5-4918-ab42-b4d9c3dcab29`. The process
+reported `HW Exception ... GPU Hang`, but the profiler did not exit. The
+existing post-exit check therefore waited for the 1,200-second timeout.
+
+During managed execution, scan newly appended bytes from this command's
+stdout and stderr captures for `GPU Hang`, `Memory access fault`, and
+`HW Exception`. Start after any existing capture bytes. Never scan argv,
+`command.json`, or unrelated logs. Retain enough boundary bytes to detect a
+diagnostic split across reads. Bound each read and scan a snapshot of the
+current file length, so continuous output cannot indefinitely postpone the
+existing timeout and size checks.
+
+On detection, raise a named fatal-diagnostic error before accepting process
+completion. Use the existing bounded cleanup for only this command's named
+container. Preserve captures through the measurement `finally` path. Do not
+reset a GPU, change inference defaults, or accept a faulted trace.
+
+The red test launches a real CPU subprocess that writes a fatal diagnostic
+and waits. Exercise the actual CLI entry, require prompt failure before its
+timeout, and inspect cleanup and preserved evidence. Cover fragmented output,
+stdout and stderr, and nonmatching pre-existing logs and command metadata.
+Mutate the live scan, its call site, and evidence preservation. Run the
+combined focused suites and full preflight on the final immutable commit.
+
+### Build and measure
+
 Use `strix:gpu0` through a bounded `rc run`. The operator owns the lease.
 Build from clean, asserted sources in unique worker-local directories. Use
 ccache and at most four build jobs. Record revisions, archive hashes,

@@ -238,6 +238,37 @@ commands. The unchanged runner was checked after each full mutation pass.
 `git diff --check` passed. Full preflight on the final committed head remains
 PENDING until the implementing agent records its result in the handoff.
 
+### Historical warm clock correction evidence
+
+Spec commit `2c09026ef` precedes the correction. The initial focused command,
+`python3 -m unittest tests.tools.test_strix_clock_windows`, failed because
+`clock_windows.py` did not exist. The completed command passed five tests.
+Eleven scratch mutations were detected, including cold inclusion, either
+missing timestamp bound, strict instead of inclusive bounds, omitted windows,
+overlap, missing samples, invalid samples, averaging leg means, and deletion
+of the command entry. The script remained byte-identical after every mutation.
+
+Run the reproduction from the repository root:
+
+```sh
+python3 docs/bench-evidence/qwen38-27b-q4km-gfx1151-ourarm-head-20260905/clock_windows.py
+```
+
+The committed samples produce 3,216 whole-leg readings, mean 2228.2011815920396
+MHz and 71.30783582089552 percent busy. Generations 2 through 4 retain 1,703
+samples, mean 2872.811509101585 MHz and 100 percent busy. Per-generation and
+per-leg details appear in the command output. The original `rederive.py`
+still reports 16 checked claims and zero mismatches. Its committed fallback
+was exercised by making only the shared `RESULT.json` existence probe return
+false during execution. No file or original calculation changed.
+
+Local evidence: `/tmp/strix-clock-window-red.log`,
+`/tmp/strix-clock-window-green.log`, `/tmp/strix-clock-window-mutations.log`,
+`/tmp/strix-clock-window-result.json`, and
+`/tmp/strix-clock-window-historical-committed.log`. These are reproduction
+outputs, not replacements for the committed raw records. The final immutable
+head's full preflight remains PENDING until reported in the handoff.
+
 ## Owed
 
 The product fixes in #3016, #3017, and #3018 stay on their owning rows.

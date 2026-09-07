@@ -52,7 +52,7 @@ class EvidenceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "revision"):
                     trace.verify_archive(pin, "llamacpp")
             for revision in ("10bf611e", "a" * 40):
-                with self.assertRaises(ValueError):
+                with mock.patch.object(trace.subprocess, "check_output", return_value=revision + "\n"), self.assertRaises(ValueError):
                     trace.verify_archive(dict(pin, revision=revision), "llamacpp")
 
     def test_runtime_output_limit_and_literal_command(self):
@@ -178,6 +178,12 @@ class CommandTests(unittest.TestCase):
         self.state = {"local": str(self.local), "manifest": copy.deepcopy(self.manifest),
                       "image_id": "image-id", "binaries": {}, "model": str(model),
                       "vllmcpp": str(self.local / "vllm-cli"), "llamacpp": str(self.local / "llama-completion")}
+        for engine in ("vllmcpp", "llamacpp"):
+            binary = Path(self.state[engine])
+            library = self.local / (engine + ".so")
+            binary.write_bytes(b"binary")
+            library.write_bytes(b"library")
+            self.state["binaries"][engine] = {str(p): trace.digest(p) for p in (binary, library)}
         self.image_env = []
         self.image_id = "image-id"
         self.bad_llama = False
@@ -186,7 +192,7 @@ class CommandTests(unittest.TestCase):
         self.excess_output = False
         self.commands = []
 
-    def invoke(self, phase="measure", tuning=None):
+    def invoke(self, phase="measure", tuning=None, lease=None):
         manifest = self.root / "manifest.json"
         state = self.root / "state.json"
         manifest.write_text(json.dumps(self.manifest))
@@ -212,21 +218,31 @@ class CommandTests(unittest.TestCase):
             self.commands.append(argv)
             if "run" in argv:
                 self.assertIn("--name", argv)
+                entry = argv.index("--entrypoint")
+                self.assertEqual(argv[entry + 2], self.image_id)
                 if "--repeat" in argv or "-no-cnv" in argv:
                     self.assertIn("fsize=536870912:536870912", argv)
                     if "-no-cnv" in argv:
+                        self.assertEqual(argv[argv.index("--temp") + 1], "0")
+                        self.assertEqual(argv[argv.index("-n") + 1], "64")
+                        self.assertEqual(argv[argv.index("-p") + 1], trace.PROMPT)
                         text = f"common_perf_print: samplers time = 2 ms / {63 if self.bad_llama else 64} tokens\ncommon_perf_print: prompt eval time = 2 ms / 5 tokens"
                     else:
                         self.assertIn("VT_OP_PROVIDER_STATS=1", argv)
                         repeat = int(argv[argv.index("--repeat") + 1])
+                        self.assertEqual(argv[argv.index("--temperature") + 1], "0")
+                        self.assertEqual(argv[argv.index("--max-tokens") + 1], "64")
+                        self.assertEqual(argv[argv.index("--prompt") + 1], trace.PROMPT)
+                        self.assertEqual(argv[argv.index("--max-num-seqs") + 1], "1")
                         text = log() if repeat == 4 else log().split("vllm-cli: run=2/4")[0].replace("/4", "/1")
                         if self.fallback:
                             text += "\n[vt reference-tier] op=test device=rocm has NO native kernel"
                     kwargs["stderr"].write(text.encode())
                     kwargs["stdout"].write(b"changed" if self.bad_output and any("VT_ROCM_Q8K_BLOCK=1" == x for x in argv) else b"text")
                 if "--build" in argv:
+                    self.assertEqual(argv[argv.index("-j") + 1], "4")
                     target = Path(argv[argv.index("--build") + 1])
-                    for suffix in ("examples/vllm-cli", "bin/llama-completion", "CMakeCache.txt"):
+                    for suffix in ("examples/vllm-cli", "bin/llama-completion", "libtest.so", "CMakeCache.txt"):
                         path = target / suffix
                         path.parent.mkdir(parents=True, exist_ok=True)
                         path.write_bytes(b"binary")
@@ -236,7 +252,8 @@ class CommandTests(unittest.TestCase):
         source = PATH.read_text()
         namespace = {"__name__": "__main__", "__file__": str(PATH)}
         prefix, entry = source.rsplit('if __name__ == "__main__":', 1)
-        with mock.patch.dict(os.environ, {"RC_DEVICE": "strix:gpu0", "RC_JOB_ID": "test", **(tuning or {})}, clear=True), mock.patch.object(sys, "argv", argv), mock.patch.object(subprocess, "check_output", side_effect=check), mock.patch.object(subprocess, "run", side_effect=execute):
+        environment = {"RC_DEVICE": "strix:gpu0", "RC_JOB_ID": "test"} if lease is None else lease
+        with mock.patch.dict(os.environ, {**environment, **(tuning or {})}, clear=True), mock.patch.object(sys, "argv", argv), mock.patch.object(subprocess, "check_output", side_effect=check), mock.patch.object(subprocess, "run", side_effect=execute):
             exec(compile(prefix, str(PATH), "exec"), namespace)
             namespace.update(MODEL_SIZE=5, MODEL_SHA=hashlib.sha256(b"model").hexdigest(), sample_clocks=clocks)
             namespace["tempfile"] = mock.Mock(mkdtemp=lambda **kwargs: tempfile.mkdtemp(dir=self.root))
@@ -248,7 +265,7 @@ class CommandTests(unittest.TestCase):
                         def launch(*args, **options):
                             return real_popen([sys.executable, "-c", "import sys,time; sys.stdout.write('x'*8192); sys.stdout.flush(); time.sleep(60)"], **options)
                         with mock.patch.object(subprocess, "Popen", side_effect=launch):
-                            return original(argv, **dict(kwargs, max_bytes=1024, timeout=.3))
+                            return original(argv, **dict(kwargs, max_bytes=4096, timeout=2))
                     with mock.patch.object(subprocess, "Popen") as popen:
                         execute(argv, **{k: v for k, v in kwargs.items() if k in ("stdout", "stderr")})
                         popen.return_value.poll.return_value = 0
@@ -261,10 +278,33 @@ class CommandTests(unittest.TestCase):
     def test_cli_build_and_measure(self):
         output = self.invoke("build")
         self.assertTrue((output / "build-state.json").is_file())
+        self.state = json.loads((output / "build-state.json").read_text())
+        for files in self.state["binaries"].values():
+            self.assertEqual(len(files), 2)
+            for path, digest in files.items():
+                self.assertEqual(trace.digest(path), digest)
         output = self.invoke()
         self.assertEqual(len(json.loads((output / "paired-result.json").read_text())["pairs"]), 6)
         self.assertEqual(json.loads((output / "trace-status.json").read_text())["matched_counts"]["completion_tokens"], 64)
         self.assertTrue(any("rm" in c for c in self.commands))
+        runs = [c for c in self.commands if "run" in c and ("--repeat" in c or "-no-cnv" in c)]
+        self.assertEqual(len(runs), 14)
+        for command, engine in zip(runs[:2], ("vllmcpp", "llamacpp")):
+            entry = command.index("--entrypoint")
+            self.assertEqual(command[entry + 1], "profiler")
+            self.assertEqual(command[entry + 3], str(Path(self.state["local"]) / ("trace-" + engine) / "trace"))
+            self.assertEqual(command[entry + 4], self.state[engine])
+        expected = []
+        for switch in trace.SWITCHES:
+            expected.extend([None, switch, switch, None, None, switch])
+        actual = []
+        for command in runs[2:]:
+            self.assertEqual(command[command.index("--entrypoint") + 1], self.state["vllmcpp"])
+            self.assertEqual(command[command.index("--repeat") + 1], "4")
+            active = [s for s in trace.SWITCHES if s + "=1" in command]
+            self.assertLessEqual(len(active), 1)
+            actual.append(active[0] if active else None)
+        self.assertEqual(actual, expected)
 
     def test_cli_rejects_archive(self):
         self.manifest["sources"]["vllmcpp"]["sha256"] = "0" * 64
@@ -274,9 +314,13 @@ class CommandTests(unittest.TestCase):
     def test_cli_rejects_valid_archive_at_wrong_llama_pin(self):
         pin = self.manifest["sources"]["llamacpp"]
         pin["revision"] = "b" * 40
-        with tarfile.open(pin["archive"], "w", format=tarfile.PAX_FORMAT, pax_headers={"comment": pin["revision"]}):
-            pass
+        with tarfile.open(pin["archive"], "w", format=tarfile.PAX_FORMAT, pax_headers={"comment": pin["revision"]}) as tar:
+            item = tarfile.TarInfo("source.txt")
+            item.size = 1
+            tar.addfile(item, io.BytesIO(b"x"))
         pin["sha256"] = trace.digest(pin["archive"])
+        with tarfile.open(pin["archive"], "r:") as tar:
+            self.assertEqual(tar.extractfile("source.txt").read(), b"x")
         with self.assertRaisesRegex(ValueError, "pin differs"):
             self.invoke("build")
 
@@ -284,6 +328,39 @@ class CommandTests(unittest.TestCase):
         Path(self.state["model"]).write_bytes(b"wrong")
         with self.assertRaisesRegex(ValueError, "sha256"):
             self.invoke()
+
+    def test_cli_rejects_corrupt_copied_model(self):
+        real_copy = trace.shutil.copyfile
+        def corrupt(source, destination, **kwargs):
+            result = real_copy(source, destination, **kwargs)
+            if Path(destination).name == "Qwen3.8-27B-Q4_K_M.gguf":
+                Path(destination).write_bytes(b"wrong")
+            return result
+        with mock.patch.object(trace.shutil, "copyfile", side_effect=corrupt), self.assertRaisesRegex(ValueError, "sha256"):
+            self.invoke("build")
+        self.assertFalse((self.root / "output/build-state.json").exists())
+
+    def test_cli_rejects_tampered_binaries_and_libraries(self):
+        for engine, files in self.state["binaries"].items():
+            for path in files:
+                with self.subTest(engine=engine, path=path):
+                    artifact = Path(path)
+                    original = artifact.read_bytes()
+                    try:
+                        artifact.write_bytes(b"tampered")
+                        with self.assertRaisesRegex(ValueError, "sha256"):
+                            self.invoke()
+                    finally:
+                        artifact.write_bytes(original)
+        self.assertEqual(self.commands, [])
+
+    def test_cli_rejects_wrong_or_missing_lease(self):
+        for lease in ({}, {"RC_DEVICE": "strix:gpu0"}, {"RC_JOB_ID": "test"},
+                      {"RC_DEVICE": "other:gpu0", "RC_JOB_ID": "test"},
+                      {"RC_DEVICE": "strix:gpu0", "RC_JOB_ID": ""}):
+            with self.subTest(lease=lease), self.assertRaisesRegex(ValueError, "requires operator-owned rc lease"):
+                self.invoke(lease=lease)
+        self.assertEqual(self.commands, [])
 
     def test_cli_rejects_manifest(self):
         self.manifest["image"] = "other"
@@ -321,6 +398,7 @@ class CommandTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "aggregate output"):
             self.invoke()
         self.assertEqual([c[len(trace.PODMAN)] for c in self.commands], ["stop", "rm"])
+        self.assertGreaterEqual((self.local / "trace-vllmcpp/stdout").stat().st_size, 8192)
 
     def test_cli_rejects_reference_fallback(self):
         self.fallback = True

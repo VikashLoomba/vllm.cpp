@@ -184,6 +184,34 @@ mutations. The runner remained byte-identical after the mutation run.
 The final immutable head receives one full preflight run. Its result and
 omitted environment or hardware gates belong to the handoff evidence.
 
+### Second review: test command identity and artifact rejection
+
+The second reviewer found eight surviving mutations in 43 checks at
+`881a0199f`. A fresh test implementer reproduced those eight survivors before
+editing. The repair changes tests and this evidence only. The runtime remains
+byte-identical to `881a0199f`, SHA256
+`bc3c23523f657b824897a433e8b1f1e394d7f08018a260b78d13580ef0ccae4a`.
+
+The command tests now reuse the build state during measurement. Temporary
+binaries and libraries carry real hashes. Separate cases corrupt the copied
+model and tamper with each measured binary and library. The tests reject
+missing and incorrect lease identities through the actual command entry.
+Command assertions check the immutable image, profiler prefix, greedy flags,
+prompt, token count, sequence count, alternating pair order, and four build jobs.
+The wrong-pin archive contains an extractable member. Removing the pin guard
+now fails with an unmet rejection assertion, rather than a tar parser error.
+The CLI output-limit test requires at least 8192 captured stdout bytes, so
+command metadata alone cannot satisfy its failure condition.
+
+`python3 -m unittest tests.tools.test_strix_kernel_trace` passed 23 tests.
+The baseline mutation run recorded eight survivors in
+`/tmp/strix-test-repair-red.log`. After the repair, all 43 mutations were
+detected in `/tmp/strix-test-repair-mutations.log`. The eight new detections
+include intended assertion failures for the missing checks and changed
+commands. The unchanged runner was checked after each full mutation pass.
+`git diff --check` passed. Full preflight on the final committed head remains
+PENDING until the implementing agent records its result in the handoff.
+
 ## Owed
 
 The product fixes in #3016, #3017, and #3018 stay on their owning rows.

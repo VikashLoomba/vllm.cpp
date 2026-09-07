@@ -42,6 +42,32 @@ The Q4/Q5 hypothesis remains owned by
 
 ## Design
 
+### Correct the historical clock window
+
+Issue #3015 also owns the clock-window ambiguity in the published lease-2
+survey. Reuse its committed `n*.err.txt` timestamps and `clock-n*.jsonl.gz`
+samples. Preserve the historical throughput values, raw artifacts, existing
+`RESULT` literals, and `rederive.py` contract. Label the existing clock means
+as whole-leg samples, including model loading and teardown.
+
+Add a separate narrow reproduction command beside `rederive.py`. It reads
+committed evidence by default and joins sample Unix timestamps to each
+generation's inclusive start and end. Require exactly four ordered,
+nonoverlapping generation windows per leg and valid samples in each window.
+Report each generation, warm generations 2 through 4, and whole-leg values.
+Pool samples without averaging per-leg averages. Test the command entry with
+synthetic cold, warm, and outside-window samples before implementation.
+Mutate cold exclusion and timestamp bounds to prove the tests distinguish
+the reported windows. Run the command on committed lease-2 evidence and
+publish its warm clock and activity values with the exact recipe.
+
+The warm windows include prefill and generation. Busy percentage measures
+sampled activity, not occupancy or a quantitative bound on host idle time.
+Keep `TOKEN_GATE=FAIL` explicit. This correction proves no new throughput or
+correctness result. A fresh reviewer checks the immutable change before landing.
+
+### Collect new paired traces
+
 Use `strix:gpu0` through a bounded `rc run`. The operator owns the lease.
 Build from clean, asserted sources in unique worker-local directories. Use
 ccache and at most four build jobs. Record revisions, archive hashes,

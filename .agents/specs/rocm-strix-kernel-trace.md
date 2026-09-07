@@ -94,6 +94,58 @@ Initial resource-controller inspection reports Strix ready and no running jobs.
 Probe job `cf4724ba-1084-40a5-8699-8990ad9adbd7` confirms the staged artifact,
 ROCm 7.2.4 directories, and the previous build image still exist.
 
+### Diagnostic harness validation
+
+The runner is `tools/bench/strix_kernel_trace/worker.py`. Its tests are
+`tests/tools/test_strix_kernel_trace.py`, discovered by the existing tools
+suite in preflight and continuous integration. The runner changes no defaults.
+
+Run the focused gate with
+`python3 -m unittest tests.tools.test_strix_kernel_trace`.
+The first run exited 1 because the runner did not exist. After implementation,
+four tests passed. The archive revision and llama count tests then failed with
+two missing-function errors. After those guards were implemented, seven tests
+passed. `git diff --check` exited 0.
+
+Fourteen in-memory scratch mutations were detected by the focused suite:
+file hash, file size, archive revision, llama pin, llama counts, generation
+count, prompt count, duration agreement, cold exclusion, clock window,
+pair completeness, output equality, process status, and runtime output bound.
+The original runner remained byte-identical. This set is not a completeness
+claim. The llama-pin mutation triggered the downstream archive parser as an
+error, so independent review must verify that guard with a valid wrong-pin
+archive too.
+
+The helper invoked full preflight before editing. That run remains PENDING
+until its process returns. Hardware compilation and measurement are owned by
+the operator and are not established by these Python tests.
+
+The manifest supplies the model path, image, clock device, profiler command
+array, and each source archive's full revision and SHA256. Create raw tar
+archives with `git archive --format=tar <revision>`. The build verifies the
+embedded commit ID and archive hash before extraction. The build phase writes
+`build-state.json`. The measure phase requires that state and the identical
+manifest, then rechecks the image, binary, library, and model hashes.
+
+Run `python3 tools/bench/strix_kernel_trace/worker.py --phase build --manifest
+<manifest.json> --output <build-output>` inside the operator's lease. Then run
+the same command with `--phase measure --state <build-output>/build-state.json`
+and a separate output directory. Both phases require `RC_DEVICE=strix:gpu0`
+and `RC_JOB_ID`. Builds use ccache and four jobs in a new worker-local directory.
+
+Matched baseline traces each run one generation. The llama production target
+is `llama-completion`. At the pin, `tools/completion/completion.cpp:44`
+documents `-no-cnv`, and `common/sampling.cpp:559` and `:574` print actual
+sample and prompt counts. The runner rejects different counts before recording
+matched traces. The profiler command comes from the operator's installed help.
+Trace interpretation remains a manual gate.
+
+The switch experiment checks emitted cold text and all completion counts.
+Warm text equality remains PENDING because `examples/cli/main.cpp:321` prints
+only the first completion. Clock summaries use generations 2 through 4 and
+their emitted Unix timestamps. These windows contain prefill and generation,
+not decode alone. The carried token gate remains FAIL.
+
 ## Owed
 
 The product fixes in #3016, #3017, and #3018 stay on their owning rows.

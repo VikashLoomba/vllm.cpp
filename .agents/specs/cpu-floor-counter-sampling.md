@@ -88,3 +88,27 @@ change, or an edit outside this scope requires operator direction.
 Initial preflight: `/tmp/cpu2448-initial-preflight.log`.
 Focused red, green, mutation, and final gate evidence are recorded with the
 implementation result. Historical benchmark numbers remain unchanged.
+
+## Outcome
+
+The sampler uses one CPU line per endpoint and integer deltas. Invalid
+samples carry failure status through both gates, including at a ceiling of
+100. Test fixtures use distinct process names and synthetic counter inputs.
+A separate real-counter smoke accepts only bounded valid results or an
+explicit invalid-sample refusal. It never retries until success.
+
+The focused gate passed 18 tests. The mutation checks detected 25 sampler
+mutations and the fixture-name collision. The sampler scratch was restored
+byte-for-byte after each mutation. Red evidence is in
+`/tmp/cpu2448-red.log`, `/tmp/cpu2448-red-leg.log`, and
+`/tmp/cpu2448-red-probes.log`. Green evidence is in
+`/tmp/cpu2448-green.log`. Mutation evidence is in
+`/tmp/cpu2448-mutations.log` and `/tmp/cpu2448-probe-mutation.log`.
+The immutable-head preflight result is reported in the implementation
+handoff at `/tmp/cpu2448-final-preflight.log`.
+
+No contention default changed. The quiet and foreign ceilings remain 10
+percent because this repair changes sampling, not the accepted contention.
+The five-second sample window and one-hour wait remain unchanged. Skipping
+the gate and clamping broken ratios were rejected because neither repairs
+the sampled counters. No CPU speed measurement or historical number changed.

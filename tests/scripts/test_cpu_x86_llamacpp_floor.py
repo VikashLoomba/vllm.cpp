@@ -17,6 +17,7 @@ import os
 import pathlib
 import re
 import shutil
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -79,8 +80,8 @@ class CpuX86FloorHarnessTests(unittest.TestCase):
             "#!/bin/sh\n"
             'case "$1" in *llama*) rss=%d;; *) rss=%d;; esac\n'
             '"$@"\nrc=$?\n'
-            "{ echo '\tUser time (seconds): 100.10'\n"
-            "  echo '\tSystem time (seconds): 2.80'\n"
+            '{ echo "\tUser time (seconds): ${TEST_USER_SECONDS:-100.10}"\n'
+            '  echo "\tSystem time (seconds): ${TEST_SYSTEM_SECONDS:-2.80}"\n'
             '  echo "\tMaximum resident set size (kbytes): $rss"; } >&2\n'
             "exit $rc\n" % (LLAMA_RSS_KB, OURS_RSS_KB),
         )
@@ -89,6 +90,8 @@ class CpuX86FloorHarnessTests(unittest.TestCase):
         self,
         out: pathlib.Path,
         argv: list[str] | None = None,
+        cpu_rows: list[str] | None = None,
+        real_cpu: bool = False,
         **env: str,
     ) -> subprocess.CompletedProcess[str]:
         base = {
@@ -108,6 +111,25 @@ class CpuX86FloorHarnessTests(unittest.TestCase):
             "BUILDERS": "no-such-process-name",
         }
         base.update(env)
+        if not real_cpu:
+            # Replace only the kernel read boundary. Both production sampler
+            # call sites, the contention decisions, and the engines stay real.
+            rows = cpu_rows or self.cpu_series([1000] * 10, [20, 0, 0, 80, 0, 0, 0, 0, 0, 0])
+            reader = self.tmp / "cpu-reader.py"
+            reader.write_text(
+                "import pathlib\n"
+                f"rows = {rows!r}\n"
+                f"state = pathlib.Path({str(self.tmp / 'cpu-index')!r})\n"
+                "i = int(state.read_text()) if state.exists() else 0\n"
+                "state.write_text(str(i + 1))\n"
+                "print(rows[min(i, len(rows) - 1)])\n"
+            )
+            script = self.tmp / "harness.sh"
+            script.write_text(SCRIPT.read_text().replace(
+                "/proc/stat", f"<(python3 {shlex.quote(str(reader))})"
+            ))
+            argv = [str(script) if arg == str(SCRIPT) else arg
+                    for arg in (argv or ["bash", str(SCRIPT)])]
         return subprocess.run(
             argv or ["bash", str(SCRIPT)],
             cwd=self.tmp,
@@ -117,6 +139,114 @@ class CpuX86FloorHarnessTests(unittest.TestCase):
             check=False,
             timeout=300,
         )
+
+    @staticmethod
+    def cpu_series(start: list[int], step: list[int]) -> list[str]:
+        return ["cpu  " + " ".join(str(a + i * b) for a, b in zip(start, step))
+                for i in range(100)]
+
+    def test_each_endpoint_uses_one_cpu_line(self) -> None:
+        # The first interval is 20%. Split endpoints instead report 110%.
+        rows = ["cpu  0 0 0 0 0 0 0 0 0 0",
+                "cpu  20 0 0 80 0 0 0 0 0 0",
+                "cpu  200 0 0 80 0 0 0 0 0 0",
+                "cpu  200 0 0 81 0 0 0 0 0 0"]
+        rows += self.cpu_series([300, 0, 0, 180, 0, 0, 0, 0, 0, 0],
+                                [20, 0, 0, 80, 0, 0, 0, 0, 0, 0])
+        got = self.run_harness(self.tmp / "evi", cpu_rows=rows,
+                               QUIET_BUSY="20", WAIT_TIMEOUT="0")
+        self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+        self.assertIn("SERIES_DONE", got.stdout)
+
+    def test_exact_cpu_shares_reach_both_production_gates(self) -> None:
+        cases = [
+            # Integer increments beyond IEEE double's exact range must survive.
+            ("large", [9007199254740992] + [0] * 9,
+             [1, 0, 0, 3, 0, 0, 0, 0, 0, 0], 25),
+            # Guest and guest_nice overlap user and nice, not extra total time.
+            ("guest", [1000] * 10, [20, 10, 0, 70, 0, 0, 0, 0, 20, 10], 30),
+            ("iowait", [1000] * 10, [0, 0, 0, 0, 100, 0, 0, 0, 0, 0], 0),
+            ("steal", [1000] * 10, [0, 0, 0, 60, 0, 0, 0, 40, 0, 0], 40),
+            ("all_busy_fields", [1000] * 10, [5, 5, 5, 70, 0, 5, 5, 5, 0, 0], 30),
+        ]
+        for name, start, step, expected in cases:
+            with self.subTest(name=name):
+                (self.tmp / "cpu-index").unlink(missing_ok=True)
+                out = self.tmp / name
+                got = self.run_harness(
+                    out, cpu_rows=self.cpu_series(start, step),
+                    QUIET_BUSY=str(expected), FOREIGN_MAX=str(expected),
+                    WAIT_TIMEOUT="0", TEST_USER_SECONDS="0", TEST_SYSTEM_SECONDS="0",
+                )
+                self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+                for leg in ("ours-1.load", "llama-1.load"):
+                    self.assertIn(f"foreign_cpu_pct: {expected}\n", (out / leg).read_text())
+
+    def test_invalid_cpu_samples_never_establish_a_quiet_window(self) -> None:
+        valid = "cpu  100 100 100 100 100 100 100 100 0 0"
+        cases = [
+            (valid, valid),  # zero delta
+            (valid, "cpu  101 100 100 100 99 100 100 100 0 0"),  # iowait decreases
+            (valid, "cpu  99 100 100 200 100 100 100 100 0 0"),  # busy resets
+            (valid, "cpu  100 100 100 99 100 100 100 100 0 0"),
+            (valid, "cpu  99999999999999999 100 100 100 100 100 100 100 0 0"),
+            (valid, "cpu  x 100 100 100 100 100 100 100 0 0"),
+            (valid, "cpu  1 2"),
+            (valid, ""),
+        ]
+        for before, after in cases:
+            with self.subTest(after=after):
+                (self.tmp / "cpu-index").unlink(missing_ok=True)
+                got = self.run_harness(self.tmp / "invalid", cpu_rows=[before, after],
+                                       QUIET_BUSY="100", WAIT_TIMEOUT="0")
+                self.assertEqual(got.returncode, 4, got.stdout + got.stderr)
+                self.assertIn("NO_QUIET_WINDOW", got.stdout)
+                self.assertIn("busy=100%", got.stdout)
+                self.assertNotIn(" START ", got.stdout)
+                self.assertIn("INVALID_CPU_SAMPLE", got.stderr)
+
+    def test_decimal_counters_and_own_time_subtraction(self) -> None:
+        rows = self.cpu_series([8] * 10, [50, 0, 0, 50, 0, 0, 0, 0, 0, 0])
+        rows = ["cpu  " + " ".join(v.zfill(8) for v in row.split()[1:]) for row in rows]
+        got = self.run_harness(self.tmp / "evi", cpu_rows=rows, QUIET_BUSY="50",
+                               FOREIGN_MAX="25", TEST_USER_SECONDS="0.25",
+                               TEST_SYSTEM_SECONDS="0", WAIT_TIMEOUT="0")
+        self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+        self.assertIn("foreign_cpu_pct: 25\n", (self.tmp / "evi/ours-1.load").read_text())
+
+    def test_invalid_leg_sample_is_discarded_even_at_full_ceiling(self) -> None:
+        rows = self.cpu_series([1000] * 10, [20, 0, 0, 80, 0, 0, 0, 0, 0, 0])[:3]
+        rows += [rows[-1]]  # no elapsed CPU time across the engine leg
+        got = self.run_harness(self.tmp / "evi", cpu_rows=rows, WAIT_TIMEOUT="0")
+        self.assertNotEqual(got.returncode, 0, got.stdout + got.stderr)
+        self.assertIn("ours rep=1 DISCARDED", got.stdout)
+        self.assertIn("INVALID_CPU_SAMPLE", got.stderr)
+        self.assertFalse((self.tmp / "evi/summary.md").exists())
+
+    def test_true_cpu_contention_refuses_or_discards(self) -> None:
+        rows = self.cpu_series([1000] * 10, [80, 0, 0, 20, 0, 0, 0, 0, 0, 0])
+        got = self.run_harness(self.tmp / "busy", cpu_rows=rows,
+                               QUIET_BUSY="79", WAIT_TIMEOUT="0")
+        self.assertEqual(got.returncode, 4, got.stdout + got.stderr)
+        self.assertIn("busy=80%", got.stdout)
+        (self.tmp / "cpu-index").unlink(missing_ok=True)
+        got = self.run_harness(self.tmp / "foreign", cpu_rows=rows, FOREIGN_MAX="79",
+                               TEST_USER_SECONDS="0", TEST_SYSTEM_SECONDS="0")
+        self.assertEqual(got.returncode, 2, got.stdout + got.stderr)
+        self.assertIn("foreign=80%", got.stdout)
+        self.assertFalse((self.tmp / "foreign/summary.md").exists())
+
+    def test_real_cpu_sampling_smoke(self) -> None:
+        got = self.run_harness(self.tmp / "real", real_cpu=True, WAIT_TIMEOUT="0")
+        self.assertIn(got.returncode, (0, 4), got.stdout + got.stderr)
+        for share in re.findall(r"(?:busy|foreign)=(\d+)%", got.stdout):
+            self.assertLessEqual(int(share), 100, got.stdout)
+        if got.returncode == 4:
+            # A zero-tick or decreasing real sample is not proof of quiet.
+            self.assertIn("INVALID_CPU_SAMPLE", got.stderr)
+            self.assertNotIn("SERIES_DONE", got.stdout)
+        else:
+            self.assertIn("SERIES_DONE", got.stdout)
 
     def test_runs_to_completion_and_creates_its_own_output_dir(self) -> None:
         out = self.tmp / "nested" / "evi"  # does not exist: the shipped bug
@@ -174,7 +304,9 @@ class CpuX86FloorHarnessTests(unittest.TestCase):
     def unique_copy(self, tool: str, name: str) -> pathlib.Path:
         source = shutil.which(tool)
         self.assertIsNotNone(source, f"{tool} is required for this test")
-        dest = self.tmp / name
+        # tempfile's directory token isolates concurrent fixtures. Keep comm
+        # below Linux's 15-character truncation boundary for pgrep -x.
+        dest = self.tmp / (name[:6] + self.tmp.name.rsplit("-", 1)[-1])
         shutil.copy(source, dest)
         dest.chmod(0o755)
         return dest
@@ -213,6 +345,20 @@ class CpuX86FloorHarnessTests(unittest.TestCase):
         )
         self.assertEqual(got.returncode, 4, got.stdout + got.stderr)
         self.assertIn("NO_QUIET_WINDOW", got.stdout)
+        self.assertIn("builders=1", got.stdout)
+
+    def test_concurrent_fixtures_do_not_share_probe_names(self) -> None:
+        other = CpuX86FloorHarnessTests()
+        other.setUp()
+        self.addCleanup(other.doCleanups)
+        probe = self.unique_copy("sleep", "vfloorforeign")
+        neighbor = other.unique_copy("sleep", "vfloorforeign")
+        for path in (probe, neighbor):
+            running = subprocess.Popen([str(path), "60"])
+            self.addCleanup(running.wait)
+            self.addCleanup(running.kill)
+        got = self.run_harness(self.tmp / "evi", BUILDERS=probe.name, WAIT_TIMEOUT="0")
+        self.assertEqual(got.returncode, 4, got.stdout + got.stderr)
         self.assertIn("builders=1", got.stdout)
 
     def test_the_recorded_correctness_hash_matches_the_recorded_output(self) -> None:

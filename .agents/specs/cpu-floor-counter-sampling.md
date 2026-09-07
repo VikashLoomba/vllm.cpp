@@ -44,7 +44,8 @@ percentage multiplication by 100, fit signed 64-bit Bash arithmetic.
 Validate before arithmetic and interpret leading zeros as decimal.
 Reject malformed, missing, oversized, or decreasing relevant counters.
 Reject a nonpositive total delta. Report an invalid-sample diagnostic and
-the conservative sentinel 100, not a measured utilization of 100 percent.
+the conservative sentinel 100 with failure status, not a measured utilization
+of 100 percent. Both gates must reject that status even at a ceiling of 100.
 Do not clamp a broken ratio into a valid measurement.
 
 Preserve subtraction of the leg's own CPU time and the existing nonnegative

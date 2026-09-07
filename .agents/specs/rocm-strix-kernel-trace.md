@@ -350,6 +350,24 @@ capture-boundary, and evidence-preservation changes. The runtime remained
 byte-identical after the pass. The final immutable
 head's preflight result and any skips belong to the implementing handoff.
 
+### Switches-only phase validation
+
+Spec commit `ff043df14` precedes the phase implementation. The new command
+tests first exited 1 because `switches` was not an accepted phase. The focused
+suite then passed 28 tests. All 50 scratch mutations were detected, including
+the previous 43 and seven phase, trace-label, schedule, and state mutations.
+The worker remained byte-identical after mutation. `managed_run` remains
+unchanged from `95f690ff7`, so #3039 can supply its separate runtime repair.
+
+Run `python3 tools/bench/strix_kernel_trace/worker.py --phase switches --manifest
+<manifest.json> --state <build-output>/build-state.json --output <new-output>`
+inside the operator's lease. The output records tracing as not run and pending
+under #3040. This command establishes no hardware result until the operator
+runs and validates the pairs. Evidence: `/tmp/strix-switches-red.log`,
+`/tmp/strix-switches-green.log`, and `/tmp/strix-switches-mutations.log`.
+The final immutable head receives one full preflight run, with its result and
+omissions reported in the handoff.
+
 ## Owed
 
 Issue [#3040](https://github.com/mudler/vllm.cpp/issues/3040) owns valid

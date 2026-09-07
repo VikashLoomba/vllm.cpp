@@ -305,7 +305,7 @@ def sample_clocks(stop, path, device):
             stop.wait(0.25)
 
 
-def measure(manifest, state, output):
+def measure(manifest, state, output, *, baseline_trace=True):
     local = Path(state["local"])
     if manifest != state["manifest"]:
         raise ValueError("measure manifest differs from build manifest")
@@ -364,14 +364,19 @@ def measure(manifest, state, output):
             return dict(runs=runs, clocks=clocks, output_sha256=digest(folder / "stdout"), returncode=0)
         return {"stderr": text}
 
-    # Capture the baseline before experimental switches can invalidate a leg.
-    ours = run("vllmcpp", "trace-vllmcpp", 1, profile=True)
-    llama = run("llamacpp", "trace-llamacpp", 1, profile=True)
-    matched = parse_llama(llama["stderr"], ours["runs"][0]["prompt_tokens"])
-    save(output / "trace-status.json", {"status": "PENDING manual kernel attribution",
-                                       "matched_counts": matched,
-                                       "trace_window": "whole process; includes load and prefill",
-                                       "token_gate": "FAIL (carried, not remeasured)"})
+    if baseline_trace:
+        # Capture the baseline before experimental switches can invalidate a leg.
+        ours = run("vllmcpp", "trace-vllmcpp", 1, profile=True)
+        llama = run("llamacpp", "trace-llamacpp", 1, profile=True)
+        matched = parse_llama(llama["stderr"], ours["runs"][0]["prompt_tokens"])
+        save(output / "trace-status.json", {"status": "PENDING manual kernel attribution",
+                                           "matched_counts": matched,
+                                           "trace_window": "whole process; includes load and prefill",
+                                           "token_gate": "FAIL (carried, not remeasured)"})
+    else:
+        save(output / "trace-status.json", {"status": "PENDING #3040: trace not run in switches phase",
+                                           "trace_run": False,
+                                           "token_gate": "FAIL (carried, not remeasured)"})
     for switch in SWITCHES:
         for pair in range(3):
             order = ("default", "candidate") if pair % 2 == 0 else ("candidate", "default")
@@ -387,7 +392,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--phase", choices=("build", "measure"), required=True)
+    parser.add_argument("--phase", choices=("build", "measure", "switches"), required=True)
     parser.add_argument("--state", type=Path)
     args = parser.parse_args()
     if os.environ.get("RC_DEVICE") != "strix:gpu0" or not os.environ.get("RC_JOB_ID"):
@@ -403,8 +408,9 @@ def main():
         build(manifest, args.output)
     else:
         if not args.state:
-            parser.error("measure requires --state from this build")
-        measure(manifest, json.loads(args.state.read_text()), args.output)
+            parser.error(f"{args.phase} requires --state from this build")
+        measure(manifest, json.loads(args.state.read_text()), args.output,
+                baseline_trace=args.phase == "measure")
 
 
 if __name__ == "__main__":

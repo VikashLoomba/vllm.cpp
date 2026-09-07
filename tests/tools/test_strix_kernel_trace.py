@@ -245,12 +245,15 @@ class CommandTests(unittest.TestCase):
         self.fatal_output = False
         self.commands = []
 
-    def invoke(self, phase="measure", tuning=None, lease=None):
+    def invoke(self, phase="measure", tuning=None, lease=None, with_state=True):
         manifest = self.root / "manifest.json"
         state = self.root / "state.json"
         manifest.write_text(json.dumps(self.manifest))
         state.write_text(json.dumps(self.state))
         argv = [str(PATH), "--phase", phase, "--manifest", str(manifest), "--state", str(state), "--output", str(self.root / "output")]
+        if not with_state:
+            start = argv.index("--state")
+            del argv[start:start + 2]
         real_check = subprocess.check_output
         real_run = subprocess.run
         real_popen = subprocess.Popen
@@ -368,6 +371,84 @@ class CommandTests(unittest.TestCase):
         self.manifest["sources"]["vllmcpp"]["sha256"] = "0" * 64
         with self.assertRaisesRegex(ValueError, "sha256"):
             self.invoke("build")
+
+    def test_cli_switches_runs_all_pairs_without_traces(self):
+        # Existing failed trace folders must not be reused or prevent the pairs.
+        for name in ("trace-vllmcpp", "trace-llamacpp"):
+            (self.local / name).mkdir()
+            (self.local / name / "evidence").write_bytes(b"prior trace")
+        output = self.invoke("switches")
+        self.assertTrue((output / "switches-identity.json").is_file())
+        status = json.loads((output / "trace-status.json").read_text())
+        self.assertIs(status["trace_run"], False)
+        self.assertTrue(status["status"].startswith("PENDING"))
+        self.assertIn("#3040", status["status"])
+        self.assertNotIn("matched_counts", status)
+        self.assertEqual(status["token_gate"], "FAIL (carried, not remeasured)")
+        self.assertEqual(len(json.loads((output / "paired-result.json").read_text())["pairs"]), 6)
+        legs = json.loads((output / "legs.json").read_text())
+        expected = [(switch, pair, arm) for switch in trace.SWITCHES
+                    for pair in range(3)
+                    for arm in (("candidate", "default") if pair == 1 else ("default", "candidate"))]
+        self.assertEqual([(x["switch"], x["pair"], x["arm"]) for x in legs], expected)
+        commands = [c for c in self.commands if "run" in c]
+        self.assertEqual(len(commands), 12)
+        for command, (switch, pair, arm) in zip(commands, expected):
+            self.assertEqual(command[command.index("--entrypoint") + 1], self.state["vllmcpp"])
+            self.assertEqual(command[command.index("--repeat") + 1], "4")
+            self.assertEqual([s for s in trace.SWITCHES if s + "=1" in command],
+                             [switch] if arm == "candidate" else [])
+            saved = json.loads((output / f"{switch}-{pair}-{arm}" / "command.json").read_text())
+            self.assertIs(saved["profiled"], False)
+        for name in ("trace-vllmcpp", "trace-llamacpp"):
+            self.assertEqual((self.local / name / "evidence").read_bytes(), b"prior trace")
+            self.assertFalse((output / name).exists())
+
+    def test_cli_switches_preserves_identity_guards(self):
+        # Each refusal occurs before starting any container.
+        for defect in ("manifest", "image", "model", "binary", "library", "host tuning", "image tuning", "lease"):
+            with self.subTest(defect=defect):
+                self.setUp()
+                options = {}
+                if defect == "manifest":
+                    self.manifest["image"] = "other"
+                elif defect == "image":
+                    self.image_id = "other"
+                elif defect == "model":
+                    Path(self.state["model"]).write_bytes(b"wrong")
+                elif defect == "binary":
+                    Path(self.state["vllmcpp"]).write_bytes(b"wrong")
+                elif defect == "library":
+                    (self.local / "llamacpp.so").write_bytes(b"wrong")
+                elif defect == "host tuning":
+                    options["tuning"] = {"VT_ROCM_Q8K_BLOCK": "1"}
+                elif defect == "image tuning":
+                    self.image_env = ["VT_ROCM_Q8K_BLOCK=1"]
+                else:
+                    options["lease"] = {"RC_DEVICE": "other:gpu0", "RC_JOB_ID": "test"}
+                with self.assertRaises(ValueError):
+                    self.invoke("switches", **options)
+                self.assertEqual(self.commands, [])
+
+    def test_cli_switches_requires_state(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.invoke("switches", with_state=False)
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(self.commands, [])
+
+    def test_cli_switches_rejects_changed_output(self):
+        self.bad_output = True
+        with self.assertRaisesRegex(ValueError, "output mismatch"):
+            self.invoke("switches")
+
+    def test_cli_switches_refuses_existing_leg(self):
+        existing = self.local / "VT_ROCM_Q8K_BLOCK-0-default"
+        existing.mkdir()
+        (existing / "evidence").write_bytes(b"previous")
+        with self.assertRaises(FileExistsError):
+            self.invoke("switches")
+        self.assertEqual(self.commands, [])
+        self.assertEqual((existing / "evidence").read_bytes(), b"previous")
 
     def test_cli_rejects_valid_archive_at_wrong_llama_pin(self):
         pin = self.manifest["sources"]["llamacpp"]

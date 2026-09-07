@@ -17,6 +17,7 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
 CHECKER = ROOT / "scripts/check-agent-record.py"
 SPEC = importlib.util.spec_from_file_location("agent_record", CHECKER)
 assert SPEC is not None and SPEC.loader is not None
@@ -48,33 +49,18 @@ def require(errors: list[str], pattern: str) -> None:
 
 
 def tracked_issues(test: unittest.TestCase) -> str:
-    """The derived issue snapshot, or a SKIP naming why it is not here.
+    """Return every canonical GitHub identity from tracked local records."""
 
-    These assertions used to read `.agents/issue-index.md`, a tracked file every
-    pull request wrote. It is derived now (#2290), and the snapshot is untracked,
-    so a fresh checkout legitimately has none. The guarantee is KEPT where it can
-    be checked and SKIPPED with its reason where it cannot -- never quietly
-    dropped, and never a hard failure on a clean clone.
-    """
-
-    # TWO sources, because the question has two halves. The snapshot is
-    # OPEN-ONLY by design, so it cannot answer for an issue that has since been
-    # closed -- #670 is one, and its only home was the retired index. That index
-    # is now the frozen archive: committed, offline, and never appended to, which
-    # is precisely what AGENTS.md keeps `.agents/completed/` for. History comes
-    # from the archive and live state from the snapshot, so no assertion is lost
-    # to the derivation.
-    archive = ROOT / ".agents/completed/issue-index.md"
-    text = archive.read_text(encoding="utf-8") if archive.is_file() else ""
-    snapshot = ROOT / ".agents/issue-index.generated.md"
-    if not snapshot.is_file():
-        if not text:
-            test.skipTest(
-                "neither the frozen archive nor a snapshot is present; run "
-                "`python3 scripts/agent-issue-index.py --refresh`"
-            )
-        return text
-    return text + snapshot.read_text(encoding="utf-8")
+    del test
+    records = [
+        agent_record.issue_records.parse_issue_file(path)
+        for path in sorted((ROOT / ".agents/issues").glob("**/*.md"))
+    ]
+    return "\n".join(
+        f"issues/{record.github})"
+        for record in records
+        if record.github is not None
+    )
 
 
 class AgentRecordMutationTests(unittest.TestCase):
@@ -1577,132 +1563,70 @@ class MtpDepthRowIsCounted(unittest.TestCase):
         )
 
 
-class IssueIndexTests(unittest.TestCase):
-    """Every guarantee of the DERIVED issue index, mutated rather than read.
-
-    The index is no longer a tracked file. `scripts/agent-issue-index.py`
-    renders `gh issue list` into an untracked snapshot, so the failure modes
-    that dominated the old tests -- a drifted preamble, a duplicated row, an
-    interleaved union merge -- cannot occur: nothing appends to a generated
-    file. What replaces them is the pair this row had to get right instead.
-
-    ABSENCE MUST NOT READ AS SUCCESS. A missing snapshot is a SKIP carrying its
-    reason, never an empty error list, because a gate that passes when its input
-    is absent is the #467 failure in a new place.
-
-    OWNERSHIP IS DIFF-SCOPED. The retired `UNOWNED_HIGH_WATER` counted every row
-    in the tree. Against a remote surface that number moves when anyone files an
-    issue anywhere, so it could only ever red `main` for reasons no commit
-    caused. The obligation is now the issues a change REFERENCES.
-    """
-
-    OWNER = "`BACKEND-ROCM`"
-
-    def row(self, number: int, owner: str | None = None) -> str:
-        owner = self.OWNER if owner is None else owner
-        return (
-            f"| [#{number}](https://github.com/mudler/vllm.cpp/issues/{number})"
-            f" | {owner} | title | bug |"
+class CanonicalIssueRecordTests(unittest.TestCase):
+    def record(self, number: int) -> object:
+        return agent_record.issue_records.IssueRecord(
+            id=f"ISSUE-GH-{number}",
+            title="Canonical issue",
+            row="ROW-A",
+            state="CLOSED",
+            kind="bug",
+            github=number,
+            mirror="DIVERGED",
+            availability="FULL",
+            created="2026-08-01",
+            updated="2026-08-02",
+            closed="2026-08-02",
+            problem="Observed failure.",
+            resolution="Closed by fixture evidence.",
         )
-
-    def index(self, owned: int = 3, unowned: int = 40) -> str:
-        rows = [self.row(1000 + i) for i in range(owned)]
-        rows += [self.row(2000 + i, "\u2014") for i in range(unowned)]
-        return agent_record.SNAPSHOT_PREAMBLE + "\n".join(rows) + "\n"
 
     def errors_for(
         self,
-        text: str | None,
-        owed: set[str] | None = None,
-        referenced: set[str] | None = None,
-    ) -> tuple[list[str], list[str]]:
+        issues_root: Path,
+        *,
+        references: set[str] | None = None,
+    ) -> list[str]:
         errors: list[str] = []
-        skips: list[str] = []
-        agent_record.check_issue_index(
-            errors, skips, text=text, owed=owed or set(),
-            referenced=referenced if referenced is not None else set(),
+        agent_record.check_issue_records(
+            errors,
+            issues_root=issues_root,
+            rows={"ROW-A"},
+            owed={},
+            references=references or set(),
+            frozen_archive=b"# frozen\n",
         )
-        return errors, skips
+        return errors
 
-    def test_unmutated_index_is_green(self) -> None:
-        # Guards every case below: a baseline that is already red would make
-        # each mutation pass for the wrong reason.
-        errors, skips = self.errors_for(self.index())
-        self.assertEqual((errors, skips), ([], []))
-
-    def test_an_absent_snapshot_skips_with_a_reason_and_does_not_pass(self) -> None:
-        # THE case this rewrite exists for. Absence is neither success nor
-        # failure, and it must never render as an empty error list alone.
-        missing = agent_record.AGENTS / "issue-index.generated.absent.md"
-        self.assertFalse(missing.exists(), "fixture path must not exist")
-        errors: list[str] = []
-        skips: list[str] = []
-        with mock.patch.object(agent_record, "SNAPSHOT", missing):
-            agent_record.check_issue_index(
-                errors, skips, owed=set(), referenced={"2000"}
-            )
-        # Referencing #2000 with no snapshot must not pass: the citation went
-        # unchecked, and that is exactly what a silent green would hide.
-        self.assertEqual(errors, [])
-        require(skips, r"agent-issue-index\.py --refresh")
-        require(skips, r"[Nn]ot a pass")
-
-    def test_a_referenced_issue_naming_no_row_is_caught(self) -> None:
-        # Diff-scoped: #2000 is dashed in the snapshot and this change cites it.
-        errors, _ = self.errors_for(self.index(), referenced={"2000"})
-        require(errors, r"references #2000, which names no owning row")
-
-    def test_an_unreferenced_dashed_row_is_not_this_changes_problem(self) -> None:
-        # The counterpart, and the reason the ratchet died: 40 dashed rows the
-        # change never mentions cost it nothing.
-        errors, _ = self.errors_for(self.index(), referenced=set())
-        self.assertEqual(errors, [])
-
-    def test_a_spec_owed_section_owns_a_referenced_dashed_row(self) -> None:
-        # The escape hatch has to work, or the gate just forces a fake row ID.
-        errors, _ = self.errors_for(
-            self.index(), owed={"2000"}, referenced={"2000"}
+    def write_record(self, issues_root: Path, number: int) -> Path:
+        record = self.record(number)
+        path = issues_root / "ROW-A" / f"{record.id}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            agent_record.issue_records.render_issue_record(record),
+            encoding="utf-8",
         )
+        return path
+
+    def test_canonical_files_are_the_authority_without_a_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            issues_root = Path(temporary) / ".agents" / "issues"
+            self.write_record(issues_root, 7)
+            errors = self.errors_for(issues_root, references={"#7"})
         self.assertEqual(errors, [])
 
-    def test_a_referenced_number_absent_from_the_snapshot_is_not_gated(self) -> None:
-        # Offline, a pull request number, a closed issue and a typo look
-        # identical. Gating this fired on four PR numbers cited as evidence in
-        # this rule's own change, so only OPEN issues carry the obligation.
-        errors, _ = self.errors_for(self.index(), referenced={"99999"})
-        self.assertEqual(errors, [])
-
-    def test_a_link_pointing_at_a_different_issue_is_caught(self) -> None:
-        # Survives from the retired IssueIntakeTable: the number and its URL
-        # must agree, or the index lies about which issue a row is.
-        mutated = self.index().replace("/issues/1000", "/issues/999", 1)
-        errors, _ = self.errors_for(mutated)
-        require(errors, r"a different issue")
-
-    def test_a_malformed_row_is_still_caught(self) -> None:
-        # The generator writes this file, so a malformed row means the GENERATOR
-        # broke. That is worth more noise, not less.
-        mutated = self.index() + "| [#3000](https://example.com/nope) | x |\n"
-        errors, _ = self.errors_for(mutated)
-        require(errors, r"malformed issue row")
-
-    def test_an_empty_snapshot_is_caught(self) -> None:
-        # A zero-row table is what a silently-truncated refresh looks like.
-        errors, _ = self.errors_for(agent_record.SNAPSHOT_PREAMBLE)
-        require(errors, r"has no rows")
-
-    def test_owed_issues_reads_specs_with_a_glob(self) -> None:
-        # A per-row surface by construction: one file per spec, so filing an
-        # owed issue never makes two branches write the same line.
-        self.assertIsInstance(agent_record.owed_issues(), set)
+    def test_a_missing_canonical_reference_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            issues_root = Path(temporary) / ".agents" / "issues"
+            self.write_record(issues_root, 7)
+            errors = self.errors_for(issues_root, references={f"ISSUE-GH-{''}8"})
+        require(errors, rf"ISSUE-GH-{''}8.*exactly one local record|cannot resolve")
 
     def test_the_retired_index_is_no_longer_a_tracked_writable_surface(self) -> None:
-        # The whole point of the row. If this file comes back, so does the lock.
         self.assertFalse(
             (agent_record.AGENTS / "issue-index.md").exists(),
             "the tracked issue index is back; it is a surface every PR writes",
         )
-
 
 class RecordAnchorRatchet(unittest.TestCase):
     """ENG-RECORD-ANCHOR-RATCHET (#632), .agents/specs/record-anchor-ratchet.md.
@@ -2399,6 +2323,303 @@ class Qwen35GdnBackendRowBacksTheRatchet(unittest.TestCase):
         )
 
 
+class RoadmapIssueProjectionTests(unittest.TestCase):
+    def test_the_roadmap_refuses_a_restored_issue_row(self) -> None:
+        roadmap = agent_record.AGENTS / "roadmap_v1.md"
+        clean = roadmap.read_text(encoding="utf-8")
+
+        def projection_errors(text: str) -> list[str]:
+            with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
+                agents = Path(tmp)
+                (agents / "roadmap_v1.md").write_text(text, encoding="utf-8")
+                (agents / "coordination.md").write_text("", encoding="utf-8")
+                errors: list[str] = []
+                with mock.patch.object(agent_record, "AGENTS", agents):
+                    agent_record.check_roadmap({}, errors)
+            return [
+                error
+                for error in errors
+                if "stores a GitHub issue table row" in error
+            ]
+
+        self.assertEqual(projection_errors(clean), [])
+        issue_row = (
+            "| [#99999](https://github.com/mudler/vllm.cpp/issues/99999) "
+            "| `BACKEND-ROCM` | title | bug |"
+        )
+        mutated = clean.replace(
+            "## Top-level portfolio",
+            issue_row + "\n\n## Top-level portfolio",
+            1,
+        )
+        self.assertNotEqual(mutated, clean, "the mutation must restore an issue row")
+        require(
+            projection_errors(mutated),
+            r"stores a GitHub issue table row",
+        )
+
+
+
+class CanonicalIssueReferenceTests(unittest.TestCase):
+    LOCAL_ID = f"ISSUE-LOCAL-{''}01ARZ3NDEKTSV4RRFFQ69G5FAV"
+
+    def intake(self, tmp: Path, *, problem: str | None = None, resolution: str = "-"):
+        archived = (
+            "| [#77](https://github.com/mudler/vllm.cpp/issues/77) "
+            "| — | Archived 77 | bug |"
+        )
+        record = agent_record.issue_records.IssueRecord(
+            id=f"ISSUE-GH-{''}77",
+            title="Archived 77",
+            row=None,
+            state="UNKNOWN",
+            kind="bug",
+            github=77,
+            mirror="MISSING",
+            availability="METADATA_ONLY",
+            created="UNKNOWN",
+            updated="UNKNOWN",
+            closed="UNKNOWN",
+            problem=problem or (
+                "Archive: `.agents/completed/issue-index.md:5`\n\n"
+                "### Frozen archive evidence\n\n"
+                f"> {archived}"
+            ),
+            resolution=resolution,
+        )
+        path = tmp / ".agents" / "issues" / "_intake" / f"ISSUE-GH-{''}77.md"
+        return path, record
+
+    @staticmethod
+    def frozen_archive() -> bytes:
+        return (
+            "# Issue index\n\n"
+            "| Issue | Row | Title | Kind |\n"
+            "|---:|---|---|---|\n"
+            "| [#77](https://github.com/mudler/vllm.cpp/issues/77) "
+            "| — | Archived 77 | bug |\n"
+        ).encode()
+
+    def test_discovers_all_four_forms_in_commit_bodies_and_changed_files(self) -> None:
+        references = agent_record.discover_issue_references(
+            (
+                f"Commit cites ISSUE-GH-{''}77, {self.LOCAL_ID}, #78, "
+                "and issues/79."
+            ),
+            {
+                Path("notes.txt"): (
+                    f"Changed file cites ISSUE-GH-{''}80, {self.LOCAL_ID}, #81, "
+                    "and https://github.com/mudler/vllm.cpp/issues/82."
+                )
+            },
+        )
+        self.assertEqual(
+            references,
+            {
+                f"ISSUE-GH-{''}77",
+                f"ISSUE-GH-{''}80",
+                self.LOCAL_ID,
+                "#78",
+                "#79",
+                "#81",
+                "#82",
+            },
+        )
+
+
+    def test_git_discovery_reads_commit_bodies_and_changed_file_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "notes.txt").write_text(f"Changed {self.LOCAL_ID}.", encoding="utf-8")
+            calls = (
+                agent_record.subprocess.CompletedProcess([], 0, stdout="base\n", stderr=""),
+                agent_record.subprocess.CompletedProcess([], 0, stdout="Commit #77\n", stderr=""),
+                agent_record.subprocess.CompletedProcess([], 0, stdout=b"notes.txt\0", stderr=b""),
+            )
+            with (
+                mock.patch.object(agent_record, "ROOT", root),
+                mock.patch.object(agent_record.subprocess, "run", side_effect=calls),
+            ):
+                references = agent_record.branch_issue_references()
+        self.assertEqual(references, {"#77", self.LOCAL_ID})
+
+    def test_git_discovery_includes_tests_and_rejects_intake_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            changed = root / "tests" / "scripts" / "probe.py"
+            changed.parent.mkdir(parents=True)
+            intake_id = "ISSUE-" + "GH-77"
+            changed.write_text(f"Tracks {intake_id}.", encoding="utf-8")
+            calls = (
+                agent_record.subprocess.CompletedProcess([], 0, stdout="base\n", stderr=""),
+                agent_record.subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+                agent_record.subprocess.CompletedProcess(
+                    [], 0, stdout=b"tests/scripts/probe.py\0", stderr=b""
+                ),
+            )
+            with (
+                mock.patch.object(agent_record, "ROOT", root),
+                mock.patch.object(agent_record.subprocess, "run", side_effect=calls),
+            ):
+                references = agent_record.branch_issue_references()
+
+            path, record = self.intake(root)
+            errors: list[str] = []
+            agent_record.check_canonical_issue_references(
+                errors,
+                references,
+                [(path, record)],
+            )
+
+        self.assertEqual(references, {intake_id})
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(errors[0], r"_intake.*triage|triage.*_intake")
+
+    def test_only_self_declarations_and_exact_same_number_evidence_are_excluded(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path, record = self.intake(Path(temporary))
+            text = agent_record.issue_records.render_issue_record(record)
+            self.assertEqual(
+                agent_record.issue_references_in_text(
+                    text,
+                    path=path,
+                    frozen_archive=self.frozen_archive(),
+                ),
+                set(),
+            )
+
+            other = replace(
+                record,
+                problem=record.problem.replace(
+                    "Archived 77",
+                    (
+                        "Archived 77 cites #88 issues/88 "
+                        f"ISSUE-GH-{''}77 {self.LOCAL_ID}"
+                    ),
+                ),
+            )
+            self.assertEqual(
+                agent_record.issue_references_in_text(
+                    agent_record.issue_records.render_issue_record(other),
+                    path=path,
+                    frozen_archive=self.frozen_archive(),
+                ),
+                {"#77", "#88", f"ISSUE-GH-{''}77", self.LOCAL_ID},
+            )
+
+    def test_local_id_and_github_declarations_do_not_hide_body_references(
+        self,
+    ) -> None:
+        record = agent_record.issue_records.IssueRecord(
+            id=self.LOCAL_ID,
+            title="Local issue",
+            row="ROW-A",
+            state="OPEN",
+            kind="bug",
+            github=501,
+            mirror="DIVERGED",
+            availability="FULL",
+            created="2026-08-01",
+            updated="2026-08-31",
+            closed="-",
+            problem=f"Body cites {self.LOCAL_ID}, #501, and issues/501.",
+            resolution="-",
+        )
+        path = Path(".agents/issues/ROW-A") / f"{self.LOCAL_ID}.md"
+        self.assertEqual(
+            agent_record.issue_references_in_text(
+                agent_record.issue_records.render_issue_record(record),
+                path=path,
+            ),
+            {self.LOCAL_ID, "#501"},
+        )
+
+    def test_malformed_frozen_evidence_has_no_reference_exclusion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path, record = self.intake(Path(temporary))
+            malformed = replace(
+                record,
+                problem=record.problem.replace(
+                    "[#77](https://github.com/mudler/vllm.cpp/issues/77)",
+                    (
+                        "[#88](https://github.com/mudler/vllm.cpp/issues/88) "
+                        "mentions #77"
+                    ),
+                ),
+            )
+            self.assertEqual(
+                agent_record.issue_references_in_text(
+                    agent_record.issue_records.render_issue_record(malformed),
+                    path=path,
+                    frozen_archive=self.frozen_archive(),
+                ),
+                {"#77", "#88"},
+            )
+
+    def test_same_number_outside_evidence_and_copied_evidence_still_count(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path, record = self.intake(
+                Path(temporary),
+                resolution="See #77 and issues/77.",
+            )
+            text = agent_record.issue_records.render_issue_record(record)
+            self.assertEqual(
+                agent_record.issue_references_in_text(
+                    text,
+                    path=path,
+                    frozen_archive=self.frozen_archive(),
+                ),
+                {"#77"},
+            )
+            copied = agent_record.issue_references_in_text(
+                record.problem,
+                path=Path(temporary) / "notes.md",
+            )
+            self.assertEqual(copied, {"#77"})
+
+    def test_unverified_same_record_evidence_gets_no_citation_exclusion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path, record = self.intake(Path(temporary))
+            text = agent_record.issue_records.render_issue_record(record)
+            for frozen_archive in (
+                b"# Issue index\n",
+                self.frozen_archive().replace(b"Archived 77", b"Changed title"),
+                self.frozen_archive().replace(b"/issues/77)", b"/issues/88)"),
+                self.frozen_archive().replace(b"| bug |", b"| feature |"),
+                self.frozen_archive().replace(b"| \xe2\x80\x94 |", b"| - |"),
+            ):
+                with self.subTest(frozen_archive=frozen_archive):
+                    self.assertEqual(
+                        agent_record.issue_references_in_text(
+                            text,
+                            path=path,
+                            frozen_archive=frozen_archive,
+                        ),
+                        {"#77"},
+                    )
+
+    def test_every_reference_form_to_intake_fails_canonical_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path, record = self.intake(Path(temporary))
+            errors: list[str] = []
+            agent_record.check_canonical_issue_references(
+                errors,
+                {f"ISSUE-GH-{''}77", "#77", "issues/77"},
+                [(path, record)],
+            )
+            self.assertEqual(len(errors), 3)
+            for error in errors:
+                self.assertRegex(error, r"_intake.*triage|triage.*_intake")
+
+    def test_intake_debt_is_reported_without_a_baseline_or_ratchet(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path, record = self.intake(Path(temporary))
+            report = agent_record.canonical_intake_debt([(path, record)])
+            self.assertEqual(report, (f"ISSUE-GH-{''}77",))
 class GdnDevicePureBackendRowBacksTheRatchet(unittest.TestCase):
     """The BACKEND ratchet bump 88 -> 89 is backed by the GDN device-pure row
     (#2907, owed from #2812).

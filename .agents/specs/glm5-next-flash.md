@@ -5351,11 +5351,11 @@ Debts this row carries, each visible rather than waived:
   started. `--device cuda` on this model still refuses by name, and O30's
   ` Paris.` on `--device cpu` at 195.5 s/token remains the only generation this
   row has ever observed. Owned by row `MODEL-MM-GLM53-FLASH-CUDA` and tracked by
-  [#2410](https://github.com/mudler/vllm.cpp/issues/2410), which is a REAL issue
+  ISSUE-GH-2410, which is a REAL issue
   filed by this wave rather than an inherited number. **The `#1998` and `#2241`
   this row cites throughout resolve to neither an issue nor a pull request
   today** (`gh issue view` and `gh pr view` both 404 while `gh issue view 2409`
-  serves, and a `--state all` listing spanning #41..#2409 does not contain
+  serves, and a `--state all` listing spanning #41..ISSUE-GH-2409 does not contain
   them). That observation is recorded and NOT acted on: this exact 404 pattern
   once got read as mass deletion and written into AGENTS.md as a falsehood, so
   the correct response is a re-measurement by someone with the forge in front of

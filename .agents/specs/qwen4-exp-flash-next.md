@@ -4725,13 +4725,13 @@ needs to claim bit-identity should compare bytes, not an aggregate.
   and the reconciliation NEITHER branch contains: what now blocks a CUDA forward
   is the QSA block's three host reads, not op registration and not the loader.
 
-- **A CI DEFECT FOUND IN FLOW, AND MAIN FIXED IT BETTER. #2407 IS A DUPLICATE.**
+- **A CI DEFECT FOUND IN FLOW, AND MAIN FIXED IT BETTER. ISSUE-GH-2407 IS A DUPLICATE.**
   `agent-record` failed on EVERY pull request: `.github/workflows/ci.yml` still
   ran `tests/scripts/test_check_issue_index_append_only.py`, which `7dc2ef1ea`
   deleted when it retired the append-only index, so the job printed
   `agent record OK: ENGINE=173 MODEL=379 ...` and then exited 2 on a missing
   file -- the gate green, the check red. This wave filed
-  [#2407](https://github.com/mudler/vllm.cpp/issues/2407) and DELETED the line.
+  ISSUE-GH-2407 and DELETED the line.
   **`origin/main` `df2ad6d84` ([#2371](https://github.com/mudler/vllm.cpp/issues/2371),
   #2373) had independently REDIRECTED it instead**, to
   `tests/scripts/test_agent_issue_index.py`.
@@ -4741,7 +4741,7 @@ needs to claim bit-identity should compare bytes, not an aggregate.
   `scripts/agent-issue-index.py` -- the derived renderer that REPLACED the
   retired index. So main's fix is BROADER than this wave's, not narrower. The
   merged `ci.yml` is byte-identical to main's, this branch carries no CI change,
-  and #2407 closes as a duplicate of #2371 rather than as work this row did.
+  and ISSUE-GH-2407 closes as a duplicate of #2371 rather than as work this row did.
 
 - **W6-CUDA-B LANDS FOUR CUDA ARMS THAT NOTHING REACHES, AND ONE BLOCKER
   REMAINS. ISSUE OWED.** `vt::Qwen4ExpGatedResidual`, `vt::RmsNormGroup`,
@@ -4753,13 +4753,13 @@ needs to claim bit-identity should compare bytes, not an aggregate.
   step can reach a CUDA queue. The wiring is owned by row `MODEL-MM-QWEN4-EXP`
   under campaign [#1978](https://github.com/mudler/vllm.cpp/issues/1978),
   tracked by [#2031](https://github.com/mudler/vllm.cpp/issues/2031) and by
-  this wave's own [#2380](https://github.com/mudler/vllm.cpp/issues/2380).
+  this wave's own ISSUE-GH-2380.
   **THAT ISSUE EXISTS, WHICH THE PREVIOUS FIVE WAVES ON THIS ROW COULD NOT
   MANAGE, AND THE REASON IS WORTH RECORDING.** Every entry above says the `gh`
   token is invalid on this host and cites `gh api user` returning 403. On
   2026-08-31 it returns **200** for `localai-org-maint-bot` and `gh issue create`
   succeeds. What is still true is the OTHER half of that story: `gh issue view
-  2031` returns "Could not resolve to an issue", and #2379 explains why — those
+  2031` returns "Could not resolve to an issue", and ISSUE-GH-2379 explains why — those
   issues were created by an account that has since been suspended, and GitHub
   HIDES a suspended account's content rather than deleting it. So the numbers
   this spec cites dangle for a reader even though the API is writable again.

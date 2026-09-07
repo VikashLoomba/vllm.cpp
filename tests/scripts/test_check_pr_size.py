@@ -77,6 +77,34 @@ class CheckerEvidenceMapping(unittest.TestCase):
 
 
 class PathClassification(unittest.TestCase):
+    def test_canonical_issue_files_are_project_records(self) -> None:
+        for path in (
+            ".agents/issues/ARCH-ONE-SURFACE/ISSUE-GH-1195.md",
+            ".agents/issues/_owed/ISSUE-GH-2390.md",
+            ".agents/issues/_intake/ISSUE-GH-41.md",
+            ".agents/issues/ENG-RECORD-CONFLICT-SURFACES/"
+            "ISSUE-" "LOCAL-01ARZ3NDEKTSV4RRFFQ69G5FAV.md",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(checker.classify_path(path), "project_record")
+
+    def test_canonical_issue_file_near_misses_fail_closed(self) -> None:
+        for path in (
+            ".agents/issues/ARCH-ONE-SURFACE/nested/ISSUE-GH-1195.md",
+            ".agents/issues/ARCH-ONE-SURFACE/ISSUE-GH-0.md",
+            ".agents/issues/ARCH-ONE-SURFACE/ISSUE-GH-01195.md",
+            ".agents/issues/ARCH-ONE-SURFACE/"
+            "ISSUE-LOCAL-01ARZ3NDEKTSV4RRFFQ69G5FAI.md",
+            ".agents/issues/_intake/"
+            "ISSUE-" "LOCAL-01ARZ3NDEKTSV4RRFFQ69G5FAV.md",
+            ".agents/issues/ISSUE-GH-1195.md",
+            ".agents/issues/_other/ISSUE-GH-1195.md",
+            ".agents/issues/ARCH-ONE-SURFACE/notes.md",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
+
     def test_state_migration_manifest_archives_are_evidence(self) -> None:
         for path in (
             ".agents/completed/state-migration-manifest.csv",

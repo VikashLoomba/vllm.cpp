@@ -195,6 +195,12 @@ COMPLETED = re.compile(r"\.agents/completed/[A-Za-z0-9_.-]+\.md\Z")
 # this. A claim in its own file has one writer and cannot collide. Classified
 # with the other per-row records it now resembles.
 CLAIM = re.compile(r"\.agents/claims/[A-Za-z0-9_.-]+\.md\Z")
+ISSUE_RECORD = re.compile(
+    r"\.agents/issues/(?:(?:[A-Z0-9][A-Za-z0-9_.-]*|_owed)/"
+    r"(?:ISSUE-GH-[1-9][0-9]*|ISSUE-LOCAL-[0-7][0-9A-HJKMNP-TV-Z]{25})"
+    r"|_intake/ISSUE-GH-[1-9][0-9]*)\.md\Z"
+)
+
 # One file per secondary oracle (AGENTS.md, "When vLLM has no implementation").
 # Same shape and therefore the same class as SPEC and CLAIM: a per-key record
 # globbed for reading, deliberately NOT a shared table every change must write.
@@ -527,6 +533,8 @@ def classify_path(path: str) -> str:
     if path in APPEND_ONLY_FILES:
         return "append_only_record"
     if path in PROJECT_RECORD_FILES:
+        return "project_record"
+    if ISSUE_RECORD.fullmatch(path):
         return "project_record"
     if path == ".agents/upstream-inventory.json":
         return "project_record"

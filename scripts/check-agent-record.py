@@ -12,9 +12,15 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+# `scripts/` is sys.path[0] when this file is run, but not when a caller loads
+# it by path, so pin the sibling issue-record module either way.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import issue_records  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parents[1]
 AGENTS = ROOT / ".agents"
+ISSUES_ROOT = AGENTS / "issues"
 
 MATRICES = {
     # 358 since 2026-08-05: +31 architectures vLLM's registry defines that we had
@@ -1160,6 +1166,8 @@ def link_bases(source: Path, text: str) -> tuple[Path, ...]:
 
 def check_links(errors: list[str]) -> None:
     for source in markdown_files():
+        if source.is_relative_to(ISSUES_ROOT):
+            continue
         text = source.read_text(encoding="utf-8")
         bases = link_bases(source, text)
         for raw_target in extract_links(text):
@@ -2030,176 +2038,258 @@ ISSUE_ROW = re.compile(
 )
 
 
-# The index is DERIVED. `scripts/agent-issue-index.py --refresh` renders
-# `gh issue list` into this untracked snapshot, so the record gates can run
-# offline while GitHub stays the record. Nothing commits it, so no pull request
-# writes it and it cannot conflict -- which is the whole of #2290.
-SNAPSHOT = AGENTS / "issue-index.generated.md"
-
-# The retired tracked index. Named only so its RETURN can be refused: if this
-# file comes back, the lock comes back with it.
+# The retired tracked index stays named so the checker can refuse its return.
 RETIRED_INDEX = AGENTS / "issue-index.md"
 
-# Enough of the generated header to build a fixture. Deliberately NOT gated
-# byte-for-byte: the old INDEX_PREAMBLE literal existed because `merge=union`
-# duplicated an edited preamble line rather than merging it, and a generated
-# file has no such failure mode. Holding a second copy of prose nothing can
-# corrupt would be drift for its own sake.
-SNAPSHOT_PREAMBLE = """# Issue index (GENERATED -- do not edit, do not commit)
 
-| Issue | Row | Title | Kind |
-|---:|---|---|---|
-"""
+ISSUE_REFERENCE_RE = re.compile(
+    r"(?<![A-Z0-9_-])ISSUE-GH-[1-9][0-9]*(?![A-Z0-9_-])"
+    r"|(?<![A-Z0-9_-])ISSUE-LOCAL-[0-7][0-9A-HJKMNP-TV-Z]{25}(?![A-Z0-9_-])"
+    r"|(?<![A-Za-z0-9])#[1-9][0-9]*(?![0-9])"
+    r"|(?<![A-Za-z0-9])issues/[1-9][0-9]*(?![0-9])"
+)
 
 
-def owed_issues() -> set[str]:
-    """Issue numbers a spec claims under `## Owed`, read with a glob.
+def issue_references_in_text(
+    text: str,
+    *,
+    path: Path | None = None,
+    frozen_archive: bytes | None = None,
+) -> set[str]:
+    """Return references, excluding only source-verified self-declarations."""
 
-    Per-row surface by construction: one file per spec, so filing an owed issue
-    never makes two branches write the same line.
-    """
+    searchable = text.replace("\r\n", "\n").replace("\r", "\n")
+    record: issue_records.IssueRecord | None = None
+    if path is not None:
+        try:
+            parsed = issue_records.parse_issue_text(searchable)
+        except issue_records.IssueRecordError:
+            parsed = None
+        if (
+            parsed is not None
+            and path.name == f"{parsed.id}.md"
+            and path.parent.parent.name == "issues"
+            and path.parent.parent.parent.name == ".agents"
+        ):
+            record = parsed
+            searchable = searchable.replace(f"ID: {record.id}", "ID: ", 1)
+            github = "-" if record.github is None else str(record.github)
+            searchable = searchable.replace(f"GitHub: {github}", "GitHub: ", 1)
 
-    owed: set[str] = set()
-    for path in sorted((AGENTS / "specs").glob("*.md")):
-        text = path.read_text(encoding="utf-8")
-        if "\n## Owed" not in text:
-            continue
-        body = text.split("\n## Owed", 1)[1].split("\n## ", 1)[0]
-        owed |= set(re.findall(r"#(\d+)", body))
-        owed |= set(re.findall(r"issues/(\d+)", body))
-    return owed
+    if record is not None and path is not None and path.parent.name == "_intake":
+        evidence = issue_records.valid_intake_archive_evidence(
+            record,
+            frozen_archive,
+        )
+        if evidence is not None and record.github is not None:
+            _, archived_line = evidence
+            masked_line = re.sub(
+                rf"(?<![A-Za-z0-9])#{record.github}(?![0-9])"
+                rf"|(?<![A-Za-z0-9])issues/{record.github}(?![0-9])",
+                "",
+                archived_line,
+            )
+            searchable = searchable.replace(
+                f"> {archived_line}",
+                f"> {masked_line}",
+                1,
+            )
+
+    references: set[str] = set()
+    for match in ISSUE_REFERENCE_RE.finditer(searchable):
+        reference = match.group(0)
+        if reference.startswith("issues/"):
+            reference = f"#{reference.removeprefix('issues/')}"
+        references.add(reference)
+    return references
 
 
-def referenced_issues(base: str = "origin/main") -> set[str]:
-    """Issue numbers THIS BRANCH cites, from its own commit messages.
+def discover_issue_references(
+    commit_bodies: str,
+    changed_files: dict[Path, str],
+    *,
+    frozen_archive: bytes | None = None,
+) -> set[str]:
+    """Discover references in both branch commit bodies and changed-file content."""
 
-    Offline and deterministic: `git log <merge-base>..HEAD`, never a network
-    call. A branch with no merge base against `base` -- a fresh clone, a
-    detached head, an unrelated history -- yields the empty set rather than
-    raising, because a gate that cannot resolve a range must not invent one.
-    Being unable to tell which issues a change cites is a reason to check none,
-    never a reason to fail the change.
-    """
+    references = issue_references_in_text(commit_bodies)
+    for path, text in changed_files.items():
+        references.update(
+            issue_references_in_text(
+                text,
+                path=path,
+                frozen_archive=frozen_archive,
+            )
+        )
+    return references
+
+
+def branch_issue_references(base: str = "origin/main") -> set[str]:
+    """Read commit bodies and changed-file contents from one offline git range."""
 
     try:
         merge_base = subprocess.run(
             ["git", "-C", str(ROOT), "merge-base", base, "HEAD"],
-            capture_output=True, text=True, timeout=20,
+            capture_output=True,
+            text=True,
+            timeout=20,
         )
         if merge_base.returncode != 0:
             return set()
+        revision = f"{merge_base.stdout.strip()}..HEAD"
         log = subprocess.run(
-            ["git", "-C", str(ROOT), "log", "--format=%B",
-             f"{merge_base.stdout.strip()}..HEAD"],
-            capture_output=True, text=True, timeout=20,
+            ["git", "-C", str(ROOT), "log", "--format=%B", revision],
+            capture_output=True,
+            text=True,
+            timeout=20,
         )
-        if log.returncode != 0:
+        changed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(ROOT),
+                "diff",
+                "--name-only",
+                "-z",
+                "--diff-filter=ACMRT",
+                revision,
+            ],
+            capture_output=True,
+            timeout=20,
+        )
+        if log.returncode != 0 or changed.returncode != 0:
             return set()
     except (OSError, subprocess.SubprocessError):
         return set()
-    return set(re.findall(r"#(\d+)", log.stdout)) | set(
-        re.findall(r"issues/(\d+)", log.stdout)
+
+    changed_files: dict[Path, str] = {}
+    for raw_path in changed.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        try:
+            relative = Path(raw_path.decode("utf-8"))
+            changed_files[relative] = (ROOT / relative).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+    try:
+        frozen_archive = (
+            ROOT / ".agents" / "completed" / "issue-index.md"
+        ).read_bytes()
+    except OSError:
+        frozen_archive = None
+    return discover_issue_references(
+        log.stdout,
+        changed_files,
+        frozen_archive=frozen_archive,
     )
 
 
-def check_issue_index(
+def canonical_intake_debt(
+    records: list[tuple[Path, issue_records.IssueRecord]],
+) -> tuple[str, ...]:
+    """Report current intake identities without comparing a shared baseline."""
+
+    return tuple(
+        sorted(
+            record.id
+            for path, record in records
+            if path.parent.name == "_intake"
+        )
+    )
+
+
+def check_canonical_issue_references(
     errors: list[str],
-    skips: list[str],
-    *,
-    text: str | None = None,
-    owed: set[str] | None = None,
-    referenced: set[str] | None = None,
+    references: set[str],
+    records: list[tuple[Path, issue_records.IssueRecord]],
 ) -> None:
-    """The issues THIS CHANGE references are well-formed, open, and owned.
+    """Resolve branch references and reject migration intake as ownership."""
 
-    Deliberately NETWORK-FREE, as the tracked version was. It reads the snapshot
-    `scripts/agent-issue-index.py --refresh` leaves behind; querying GitHub here
-    would make the gate fail on connectivity, which is the class of flake this
-    protocol exists to remove.
+    materialized = [record for _, record in records]
+    paths = {record.id: path for path, record in records}
+    for reference in sorted(references):
+        normalized = (
+            f"#{reference.removeprefix('issues/')}"
+            if reference.startswith("issues/")
+            else reference
+        )
+        try:
+            record = issue_records.resolve_issue_reference(normalized, materialized)
+        except issue_records.IssueRecordError as error:
+            if normalized.startswith("#"):
+                continue
+            errors.append(str(error))
+            continue
+        if paths[record.id].parent.name == "_intake":
+            errors.append(
+                f"issue reference {reference} resolves to _intake record "
+                f"{record.id}; triage it to a canonical row or exactly owned _owed"
+            )
 
-    ABSENCE IS A SKIP, NOT A PASS. An absent or stale snapshot appends to
-    `skips` with the command that fixes it and leaves `errors` alone. A gate
-    that goes quiet when its input vanishes is #467 in a new place, so the
-    caller must report the skip and `--fail-on-skip` must redden on it.
 
-    OWNERSHIP IS DIFF-SCOPED. The retired `UNOWNED_HIGH_WATER` counted every row
-    in the tree. Against a surface GitHub owns that count moves whenever anyone
-    files an issue anywhere, so a ratchet on it could only red `main` for
-    reasons no commit caused -- the same lock in a new place. What a change can
-    answer for is the issues it cites, so that is what is gated.
-
-    `text`, `owed` and `referenced` are injectable so a test can build a small
-    snapshot without a network call or a git history.
-    """
+def check_issue_records(
+    errors: list[str],
+    *,
+    issues_root: Path = ISSUES_ROOT,
+    rows: set[str] | None = None,
+    owed: issue_records.OwedLookup | None = None,
+    references: set[str] | None = None,
+    frozen_archive: bytes | None = None,
+) -> None:
+    """Validate canonical local issue authority and branch references offline."""
 
     if RETIRED_INDEX.is_file():
         errors.append(
-            f"{RETIRED_INDEX.relative_to(ROOT)}: the tracked issue index is back. "
-            "It is a surface every pull request writes, and GitHub does not run "
-            "the merge=union driver that was supposed to make that safe (#883, "
-            "#2290). The index is derived; run scripts/agent-issue-index.py"
+            f"{RETIRED_INDEX.relative_to(ROOT)}: the tracked issue index is back; "
+            "canonical issue authority belongs under .agents/issues/"
         )
-
-    label = SNAPSHOT.relative_to(ROOT)
-    if text is None:
-        if not SNAPSHOT.is_file():
-            skips.append(
-                f"{label} is absent; run "
-                "`python3 scripts/agent-issue-index.py --refresh`. "
-                "Not a pass: the issues this change cites went unchecked"
-            )
-            return
-        text = SNAPSHOT.read_text(encoding="utf-8")
-    if owed is None:
-        owed = owed_issues()
-    if referenced is None:
-        referenced = referenced_issues()
-
-    rows = 0
-    owners: dict[str, str | None] = {}
-    for line in text.splitlines():
-        # Any table line that is not the header or the separator. Matching only
-        # `| [#` would make a row that LOST its link invisible instead of
-        # malformed, which is the failure this loop exists to report.
-        if not line.startswith("|") or line.startswith("| Issue") or set(line) <= set("|-: "):
-            continue
-        match = ISSUE_ROW.match(line)
-        if not match:
-            errors.append(
-                f"{label}: malformed issue row {line[:60]!r}. This file is "
-                "GENERATED, so a malformed row means the generator broke; "
-                "expected | [#N](https://github.com/.../issues/N) | `ROW-ID` or — | title | kind |"
-            )
-            continue
-        rows += 1
-        number, url, url_number, row_id = match.group(1), match.group(2), match.group(3), match.group(4)
-        if number != url_number:
-            errors.append(f"{label}: issue #{number} links to {url}, a different issue")
-        owners[number] = row_id
-
-    if rows == 0:
-        errors.append(
-            f"{label}: the snapshot has no rows, which is what a silently "
-            "truncated refresh looks like"
-        )
+    if not issues_root.is_dir():
+        errors.append(f"{issues_root}: canonical issue directory is absent")
         return
 
-    for number in sorted(referenced, key=int):
-        # A referenced number ABSENT from the snapshot is not gated. Offline, a
-        # pull request number, a closed issue and a typo are indistinguishable --
-        # `#2248` in a commit body is a pull request, and demanding it be an open
-        # issue fired on four such citations in this rule's own change. Only
-        # OPEN issues, which the snapshot can actually speak to, carry the
-        # ownership obligation.
-        if number not in owners:
-            continue
-        if owners[number] is None and number not in owed:
-            errors.append(
-                f"{label}: this change references #{number}, which names no "
-                "owning row. Add a `Row: `ROW-ID`` line to the issue body, or "
-                "list it under `## Owed` in the spec that owes it. Filing an "
-                "issue does not defer the fix"
+    effective_rows = issue_records.canonical_rows(ROOT) if rows is None else rows
+    effective_owed = (
+        issue_records.owed_issue_counts(ROOT) if owed is None else owed
+    )
+    if frozen_archive is None:
+        try:
+            frozen_archive = (
+                ROOT / ".agents" / "completed" / "issue-index.md"
+            ).read_bytes()
+        except OSError:
+            frozen_archive = None
+
+    records: list[tuple[Path, issue_records.IssueRecord]] = []
+    paths = sorted(issues_root.glob("**/*.md"))
+    if not paths:
+        errors.append(f"{issues_root}: canonical issue directory contains no records")
+        return
+    for path in paths:
+        try:
+            record = issue_records.parse_issue_file(path)
+            issue_records.validate_issue_record(
+                record,
+                path,
+                effective_rows,
+                effective_owed,
+                frozen_archive=frozen_archive,
             )
+        except (OSError, issue_records.IssueRecordError) as error:
+            label = path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
+            errors.append(f"{label}: {error}")
+            continue
+        records.append((path, record))
+
+    try:
+        issue_records.validate_issue_collection(record for _, record in records)
+    except issue_records.IssueRecordError as error:
+        errors.append(f"{issues_root}: {error}")
+
+    check_canonical_issue_references(
+        errors,
+        branch_issue_references() if references is None else references,
+        records,
+    )
 
 
 def check_roadmap(by_id: dict[str, ClaimRow], errors: list[str]) -> None:
@@ -2225,6 +2315,15 @@ def check_roadmap(by_id: dict[str, ClaimRow], errors: list[str]) -> None:
     ]
     seen: list[tuple[int, str]] = []
     for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        issue = ISSUE_ROW.match(line)
+        if issue:
+            errors.append(
+                f"{path.relative_to(ROOT)}:{line_no}: stores a GitHub issue table row "
+                f"for #{issue.group(1)}. Canonical issue authority belongs under "
+                ".agents/issues/; refresh only the untracked generated view with "
+                "`python3 scripts/agent-issue-index.py --refresh`"
+            )
+            continue
         if not line.startswith("|"):
             continue
         cells = split_cells(line)
@@ -2272,7 +2371,7 @@ def main(argv: list[str] | None = None) -> int:
     by_id: dict[str, ClaimRow] = {}
     if not errors:
         check_links(errors)
-        check_issue_index(errors, skips)
+        check_issue_records(errors)
         rows, by_id = check_matrices(errors)
         check_engine_summary(rows, errors)
         check_row_contracts(rows, by_id, errors)

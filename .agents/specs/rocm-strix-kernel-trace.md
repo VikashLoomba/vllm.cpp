@@ -146,6 +146,44 @@ only the first completion. Clock summaries use generations 2 through 4 and
 their emitted Unix timestamps. These windows contain prefill and generation,
 not decode alone. The carried token gate remains FAIL.
 
+### Review repair: container lifecycle and command-path guards
+
+The first review rejected the harness on container cleanup, inherited image
+tuning, output monitoring, and tests that did not enter the command path.
+The repair runs each container with a unique name. A bounded `finally` block
+stops and removes that name after success, process failure, timeout, or excess
+output. Cleanup failure stops the harness with an error.
+
+Both phases inspect `Config.Env` and reject `VT_`, `GGML_`, `HSA_`, `HIP_`,
+`ROCR_`, and `PYTORCH_` variables. Containers run the inspected image ID.
+Measurement records the image environment in `image-environment.json`.
+The existing manifest and build-state format remain accepted. Measurement
+rechecks the environment even when an older build state lacks `image_env`.
+
+The host monitors the aggregate bytes in each leg directory, including logs
+and profiler files, against 512 MiB every 100 ms. This is a sampled stop
+threshold, not a strict disk quota. A writer can overshoot between samples.
+The container's per-file limit remains an additional guard. Build commands
+use the same lifecycle and monitor the build output directory.
+
+The repair's red run exited 1 with missing container names and a missing
+managed execution function. The focused suite then passed 20 tests. Tests
+execute the actual `__main__` block with temporary archives, state, and logs.
+External build and GPU commands are simulated. Real CPU subprocesses prove
+timeout cleanup, failure cleanup, host-output detection, and profiler-file
+detection. A real subprocess also exceeds host output through the CLI path.
+Different cold and warm timings pin each pair's warm median and ratio.
+Every vllm.cpp leg sets `VT_OP_PROVIDER_STATS=1` and retains the complete log.
+An explicit `[vt reference-tier]` warning rejects a leg, as does a missing
+kernel message. Absence of a warning alone does not prove zero fallback.
+
+Repair evidence resides in `/tmp/strix-repair-red.log`,
+`/tmp/strix-repair-green.log`, and `/tmp/strix-repair-mutations.log`.
+All 35 scratch mutations were detected, including the 25 original reviewer
+mutations. The runner remained byte-identical after the mutation run.
+The final immutable head receives one full preflight run. Its result and
+omitted environment or hardware gates belong to the handoff evidence.
+
 ## Owed
 
 The product fixes in #3016, #3017, and #3018 stay on their owning rows.

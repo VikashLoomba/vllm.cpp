@@ -18,6 +18,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import uuid
 
 PROMPT = "The capital of France is"
 MODEL_SIZE = 17106775008
@@ -26,6 +27,7 @@ LLAMA_REV = "10bf611e533d81f739128304991c5e133c6aebd8"
 SWITCHES = ("VT_ROCM_Q8K_BLOCK", "VT_ROCM_Q6K_SMALL_PRIVATE")
 PODMAN = ["podman", "--storage-driver=vfs", "--root", "/tmp/podman-pr66-root-vfs",
           "--runroot", "/tmp/podman-pr66-run-vfs"]
+TUNING_PREFIXES = ("VT_", "GGML_", "HSA_", "HIP_", "ROCR_", "PYTORCH_")
 
 
 def digest(path):
@@ -140,17 +142,66 @@ def save(path, data):
     Path(path).write_text(json.dumps(data, indent=2) + "\n")
 
 
+def inspect_image(manifest):
+    image = subprocess.check_output(PODMAN + ["image", "inspect", "--format", "{{.Id}}", manifest["image"]], text=True).strip()
+    env = json.loads(subprocess.check_output(PODMAN + ["image", "inspect", "--format", "{{json .Config.Env}}", image], text=True)) or []
+    tuning = [value for value in env if value.split("=", 1)[0].startswith(TUNING_PREFIXES)]
+    if tuning:
+        raise ValueError(f"image tuning variables: {tuning}")
+    return image, env
+
+
+def managed_run(argv, *, stdout, stderr, timeout, output_dir=None, max_bytes=536870912):
+    """Stop the named container on every exit, including timeout and output growth.
+
+    The aggregate output threshold is sampled every 100 ms, so an active writer
+    can exceed it between samples. The container's per-file limit also applies.
+    """
+    name = argv[argv.index("--name") + 1]
+    process = None
+    started = time.monotonic()
+    try:
+        process = subprocess.Popen(argv, stdout=stdout, stderr=stderr, stdin=subprocess.DEVNULL)
+        while True:
+            if output_dir is not None:
+                size = sum(p.stat().st_size for p in Path(output_dir).rglob("*") if p.is_file() and not p.is_symlink())
+                if size > max_bytes:
+                    raise ValueError(f"aggregate output exceeds {max_bytes} bytes")
+            status = process.poll()
+            if status is not None:
+                return subprocess.CompletedProcess(argv, status)
+            if time.monotonic() - started >= timeout:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            time.sleep(0.1)
+    finally:
+        failures = []
+        for cleanup in (["stop", "--ignore", "--time", "2", name], ["rm", "--force", "--ignore", name]):
+            try:
+                subprocess.run(PODMAN + cleanup, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=15, check=True)
+            except (subprocess.SubprocessError, OSError) as exc:
+                failures.append(str(exc))
+        if process is not None:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+        if failures:
+            raise RuntimeError("container cleanup failed: " + "; ".join(failures))
+
+
 def command(argv, log, timeout=3600):
     print(json.dumps({"command": list(map(str, argv)), "log": str(log)}), flush=True)
     with Path(log).open("w") as stream:
         stream.write(json.dumps(list(map(str, argv))) + "\n")
         stream.flush()
-        subprocess.run(list(map(str, argv)), stdout=stream, stderr=subprocess.STDOUT,
-                       check=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        result = managed_run(list(map(str, argv)), stdout=stream, stderr=subprocess.STDOUT,
+                             timeout=timeout, output_dir=Path(log).parent)
+        result.check_returncode()
 
 
 def container(manifest, local, entrypoint, args, env=None, limit_output=False):
-    result = PODMAN + ["run", "--rm", "--device=/dev/kfd", "--device=/dev/dri", "--group-add", "video",
+    result = PODMAN + ["run", "--rm", "--name", "strix-3015-" + uuid.uuid4().hex,
+                      "--device=/dev/kfd", "--device=/dev/dri", "--group-add", "video",
                       "-v", f"{local}:{local}:rw", "-v", "/workspace/ccache:/workspace/ccache:rw"]
     if limit_output:
         result += ["--ulimit", "fsize=536870912:536870912"]
@@ -166,10 +217,12 @@ def build(manifest, output):
              "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
              "rc_job_id": os.environ.get("RC_JOB_ID"), "created_unix": time.time()}
     save(output / "build-state.partial.json", state)
-    image = subprocess.check_output(PODMAN + ["image", "inspect", "--format", "{{.Id}}", manifest["image"]], text=True).strip()
+    image, image_env = inspect_image(manifest)
     state["image_id"] = image
-    command(container(manifest, local, "ccache", ["--version"]), output / "ccache-version.log")
-    command(container(manifest, local, "/opt/rocm/lib/llvm/bin/clang++", ["--version"]), output / "compiler-version.log")
+    state["image_env"] = image_env
+    runtime = dict(manifest, image=image)
+    command(container(runtime, local, "ccache", ["--version"]), output / "ccache-version.log")
+    command(container(runtime, local, "/opt/rocm/lib/llvm/bin/clang++", ["--version"]), output / "compiler-version.log")
     for engine in ("vllmcpp", "llamacpp"):
         pin = manifest["sources"][engine]
         verify_archive(pin, engine)
@@ -192,8 +245,8 @@ def build(manifest, output):
                       "-DGGML_NATIVE=OFF", "-DLLAMA_BUILD_TESTS=OFF", "-DLLAMA_CURL=OFF"]
             binary, build_target = target / "bin/llama-completion", "llama-completion"
         env = {"CCACHE_DIR": "/workspace/ccache", "CCACHE_BASEDIR": str(source)}
-        command(container(manifest, local, "cmake", ["-S", source, "-B", target, *flags], env), output / f"{engine}-configure.log")
-        command(container(manifest, local, "cmake", ["--build", target, "-j", "4", "--target", build_target], env), output / f"{engine}-build.log", 7200)
+        command(container(runtime, local, "cmake", ["-S", source, "-B", target, *flags], env), output / f"{engine}-configure.log")
+        command(container(runtime, local, "cmake", ["--build", target, "-j", "4", "--target", build_target], env), output / f"{engine}-build.log", 7200)
         state["sources"][engine] = pin
         paths = [binary] + sorted(p for p in target.rglob("*.so*") if p.is_file() and not p.is_symlink())
         state["binaries"][engine] = {str(p): digest(p) for p in paths}
@@ -229,9 +282,11 @@ def measure(manifest, state, output):
     local = Path(state["local"])
     if manifest != state["manifest"]:
         raise ValueError("measure manifest differs from build manifest")
-    image = subprocess.check_output(PODMAN + ["image", "inspect", "--format", "{{.Id}}", manifest["image"]], text=True).strip()
+    image, image_env = inspect_image(manifest)
     if image != state["image_id"]:
         raise ValueError("build image changed")
+    save(output / "image-environment.json", {"image_id": image, "env": image_env})
+    runtime = dict(manifest, image=image)
     for files in state["binaries"].values():
         for path, sha in files.items():
             verify_file(path, sha)
@@ -250,6 +305,7 @@ def measure(manifest, state, output):
         env = {"LD_LIBRARY_PATH": f"{local}/build-{engine}:{local}/build-{engine}/bin:/opt/rocm/lib"}
         env.update(tuning or {})
         if engine == "vllmcpp":
+            env["VT_OP_PROVIDER_STATS"] = "1"
             args = ["--model", state["model"], "--prompt", PROMPT, "--max-tokens", "64",
                     "--temperature", "0", "--repeat", str(repeat), "--max-num-seqs", "1"]
         else:
@@ -257,7 +313,7 @@ def measure(manifest, state, output):
         app = [state[engine], *args]
         if profile:
             app = [s.replace("{trace_dir}", str(folder / "trace")) for s in prefix] + app
-        argv = container(manifest, local, app[0], app[1:], env, limit_output=True)
+        argv = container(runtime, local, app[0], app[1:], env, limit_output=True)
         save(folder / "command.json", {"argv": argv, "tuning": tuning, "profiled": profile,
                                       "prompt": PROMPT, "max_tokens": 64, "repeat": repeat})
         stop = threading.Event()
@@ -265,14 +321,14 @@ def measure(manifest, state, output):
         sampler.start()
         try:
             with (folder / "stdout").open("wb") as stdout, (folder / "stderr").open("wb") as stderr:
-                completed = subprocess.run(argv, stdout=stdout, stderr=stderr, stdin=subprocess.DEVNULL, timeout=1200)
+                completed = managed_run(argv, stdout=stdout, stderr=stderr, timeout=1200, output_dir=folder)
             save(folder / "exit.json", {"returncode": completed.returncode})
         finally:
             stop.set()
             sampler.join()
             shutil.copytree(folder, output / tag)
         text = (folder / "stderr").read_text(errors="replace")
-        if completed.returncode != 0 or re.search(r"GPU Hang|Memory access fault|HW Exception|no kernel for op", text):
+        if completed.returncode != 0 or re.search(r"GPU Hang|Memory access fault|HW Exception|no kernel for op|\[vt reference-tier\]", text):
             raise ValueError(f"leg {tag} failed; see captured logs")
         if engine == "vllmcpp":
             runs = parse_ours(text, repeat)
@@ -309,7 +365,7 @@ def main():
     args = parser.parse_args()
     if os.environ.get("RC_DEVICE") != "strix:gpu0" or not os.environ.get("RC_JOB_ID"):
         raise ValueError("requires operator-owned rc lease on strix:gpu0")
-    inherited = {k: v for k, v in os.environ.items() if k.startswith(("VT_", "GGML_", "HSA_", "HIP_", "ROCR_"))}
+    inherited = {k: v for k, v in os.environ.items() if k.startswith(TUNING_PREFIXES)}
     if inherited:
         raise ValueError(f"inherited tuning variables: {inherited}")
     manifest = json.loads(args.manifest.read_text())

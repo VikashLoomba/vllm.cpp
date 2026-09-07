@@ -418,7 +418,9 @@ agree. The landed figure stands; nothing here supersedes it.
 - llama.cpp's custody chain has one open link, carried forward: the source is
   pinned by content manifest and the binaries are pinned as bytes, but no
   compiler ran in this lease.
-- Clock sampling on AMD is ad-hoc. No in-tree harness samples AMD clock state.
+- This historical survey used an ad-hoc AMD clock sampler. The subsequent
+  [#3015 worker](../../tools/bench/strix_kernel_trace/worker.py) samples AMD
+  clock state and folds it into recorded warm generation windows.
 
 ## Evidence
 

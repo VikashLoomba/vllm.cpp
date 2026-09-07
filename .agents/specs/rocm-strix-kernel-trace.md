@@ -8,7 +8,13 @@ Issue: [#3015](https://github.com/mudler/vllm.cpp/issues/3015).
 
 Investigation on base `f98b638673b4d2edc0250eec56d229357ea38ab1`.
 The user directed autonomous resumption on 2026-09-07. This spec precedes
-the diagnostic harness. One pull request follows the repository default.
+the diagnostic harness. The operator selected the recorded, authorized local
+merge path after independent review and operator verification.
+The historical warm-clock correction is complete. New traces contain invalid
+timestamps and remain unusable for timing attribution under #3040. The
+switch-only measurement completed with independently reproduced diagnostic
+pairs. Correctness remains failing and warm output equality remains pending.
+Issue #3015 remains open.
 
 ## Scope
 
@@ -195,9 +201,11 @@ claim. The llama-pin mutation triggered the downstream archive parser as an
 error, so independent review must verify that guard with a valid wrong-pin
 archive too.
 
-The helper invoked full preflight before editing. That run remains PENDING
-until its process returns. Hardware compilation and measurement are owned by
-the operator and are not established by these Python tests.
+At the original harness checkpoint, the helper invoked preflight before
+editing and reported its result as PENDING. The completed combined-runtime
+validation is recorded in the hardware evidence below. Hardware compilation
+and measurement are owned by the operator and are not established by these
+Python tests.
 
 The manifest supplies the model path, image, clock device, profiler command
 array, and each source archive's full revision and SHA256. Create raw tar
@@ -288,8 +296,9 @@ The baseline mutation run recorded eight survivors in
 detected in `/tmp/strix-test-repair-mutations.log`. The eight new detections
 include intended assertion failures for the missing checks and changed
 commands. The unchanged runner was checked after each full mutation pass.
-`git diff --check` passed. Full preflight on the final committed head remains
-PENDING until the implementing agent records its result in the handoff.
+`git diff --check` passed. The test-repair checkpoint reported full preflight
+as PENDING. The completed combined-runtime validation is recorded in the
+hardware evidence below.
 
 ### Historical warm clock correction evidence
 
@@ -319,8 +328,9 @@ Local evidence: `/tmp/strix-clock-window-red.log`,
 `/tmp/strix-clock-window-green.log`, `/tmp/strix-clock-window-mutations.log`,
 `/tmp/strix-clock-window-result.json`, and
 `/tmp/strix-clock-window-historical-committed.log`. These are reproduction
-outputs, not replacements for the committed raw records. The final immutable
-head's full preflight remains PENDING until reported in the handoff.
+outputs, not replacements for the committed raw records. That checkpoint
+reported full preflight as PENDING. The completed combined-runtime validation
+is recorded in the hardware evidence below.
 
 ### Live fault-stop repair evidence
 
@@ -368,7 +378,43 @@ runs and validates the pairs. Evidence: `/tmp/strix-switches-red.log`,
 The final immutable head receives one full preflight run, with its result and
 omissions reported in the handoff.
 
+### Hardware evidence
+
+The [2026-09-07 capture bundle](../../docs/bench-evidence/strix-kernel-trace-3015-20260907/README.md)
+preserves source and artifact pins, build logs, both failed profiling attempts,
+the completed kernel-only inventory, and all 12 switch legs. Its checksum
+manifests verify the packaged files and the original uncompressed captures.
+The README reproduces the raw-data fold with the existing pinned worker.
+
+The full trace reported a GPU hang and 16 timestamp swap warnings; the
+completed kernel-only control reported 62. The latter contains 85,737 dispatch
+rows, but neither capture supports kernel timing attribution. Scratch and VGPR
+counts describe resource metadata, not spill traffic. A separate version probe
+pins the installed profiler to the inspected timestamp-adjustment source.
+
+Independent folding reproduces all 12 raw legs and six paired summaries.
+Median default/candidate elapsed-time ratios are 1.067395 for
+`VT_ROCM_Q8K_BLOCK` and 0.892823 for `VT_ROCM_Q6K_SMALL_PRIVATE`.
+These unprofiled warm whole-completion measurements include prefill.
+`TOKEN_GATE=FAIL` is carried rather than remeasured; warm output equality is
+PENDING because the CLI exposes only cold text. No performance result or
+default change is accepted.
+
+Combined runtime `dcb5351cd` passed 37 focused tests. Independent review
+detected all 59 mutations. Reviewer and operator full preflights each exited
+0 with no failed checks and five argument-dependent skips: ARM ISA, CPU ISA,
+CUDA fat-gencode, PR size, and Triton multiarch. Raw validation logs are in
+the bundle. These completed results supersede the earlier pending checkpoints
+without replacing their red-test and mutation provenance.
+
 ## Owed
+
+The matched timing trace remains owed under
+[#3040](https://github.com/mudler/vllm.cpp/issues/3040). The completed
+kernel-only capture proves dispatch inventory only. Its timestamp warnings
+prevent timing attribution. The delayed live-fault response in
+[#3039](https://github.com/mudler/vllm.cpp/issues/3039) is repaired by the
+runtime in this change, pending landing. A GPU reset is not part of the repair.
 
 Issue [#3040](https://github.com/mudler/vllm.cpp/issues/3040) owns valid
 profiler timestamps and the resulting kernel-time attribution.

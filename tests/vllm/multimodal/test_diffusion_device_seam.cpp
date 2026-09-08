@@ -125,9 +125,11 @@ class FakeXpuBackend final : public vt::Backend {
 // refuse a configuration that works.
 class PartialXpuPlatform final : public vllm::platforms::Platform {
  public:
-  explicit PartialXpuPlatform(FakeXpuBackend& backend) : backend_(backend) {}
+  explicit PartialXpuPlatform(FakeXpuBackend& backend,
+                              vt::DeviceType type = vt::DeviceType::kXPU)
+      : backend_(backend), type_(type) {}
 
-  vt::DeviceType device_type() const override { return vt::DeviceType::kXPU; }
+  vt::DeviceType device_type() const override { return type_; }
   vt::Backend& backend() const override { return backend_; }
   vllm::platforms::DeviceCapability get_device_capability() const override { return {}; }
   std::vector<vt::DType> supported_dtypes() const override { return {vt::DType::kBF16}; }
@@ -142,6 +144,7 @@ class PartialXpuPlatform final : public vllm::platforms::Platform {
 
  private:
   FakeXpuBackend& backend_;
+  vt::DeviceType type_;
 };
 
 // THE BYPASS LANE IS A REAL CONFIGURATION OF THIS REPOSITORY, not a debugging
@@ -995,6 +998,14 @@ TEST_CASE("ltx2 vae: a ZERO-PAD decode is correct on a RECYCLED pool block, twic
 }
 
 TEST_CASE("ltx2 vae: a device queue whose PLATFORM IS UNREGISTERED is refused by name") {
+  // Reproduce HIP static registration on CPU without replacing a real platform.
+  // The fixture must still reach the missing-platform refusal when ROCm exists.
+  static PartialXpuPlatform registered_rocm(Backend(), vt::DeviceType::kROCM);
+  if (!vllm::platforms::HasPlatform(vt::DeviceType::kROCM)) {
+    vllm::platforms::RegisterPlatform(vt::DeviceType::kROCM, &registered_rocm);
+  }
+  REQUIRE(vllm::platforms::HasPlatform(vt::DeviceType::kROCM));
+
   // #1904's stated obstacle, made executable. Routing the decode's memory
   // through `DBuf` makes a registered PLATFORM a precondition it did not have
   // before, because `ResolveDevicePoolPolicy` reads the pool's soft cap off

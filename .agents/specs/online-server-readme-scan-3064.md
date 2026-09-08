@@ -44,4 +44,17 @@ This repair needs no external compute, assets, or model execution.
 
 ## Now
 
-ACTIVE: specification precedes the regression and repair.
+ACTIVE: repair passes focused and full tools suites. Full preflight and fresh
+review remain required before landing.
+
+## Outcome
+
+The existing debt assertion failed on unchanged `415d17859`. The new injected
+README regression failed before the exception was removed.
+After the repair, the server-binary suite passes 20 tests and the full tools
+suite passes 799 tests. Removing README from discovery in a scratch copy makes
+the new regression fail. Restoring the copied module restores its passing
+result and byte equality with the candidate.
+The scan retains every stale-artifact pattern and replay-fallback rule.
+Removing only the failing debt assertion was rejected because that would leave
+the README unscanned. No product default or oracle changes are needed.

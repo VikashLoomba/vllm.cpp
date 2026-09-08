@@ -2,7 +2,12 @@
 
 Issue #3085 retired the checker constants that these comments accompanied.
 The text below is preserved verbatim as historical evidence; it does not set
-or validate a current matrix size.
+or validate a current matrix size. The SHA-256 covers every UTF-8 byte after the
+begin marker through the newline immediately before the end marker. The marker
+lines and digest line are excluded.
+
+<!-- matrix-cardinality-history-sha256: 7c834576bc1119d52e3a88e8ded3c29bcce7b640ee4ef02bd7b9bdeef0b744b7 -->
+<!-- matrix-cardinality-history:begin -->
 
 ## Model, quantization, kernel, and backend history
 
@@ -822,3 +827,481 @@ or validate a current matrix size.
 # to `src include`. Real new rows, which is the only reason this number moves.
 
 ```
+
+## Retired live-test cardinality prose
+
+These test comments and docstrings were still live after the checker stopped
+enforcing cross-file cardinalities. They are preserved verbatim here because
+they explain the historical transitions, collisions, and mutation method. They
+do not define current test behavior.
+
+````text
+--- tests/scripts/test_agent_record.py:245-245 ---
+"""The #117 row and its ratchet bump are one semantic change."""
+--- tests/scripts/test_agent_record.py:255-271 ---
+"""The four dead-capability rows and the 173 -> 177 bump are one change.
+
+        Each row records a symbol or knob with a user-facing promise and no
+        production caller, found while gating the MoE placement install: the
+        `VT_QWEN35_STAGE_MIN_FREE_FRAC` knob whose only hit in compiled code is a
+        comment, jump-forward's `DrainForcedTokens`, the unreachable
+        `ResolveAttentionWindow`, and the one-directional env-doc gate that let
+        the first one outlive its reader.
+
+        This is the ratchet's own evidence contract, and it is load-bearing in
+        both directions. Against the BASE checker, pinned at 173 while the matrix
+        carries 177, `check_matrices` reports an engine-row count error and this
+        test FAILS. Against HEAD it passes. That is what separates a bump made
+        for four real rows from a bump made to silence a failure -- the
+        distinction `test_engine_row_ratchet_is_load_bearing` exists to protect
+        and that this case supplies the instance of.
+        """
+--- tests/scripts/test_agent_record.py:295-303 ---
+"""The #606 row and its 152 -> 153 ratchet bump are one semantic change.
+
+        Same shape as the #117 assertion above, and it exists for the same
+        reason: the bump and the row have to arrive together, or a number was
+        moved to silence a failure. This one also pins WHICH matrix owns the
+        row, because SERVE-* IDs are reachable from more than one, and a row
+        that drifted into another matrix would leave the engine count short
+        while the pin still read 153.
+        """
+--- tests/scripts/test_agent_record.py:313-323 ---
+"""The #633 row and its 153 -> 154 ratchet bump are one semantic change.
+
+        Same shape as the #117 and #606 assertions above, and it carries one
+        extra hazard worth pinning. This bump COLLIDED: `main` took the constant
+        152 -> 153 for `SERVE-RECIPE-ARGS` while the omni-pin branch took the
+        same 152 -> 153 for its own row, so both sides read 153 and the merge
+        looked clean. Resolving it by keeping either 153 would have dropped a
+        real row while leaving the matrix internally consistent, which is
+        exactly the state no other assertion here can see. Naming BOTH rows is
+        what makes 154 checkable rather than plausible.
+        """
+--- tests/scripts/test_agent_record.py:436-448 ---
+"""373 needs BOTH rows named, because the merge that produced it collided.
+
+        The same hazard the omni-pin assertion above records, on the MODEL pin
+        and on the same day. `main` took the constant 370 -> 372 for IndexTTS-2.5
+        (two architectures) while the Music3 branch took 370 -> 371 for its own
+        row. Neither side was wrong about its own change, and neither number was
+        373 -- so whichever side an auto-merge kept, the tree would have been
+        internally consistent while silently short a real architecture.
+
+        A count assertion alone cannot see that: it only knows the pin matches
+        the rows it can find. Naming the three rows is what makes 373 checkable
+        rather than plausible.
+        """
+--- tests/scripts/test_agent_record.py:1131-1135 ---
+"""The BACKEND ratchet bump is backed by a real row (#393).
+
+    The count is re-pinned by hand, so a bump with no row behind it looks
+    exactly like a bump for a new row. This ties this bump to this row.
+    """
+--- tests/scripts/test_agent_record.py:1147-1155 ---
+"""The MODEL ratchet bump 373 -> 375 is backed by two real rows (#490).
+
+    Same shape, and the same reason, as the BACKEND class above: the count is
+    re-pinned by hand, so a bump with nothing behind it is indistinguishable
+    from a bump for rows that really landed. `test_model_row_ratchet_is_
+    load_bearing` proves the pin BINDS by moving it, which holds for any value
+    of the pin; it cannot say whether THIS value is the right one. These two
+    tests do, by tying the pin to the rows the matrix actually carries.
+    """
+--- tests/scripts/test_agent_record.py:1173-1180 ---
+"""The BACKEND ratchet bump to 82 is backed by a real row (#670).
+
+    Same shape as TenstorrentResidualGoldenRowIsCounted and for the same
+    reason: the count is re-pinned by hand, so a bump with no row behind it is
+    indistinguishable from a bump for a new row. `b55f6ec14` set the precedent
+    that a ratchet bump lands with a case keyed to ITS OWN row; this is that
+    case for BACKEND-TENSTORRENT-MISTRAL.
+    """
+--- tests/scripts/test_agent_record.py:1208-1208 ---
+"""The BACKEND ratchet bump to 84 is backed by a real row (#1105)."""
+--- tests/scripts/test_agent_record.py:1221-1221 ---
+"""The BACKEND ratchet bump to 85 is backed by a real row (#1105)."""
+--- tests/scripts/test_agent_record.py:1234-1247 ---
+"""The BACKEND ratchet bump to 83 is backed by a real row (#979).
+
+    Same shape and same reason as the two cases above: the count is re-pinned
+    by hand, so a bump with no row behind it is indistinguishable from a bump
+    for a new row. Inherits the removal mutation unchanged so only the row and
+    its two required links differ.
+
+    This row exists because the llama.cpp comparator on a CURRENT CUDA card had
+    no owner at all. `BACKEND-GATE-CPU-LLAMACPP` is the CPU floor and
+    `BACKEND-GATE-CUDA-LLAMACPP-LEGACY` is scoped to the pre-Ampere arches vLLM
+    drops, so a GB10 GGUF comparison fell between them, which is how
+    `bench-27b-five-way.md` came to list a llama.cpp CUDA arm with nothing
+    tracking it.
+    """
+--- tests/scripts/test_agent_record.py:1283-1300 ---
+"""The ENGINE ratchet bump 156 -> 157 is backed by a real row (#81).
+
+    Same shape and the same reason as the BACKEND classes above, applied to the
+    pin that actually moved in this change. `ENGINE_ROWS` is re-pinned by hand,
+    so a bump with nothing behind it is indistinguishable from a bump for a row
+    that landed. `test_engine_row_ratchet_is_load_bearing` proves the pin BINDS
+    by moving it, which holds for any value of the pin and cannot say whether
+    157 is the right value. This class says that, by tying the pin to the row
+    the matrix carries.
+
+    The ENGINE pin is not in `MATRICES`, it is the module constant
+    `ENGINE_ROWS` counted over rows whose `path` equals `ENGINE_MATRIX`, so the
+    removal mutation redirects `ENGINE_MATRIX` and `MATRIX_PATHS` TOGETHER.
+    Rows are parsed from the list while the count is taken against the
+    constant, so patching one alone counts zero engine rows for a reason that
+    has nothing to do with the removal, and the case would go red for the wrong
+    reason.
+    """
+--- tests/scripts/test_agent_record.py:1804-1812 ---
+"""The ENGINE ratchet bump 164 -> 165 is backed by a real row (#1280).
+
+    Same shape and the same reason as `MtpDepthRowIsCounted`, applied to the pin
+    this change moves. `ENGINE_ROWS` is re-pinned by hand, so a bump with
+    nothing behind it looks exactly like a bump for a row that landed.
+    `test_engine_row_ratchet_is_load_bearing` proves the pin BINDS by moving it,
+    which holds for any value and cannot say whether 165 is the right one. This
+    class says that, by tying the pin to the row the matrix carries.
+    """
+--- tests/scripts/test_agent_record.py:1832-1850 ---
+"""The ENGINE ratchet bump 167 -> 168 is backed by a real row (#1365).
+
+    Same shape and the same reason as `HfModelDownloadRowIsCounted`, applied to
+    the pin this change moves. `ENGINE_ROWS` is re-pinned by hand, so a bump
+    with nothing behind it looks exactly like a bump for a row that landed.
+    `test_engine_row_ratchet_is_load_bearing` proves the pin BINDS by moving it,
+    which holds for any value and cannot say whether 168 is the right one. This
+    class says that, by tying the pin to the row the matrix carries.
+
+    This class asserts nothing about `.agents/issue-index.md`, where the sibling
+    classes assert their issue number, and this change appends no row there.
+    #1365's row already landed in `9e1a5e573` and a second row for one issue
+    number is what `check-agent-record.py` reports as `issue #1365 listed
+    twice`. The row's TEXT is stale, because #1365 was re-scoped in place from
+    the symptom onto the cause after the row landed, so `assertIn("issues/1365)",
+    index)` would pass here against a row describing the symptom and would
+    measure nothing about this row's work. The staleness is recorded in the
+    spec's `## Dependencies` instead, where prose can say it.
+    """
+--- tests/scripts/test_agent_record.py:1872-1885 ---
+"""The ENGINE ratchet bump 169 -> 170 is backed by a real row (#1541).
+
+    Same shape and the same reason as `BpeQuadraticMergeRowIsCounted`, applied
+    to the pin this change moves. `ENGINE_ROWS` is re-pinned by hand, so a bump
+    with nothing behind it looks exactly like a bump for a row that landed, and
+    `scripts/check-pr-size.py`'s `governance_checker` contract refuses a checker
+    constant whose only artifact is the constant.
+
+    This class asserts nothing about `.agents/issue-index.md`, and that is not
+    an omission. #1541's row already landed with the closing commit of
+    `SPEC-BPE-QUADRATIC-MERGE`, the index is append-only, and a second row for
+    one issue number is what `check-agent-record.py` reports as `issue #1541
+    listed twice`.
+    """
+--- tests/scripts/test_agent_record.py:1907-1926 ---
+"""The ENGINE ratchet bump 171 -> 172 is backed by a real row (#1925).
+
+    Same shape and the same reason as `RequestLengthGuardRowIsCounted`, applied
+    to the pin this change moves. `ENGINE_ROWS` is re-pinned by hand, so a bump
+    with nothing behind it looks exactly like a bump for a row that landed, and
+    `scripts/check-pr-size.py`'s `governance_checker` contract refuses a checker
+    constant whose only artifact is the constant.
+
+    `test_engine_row_ratchet_is_load_bearing` proves the pin BINDS by moving it,
+    which holds for any value and cannot say whether 172 is the right one. This
+    class says that, by tying the pin to the row the matrix now carries.
+
+    One case beyond the precedent shape. The bump did not only move the total:
+    it moved the `KV cache and memory` area from 25 rows to 26 and its `READY`
+    column from 3 to 4, and those cells are a second hand-maintained record of
+    the same landing. A row counted into the total but sitting under the wrong
+    heading, or carrying a state the area column does not expect, keeps the pin
+    at 172 and still misfiles the work, so the placement is asserted from the
+    document's own headings rather than left to the total alone.
+    """
+--- tests/scripts/test_agent_record.py:2135-2149 ---
+"""The KERNEL ratchet bump 57 -> 58 is backed by a real row (#1451).
+
+    Same shape and the same reason as `MtpDepthRowIsCounted` above, applied to
+    the pin that moved in this change. `MATRICES["KERNEL"]` is re-pinned BY
+    HAND, so a bump with nothing behind it is indistinguishable from a bump for
+    a row that landed -- and a recorded expected-count that can move without
+    evidence stops catching the thing it exists to catch, the unrecorded row.
+    That is the same shape as a floor set below the real count.
+
+    `test_kernel_row_ratchet_is_load_bearing` elsewhere proves the pin BINDS by
+    moving it, which holds for ANY value and cannot say whether 58 is the RIGHT
+    one. These cases say that, two ways: by tying the pin to the row the matrix
+    carries, and by deriving the expected value from the shipped file rather
+    than restating the constant.
+    """
+--- tests/scripts/test_agent_record.py:2173-2182 ---
+"""The BACKEND ratchet bump 86 -> 87 is backed by the Qwen3.5 GDN row
+    (#1715).
+
+    Same shape and reason as the BACKEND-TENSTORRENT-RESIDUAL-GOLDEN class
+    above: the count is re-pinned by hand, so a bump with no row behind it is
+    indistinguishable from a bump for a row that really landed. The first test
+    ties THIS value of the pin to a real matrix line; the second proves the pin
+    BINDS against the shipped matrix file through the checker's own entry point,
+    which is what makes the pair semantic evidence rather than a restatement.
+    """
+--- tests/scripts/test_agent_record.py:2491-2502 ---
+"""The BACKEND ratchet bump 88 -> 89 is backed by the GDN device-pure row
+    (#2907, owed from #2812).
+
+    Same shape as `Ltx2VaeKernelRowIsCounted`, applied to the pin that moved in
+    this change: `MATRICES["BACKEND"]` is re-pinned BY HAND, so a bump with
+    nothing behind it is indistinguishable from a bump for a row that landed.
+    The cases tie THIS value of the pin to the row the matrix carries, derive
+    the expected count from the shipped file rather than restating the
+    constant, and prove the comparison real by moving the pin one in EACH
+    direction -- an off-by-one that only reds downward would let the count
+    grow silently, which is how an unrecorded row hides.
+    """
+--- tests/scripts/test_agent_record.py:2538-2549 ---
+"""The BACKEND ratchet bump 89 -> 90 is backed by the keep-quant row
+    (#2959).
+
+    Same shape as `GdnDevicePureBackendRowBacksTheRatchet`, applied to the pin
+    that moved in this change: `MATRICES["BACKEND"]` is re-pinned BY HAND, so
+    a bump with nothing behind it is indistinguishable from a bump for a row
+    that landed. The cases tie THIS value of the pin to the row the matrix
+    carries, derive the expected count from the shipped file rather than
+    restating the constant, and prove the comparison real by moving the pin
+    one in EACH direction -- an off-by-one that only reds downward would let
+    the count grow silently, which is how an unrecorded row hides.
+    """
+````
+## Additional retired live-test rationale
+
+````text
+--- tests/scripts/test_agent_record.py:334-343 ---
+"""The #632 row and its 154 -> 155 bump are one semantic change.
+
+        Same shape as the #117, #606 and #633 assertions above. Worth naming
+        here for one reason beyond the count: this row exists BECAUSE the
+        `path:line` citations in these matrices were 83% unparsed by the very
+        checker this test guards. That is no longer true, and the row is now
+        the first thing its own ratchet polices -- `RecordAnchorRatchet` below
+        counts the anchors in this row's `Our code` cell like any other. Pinning
+        the row still says the thing a count cannot: that it exists.
+        """
+--- tests/scripts/test_agent_record.py:354-372 ---
+"""The #1110 row and its 157 -> 158 bump are one semantic change.
+
+        Same shape as the #117, #606, #633 and #632 assertions above, and owed for
+        the same reason: the bump is the whole of what
+        `scripts/check-agent-record.py` changed for this row, so without an
+        assertion naming the row the constant is the only artifact and 158 is
+        plausible rather than checkable. That is exactly the state the
+        `governance_checker` evidence contract in `scripts/check-pr-size.py`
+        refuses, and it refused this row's first commit by name.
+
+        The pin is also the only mechanical statement available about WHERE this
+        row belongs. It sits between two offload rows that could each plausibly
+        have absorbed it -- `ENG-WEIGHT-OFFLOAD` owns the mirrored device-to-host
+        tier and cannot grow a disk arm without breaking a 1:1 transcription of
+        `vllm/config/offload.py`, and `ENG-EXPERT-STREAM` owns the streaming
+        mechanism rather than its configuration -- so "a genuinely new row" is a
+        claim, and naming it here is what makes the claim fail if the row is ever
+        folded into a neighbour without the count following.
+        """
+--- tests/scripts/test_agent_record.py:383-398 ---
+"""The #1922 row and its 171 -> 172 bump are one semantic change.
+
+        Same shape as the #117, #606, #633, #632, #1110 and #1433 assertions
+        around it, and owed for the same reason: the bump is the whole of what
+        `scripts/check-agent-record.py` changed for this row, so without an
+        assertion naming the row the constant is the only artifact and 172 is
+        plausible rather than checkable.
+
+        The hazard this row carries is not the count, it is the NEIGHBOUR.
+        `POOL-DEVICE-KEY` is `DONE` and owns the same allocator's DEVICE key,
+        and a reader who folds the two together leaves the matrix internally
+        consistent while silently retiring the row that owns its REUSE policy --
+        which is what #1922 is about and what `POOL-DEVICE-KEY` never covered.
+        So the section is asserted too: this row lives in the engine matrix, and
+        exactly once.
+        """
+--- tests/scripts/test_agent_record.py:409-423 ---
+"""The #1433 row and its 170 -> 171 bump are one semantic change.
+
+        Same shape as the #117, #606, #633, #632 and #1110 assertions above, and
+        owed for the same reason: the bump is the whole of what
+        `scripts/check-agent-record.py` changed for this row, so without an
+        assertion naming the row the constant is the only artifact and 171 is
+        plausible rather than checkable.
+
+        This row carries one hazard the count cannot see. It is the SECOND
+        upstream-pin row in the same section, beside `ENG-UPSTREAM-OMNI-PIN`,
+        and the two are about different repositories -- `Lightricks/LTX-2` and
+        `vllm-project/vllm-omni` -- that both answer for LTX-2.5. Folding either
+        into the other leaves the matrix internally consistent and silently
+        retires a pin, so naming BOTH is what makes 171 checkable.
+        """
+--- tests/scripts/test_agent_record.py:464-474 ---
+"""The #634 rows and the 370 -> 372 bump are one semantic change.
+
+        IndexTTS-2.5 is registered by vLLM-Omni as TWO architectures, a talker
+        and an S2Mel decoder, so it moves the pin by two rather than one. That
+        is the hazard worth pinning: a port described in prose as "a model" is
+        the shape that lands one row and a bump of two, and the count alone
+        cannot tell that from two rows landing. Both are named here, and both
+        are asserted `INVENTORIED` rather than `SPIKE` — they are unclaimed and
+        blocked on #633, and `SPIKE` would owe a `CLAIM-*` owner they do not
+        have.
+        """
+--- tests/scripts/test_agent_record.py:491-514 ---
+"""The #699 rows and the 373 -> 375 bump are one semantic change.
+
+        dots3-note is the IndexTTS-2.5 shape again on a different lane: vLLM
+        registers it as TWO architectures, `Dots3NoteForCausalLM` and its
+        speculative head `Dots3NoteMTPModel`, so a port described in prose as
+        "a model" moves the pin by two. Naming both is what makes 375 checkable
+        rather than plausible.
+
+        What this catches that nothing else does, measured: RENAMING the MTP row
+        leaves the count at 375, touches no claim, and every other check stays
+        green -- only this assertion goes red. That is the whole point of naming
+        rows rather than counting them.
+
+        The state assertions are deliberately weaker evidence, and the record
+        says so rather than implying otherwise: mutating either row's lifecycle
+        is already caught upstream of here by the claim-ownership and
+        spec-structure rules (INVENTORIED -> SPIKE trips "SPIKE row has no
+        CLAIM-* owner"; SPIKE -> ACTIVE trips the structured-spec requirement).
+        They are pinned anyway because the asymmetry is intentional -- the
+        target row is `SPIKE` with a committed spec and an owner, the MTP row is
+        `INVENTORIED` because it is unclaimed and blocked behind the target's
+        oracle and hardware gaps -- and a future refactor of those rules should
+        not silently take the pin with it.
+        """
+--- tests/scripts/test_agent_record.py:529-570 ---
+"""The #1978 row and the 377 -> 378 bump are one semantic change.
+
+        Same contract as `test_dots3_rows_are_inside_the_model_ratchet` above,
+        with the arithmetic going the other way. dots3-note and IndexTTS-2.5
+        each moved this pin by TWO because vLLM registers two architectures for
+        what prose calls one model. `Qwen4ExpForConditionalGeneration` moves it
+        by ONE: its MTP head is an `mtp` block inside the same text config, not
+        a separately registered architecture, so there is no
+        `MODEL-SPEC-qwen4-exp-*` row and there must not be one. Naming the row
+        is what makes 378 checkable rather than plausible.
+
+        What this catches that nothing else does: renaming the row, or adding a
+        second qwen4_exp row to "match" the two-row precedent, both leave the
+        count reachable by a compensating edit elsewhere in the matrix while
+        every other check stays green. Only an assertion that names the row
+        goes red.
+
+        The STATE pin is the weaker half of the evidence, stated rather than
+        implied, and it has now been moved ONCE, deliberately and with an
+        argument -- which is the movement it was written to make visible rather
+        than to prevent. It was `READY` while the spec was committed and no
+        product code had landed. W1 (#1981) landed the config surface: the
+        architecture resolves, its config parses and validates, and the loader,
+        forward and KV-cache spec refuse by name. That is a lifecycle change,
+        and AGENTS.md Records requires the owning matrix row to move with it, so
+        the row is `ACTIVE` and carries `CLAIM-MODEL-MM-QWEN4-EXP-W1`.
+
+        The pin stays, at the new value, for the reason it was written: the
+        structured-spec rules already catch `ACTIVE` without a spec and the
+        claim-ownership rules already catch `ACTIVE` without a claim, but
+        neither would notice a silent slide BACK to `READY` on a row that has
+        shipped code, and neither names this row. Updating the value is not the
+        same as removing the assertion -- everything below still names the row,
+        still requires exactly one of it, and still requires it to live in
+        `model-matrix.md`, which is what makes 378 checkable rather than
+        plausible.
+
+        The row is also beyond-pin in the strongest sense this file has carried:
+        vLLM does not implement `qwen4_exp` at ANY revision, not merely after
+        `555967922`. Its Upstream cell therefore names no pinned module or
+        class, and the at-the-pin static invariants are untouched.
+        """
+--- tests/scripts/test_agent_record.py:594-631 ---
+"""The #1998 row and the 378 -> 379 bump are one semantic change.
+
+        Same contract as the qwen4-exp test above, and it guards the arithmetic
+        against a *stronger* pull toward two-or-three. dots3-note and
+        IndexTTS-2.5 each moved this pin by TWO because vLLM registers two
+        architectures for what prose calls one model, and the OPEN vllm#53906
+        would register THREE for GLM-5.3-Flash: `Glm5NextForCausalLM`,
+        `Glm5NextForConditionalGeneration` and `Glm5NextMTPModel`. It still
+        moves by ONE, because none of the three is registered at any vLLM
+        revision and the only architecture a published artifact declares is
+        `Glm5NextForConditionalGeneration`. The MTP head is `layers.45` inside
+        the same checkpoint -- the transformers reference discards it at
+        `modular_glm5_next.py:1235` -- not a separately registered architecture,
+        so there is no `MODEL-SPEC-glm5-next-*` row and there must not be one
+        until vLLM registers one.
+
+        What this catches that nothing else does: renaming the row, or adding a
+        second or third glm5_next row to "match" the upstream PR, both leave the
+        count reachable by a compensating edit elsewhere in the matrix while
+        every other check stays green. Only an assertion that names the row goes
+        red.
+
+        The state is pinned deliberately and is the weaker half of the evidence,
+        stated rather than implied, for the same reason the qwen4-exp test gives:
+        pinning it here means a future refactor of the structured-spec or
+        claim-ownership rules cannot silently take this pin with it.
+
+        It was `READY` when this test was written, on the stated premise that the
+        spec was committed and no product code had landed. W7a (#2011) landed
+        product code -- `scripts/convert-glm5-next-gguf.py`, the first thing on
+        this row that is not a record -- so the premise expired and the pin moves
+        with it to `ACTIVE`, in the same change that moves the matrix row. The
+        assertion is NOT weakened: it still names one exact state, and a pin that
+        followed the row automatically would assert nothing at all. What it stops
+        catching is only the one transition it was updated for; it still goes red
+        on a rename, on a second glm5_next row, and on any later state change
+        made without touching this file.
+        """
+--- tests/scripts/test_agent_record.py:648-679 ---
+"""The #2181 row and the QUANT 84 -> 85 bump are one semantic change.
+
+        Same contract as the MODEL ratchet tests above, on the quantization
+        matrix, and the arithmetic it holds is the one this scheme invites
+        someone to get wrong.
+
+        EXL3 ships in TWO on-disk layouts, and they are one scheme. The stock
+        `turboderp/*-exl3` checkpoints store `{prefix}.{trellis,suh,svh}` with
+        no rank segment, while the SparkInfer DeepSeek-V4 artifact stores
+        `...{w1,w2,w3}.rank{r}.{trellis,suh,svh}` under its own declared
+        `version: rank-sliced-deepseek-v4-v1`. Two readers, one format: the
+        codeword window, the MCG codebook, the H128 sign vectors and the absence
+        of scales are identical, and `vt::Exl3DequantLinear` decodes both. So the
+        count moves by ONE. Splitting it into a native row and a rank-sliced row
+        would be the dots3-note/IndexTTS-2.5 two-row shape applied where it does
+        not belong, because there is one encoding here and not two.
+
+        What this catches that nothing else does: renaming the row, or adding a
+        second EXL3 row for the other layout, each leaves the count reachable by
+        a compensating edit elsewhere in the matrix while every other check stays
+        green. Only an assertion that names the row goes red.
+
+        `ACTIVE` is pinned deliberately and is the weaker half of the evidence,
+        stated rather than implied: the row is `ACTIVE` because W1a landed
+        product code, even though that code is UNREACHED -- no production path
+        constructs `Exl3LinearMethod` yet -- and pinning the state here means a
+        later refactor of the claim-ownership or structured-spec rules cannot
+        silently take this pin with it. The state was `SPIKE` in the first draft
+        of this row while the spec's own `## Now` already said `ACTIVE`; a fresh
+        review caught the divergence, and this assertion is what stops it
+        recurring.
+        """
+--- tests/scripts/test_agent_record.py:733-740 ---
+"""The #609/#610 rows and the 362 -> 369 bump are one semantic change.
+
+        Mirrors `test_windows_release_row_is_inside_the_engine_ratchet`: name
+        the rows the bump was taken FOR, so a count raised to silence a broken
+        parse cannot look identical to a count raised because rows landed. Two
+        of the seven are pinned, one per issue; seven near-identical assertions
+        would add repetition, not force.
+        """
+````
+<!-- matrix-cardinality-history:end -->

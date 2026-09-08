@@ -33,6 +33,7 @@ import pathlib
 import re
 import sys
 import unittest
+from unittest import mock
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 EXAMPLES_CMAKE = REPO_ROOT / "examples" / "CMakeLists.txt"
@@ -422,6 +423,27 @@ class ServerBinaryNameContract(unittest.TestCase):
                     f"{path.name} no longer falls back to the pre-rename "
                     "examples/server, so a pre-W6 evidence tree cannot replay",
                 )
+
+    def test_repository_scan_detects_a_stale_readme_command(self) -> None:
+        """Exercise README discovery and reporting without editing user files."""
+        if declared_server_output_name() == "server":
+            self.skipTest("the target name IS the output name; nothing to reject")
+        readme = REPO_ROOT / "README.md"
+        read_text = pathlib.Path.read_text
+
+        def with_stale_readme(path, *args, **kwargs):
+            if path == readme:
+                return "# Quick start\nbuild/examples/server --help\n"
+            return read_text(path, *args, **kwargs)
+
+        with mock.patch.object(pathlib.Path, "read_text", with_stale_readme):
+            self.assertIn(
+                "README.md:2: build/examples/server --help",
+                stale_server_artifact_references(),
+                "the repository scan must inspect README commands",
+            )
+            with self.assertRaises(AssertionError):
+                self.test_no_live_consumer_resolves_the_stale_artifact_path()
 
     def test_the_policy_block_is_exactly_one_named_file(self) -> None:
         """Debt has to stay one file with one reason, or it is just a hole."""

@@ -21,6 +21,7 @@
 #include "vt/cpu/cpu_threadpool.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#include "vt/quant.h"
 // This OBJECT library is not the `vllm` target, so it does not inherit the
 // PUBLIC VLLM_CPP_TENSTORRENT define. Force the real declarations; the
 // header's inline no-ops are only for CPU/Vulkan/Windows TUs.
@@ -192,6 +193,26 @@ bool& tt_capture_active() {
 }
 }  // namespace
 
+// KEEPQUANT W3 capture-safety probe (tenstorrent_device.h): staging writes the
+// keep-quant decode performed while a capture was active. The staged arm must
+// hold this at zero across a captured run (the W3 red-first test reads it).
+// The counter lives at internal linkage; the accessors below the file's
+// anonymous namespace give the parity/test TUs the external surface.
+namespace {
+std::atomic<int64_t>& KeepQuantCaptureStagingWritesCounter() {
+  static std::atomic<int64_t>* c = new std::atomic<int64_t>(0);  // never destroyed (#1486)
+  return *c;
+}
+
+// W4a wave-3a: the E=1 slice-decode chunk-rows override (0 = production
+// policy). Internal linkage; the ForTest setter below the anonymous
+// namespace is the external surface (the staging-counter pattern).
+std::atomic<int64_t>& KeepQuantChunkRowsOverride() {
+  static std::atomic<int64_t> v{0};
+  return v;
+}
+}  // namespace
+
 // ITEM 5 (rope): persistent device cos/sin (expanded per head), built OUTSIDE
 // capture and ttnn::copy'd in-region — the UploadRows in RopeApplyDeviceNeox
 // was the enqueue_write that killed capture at mid-layer-0. The cache is
@@ -270,9 +291,9 @@ std::string ZeroCacheKey(const ttnn::Shape& shape, ttnn::DataType dt,
 }
 }  // namespace
 
-ttnn::Tensor ZeroCacheGet(const ttnn::Tensor& like, MeshDevice& device) {
-  const std::string key = ZeroCacheKey(like.logical_shape(), like.dtype(),
-                                       like.layout());
+ttnn::Tensor ZeroCacheGet(const ttnn::Shape& shape, ttnn::DataType dt,
+                          ttnn::Layout lt, MeshDevice& device) {
+  const std::string key = ZeroCacheKey(shape, dt, lt);
   std::lock_guard<std::mutex> g(ZeroCacheMutex());
   auto& c = ZeroCache();
   auto it = c.find(key);
@@ -280,11 +301,14 @@ ttnn::Tensor ZeroCacheGet(const ttnn::Tensor& like, MeshDevice& device) {
     VT_CHECK(!tt_capture_active(),
              "tenstorrent: zero-cache miss during capture — warm the "
              "host-free path eagerly (VT_TT_HOST_FREE_DECODE warmup) first");
-    it = c.emplace(key, ttnn::zeros(like.logical_shape(), like.dtype(),
-                                     like.layout(), std::ref(device)))
-             .first;
+    it = c.emplace(key, ttnn::zeros(shape, dt, lt, std::ref(device))).first;
   }
   return it->second;
+}
+
+ttnn::Tensor ZeroCacheGet(const ttnn::Tensor& like, MeshDevice& device) {
+  return ZeroCacheGet(like.logical_shape(), like.dtype(), like.layout(),
+                      device);
 }
 
 void ZeroCachePrime(const ttnn::Shape& shape, ttnn::DataType dt,
@@ -1713,17 +1737,14 @@ void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids
   if (!in_place) CommitDevice2D(out, std::move(dev_out));
 }
 
-// kKeepQuantDecode: Q4_K block decode as a device compute chain — the packed
-// stream is decoded on the device, not staged through a host decode. Contract
-// is DequantQ4_K (cpu_quant_dequant.cpp:167, GetScaleMinK4 just above it;
-// llama.cpp dequantize_row_q4_K): per block_q4_K {f16 d; f16 dmin; u8
-// scales[12]; u8 qs[128]}, y[g*32+l] = d1*(nib) - m1 with d1 = d*sc, m1 =
-// dmin*mm, sc/mm from GetScaleMinK4(is, scales), groups 0..7 over the 8
-// 32-nibble lanes (low nibbles first, then high nibbles, of the same 32
-// bytes). The eager arm mirrors kEmbedding's staging: Alloc hands back a
-// host-mapped pointer, so the packed bytes are read from t.data, assembled to
-// little-endian u32 words (the GGUF stream order ReadF16 already assumes),
-// and uploaded as one INT32 tensor. Every unpack step is device work:
+// kKeepQuantDecode: packed-block decode as a device compute chain — the packed
+// stream is decoded on the device, not staged through a host decode. Contracts
+// are DequantQ4_K/DequantQ5_K/DequantQ6_K/DequantQ8_0 (cpu_quant_dequant.cpp;
+// llama.cpp dequantize_row_q4_K:1471, q5_K:1673, q6_K:1881, q8_0:495). Q4_K:
+// per block_q4_K {f16 d; f16 dmin; u8 scales[12]; u8 qs[128]}, y[g*32+l] =
+// d1*(nib) - m1 with d1 = d*sc, m1 = dmin*mm, sc/mm from GetScaleMinK4(is,
+// scales), groups 0..7 over the 8 32-nibble lanes (low nibbles first, then
+// high nibbles, of the same 32 bytes). Every unpack step is device work:
 // bitwise masks/shifts for the nibbles, scale bytes, and f16 halves;
 // reshape/permute only reorder lanes; d/dmin widen f16->f32 exactly via the
 // integer bit-construction chain of vt::F16ToF32 (loader
@@ -1735,62 +1756,217 @@ void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids
 // every finite pattern is bit-exact. nibbles and scale factors typecast to
 // f32 exactly (values <= 255); d1/m1 and the final y = d1*nib - m1 are
 // separate f32 ttnn ops (no FMA), the same IEEE order as the host under
-// -ffp-contract=off. Trace capture (BACKEND-TENSTORRENT-KEEPQUANT W3) owns a
-// device-authoritative staging arm; this eager arm reads the host-mapped
-// staging the same way kEmbedding does.
-// A device tensor filled with -0.0f. from_vector is a host memcpy, so the
-// negative-zero bit pattern survives staging intact — no SFPU op between the
-// host value and the device buffer (multiply and the i32<->f32 bitcast both
-// canonicalize -0 to +0). where() consumes it as the true branch of the
-// signed-zero repair.
-void KeepQuantDecodeKernel(Queue&, Tensor& out, const Tensor& packed) {
-  TT_OP_TRACE("KeepQuantDecode");
-  VT_CHECK(packed.rank == 2 && out.rank == 2,
-           "tenstorrent kKeepQuantDecode: packed rank-2 [rows, nb], out "
-           "rank-2 [rows, nb*256]");
-  VT_CHECK(packed.dtype == DType::kQ4_K,
-           "tenstorrent kKeepQuantDecode: packed dtype must be kQ4_K");
-  VT_CHECK(out.dtype == DType::kF32,
-           "tenstorrent kKeepQuantDecode: out must be f32");
-  VT_CHECK(packed.IsContiguous() && out.IsContiguous(),
-           "tenstorrent kKeepQuantDecode: contiguous required");
-  const int64_t rows = packed.shape[0];
-  const int64_t nb = packed.shape[1];
-  VT_CHECK(out.shape[0] == rows && out.shape[1] == nb * 256,
-           "tenstorrent kKeepQuantDecode: out shape mismatch");
-  const int64_t b64 = rows * nb;
-  const uint32_t B = static_cast<uint32_t>(b64);
+// -ffp-contract=off.
+//
+// THE SHARED DECODE (KEEPQUANT W2, generalized W3): the packed-block -> f32
+// chains, each returning the repaired f32 {rows, nb*elems} in ROW_MAJOR.
+// KeepQuantDecode commits it to the host-visible output; the quant matmul
+// (MatmulBTQuantKernel below) consumes it as the weight operand. One decode
+// per encoding, two consumers, one numerics authority:
+//   Q4_K 144B/256 and Q5_K 176B/256: {f16 d; f16 dmin; u8 scales[12]; ...}
+//   — Q5_K inserts qh[32] between scales and qs (the 5th bit, +16) and its
+//   tail is Q4_K's verbatim; Q6_K 210B/256: {u8 ql[128]; u8 qh[64]; i8
+//   scales[16]; f16 d} — SIGNED 8-bit scales, 16 sub-blocks of 16, no min
+//   term, q = nib6 - 32; Q8_0 34B/32: {f16 d; i8 qs[32]} — plain int8 times
+//   the f16 scale. 210 and 34 are not multiples of four, so those blocks pad
+//   to 53 / 9 words (2 pad bytes at the stream tail, zero-filled).
+//
+// STAGING (W3): the packed stream is staged as a resident i32 word shadow ONCE
+// per weight (EnsureKeepQuantWords below, the EnsureMatmulWeightDevice
+// persistent-shadow pattern), so the per-call decode runs entirely on-core
+// from the resident words — no host repack, no from_vector upload. The -0.0f
+// signed-zero repair constant is built by BIT ops from the zero-cache's +0
+// (multiply canonicalizes -0 to +0 on the SFPU, so the sign bit is set below
+// the float domain), because a per-call from_vector of the constant would be
+// exactly the captured-graph write this wave removes.
 
+
+// ---- KEEPQUANT W3: the resident i32 word shadow -----------------------------
+// Words per staged packed block: 144B -> 36 and 176B -> 44 (multiples of
+// four); 210B -> 53 and 34B -> 9 for Q6_K/Q8_0, whose 2-byte tails the
+// staging zero-fills (the GGUF stream never carries them, and every byte
+// position the decoders read is inside the true block bytes, so the pad
+// never reaches an output).
+int KeepQuantWordsPerBlock(DType enc) {
+  switch (enc) {
+    case DType::kQ4_K: return 36;
+    case DType::kQ5_K: return 44;
+    case DType::kQ6_K: return 53;
+    case DType::kQ8_0: return 9;
+    default: return 0;
+  }
+}
+
+struct KeepQuantWordShadow {
+  ttnn::Tensor words;  // {B, wpb} INT32 ROW_MAJOR — the packed stream, word-staged
+  int64_t rows = 0;
+  int64_t nb = 0;
+  int wpb = 0;
+};
+
+std::mutex& KeepQuantWordMutex() {
+  static std::mutex m;
+  return m;
+}
+// Keyed by the packed tensor's host base pointer — the EnsureMatmulWeightDevice
+// persistent-shadow pattern. An interior view carries its own pointer, so a
+// differently-offset view stages its own shadow and never consumes another
+// slice's bytes (the Qwen3.5 BA interior-view fatality).
+std::map<const void*, KeepQuantWordShadow>& KeepQuantWordShadows() {
+  static std::map<const void*, KeepQuantWordShadow>* m =
+      new std::map<const void*, KeepQuantWordShadow>();  // never destroyed (#1486)
+  return *m;
+}
+
+// Stage the packed keep-quant stream as a resident i32 word tensor ONCE per
+// weight — the eager pre-capture step or the first eager call pays it — and
+// serve it forever after: the per-call decode runs entirely on-core from the
+// resident words (no host repack, no from_vector upload). The packed master is
+// immutable post-load, so a serve can never go stale (same assumption as the
+// BufferSlot/WeightViewShadow resident shadows).
+ttnn::Tensor EnsureKeepQuantWords(const Tensor& packed, DType enc, int64_t rows,
+                                  int64_t nb, MeshDevice& device) {
+  VT_CHECK(packed.rank == 2 && packed.IsContiguous(),
+           "tenstorrent EnsureKeepQuantWords: contiguous rank-2 packed");
+  const int wpb = KeepQuantWordsPerBlock(enc);
+  VT_CHECK(wpb > 0, "tenstorrent EnsureKeepQuantWords: unsupported encoding");
+  {
+    std::lock_guard<std::mutex> g(KeepQuantWordMutex());
+    auto it = KeepQuantWordShadows().find(packed.data);
+    if (it != KeepQuantWordShadows().end() && it->second.rows == rows &&
+        it->second.nb == nb && it->second.wpb == wpb) {
+      return it->second.words;
+    }
+  }
+  // MISS = the one staging write this weight ever pays. A capture-time arrival
+  // refuses by name (the ServeActF32 / zero-cache precedent): a captured graph
+  // pins capture-time bytes its replay cannot refresh (the #2812 class), and
+  // the engine's pre-capture eager step ("run one EAGER step", qwen3_5.cpp)
+  // warms the shadow, so every later call — captured or not — hits it.
+  if (tt_capture_active()) {
+    KeepQuantCaptureStagingWritesCounter()++;
+    if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr)
+      std::fprintf(stderr,
+                   "[TT-KQ] EnsureKeepQuantWords word staging during capture\n");
+  }
+  VT_CHECK(!tt_capture_active(),
+           "tenstorrent: keep-quant word-shadow miss during trace capture (" +
+               std::string(Name(enc)) +
+               ") — warm the keep-quant arm eagerly first");
   EnsureHost(packed);
   const uint8_t* bytes = packed.Ptr<uint8_t>();
-  // 36 u32 words per 144-byte block, little-endian (GGUF stream order; the
-  // f16 halves land in word 0: d in bits 0..15, dmin in bits 16..31).
+  const int64_t b64 = rows * nb;
+  const int64_t block_bytes = BlockBytes(enc);
   std::vector<int32_t> words;
-  words.reserve(static_cast<size_t>(b64) * 36);
+  words.reserve(static_cast<size_t>(b64) * static_cast<size_t>(wpb));
+  std::vector<uint8_t> padded(static_cast<size_t>(wpb) * 4u, 0u);
   for (int64_t b = 0; b < b64; ++b) {
-    const uint8_t* blk = bytes + b * 144;
-    for (int wj = 0; wj < 36; ++wj) {
-      const uint8_t* p = blk + wj * 4;
+    std::memcpy(padded.data(), bytes + b * block_bytes,
+                static_cast<size_t>(block_bytes));
+    for (int wj = 0; wj < wpb; ++wj) {
+      const uint8_t* p = padded.data() + wj * 4;
       words.push_back(static_cast<int32_t>(
           static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
           (static_cast<uint32_t>(p[2]) << 16) |
           (static_cast<uint32_t>(p[3]) << 24)));
     }
   }
-  MeshDevice& device = SharedMeshDevice();
-  ttnn::Tensor w = ttnn::Tensor::from_vector<int32_t>(
+  ttnn::Tensor staged = ttnn::Tensor::from_vector<int32_t>(
       std::move(words),
-      SpecOf(tt::tt_metal::Shape({B, 36u}), ttnn::DataType::INT32,
-             ttnn::Layout::ROW_MAJOR),
+      SpecOf(tt::tt_metal::Shape({static_cast<uint32_t>(b64),
+                                  static_cast<uint32_t>(wpb)}),
+             ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR),
       &device);
+  std::lock_guard<std::mutex> g(KeepQuantWordMutex());
+  KeepQuantWordShadows()[packed.data] =
+      KeepQuantWordShadow{staged, rows, nb, wpb};
+  return staged;
+}
+
+// Stream bytes [first, last) of the word-staged block as u8 {B, last-first}
+// (little-endian lanes). concat stacks the four lane tensors, so the
+// (lane, word)->(word, lane) permute restores stream order — the same trick
+// the Q4_K scale extraction uses, generalized to any byte range.
+ttnn::Tensor KeepQuantByteRange(const ttnn::Tensor& w, uint32_t B, int first,
+                                int last) {
+  const int w0 = first / 4;
+  const int nwords = (last + 3) / 4 - w0;
+  ttnn::Tensor sw = ttnn::slice(
+      w, ttsl::SmallVector<uint32_t>{0u, static_cast<uint32_t>(w0)},
+      ttsl::SmallVector<uint32_t>{B,
+                                  static_cast<uint32_t>(w0 + nwords)},
+      ttsl::SmallVector<uint32_t>{1u, 1u});
+  auto byte_lane = [](const ttnn::Tensor& t, int shift) {
+    return ttnn::bitwise_and(ttnn::bitwise_right_shift(t, shift), 0xFF);
+  };
+  ttnn::Tensor stream = ttnn::reshape(
+      ttnn::permute(
+          ttnn::reshape(
+              ttnn::concat(std::vector<ttnn::Tensor>{
+                  byte_lane(sw, 0), byte_lane(sw, 8), byte_lane(sw, 16),
+                  byte_lane(sw, 24)},
+                  /*dim=*/1),
+              ttnn::Shape({B, 4u, static_cast<uint32_t>(nwords)})),
+          ttsl::SmallVector<int64_t>{0, 2, 1}),
+      ttnn::Shape({B, static_cast<uint32_t>(4 * nwords)}));
+  const int off = first - 4 * w0;
+  return ttnn::slice(
+      stream, ttsl::SmallVector<uint32_t>{0u, static_cast<uint32_t>(off)},
+      ttsl::SmallVector<uint32_t>{B,
+                                  static_cast<uint32_t>(off + last - first)},
+      ttsl::SmallVector<uint32_t>{1u, 1u});
+}
+
+// The -0.0f signed-zero repair constant, one cached device tensor per shape.
+// It cannot be BUILT on device: the i32->f32 bitcast maps -0 to +0 (the W1
+// comment was literal — bit-31-setting scalars also die in the scalar
+// binding, and multiply/subtract canonicalize what survives), so every
+// device-side construction arrived +0 and a forced-true ternary wrote +0.
+// Host bytes survive the whole chain: -0.0f uploaded once per shape — a
+// one-time staging fill, warmed by the same eager pre-pass as the word
+// shadows and refused on a capture-time miss — then selected by where(),
+// pure data movement on both ends.
+ttnn::Tensor Neg0CacheGet(const ttnn::Shape& shape, MeshDevice& device) {
+  const std::string key = "neg0/" + ZeroCacheKey(shape,
+                                                 ttnn::DataType::FLOAT32,
+                                                 ttnn::Layout::TILE);
+  std::lock_guard<std::mutex> g(ZeroCacheMutex());
+  auto& c = ZeroCache();
+  auto it = c.find(key);
+  if (it == c.end()) {
+    VT_CHECK(!tt_capture_active(),
+             "tenstorrent: -0 cache miss during capture — warm the keep-quant "
+             "decode eagerly first");
+    uint64_t n = 1;
+    for (const auto d : shape.view()) n *= d;
+    std::vector<float> z(static_cast<size_t>(n), -0.0f);
+    it = c.emplace(key,
+                   ttnn::to_layout(
+                       ttnn::Tensor::from_vector<float>(
+                           std::move(z),
+                           SpecOf(shape, ttnn::DataType::FLOAT32,
+                                  ttnn::Layout::ROW_MAJOR),
+                           &device),
+                       ttnn::Layout::TILE))
+             .first;
+  }
+  return it->second;
+}
+
+// Decode `slice_rows` packed rows (nb blocks each) ALREADY staged as the
+// resident i32 word tensor w ([slice_rows*nb, wpb]) into the repaired f32
+// {slice_rows, nb*elems} in ROW_MAJOR — the W3 chains, one encoding each, run
+// on a word RANGE instead of a whole packed tensor. DecodeKeepQuantBlocksF32
+// below is the whole-tensor form; the grouped keep-quant matmul
+// (MatmulBTQuantGroupedKernel) slices the tower's words to the P selected
+// [N,K] row-ranges per call and runs THIS. Same chain, same numerics, so the
+// W1/W3 bit-exact pins carry over unchanged.
+ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
+                                     int64_t slice_rows, int64_t nb,
+                                     MeshDevice& device) {
+  const uint32_t B = static_cast<uint32_t>(slice_rows * nb);
 
   // f16 bit pattern (held in INT32) -> f32 value, the integer chain of
-  // vt::F16ToF32 (minimax_h3_vae_loader.cpp:47): normal/inf/NaN bits are
-  // sign | (exp+112)<<23 | mant<<13; subnormal mant*2^-24 is exact in f32
-  // (integer typecast times a power of two); zero keeps its sign bit. where()
-  // demands TILE, so the selection runs there; finite patterns come out
-  // bit-exact, and a NaN payload canonicalizes to inf across the SFPU
-  // bitcast (hardware pin — see the kernel comment above).
   auto f16_bits_to_f32 = [](ttnn::Tensor t) {
     t = ttnn::to_layout(t, ttnn::Layout::TILE);
     const ttnn::Tensor sign_b = ttnn::bitwise_left_shift(
@@ -1814,164 +1990,783 @@ void KeepQuantDecodeKernel(Queue&, Tensor& out, const Tensor& packed) {
     return ttnn::to_layout(ttnn::bitcast(out_bits, ttnn::DataType::FLOAT32),
                            ttnn::Layout::ROW_MAJOR);
   };
-  ttnn::Tensor w0 = ttnn::slice(
-      w, ttsl::SmallVector<uint32_t>{0u, 0u},
-      ttsl::SmallVector<uint32_t>{B, 1u}, ttsl::SmallVector<uint32_t>{1u, 1u});
-  ttnn::Tensor d_bits = ttnn::bitwise_and(w0, 0xFFFF);
-  ttnn::Tensor dmin_bits =
-      ttnn::bitwise_and(ttnn::bitwise_right_shift(w0, 16), 0xFFFF);
-  ttnn::Tensor d = f16_bits_to_f32(d_bits);
-  ttnn::Tensor dmin = f16_bits_to_f32(dmin_bits);
-
-  // Scale bytes: words 1..3 hold scales[0..11]. Four byte-lane shifts, then a
-  // (t,word)->(word,t) lane order fix: concat stacks the shift tensors, so
-  // col = 3*lane + word; reshape to (lane,word), permute to (word,lane), and
-  // the flat order is scales[k], k = 4*word + lane.
-  ttnn::Tensor sw = ttnn::slice(
-      w, ttsl::SmallVector<uint32_t>{0u, 1u},
-      ttsl::SmallVector<uint32_t>{B, 4u}, ttsl::SmallVector<uint32_t>{1u, 1u});
-  auto byte_lane = [](const ttnn::Tensor& t, int shift) {
-    return ttnn::bitwise_and(ttnn::bitwise_right_shift(t, shift), 0xFF);
+  // u8 byte -> SIGNED i8 value as exact f32: v - 256*bit7 (the int8 sign
+  // extension; every operand and step is exact in the integer domain).
+  // Q6_K's scales and Q8_0's qs are the signed-byte consumers.
+  auto signed_byte_f32 = [](const ttnn::Tensor& v) {
+    const ttnn::Tensor u = ttnn::bitwise_and(v, 0xFF);
+    const ttnn::Tensor bit7 = ttnn::bitwise_right_shift(u, 7);
+    return ttnn::subtract(
+        ttnn::typecast(u, ttnn::DataType::FLOAT32),
+        ttnn::multiply(ttnn::typecast(bit7, ttnn::DataType::FLOAT32),
+                       256.0f));
   };
-  ttnn::Tensor sb = ttnn::reshape(
-      ttnn::permute(
-          ttnn::reshape(
-              ttnn::concat(std::vector<ttnn::Tensor>{
-                  byte_lane(sw, 0), byte_lane(sw, 8), byte_lane(sw, 16),
-                  byte_lane(sw, 24)},
-                  /*dim=*/1),
-              ttnn::Shape({B, 4u, 3u})),
-          ttsl::SmallVector<int64_t>{0, 2, 1}),
-      ttnn::Shape({B, 12u}));
-  ttnn::Tensor sa = ttnn::slice(
-      sb, ttsl::SmallVector<uint32_t>{0u, 0u},
-      ttsl::SmallVector<uint32_t>{B, 4u}, ttsl::SmallVector<uint32_t>{1u, 1u});
-  ttnn::Tensor sm = ttnn::slice(
-      sb, ttsl::SmallVector<uint32_t>{0u, 4u},
-      ttsl::SmallVector<uint32_t>{B, 8u}, ttsl::SmallVector<uint32_t>{1u, 1u});
-  ttnn::Tensor sc = ttnn::slice(
-      sb, ttsl::SmallVector<uint32_t>{0u, 8u},
-      ttsl::SmallVector<uint32_t>{B, 12u}, ttsl::SmallVector<uint32_t>{1u, 1u});
-  // GetScaleMinK4(is, scales) for is = 0..7, group-major: is<4 low pair from
-  // scales[is]/scales[is+4]; is>=4 high pair from scales[is+4] low bits and
-  // scales[is-4]/scales[is] top bits.
-  auto top6l4 = [](const ttnn::Tensor& t) {
-    return ttnn::bitwise_left_shift(ttnn::bitwise_right_shift(t, 6), 4);
+  // Signed-zero repair, third mechanism, after two device-falsified drafts.
+  // Draft one selected a -0 constant through where() over an arithmetic-f32
+  // mask: the ternary never took its true branch (every sweep mismatch was
+  // dev +0 where the oracle keeps -0, none the reverse). Draft two OR-ed the
+  // sign bit into the product's own bits — bitwise work over a BITCAST of an
+  // F32 TILE tensor, which mangled every bit pattern through a
+  // reduced-precision path and landed the whole sweep on the f16 grid. This
+  // one keeps to primitives the working f16 decode above proves:
+  //   - the zero test is a FLOAT compare (IEEE eq() is true for both zeros)
+  //     — never a bitcast of the product;
+  //   - the -0 constant is born-int: cached INT32 zeros OR the sign bit
+  //     (scalar), then the chain's own bitcast(int -> float);
+  //   - the where() predicate is a COMPARISON output (gt(mask, 0)) — the
+  //     one predicate form the f16 decode exercises (its two where() calls);
+  //   - the {0,1} masks are broadcast f32 arithmetic over sign bits
+  //     typecast OUT of born-int patterns (the proven direction).
+  auto neg0_full = [&device](const ttnn::Shape& shape) {
+    return Neg0CacheGet(shape, device);
   };
-  ttnn::Tensor sc_f = ttnn::typecast(
-      ttnn::concat(std::vector<ttnn::Tensor>{
-          ttnn::bitwise_and(sa, 63),
-          ttnn::bitwise_or(ttnn::bitwise_and(sc, 0xF), top6l4(sa))},
-          /*dim=*/1),
-      ttnn::DataType::FLOAT32);  // {B, 8}, values <= 63: exact
-  ttnn::Tensor mm_f = ttnn::typecast(
-      ttnn::concat(std::vector<ttnn::Tensor>{
-          ttnn::bitwise_and(sm, 63),
-          ttnn::bitwise_or(ttnn::bitwise_right_shift(sc, 4), top6l4(sm))},
-          /*dim=*/1),
-      ttnn::DataType::FLOAT32);  // {B, 8}, values <= 63: exact
-
-  // Nibbles: words 4..35 are qs[128]; 8 nibble-lane shifts -> {B,256} with
-  // idx = 8*lane + word. Flat idx = 16l + 8h + 8q + r over (byte lane l,
-  // nibble half h, quarter q, word-in-quarter r); permute (l,h,q,r) ->
-  // (q,h,r,l) so the flat order is the output order q*64 + h*32 + 4r + l —
-  // scale group 2q+h covers the same 32-value run.
-  ttnn::Tensor qw = ttnn::slice(
-      w, ttsl::SmallVector<uint32_t>{0u, 4u},
-      ttsl::SmallVector<uint32_t>{B, 36u}, ttsl::SmallVector<uint32_t>{1u, 1u});
-  auto nib = [](const ttnn::Tensor& t, int shift) {
-    return ttnn::bitwise_and(ttnn::bitwise_right_shift(t, shift), 0xF);
+  // {0,1} f32 masks, built in ROW_MAJOR elementwise ops end to end: the
+  // sign bit travels as an integer (shift/and over the BIT pattern — never
+  // a device float, whose zero sign is already canonicalized), and the
+  // zero test is a float compare. Callers combine masks with broadcast f32
+  // arithmetic and reshape ROW_MAJOR only.
+  auto sign_bit_f32 = [](const ttnn::Tensor& bits, int shift) {
+    return ttnn::typecast(
+        ttnn::bitwise_and(ttnn::bitwise_right_shift(bits, shift), 1),
+        ttnn::DataType::FLOAT32);
   };
-  ttnn::Tensor nibf = ttnn::typecast(
-      ttnn::reshape(
-          ttnn::permute(
-              ttnn::reshape(
-                  ttnn::concat(std::vector<ttnn::Tensor>{
-                      nib(qw, 0), nib(qw, 4), nib(qw, 8), nib(qw, 12),
-                      nib(qw, 16), nib(qw, 20), nib(qw, 24), nib(qw, 28)},
-                      /*dim=*/1),
-                  ttnn::Shape({B, 4u, 2u, 4u, 8u})),
-              ttsl::SmallVector<int64_t>{0, 3, 2, 4, 1}),
-          ttnn::Shape({B, 8u, 32u})),
-      ttnn::DataType::FLOAT32);  // {B, 8, 32}, values <= 15: exact
-
-  // y = (d*sc)*nib - (dmin*mm): the host's exact f32 order, as separate ops.
-  // Signed-zero repair first: the device multiply canonicalizes (-x)*0 to +0
-  // and the i32->f32 bitcast maps -0 to +0, while the host chain is
-  // IEEE-exact for zeros — y keeps d's sign through a zero product and
-  // dmin's through a zero m1 (mm is unsigned, so the IEEE sign of both
-  // intermediates is the f16 sign bit). The sign is read from the f16 BIT
-  // patterns — never from a device float, whose zero sign is already
-  // canonicalized — and where() demands TILE, so the repairs run there. The
-  // combine subtracts back in ROW_MAJOR: a TILE {B,8,1} operand physically
-  // pads to 32 columns and a TILE broadcast reads those padding columns as
-  // data, which corrupted every non-zero logical column (238/256 at B=1).
-  auto neg01 = [](const ttnn::Tensor& bits) {
+  auto zero_mask_f32 = [](const ttnn::Tensor& v) {
+    return ttnn::typecast(
+        ttnn::to_layout(ttnn::eq(v, 0.0f), ttnn::Layout::ROW_MAJOR),
+        ttnn::DataType::FLOAT32);
+  };
+  // The repair itself: where(gt(mask, 0), -0, value), every input TILE (a
+  // TILE predicate mixed with ROW_MAJOR branches wrote only its first 16
+  // output elements once already). Callers pass the value BY VALUE (a
+  // shared-handle copy): moving it in beside an argument expression that
+  // still reads it is unspecified-order evaluation, and the moved-from read
+  // segfaults inside to_layout.
+  auto repair = [](ttnn::Tensor value, const ttnn::Tensor& mask_f32,
+                   const ttnn::Tensor& neg0) {
     return ttnn::to_layout(
-        ttnn::bitwise_and(ttnn::bitwise_right_shift(bits, 15), 1),
+        ttnn::where(ttnn::to_layout(ttnn::gt(mask_f32, 0.0f),
+                                    ttnn::Layout::TILE),
+                    neg0, ttnn::to_layout(value, ttnn::Layout::TILE)),
+        ttnn::Layout::ROW_MAJOR);
+  };
+
+  switch (enc) {
+    case DType::kQ4_K:
+    case DType::kQ5_K: {
+      // Word 0: d | dmin. Words 1..3: scales[12]. Q5_K moves qs to words
+      // 12..43 (ql[128] @ byte 48) and inserts qh[32] @ byte 16 (words
+      // 4..11); the scale unpack and the 8x32 nibble planes are Q4_K's
+      // verbatim, and Q5_K adds the 5th bit (+16) before the same epilogue.
+      const bool q5 = enc == DType::kQ5_K;
+      ttnn::Tensor w0 = ttnn::slice(
+          w, ttsl::SmallVector<uint32_t>{0u, 0u},
+          ttsl::SmallVector<uint32_t>{B, 1u},
+          ttsl::SmallVector<uint32_t>{1u, 1u});
+      ttnn::Tensor d_bits = ttnn::bitwise_and(w0, 0xFFFF);
+      ttnn::Tensor dmin_bits =
+          ttnn::bitwise_and(ttnn::bitwise_right_shift(w0, 16), 0xFFFF);
+      ttnn::Tensor d = f16_bits_to_f32(d_bits);
+      ttnn::Tensor dmin = f16_bits_to_f32(dmin_bits);
+
+      ttnn::Tensor sb = KeepQuantByteRange(w, B, 4, 16);  // scales[12]
+      // GetScaleMinK4(is, scales) for is = 0..7, group-major: is<4 low pair from
+      // scales[is]/scales[is+4]; is>=4 high pair from scales[is+4] low bits and
+      // scales[is-4]/scales[is] top bits.
+      auto top6l4 = [](const ttnn::Tensor& t) {
+        return ttnn::bitwise_left_shift(ttnn::bitwise_right_shift(t, 6), 4);
+      };
+      ttnn::Tensor sa = ttnn::slice(
+          sb, ttsl::SmallVector<uint32_t>{0u, 0u},
+          ttsl::SmallVector<uint32_t>{B, 4u},
+          ttsl::SmallVector<uint32_t>{1u, 1u});
+      ttnn::Tensor sm = ttnn::slice(
+          sb, ttsl::SmallVector<uint32_t>{0u, 4u},
+          ttsl::SmallVector<uint32_t>{B, 8u},
+          ttsl::SmallVector<uint32_t>{1u, 1u});
+      ttnn::Tensor sc = ttnn::slice(
+          sb, ttsl::SmallVector<uint32_t>{0u, 8u},
+          ttsl::SmallVector<uint32_t>{B, 12u},
+          ttsl::SmallVector<uint32_t>{1u, 1u});
+      ttnn::Tensor sc_f = ttnn::typecast(
+          ttnn::concat(std::vector<ttnn::Tensor>{
+              ttnn::bitwise_and(sa, 63),
+              ttnn::bitwise_or(ttnn::bitwise_and(sc, 0xF), top6l4(sa))},
+              /*dim=*/1),
+          ttnn::DataType::FLOAT32);  // {B, 8}, values <= 63: exact
+      ttnn::Tensor mm_f = ttnn::typecast(
+          ttnn::concat(std::vector<ttnn::Tensor>{
+              ttnn::bitwise_and(sm, 63),
+              ttnn::bitwise_or(ttnn::bitwise_right_shift(sc, 4), top6l4(sm))},
+              /*dim=*/1),
+          ttnn::DataType::FLOAT32);  // {B, 8}, values <= 63: exact
+
+      // Nibbles: 32 words are qs[128]; 8 nibble-lane shifts -> {B,256} with
+      // idx = 8*lane + word. Flat idx = 16l + 8h + 8q + r over (byte lane l,
+      // nibble half h, quarter q, word-in-quarter r); permute (l,h,q,r) ->
+      // (q,h,r,l) so the flat order is the output order q*64 + h*32 + 4r + l —
+      // scale group 2q+h covers the same 32-value run.
+      const uint32_t qs_w0 = q5 ? 12u : 4u;
+      ttnn::Tensor qw = ttnn::slice(
+          w, ttsl::SmallVector<uint32_t>{0u, qs_w0},
+          ttsl::SmallVector<uint32_t>{B, qs_w0 + 32u},
+          ttsl::SmallVector<uint32_t>{1u, 1u});
+      auto nib = [](const ttnn::Tensor& t, int shift) {
+        return ttnn::bitwise_and(ttnn::bitwise_right_shift(t, shift), 0xF);
+      };
+      ttnn::Tensor x5 = ttnn::typecast(
+          ttnn::reshape(
+              ttnn::permute(
+                  ttnn::reshape(
+                      ttnn::concat(std::vector<ttnn::Tensor>{
+                          nib(qw, 0), nib(qw, 4), nib(qw, 8), nib(qw, 12),
+                          nib(qw, 16), nib(qw, 20), nib(qw, 24), nib(qw, 28)},
+                          /*dim=*/1),
+                      ttnn::Shape({B, 4u, 2u, 4u, 8u})),
+                  ttsl::SmallVector<int64_t>{0, 3, 2, 4, 1}),
+              ttnn::Shape({B, 8u, 32u})),
+          ttnn::DataType::FLOAT32);  // {B, 8, 32}, values <= 15: exact
+      if (q5) {
+        // The 5th bit: output col c reads bit c/32 — the group index g — of
+        // qh[c%32] (host u1 = 1<<2q for the low plane and u2 = 2<<2q for the
+        // high plane of quarter q; g = 2q+h is exactly that bit). qh bytes
+        // broadcast {B,1,32} against one shift per group; +16*bit is exact.
+        ttnn::Tensor qh = KeepQuantByteRange(w, B, 16, 48);  // qh[32]
+        ttnn::Tensor qh3 = ttnn::reshape(qh, ttnn::Shape({B, 1u, 32u}));
+        std::vector<ttnn::Tensor> planes;
+        planes.reserve(8);
+        for (int g = 0; g < 8; ++g)
+          planes.push_back(
+              ttnn::bitwise_and(ttnn::bitwise_right_shift(qh3, g), 1));
+        x5 = ttnn::add(
+            x5,
+            ttnn::multiply(
+                ttnn::typecast(
+                    ttnn::reshape(ttnn::concat(std::move(planes), /*dim=*/1),
+                                  ttnn::Shape({B, 8u, 32u})),
+                    ttnn::DataType::FLOAT32),
+                16.0f));  // values <= 31: exact
+      }
+
+      // y = (d*sc)*x - (dmin*mm): the host's exact f32 order, as separate ops,
+      // every operand held at {B,8,32} — one 32x32 tile per block, the shape
+      // every op handles (a TILE {B,8,1} operand physically pads to 32
+      // columns and a TILE broadcast reads those padding columns as data,
+      // which corrupted every non-zero logical column at B=1).
+      // Signed-zero repair as bit work (or_sign above): the device multiply
+      // AND subtract canonicalize a zero result's sign, while the host chain
+      // is IEEE-exact — prod keeps d's sign through a zero product and m1
+      // keeps dmin's through a zero product (mm and x are unsigned, so the
+      // IEEE sign of both intermediates is the f16 sign bit), and a zero y
+      // keeps a sign only when the m1 term's bit is clear ((-0) - (+0) is
+      // -0). All three masks are broadcast f32 arithmetic on {0,1} values
+      // read from the f16 BIT patterns — never from a device float, whose
+      // zero sign is already canonicalized.
+      // Signed-zero repair (repair/neg0_full above): the device multiply AND
+      // subtract canonicalize a zero result's sign, while the host chain is
+      // IEEE-exact — prod keeps d's sign through a zero product and m1 keeps
+      // dmin's through a zero product (mm and x are unsigned, so the IEEE
+      // sign of both intermediates is the f16 sign bit), and a zero y keeps a
+      // sign only when the m1 term's bit is clear ((-0) - (+0) is -0).
+      ttnn::Tensor dsign =
+          ttnn::reshape(sign_bit_f32(d_bits, 15), ttnn::Shape({B, 1u, 1u}));
+      ttnn::Tensor prod =
+          ttnn::multiply(ttnn::reshape(ttnn::multiply(d, sc_f),
+                                       ttnn::Shape({B, 8u, 1u})),
+                         x5);
+      prod = repair(prod, ttnn::multiply(dsign, zero_mask_f32(prod)),
+                    neg0_full(ttnn::Shape({B, 8u, 32u})));
+      ttnn::Tensor dminsign =
+          ttnn::reshape(sign_bit_f32(dmin_bits, 15), ttnn::Shape({B, 1u, 1u}));
+      // Repair m1 at its FINAL {B,8,1} shape: the subtract must consume the
+      // repaired tensor directly. Reshaping a to_layout(ROW_MAJOR) round-trip
+      // output before the subtract made the broadcast read block 0's m1 row
+      // for every block (constant y offset per element beyond block 0).
+      ttnn::Tensor m1 = ttnn::reshape(ttnn::multiply(dmin, mm_f),
+                                      ttnn::Shape({B, 8u, 1u}));
+      m1 = repair(m1, ttnn::multiply(dminsign, zero_mask_f32(m1)),
+                  neg0_full(ttnn::Shape({B, 8u, 1u})));
+      ttnn::Tensor y = ttnn::subtract(prod, m1);
+      y = repair(
+          y,
+          ttnn::multiply(
+              ttnn::reshape(ttnn::subtract(dsign,
+                                           ttnn::multiply(dsign, dminsign)),
+                            ttnn::Shape({B, 1u, 1u})),
+              zero_mask_f32(y)),
+          neg0_full(ttnn::Shape({B, 8u, 32u})));
+      return ttnn::reshape(
+          std::move(y),
+          ttnn::Shape({static_cast<uint32_t>(slice_rows),
+                       static_cast<uint32_t>(nb) * 256u}));
+    }
+    case DType::kQ6_K: {
+      // Word 52 holds d in its low half (bytes 208..209). 16 sub-blocks of
+      // 16: output col c sits in sub-block s = c/16 at i = c%16, and
+      // s = 8h + 2r + l/16 over (half h, run r, l in 0..32): per (h, r) the
+      // host loop reads ql byte 64h + 32*(r&1) + l, low nibble for r<2 / high
+      // otherwise, ORs the 2 high bits (qh[32h + l] >> 2r) & 3 into bit 4,
+      // subtracts the 32 bias, and multiplies (d*sc)*q with the SIGNED scale
+      // sc[8h + 2r + l/16] — no min term. Eight {B,2,16} pieces concat in
+      // (h, r, l/16, l%16) order straight into [s][i].
+      ttnn::Tensor w52 = ttnn::slice(
+          w, ttsl::SmallVector<uint32_t>{0u, 52u},
+          ttsl::SmallVector<uint32_t>{B, 53u},
+          ttsl::SmallVector<uint32_t>{1u, 1u});
+      ttnn::Tensor d_bits = ttnn::bitwise_and(w52, 0xFFFF);
+      ttnn::Tensor d3 = ttnn::reshape(f16_bits_to_f32(d_bits),
+                                      ttnn::Shape({B, 1u, 1u}));
+      ttnn::Tensor ql = KeepQuantByteRange(w, B, 0, 128);
+      ttnn::Tensor qh = KeepQuantByteRange(w, B, 128, 192);
+      ttnn::Tensor sc_bytes = KeepQuantByteRange(w, B, 192, 208);
+      ttnn::Tensor sc_f = signed_byte_f32(sc_bytes);  // {B,16}: exact ints
+      ttnn::Tensor sc_sign = ttnn::typecast(
+          ttnn::bitwise_and(ttnn::bitwise_right_shift(sc_bytes, 7), 1),
+          ttnn::DataType::FLOAT32);  // {B,16} in {0,1}: the i8 sign bit
+      std::vector<ttnn::Tensor> halves;
+      halves.reserve(2);
+      std::vector<ttnn::Tensor> sign_halves;
+      sign_halves.reserve(2);
+      for (int h = 0; h < 2; ++h) {
+        std::vector<ttnn::Tensor> runs;
+        runs.reserve(4);
+        std::vector<ttnn::Tensor> sign_runs;
+        sign_runs.reserve(4);
+        for (int r = 0; r < 4; ++r) {
+          const int qoff = 64 * h + 32 * (r % 2);
+          ttnn::Tensor qb = ttnn::slice(
+              ql,
+              ttsl::SmallVector<uint32_t>{0u,
+                                          static_cast<uint32_t>(qoff)},
+              ttsl::SmallVector<uint32_t>{
+                  B, static_cast<uint32_t>(qoff + 32)},
+              ttsl::SmallVector<uint32_t>{1u, 1u});
+          ttnn::Tensor nib = (r < 2) ? ttnn::bitwise_and(qb, 0xF)
+                                     : ttnn::bitwise_right_shift(qb, 4);
+          ttnn::Tensor hb = ttnn::slice(
+              qh,
+              ttsl::SmallVector<uint32_t>{0u,
+                                          static_cast<uint32_t>(32 * h)},
+              ttsl::SmallVector<uint32_t>{
+                  B, static_cast<uint32_t>(32 * h + 32)},
+              ttsl::SmallVector<uint32_t>{1u, 1u});
+          ttnn::Tensor hi2 = ttnn::bitwise_and(
+              ttnn::bitwise_right_shift(hb, 2 * r), 3);
+          ttnn::Tensor nib6 =
+              ttnn::bitwise_or(nib, ttnn::bitwise_left_shift(hi2, 4));
+          ttnn::Tensor q6 = ttnn::subtract(
+              ttnn::typecast(nib6, ttnn::DataType::FLOAT32),
+              32.0f);  // {B,32}, values in [-32, 31]: exact
+          const int soff = 8 * h + 2 * r;
+          ttnn::Tensor s2 = ttnn::slice(
+              sc_f,
+              ttsl::SmallVector<uint32_t>{0u,
+                                          static_cast<uint32_t>(soff)},
+              ttsl::SmallVector<uint32_t>{
+                  B, static_cast<uint32_t>(soff + 2)},
+              ttsl::SmallVector<uint32_t>{1u, 1u});
+          // (d*sc) first — the host's left-to-right association — then *q.
+          runs.push_back(ttnn::multiply(
+              ttnn::multiply(d3,
+                             ttnn::reshape(s2, ttnn::Shape({B, 2u, 1u}))),
+              ttnn::reshape(q6, ttnn::Shape({B, 2u, 16u}))));
+          // sign(q): the nibble sits below bit 5 before the -32 bias, so
+          // q < 0 is exactly nib6 < 32 — an INT32 compare on the raw bits,
+          // never a device float's canonicalized zero sign.
+          sign_runs.push_back(
+              ttnn::reshape(ttnn::typecast(ttnn::lt(nib6, 32),
+                                           ttnn::DataType::FLOAT32),
+                            ttnn::Shape({B, 2u, 16u})));
+        }
+        halves.push_back(ttnn::concat(std::move(runs), /*dim=*/1));
+        sign_halves.push_back(
+            ttnn::concat(std::move(sign_runs), /*dim=*/1));
+      }
+      ttnn::Tensor prod = ttnn::reshape(
+          ttnn::concat(std::move(halves), /*dim=*/1),
+          ttnn::Shape({B, 16u, 16u}));  // [s][i] with s = 8h + 2r + l/16
+      ttnn::Tensor qsign = ttnn::reshape(
+          ttnn::concat(std::move(sign_halves), /*dim=*/1),
+          ttnn::Shape({B, 16u, 16u}));
+      // Zero-product sign: the IEEE sign of (d*sc)*q is the XOR of all
+      // three operand signs — d's f16 bit, sc's i8 bit7, and sign(q) above
+      // (q and the typecast zeros are +0, so they contribute their bit
+      // directly). The XOR of three {0,1} masks is
+      // a+b+c-2(ab+ac+bc)+4abc, exact in f32 broadcast arithmetic; the
+      // product is repaired where that XOR lands on a zero (or_sign).
+      ttnn::Tensor ds = ttnn::reshape(sign_bit_f32(d_bits, 15),
+                                      ttnn::Shape({B, 1u, 1u}));
+      ttnn::Tensor ss = ttnn::reshape(sc_sign, ttnn::Shape({B, 16u, 1u}));
+      ttnn::Tensor ds_ss = ttnn::multiply(ds, ss);  // {B,16,1}
+      ttnn::Tensor pairs = ttnn::add(
+          ttnn::add(ds_ss, ttnn::multiply(ds, qsign)),
+          ttnn::multiply(ss, qsign));  // ab + ac + bc
+      ttnn::Tensor quad = ttnn::multiply(ds_ss, qsign);  // abc
+      ttnn::Tensor pred =
+          ttnn::add(ttnn::subtract(ttnn::add(ttnn::add(ds, ss), qsign),
+                                   ttnn::multiply(pairs, 2.0f)),
+                    ttnn::multiply(quad, 4.0f));
+      prod = repair(prod, ttnn::multiply(pred, zero_mask_f32(prod)),
+                    neg0_full(ttnn::Shape({B, 16u, 16u})));
+      return ttnn::reshape(
+          prod,
+          ttnn::Shape({static_cast<uint32_t>(slice_rows),
+                       static_cast<uint32_t>(nb) * 256u}));
+    }
+    case DType::kQ8_0: {
+      // Word 0: d | first two qs bytes. qs[32] = stream bytes 2..33; host:
+      // y = qs * d — IEEE multiply is commutative in value AND zero sign, so
+      // the device's d*q is the same bit pattern.
+      ttnn::Tensor w0 = ttnn::slice(
+          w, ttsl::SmallVector<uint32_t>{0u, 0u},
+          ttsl::SmallVector<uint32_t>{B, 1u},
+          ttsl::SmallVector<uint32_t>{1u, 1u});
+      ttnn::Tensor d_bits = ttnn::bitwise_and(w0, 0xFFFF);
+      ttnn::Tensor d = f16_bits_to_f32(d_bits);  // {B,1}
+      ttnn::Tensor qb = KeepQuantByteRange(w, B, 2, 34);  // {B,32} raw bytes
+      ttnn::Tensor qf = signed_byte_f32(qb);
+      ttnn::Tensor prod = ttnn::multiply(d, qf);  // {B,32}
+      // Zero-product sign: the IEEE product's sign is sign(d) XOR sign(q) —
+      // sign(d) is the f16 bit, sign(q) the raw byte's bit7 (a zero byte
+      // typecasts to +0 and contributes a clear bit, exactly its sign). The
+      // XOR of two {0,1} masks is a+b-2ab, exact in f32 broadcast
+      // arithmetic; the product is repaired where the XOR lands on a zero.
+      ttnn::Tensor dsign = sign_bit_f32(d_bits, 15);  // {B,1}
+      ttnn::Tensor qsign = sign_bit_f32(qb, 7);       // {B,32}
+      ttnn::Tensor pred = ttnn::subtract(
+          ttnn::add(dsign, qsign),
+          ttnn::multiply(ttnn::multiply(dsign, qsign), 2.0f));
+      prod = repair(prod, ttnn::multiply(pred, zero_mask_f32(prod)),
+                    neg0_full(ttnn::Shape({B, 32u})));
+      return ttnn::reshape(
+          prod,
+          ttnn::Shape({static_cast<uint32_t>(slice_rows),
+                       static_cast<uint32_t>(nb) * 32u}));
+    }
+    default:
+      // EnsureKeepQuantWords refuses anything else before this point.
+      VT_CHECK(false, "tenstorrent keep-quant decode: unsupported encoding");
+      return w;
+  }
+}
+
+// The whole-tensor form: stage the packed [rows, nb] tensor once (EnsureKeepQuantWords)
+// and run the chains on all of it — the W1/W3 keep-quant decode entry.
+ttnn::Tensor DecodeKeepQuantBlocksF32(const Tensor& packed, DType enc,
+                                      int64_t rows, int64_t nb,
+                                      MeshDevice& device) {
+  const ttnn::Tensor w = EnsureKeepQuantWords(packed, enc, rows, nb, device);
+  return DecodeKeepQuantWordsF32(w, enc, rows, nb, device);
+}
+
+void KeepQuantDecodeKernel(Queue&, Tensor& out, const Tensor& packed) {
+  TT_OP_TRACE("KeepQuantDecode");
+  VT_CHECK(packed.rank == 2 && out.rank == 2,
+           "tenstorrent kKeepQuantDecode: packed rank-2 [rows, nb], out "
+           "rank-2 [rows, nb*elems]");
+  const DType enc = packed.dtype;
+  VT_CHECK(enc == DType::kQ4_K || enc == DType::kQ5_K || enc == DType::kQ6_K ||
+               enc == DType::kQ8_0,
+           std::string("tenstorrent kKeepQuantDecode: packed dtype ") +
+               Name(enc) +
+               " has no registered keep-quant decode (registered set: kQ4_K/"
+               "kQ5_K/kQ6_K/kQ8_0)");
+  const int64_t elems = BlockElems(enc);
+  VT_CHECK(out.dtype == DType::kF32,
+           "tenstorrent kKeepQuantDecode: out must be f32");
+  VT_CHECK(packed.IsContiguous() && out.IsContiguous(),
+           "tenstorrent kKeepQuantDecode: contiguous required");
+  const int64_t rows = packed.shape[0];
+  const int64_t nb = packed.shape[1];
+  VT_CHECK(out.shape[0] == rows && out.shape[1] == nb * elems,
+           "tenstorrent kKeepQuantDecode: out shape mismatch");
+  ttnn::Tensor y =
+      DecodeKeepQuantBlocksF32(packed, enc, rows, nb, SharedMeshDevice());
+  CommitDeviceLogical2D(out, std::move(y), static_cast<uint32_t>(rows),
+                        static_cast<uint32_t>(nb * elems));
+}
+
+// kMatmulBTQuant (KEEPQUANT W2, generalized W3, switched W4a wave-3b-1):
+// `a` is [M,K] float, `b` is [N,K] packed keep-quant blocks — out = a @ b^T,
+// reached through vt::MatmulBT's block-weight dispatch (ops.cpp:163), the
+// entry every model matmul helper already uses. W4a wave-3b-1 (#3030): the
+// dense keep-quant matmul IS the wave-3a chunked E=1 grouped arm — the
+// production dense path consumes PACKED words. The PACKED words stage once
+// per weight (EnsureKeepQuantWords) and each call slice-decodes + accumulates
+// in capture-safe chunks (256 MiB plane policy, see the E=1 arm); the decoded
+// bf16 TWIN of wave-2/W3 is GONE from this path. The fourth spec amendment
+// makes this the row's production surface: the whole keep-quant set beyond
+// the gather class is served PACKED, and a captured graph must never hold a
+// whole-weight tile. The gather class keeps its own embed-table twin
+// (EnsureEmbedTableDevice); the vehicle's tied head shares the GGUF tensor
+// with the embedding — its GATHER keeps that twin, its MATMUL stages only the
+// packed words. Non-keep-quant (bf16/f32) weights never enter this kernel
+// (vt::MatmulBT routes them to kMatmulBT), and non-TT devices are untouched.
+// Exactly the encodings DeviceKeepQuantSupported admits on kTENSTORRENT
+// (gguf_keep_quant.cpp). Refusing here BY NAME keeps an admitted-but-
+// unimplemented encoding from reaching the device.
+void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
+                                const Tensor& weight, const Tensor& expert_ids);
+void MatmulBTQuantKernel(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+  TT_OP_TRACE("MatmulBTQuant");
+  VT_CHECK(a.rank == 2 && b.rank == 2 && out.rank == 2,
+           "tenstorrent kMatmulBTQuant: rank-2 a/b/out required");
+  const DType enc = b.dtype;
+  // vt::Name() emits the lowercase storage name ("q4_0"); the refusal must
+  // name the ENUM the caller passed, so the k-prefix and capital go on here.
+  const std::string enc_lower = Name(enc);
+  const std::string enc_name =
+      std::string("k") + static_cast<char>(enc_lower[0] - 'a' + 'A') +
+      enc_lower.substr(1);
+  VT_CHECK(enc == DType::kQ4_K || enc == DType::kQ5_K || enc == DType::kQ6_K ||
+               enc == DType::kQ8_0,
+           std::string("tenstorrent kMatmulBTQuant: ") + enc_name +
+               " has no keep-quant decode on TENSTORRENT; the registered set "
+               "is kQ4_K/kQ5_K/kQ6_K/kQ8_0 (BACKEND-TENSTORRENT-KEEPQUANT)");
+  const int64_t elems = BlockElems(enc);
+  VT_CHECK(b.shape[1] % elems == 0,
+           std::string("tenstorrent kMatmulBTQuant: K must be a whole number "
+                       "of ") +
+               Name(enc) + " blocks (" + std::to_string(elems) + " elems)");
+  VT_CHECK(IsFloatDType(a.dtype) &&
+               (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
+           "tenstorrent kMatmulBTQuant: float activation, f32/bf16 out");
+  const uint32_t M = static_cast<uint32_t>(a.shape[0]);
+  const uint32_t K = static_cast<uint32_t>(a.shape[1]);
+  const uint32_t N = static_cast<uint32_t>(b.shape[0]);
+  VT_CHECK(b.shape[1] == K, "tenstorrent kMatmulBTQuant: a/b inner dim mismatch");
+  VT_CHECK(out.shape[0] == M && out.shape[1] == N,
+           "tenstorrent kMatmulBTQuant: out shape mismatch");
+  VT_CHECK(a.IsContiguous() && b.IsContiguous() && out.IsContiguous(),
+           "tenstorrent kMatmulBTQuant: strided tensors are not supported in W2");
+
+  // W4a wave-3b-1 (#3030): the dispatch. P = M output rows against expert 0;
+  // the ids are statically all zero and the E=1 arm never reads them (the
+  // capture contract proven by the garbage-ids leg), so a host zeros tensor
+  // is all the grouped contract needs. Capture-safe by construction: the
+  // eager warm step stages every word shadow before capture (a capture-time
+  // miss refuses inside EnsureKeepQuantWords) and every chunk offset is a
+  // capture-time constant replayed verbatim.
+  std::vector<int32_t> zero_ids(static_cast<size_t>(a.shape[0]), 0);
+  const Tensor ids = Tensor::Contiguous(zero_ids.data(), DType::kI32,
+                                        Device{DeviceType::kCPU, 0},
+                                        {a.shape[0]});
+  MatmulBTQuantGroupedKernel(q, out, a, b, ids);
+}
+
+// The decoded bf16 twin map, retained after the wave-3b-1 switch as the
+// TWIN-ABSENCE probe's surface and the recycled-address hygiene hook: the
+// dense keep-quant matmul no longer inserts (it serves packed words through
+// the E=1 grouped arm), so a populated entry for a matmul weight is exactly
+// the regression the probe names. Same collision discipline as before: the
+// free path drops by host pointer (UnregisterHostBuffer).
+struct DecodedWeightShadow {
+  std::optional<ttnn::Tensor> device;
+  uint32_t rows = 0, cols = 0;
+  DType enc = DType::kF32;
+};
+std::mutex& DecodedWeightMutex() {
+  static std::mutex m;
+  return m;
+}
+std::map<uintptr_t, DecodedWeightShadow>& DecodedWeightShadows() {
+  static std::map<uintptr_t, DecodedWeightShadow>* m =
+      new std::map<uintptr_t, DecodedWeightShadow>(); // never destroyed (#1486)
+  return *m;
+}
+// Free path hook: a freed host weight must drop its twin, so a recycled
+// address can never alias a stale decode (UnregisterHostBuffer).
+void DropDecodedWeightShadow(void* host) {
+  if (host == nullptr) return;
+  std::lock_guard<std::mutex> g(DecodedWeightMutex());
+  DecodedWeightShadows().erase(reinterpret_cast<uintptr_t>(host));
+}
+
+// kMatmulBTQuantGrouped (KEEPQUANT W4a wave-2, #3030): out[P,N], act[Pa,K]
+// (Pa==1 broadcast), weight[E*N,K] PACKED block-quant, expert_ids[P] i32 —
+// the expert-batched analog of MatmulBTQuantKernel above, mirroring the ROCm
+// reference's native packed-weight grouped GEMM
+// (rocm_grouped_gemm.hip MatmulBTQuantGroupedKernelRocm). The tower sits on
+// device in its i32 WORD form (EnsureKeepQuantWords — the PACKED residency,
+// never a bf16 twin), and each call decodes ONLY the P selected [N,K]
+// row-slices (per group p: word rows [e*N*nb, (e+1)*N*nb)) through the
+// bit-exact W3 chain on the slice (DecodeKeepQuantWordsF32), rounds the
+// decoded weight ONCE to bf16 (the device's round-once convention), and runs
+// the kMatmulBT tile matmul per group — the CPU provider's per-group
+// structure (cpu_quant_gemm.cpp, the comparison oracle) with the decode
+// on-core. The whole tower is NEVER decoded; no twin is built.
+//
+// REGISTERED SET: exactly {Q4_K, Q5_K, Q6_K, Q8_0} on kTENSTORRENT (W4a
+// wave-2b widened the wave-2 pair: the 27B pin carries 67 Q6_K + 48 Q5_K
+// tensors, so the tower is not servable without them). The two K-quant
+// decodes are the W3 dense chains verbatim, run on the selected word slice —
+// Q6_K mirrors the ROCm grouped kernel's native dequant
+// (rocm_grouped_gemm.hip:1456), and Q5_K has NO ROCm grouped reference (the
+// ROCm set is Q8_0/Q4_K/Q6_K), so its decode derives from the W3 dense Q5_K
+// chain, bit-exact vs vt::cpu::BlockToFloat. Any other encoding refuses BY
+// NAME. Never a silent wrong answer — the ROCm refusal precedent.
+//
+// W4a wave-3a (#3030) split the two arms by capture compatibility:
+//  - E=1 (dense, the 27B path) is CHUNKED slice-decode + f32 assembly and
+//    never reads the routing ids (statically all zero) — capture-clean and
+//    trace-bounded, see the CHUNK POLICY comment in the arm;
+//  - E=N (experts) keeps the wave-2 whole-slice decode and its dynamic-id
+//    host readback; its capture indirection is staged-owed behind a MoE
+//    artifact (spec ## W4), and it stays UNREACHED (no production entry
+//    point until wave-3b wires the model).
+constexpr int64_t kKeepQuantChunkPlaneBytes = 256 << 20;  // 256 MiB f32 plane
+void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
+                                const Tensor& weight,
+                                const Tensor& expert_ids) {
+  TT_OP_TRACE("MatmulBTQuantGrouped");
+  VT_CHECK(act.rank == 2 && weight.rank == 2 && out.rank == 2,
+           "tenstorrent kMatmulBTQuantGrouped: rank-2 act/weight/out required");
+  const DType enc = weight.dtype;
+  // vt::Name() emits the lowercase storage name ("q4_0"); the refusal must
+  // name the ENUM the caller passed, so the k-prefix and capital go on here
+  // (the MatmulBTQuantKernel convention).
+  const std::string enc_lower = Name(enc);
+  const std::string enc_name =
+      std::string("k") + static_cast<char>(enc_lower[0] - 'a' + 'A') +
+      enc_lower.substr(1);
+  VT_CHECK(enc == DType::kQ4_K || enc == DType::kQ5_K ||
+               enc == DType::kQ6_K || enc == DType::kQ8_0,
+           std::string("tenstorrent kMatmulBTQuantGrouped: ") + enc_name +
+               " has no GROUPED keep-quant decode on TENSTORRENT; the "
+               "registered set is kQ4_K/kQ5_K/kQ6_K/kQ8_0 (BACKEND-"
+               "TENSTORRENT-KEEPQUANT W4a)");
+  const int64_t elems = BlockElems(enc);
+  VT_CHECK(weight.shape[1] % elems == 0,
+           std::string("tenstorrent kMatmulBTQuantGrouped: K must be a whole "
+                       "number of ") +
+               Name(enc) + " blocks (" + std::to_string(elems) + " elems)");
+  VT_CHECK(IsFloatDType(act.dtype) &&
+               (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
+           "tenstorrent kMatmulBTQuantGrouped: float activation, f32/bf16 out");
+  VT_CHECK(act.IsContiguous() && weight.IsContiguous() && out.IsContiguous(),
+           "tenstorrent kMatmulBTQuantGrouped: strided tensors are not "
+           "supported in W4a wave-2");
+  const int64_t P = out.shape[0];
+  const int64_t N = out.shape[1];
+  const int64_t K = act.shape[1];
+  const int64_t Pa = act.shape[0];
+  VT_CHECK(Pa == P || Pa == 1,
+           "tenstorrent kMatmulBTQuantGrouped: act rows must be P (per-expert) "
+           "or 1 (broadcast)");
+  VT_CHECK(weight.shape[1] == K,
+           "tenstorrent kMatmulBTQuantGrouped: act/weight inner dim mismatch");
+  VT_CHECK(weight.shape[0] % N == 0,
+           "tenstorrent kMatmulBTQuantGrouped: weight rows must be a whole "
+           "multiple of N");
+  VT_CHECK(out.shape[0] == P && out.shape[1] == N,
+           "tenstorrent kMatmulBTQuantGrouped: out shape mismatch");
+  const int64_t E = weight.shape[0] / N;
+  const int64_t nb = K / elems;
+  if (P == 0 || N == 0) return;
+
+  MeshDevice& device = SharedMeshDevice();
+
+  // Stage the PACKED tower once — the resident i32 word shadow keyed by the
+  // host weight pointer, served forever after (the dense arm's pattern). The
+  // per-call decode reads word ROW-RANGES of it; a capture-time miss refuses
+  // inside EnsureKeepQuantWords, as on the dense arm.
+  const ttnn::Tensor words = EnsureKeepQuantWords(weight, enc, E * N, nb, device);
+
+  // Activation: the MatmulBTQuantKernel convention — one device-side bf16
+  // round of an f32 master, TILE layout, shared by every group. Pa > 1 takes
+  // the per-group row view from the ROW_MAJOR form (the proven slice domain);
+  // Pa == 1 IS the single row.
+  ttnn::Tensor dev_a = EnsureDevice2D(act, device);
+  if (act.dtype == DType::kF32)
+    dev_a = ttnn::to_layout(
+        ttnn::typecast(std::move(dev_a), ttnn::DataType::BFLOAT16),
+        ttnn::Layout::TILE);
+  else if (dev_a.layout() != ttnn::Layout::TILE)
+    // W4a wave-3b-1 (#3030): a bf16 activation can arrive ROW_MAJOR — the
+    // exact-shape slot hit returns the layout its producer committed (the
+    // vehicle's silu-mul output feeding the down projection). A ROW_MAJOR
+    // operand keeps its unpadded logical shape, so ttnn's auto program
+    // config divides a sub-tile M by the 32-tile height and fatals
+    // (per_core_M == 0, matmul_program_config.cpp get_mcast_1d_config).
+    // Convert once, before the chunk loop; zero tile padding adds only
+    // discarded zero output rows.
+    dev_a = ttnn::to_layout(std::move(dev_a), ttnn::Layout::TILE);
+  ttnn::Tensor a_rows;
+  if (E > 1 && Pa > 1)
+    a_rows = ttnn::to_layout(std::move(dev_a), ttnn::Layout::ROW_MAJOR);
+
+  const uint32_t wpb = static_cast<uint32_t>(KeepQuantWordsPerBlock(enc));
+
+  if (E == 1) {
+    // == W4a wave-3a (#3030): the DENSE arm — CHUNKED slice-decode + f32
+    // assembly, capture-clean. The fourth spec amendment (b40907ee2) makes
+    // this arm the row's production surface: the whole keep-quant set beyond
+    // the gather class is served PACKED through E=1, and a captured graph
+    // must never hold a whole-weight tile. Wave-1b falsified that shape on
+    // the vehicle; the chunk-count survey below (P150, 2026-09-07) measured
+    // BOTH capture-time failure modes on the head shape [248320, 1024] Q6_K:
+    // one whole-weight chunk dies on DEVICE DRAM (bank_manager.cpp:462 — a
+    // 1.02 GiB f32 decode plane), while many small chunks die on the TRACE
+    // REGION (mesh_trace.cpp:81): the captured command stream costs ~3.3 MB
+    // per chunk (485 chunks = 1,566,662,656 B; 16 chunks = 53,764,096 B;
+    // 2-4 chunks capture clean). CHUNK POLICY: decode [chunk, K] word
+    // ranges — one tile matmul per chunk — so the live working set is the
+    // i32 word slice, the chain's f32 planes and the bf16 tile of ONE chunk
+    // plus the tiny f32 partials, never a whole-weight tile; each chunk's
+    // decoded tile dies before the next chunk allocates. The budget bounds
+    // the chain's largest live tensor — one [chunk, K] f32 plane — at
+    // 256 MiB (chunk = 256 MiB / (4 B . K), and a whole decode for any
+    // weight whose plane fits), while ceil(N / 8) keeps the command stream
+    // under the 52,428,800 B trace region for weights large enough to
+    // chunk. Chunks cover DISJOINT weight rows, so every output element is
+    // still ONE dot over the full K and chunks concatenate in f32; the
+    // decode itself is unchanged (the bit-exact leg pins it). Capture-clean:
+    // E=1 ids are statically all zero — the only in-range expert — so the
+    // routing ids are never EnsureHosted or read, and every chunk offset is
+    // a capture-time constant replayed verbatim.
+    const int64_t chunk_override =
+        KeepQuantChunkRowsOverride().load(std::memory_order_relaxed);
+    // W4a wave-3b-2 (#3030): the plane budget is env-tunable the way
+    // VT_TT_TRACE_REGION_MB is. The 256 MiB default was surveyed on the 0.8B
+    // vehicle; at 27B the first forward's ffn_down chunk died with 244 MB
+    // free and a 105 MB largest block, so the gate recipe can shrink the
+    // plane without a rebuild. Empty/unset keeps the surveyed default.
+    int64_t plane_bytes = kKeepQuantChunkPlaneBytes;
+    bool plane_env_set = false;
+    if (const char* plane_env = std::getenv("VT_TT_KEEPQUANT_CHUNK_BYTES");
+        plane_env != nullptr && plane_env[0] != '\0') {
+      const long long parsed = std::atoll(plane_env);
+      if (parsed > 0) {
+        plane_bytes = static_cast<int64_t>(parsed);
+        plane_env_set = true;
+      }
+    }
+    int64_t chunk =
+        chunk_override > 0
+            ? std::min(chunk_override, N)
+            : std::min(N, std::max<int64_t>(
+                              plane_bytes / (K * 4),
+                              (N + 7) / 8));
+    // W4a wave-3b-2 (#3030): the env knob is a HARD CAP — the ceil(N/8)
+    // trace term above forces N/8-row chunks for wide-N weights (the head
+    // [248320, 5120] would decode 31040-row planes, 606+ MB, whatever the
+    // plane budget says), which is exactly the alloc that died at 27B. A
+    // set knob trades command-stream length for live memory, the same
+    // trade VT_TT_TRACE_REGION_MB records on its axis.
+    if (plane_env_set)
+      chunk = std::min(chunk, std::max<int64_t>(plane_bytes / (K * 4), 1));
+    std::vector<ttnn::Tensor> partials;
+    partials.reserve(static_cast<size_t>((N + chunk - 1) / chunk));
+    for (int64_t c0 = 0; c0 < N; c0 += chunk) {
+      const int64_t c1 = std::min(N, c0 + chunk);
+      const ttnn::Tensor sl = ttnn::slice(
+          words,
+          ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(c0 * nb), 0u},
+          ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(c1 * nb), wpb},
+          ttsl::SmallVector<uint32_t>{1u, 1u});
+      ttnn::Tensor wf = DecodeKeepQuantWordsF32(sl, enc, c1 - c0, nb, device);
+      ttnn::Tensor wb = ttnn::to_layout(
+          ttnn::typecast(std::move(wf), ttnn::DataType::BFLOAT16),
+          ttnn::Layout::TILE);
+      ttnn::Tensor part = ttnn::operations::matmul::matmul(
+          dev_a, std::move(wb), /*transpose_a=*/false, /*transpose_b=*/true);
+      partials.push_back(ttnn::to_layout(
+          ttnn::typecast(std::move(part), ttnn::DataType::FLOAT32),
+          ttnn::Layout::ROW_MAJOR));
+    }
+    ttnn::Tensor assembled =
+        partials.size() == 1
+            ? std::move(partials[0])
+            : ttnn::concat(std::move(partials), /*dim=*/1);
+    if (Pa == 1 && P > 1) {
+      // Broadcast contract: every output row is the SAME [1, K] activation
+      // against expert 0 — replicate the assembled row. Bit-identical to the
+      // wave-2 per-group decode (identical operands, identical programs).
+      std::vector<ttnn::Tensor> rows(static_cast<size_t>(P), assembled);
+      assembled = ttnn::concat(std::move(rows), /*dim=*/0);
+    }
+    if (out.dtype == DType::kBF16)
+      assembled =
+          ttnn::typecast(std::move(assembled), ttnn::DataType::BFLOAT16);
+    // Commit form: TILE — the layout the twin path's matmul output carried.
+    // The ROW_MAJOR assembly above is an internal concat domain only. A
+    // ROW_MAJOR commit leaves a ROW_MAJOR slot for the next consumer, and
+    // downstream consumers build tile-padded views over that slot's buffer
+    // (the vehicle's rope -> paged-KV RAC reshape view exceeded the buffer:
+    // mesh_tensor_impl.hpp packed-size fatal on the replay step). Values are
+    // unchanged; only the committed slot's layout lands as the twin's did.
+    if (assembled.layout() != ttnn::Layout::TILE)
+      assembled = ttnn::to_layout(std::move(assembled), ttnn::Layout::TILE);
+    CommitDeviceLogical2D(out, std::move(assembled), static_cast<uint32_t>(P),
+                          static_cast<uint32_t>(N));
+    return;
+  }
+
+  // E=N EXPERT TOWER arm: the wave-2 path unchanged. The routing ids are
+  // dynamic here; the established TT index-tensor contract is EnsureHost + a
+  // host read (EmbeddingKernel), range-checked like the embedding gather.
+  // That host readback is the arm's eager construct, and its capture
+  // indirection is staged-owed behind a MoE artifact (spec ## W4).
+  EnsureHost(expert_ids);
+  const int32_t* eids = expert_ids.Ptr<int32_t>();
+  for (int64_t p = 0; p < P; ++p)
+    VT_CHECK(eids[p] >= 0 && eids[p] < E,
+             "tenstorrent kMatmulBTQuantGrouped: expert id out of range (id " +
+                 std::to_string(eids[p]) + ", E " + std::to_string(E) + ")");
+
+  // The selected [N,K] slice for group p: word rows [e*N*nb, (e+1)*N*nb) —
+  // decode, one bf16 RNE, TILE — the dense dot's exact weight convention.
+  auto slice_decode = [&](int64_t p) {
+    const int64_t w0 = eids[p] * N * nb;
+    ttnn::Tensor sl = ttnn::slice(
+        words, ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(w0), 0u},
+        ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(w0 + N * nb), wpb},
+        ttsl::SmallVector<uint32_t>{1u, 1u});
+    ttnn::Tensor wf = DecodeKeepQuantWordsF32(sl, enc, N, nb, device);
+    return ttnn::to_layout(
+        ttnn::typecast(std::move(wf), ttnn::DataType::BFLOAT16),
         ttnn::Layout::TILE);
   };
-  auto is_zero = [](ttnn::Tensor v) {
-    v = ttnn::to_layout(std::move(v), ttnn::Layout::TILE);
-    return ttnn::eq(
-        ttnn::bitwise_and(
-            ttnn::bitcast(std::move(v), ttnn::DataType::INT32), 0x7FFFFFFF),
-        0);
-  };
-  ttnn::Tensor prod =
-      ttnn::multiply(ttnn::reshape(ttnn::multiply(d, sc_f),
-                                   ttnn::Shape({B, 8u, 1u})),
-                     nibf);
-  // pred = (sign bit set) AND (value == 0), assembled in the f32 domain:
-  // neg01/zero masks typecast to {0,1} f32 and a MULTIPLY broadcasts them
-  // ({B,1,1} x {B,8,32} -> {B,8,32}, exact on {0,1}) — the same broadcast-
-  // multiply family the d1/nib path uses. logical_and with a broadcast
-  // predicate is avoided deliberately, and so is any {B,256} reshape of
-  // prod: with either present the ternary wrote only the first 16 output
-  // elements and left recycled buffer bytes beyond. Every tensor here stays
-  // {B,8,32} — one 32x32 tile per block, the shape every op handles.
-  auto zero_mask = [&](ttnn::Tensor v) {
-    return ttnn::typecast(is_zero(std::move(v)), ttnn::DataType::FLOAT32);
-  };
-  auto sign_mask = [&](const ttnn::Tensor& bits) {
-    return ttnn::typecast(neg01(bits), ttnn::DataType::FLOAT32);
-  };
-  ttnn::Tensor pred = ttnn::multiply(
-      ttnn::reshape(sign_mask(d_bits), ttnn::Shape({B, 1u, 1u})),
-      zero_mask(prod));
-  // All three where() inputs in TILE: the ternary demands a TILE predicate,
-  // and a TILE predicate mixed with ROW_MAJOR branches made it write only
-  // its first 16 output elements (stale recycled bytes beyond).
-  ttnn::Tensor prodT = ttnn::to_layout(prod, ttnn::Layout::TILE);
-  ttnn::Tensor neg0T = ttnn::Tensor::from_vector<float>(
-      std::vector<float>(static_cast<size_t>(B) * 256, -0.0f),
-      SpecOf(tt::tt_metal::Shape({B, 8u, 32u}), ttnn::DataType::FLOAT32,
-             ttnn::Layout::TILE),
-      &device);
-  prod = ttnn::to_layout(
-      ttnn::where(pred, neg0T, prodT), ttnn::Layout::ROW_MAJOR);
-  ttnn::Tensor m1 = ttnn::reshape(ttnn::multiply(dmin, mm_f),
-                                  ttnn::Shape({B, 8u, 1u}));
-  // Repair m1 at its FINAL {B,8,1} shape: the subtract must consume the
-  // where() output directly. Reshaping a to_layout(ROW_MAJOR) round-trip
-  // output before the subtract made the broadcast read block 0's m1 row for
-  // every block (constant y offset per element beyond block 0).
-  ttnn::Tensor pred8 = ttnn::multiply(
-      ttnn::reshape(sign_mask(dmin_bits), ttnn::Shape({B, 1u, 1u})),
-      zero_mask(m1));
-  ttnn::Tensor m1T = ttnn::to_layout(m1, ttnn::Layout::TILE);
-  ttnn::Tensor neg0T8 = ttnn::Tensor::from_vector<float>(
-      std::vector<float>(static_cast<size_t>(B) * 8, -0.0f),
-      SpecOf(tt::tt_metal::Shape({B, 8u, 1u}), ttnn::DataType::FLOAT32,
-             ttnn::Layout::TILE),
-      &device);
-  m1 = ttnn::to_layout(
-      ttnn::where(pred8, neg0T8, m1T), ttnn::Layout::ROW_MAJOR);
-  ttnn::Tensor y = ttnn::subtract(prod, m1);
-  y = ttnn::reshape(ttnn::to_layout(std::move(y), ttnn::Layout::ROW_MAJOR),
-                    ttnn::Shape({B, 256u}));
-  CommitDeviceLogical2D(out, std::move(y), static_cast<uint32_t>(rows),
-                        static_cast<uint32_t>(nb * 256));
+
+  std::vector<ttnn::Tensor> outs;
+  outs.reserve(static_cast<size_t>(P));
+  for (int64_t p = 0; p < P; ++p) {
+    ttnn::Tensor a_p;
+    if (Pa == 1) {
+      a_p = dev_a;
+    } else {
+      a_p = ttnn::to_layout(
+          ttnn::slice(a_rows,
+                      ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(p), 0u},
+                      ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(p + 1),
+                                                  static_cast<uint32_t>(K)},
+                      ttsl::SmallVector<uint32_t>{1u, 1u}),
+          ttnn::Layout::TILE);
+    }
+    outs.push_back(ttnn::operations::matmul::matmul(
+        std::move(a_p), slice_decode(p), /*transpose_a=*/false,
+        /*transpose_b=*/true));
+  }
+  // Assemble [P,N] and commit ONCE (the slot is per host pointer, so the
+  // commit must be a single whole-output store). The tile matmul output is
+  // bf16, committed as the dense arm commits it; the P > 1 assembly goes
+  // through ROW_MAJOR f32 (the chains' commit form) and lands out.dtype.
+  ttnn::Tensor assembled;
+  if (P == 1) {
+    assembled = std::move(outs[0]);
+  } else {
+    std::vector<ttnn::Tensor> rows_f;
+    rows_f.reserve(outs.size());
+    for (auto& t : outs)
+      rows_f.push_back(ttnn::to_layout(
+          ttnn::typecast(std::move(t), ttnn::DataType::FLOAT32),
+          ttnn::Layout::ROW_MAJOR));
+    assembled = ttnn::concat(std::move(rows_f), /*dim=*/0);
+    if (out.dtype == DType::kBF16)
+      assembled =
+          ttnn::typecast(std::move(assembled), ttnn::DataType::BFLOAT16);
+  }
+  CommitDeviceLogical2D(out, std::move(assembled), static_cast<uint32_t>(P),
+                        static_cast<uint32_t>(N));
 }
 
 // Upload a rank-1 affine vector as TILE BFLOAT16 [1, d], caching on the weight's
@@ -2269,6 +3064,35 @@ void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
                                 ttsl::SmallVector<uint32_t>{1, 1});
   ttnn::Tensor silu_gate = ttnn::silu(gate);
   ttnn::Tensor dev_y = ttnn::multiply(silu_gate, up);
+  CommitDevice2D(out, std::move(dev_y));
+}
+
+// kMoeSiluMul: silu(gate) * up with SPLIT operands (ops.cpp MoeSiluMul -> id 63;
+// cpu_ops.cpp MoeSiluMulKernel, cuda_moe.cu MoeSiluMulKernel). The split sibling
+// of kSiluAndMul above: the GGUF dense MLP arm reaches the DenseMlpBlock tail
+// with gate/up as TWO separate [T,I] GEMM outputs (GGUF stores ff_gate/ff_up
+// unmerged), so there is no merged [T,2I] operand to slice. Same ttnn math
+// (ttnn::silu + ttnn::multiply) and the same capture-safe EnsureDevice2D /
+// CommitDevice2D staging as kSiluAndMul, so the captured e2e treats it
+// identically. The vehicle path feeds f32 gate/up, where the CPU kernel's
+// RoundThrough(gate.dtype) narrowing is the identity.
+void MoeSiluMulKernel(Queue&, Tensor& out, const Tensor& gate, const Tensor& up) {
+  TT_OP_TRACE("MoeSiluMul");
+  VT_CHECK(gate.rank == 2 && up.rank == 2 && out.rank == 2,
+           "tenstorrent kMoeSiluMul: only rank-2 tensors are supported");
+  VT_CHECK(IsFloatDType(gate.dtype) && IsFloatDType(up.dtype) &&
+               (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
+           "tenstorrent kMoeSiluMul: float in, f32/bf16 out");
+  VT_CHECK(gate.IsContiguous() && up.IsContiguous() && out.IsContiguous(),
+           "tenstorrent kMoeSiluMul: strided (non-contiguous) tensors are not supported");
+  VT_CHECK(gate.shape[0] == out.shape[0] && gate.shape[1] == out.shape[1] &&
+               up.shape[0] == gate.shape[0] && up.shape[1] == gate.shape[1],
+           "tenstorrent kMoeSiluMul: gate, up and out must share one [T, I] shape");
+
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::Tensor dev_g = EnsureDevice2D(gate, device);
+  ttnn::Tensor dev_u = EnsureDevice2D(up, device);
+  ttnn::Tensor dev_y = ttnn::multiply(ttnn::silu(dev_g), dev_u);
   CommitDevice2D(out, std::move(dev_y));
 }
 
@@ -6658,12 +7482,19 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
     RegisterOp(OpId::kKeepQuantDecode, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<KeepQuantDecodeFn>(&KeepQuantDecodeKernel)));
+    RegisterOp(OpId::kMatmulBTQuant, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulBTQuantKernel)));
+    RegisterOp(OpId::kMatmulBTQuantGrouped, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<MatmulBTQuantGroupedFn>(
+                   &MatmulBTQuantGroupedKernel)));
     RegisterOp(OpId::kLayerNorm, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<LayerNormFn>(&LayerNormKernel)));
     RegisterOp(OpId::kRmsNorm, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernel)));
     RegisterOp(OpId::kSiluAndMul, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<SiluAndMulFn>(&SiluAndMulKernel)));
+    RegisterOp(OpId::kMoeSiluMul, DeviceType::kTENSTORRENT,
+               reinterpret_cast<void*>(static_cast<MoeSiluMulFn>(&MoeSiluMulKernel)));
     RegisterOp(OpId::kCastBf16, DeviceType::kTENSTORRENT,
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16Kernel)));
     RegisterOp(OpId::kCastF32, DeviceType::kTENSTORRENT,
@@ -6712,6 +7543,48 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+
+int64_t KeepQuantCaptureStagingWrites() {
+  return KeepQuantCaptureStagingWritesCounter().load(std::memory_order_relaxed);
+}
+void ResetKeepQuantCaptureStagingWritesForTest() {
+  KeepQuantCaptureStagingWritesCounter().store(0, std::memory_order_relaxed);
+}
+
+// W4a wave-3a test hooks — the contract lives in tenstorrent_device.h.
+void KeepQuantChunkRowsOverrideForTest(int64_t rows) {
+  KeepQuantChunkRowsOverride().store(rows, std::memory_order_relaxed);
+}
+std::atomic<int64_t>& LastTraceBytes() {
+  static std::atomic<int64_t> v{0};
+  return v;
+}
+int64_t LastTraceBytesForTest() {
+  return LastTraceBytes().load(std::memory_order_relaxed);
+}
+
+// W4a wave-3b-1 residency-policy probes — the contract lives in
+// tenstorrent_device.h. Each reads its map under its own mutex; a nullptr or
+// absent host reads false. Defined OUTSIDE the anonymous namespace (the
+// wave-3a hook pattern): a -Werror=unused-function TU would reject an
+// anonymous-namespace helper no other file-local code calls.
+bool KeepQuantWordShadowPresentForTest(const void* host) {
+  if (host == nullptr) return false;
+  std::lock_guard<std::mutex> g(KeepQuantWordMutex());
+  return KeepQuantWordShadows().find(host) != KeepQuantWordShadows().end();
+}
+bool DecodedWeightShadowPresentForTest(const void* host) {
+  if (host == nullptr) return false;
+  std::lock_guard<std::mutex> g(DecodedWeightMutex());
+  return DecodedWeightShadows().find(reinterpret_cast<uintptr_t>(host)) !=
+         DecodedWeightShadows().end();
+}
+bool EmbedTableShadowPresentForTest(const void* host) {
+  if (host == nullptr) return false;
+  std::lock_guard<std::mutex> g(EmbedTableMutex());
+  return EmbedTableShadows().find(reinterpret_cast<uintptr_t>(host)) !=
+         EmbedTableShadows().end();
+}
 
 // ---- ttnn mesh-trace capture (Backend graph-capture mapping) ----------------
 // Process-local single-slot capture + multi-graph handles (opaque MeshTraceId*).
@@ -6778,6 +7651,10 @@ void TraceEndCapture() {
   VT_CHECK(s.capturing, "tenstorrent: TraceEndCapture without Begin");
   MeshDevice& device = SharedMeshDevice();
   ttnn::operations::trace::end_trace_capture(&device, s.capturing_id, kTraceCq);
+  // W4a wave-3a: expose the device-reported live trace demand so the
+  // chunked E=1 arm's fit inside the 50 MiB trace region is a measurement,
+  // not an assumption (the wave-1b falsification class).
+  LastTraceBytes() = static_cast<int64_t>(device.get_trace_buffers_size());
   // Drop previous single-slot replay if any.
   if (s.has_replay) {
     try {
@@ -6811,6 +7688,7 @@ void* TraceEndCaptureGraph() {
   VT_CHECK(s.capturing, "tenstorrent: TraceEndCaptureGraph without Begin");
   MeshDevice& device = SharedMeshDevice();
   ttnn::operations::trace::end_trace_capture(&device, s.capturing_id, kTraceCq);
+  LastTraceBytes() = static_cast<int64_t>(device.get_trace_buffers_size());
   NoteGraphCaptured();
   s.capturing = false;
   tt_capture_active() = false;
@@ -6989,6 +7867,7 @@ void UnregisterHostBuffer(void* host) {
   }
   DropPagedKvShadow(host);
   DropEmbedTableShadow(host);
+  DropDecodedWeightShadow(host);
 }
 
 void MarkHostWritten(void* host) {

@@ -303,6 +303,31 @@ BENCH_EVIDENCE_RUN = re.compile(
     r"docs/bench-evidence/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
     r"\.(?:txt|log|gz|sh|cu|py|jsonl|rc)\Z"
 )
+# #3060: exact client stdout and the harness patch archived with two EXL3 runs.
+# The patch records an external server-wrapper adaptation, and the live
+# variadic recipe applies its staged copy. Keep this admission exact so an
+# uninspected log or patch cannot inherit the evidence class.
+# Source/history: .agents/specs/gate-pr-size-bench-evidence.md.
+RECORDED_BENCH_EVIDENCE = frozenset(
+    {
+        "docs/bench-evidence/qwen38-27b-exl3-headtohead-20260903/OURS-A.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-headtohead-20260903/OURS-B.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-headtohead-20260903/THEIRS-A.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-headtohead-20260903/THEIRS-B.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-headtohead-20260903/serve_openai-usage.patch",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r1-c1.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r1-c4.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r1-c8.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r2-c1.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r2-c4.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r2-c8.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/PROBE.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/THEIRS-r1-c1.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/THEIRS-r1-c4.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/THEIRS-r1-c8.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/THEIRS-r2-c8.clientlog",
+    }
+)
 # #2609. The lease RECIPES: the exact script a `rc` job ran to produce a number
 # a spec then cites. Same class and same reasoning as BENCH_EVIDENCE_RUN's `.sh`
 # and `.cu` above -- verified, not assumed: nothing under CMakeLists.txt,
@@ -554,6 +579,7 @@ def classify_path(path: str) -> str:
         or SYNC_RECORD.fullmatch(path)
         or BENCH_EVIDENCE.fullmatch(path)
         or BENCH_EVIDENCE_RUN.fullmatch(path)
+        or path in RECORDED_BENCH_EVIDENCE
         or AGENT_RUN_SCRIPT.fullmatch(path)
     ):
         return "evidence"

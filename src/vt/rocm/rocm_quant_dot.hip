@@ -918,6 +918,7 @@ void MatmulQ8_0Rocm(Tensor& out, const Tensor& a, const Tensor& b,
         act, m, n, nb, w_row_bytes);
   CheckHipLaunch("matmul_bt_quant Q8_0 launch");
 }
+}  // namespace
 
 // The kROCM provider for OpId::kMatmulBTQuant. Validation already done by
 // vt::MatmulBTQuant (ops.cpp). Contract: b is [N,K] block-quant, a [M,K]
@@ -925,6 +926,12 @@ void MatmulQ8_0Rocm(Tensor& out, const Tensor& a, const Tensor& b,
 // dtype cannot fall back to the CPU kernel (it would follow device pointers),
 // so it throws naming the dtype — VT_GGUF_KEEP_QUANT=0 restores the load-time
 // bf16 expansion for such files.
+//
+// External linkage on purpose: rocm_ops.hip declares and registers these two
+// entry points for kROCM, and rocm_moe_gate_up_swiglu.hip calls the grouped
+// one. Internal-linkage definitions here left those references unresolved at
+// link. The helpers above stay internal; only the two entry points are
+// exported, and registration stays with rocm_ops.hip's single registrar.
 void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a,
                              const Tensor& b) {
   hipStream_t s = static_cast<hipStream_t>(q.handle);
@@ -1056,20 +1063,9 @@ void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
   }
 }
 
-// Registers the ROCm keep-quant GEMM during static init (table fill only, no
-// HIP calls — same contract as every other registrar). This makes
-// GgufQuantComputeAvailable).
-struct Registrar {
-  Registrar() {
-    RegisterOp(OpId::kMatmulBTQuant, DeviceType::kROCM,
-               reinterpret_cast<void*>(
-                   static_cast<MatmulFn>(&MatmulBTQuantKernelRocm)));
-    RegisterOp(OpId::kMatmulBTQuantGrouped, DeviceType::kROCM,
-               reinterpret_cast<void*>(
-                   static_cast<MatmulBTQuantGroupedFn>(
-                       &MatmulBTQuantGroupedKernelRocm)));
-  }
-} registrar;
+// The two providers above are registered exactly once, by rocm_ops.hip's
+// static registrar — this file deliberately carries no Registrar of its own.
+// A second registration of the same OpId+DeviceType would make which registrar
+// wins depend on static-init order across translation units.
 
-}  // namespace
 }  // namespace vt::rocm

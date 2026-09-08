@@ -116,8 +116,8 @@ The owning pull request closes #3060 when the repair lands.
 
 ## Now
 
-`ACTIVE`. Initial source investigation and baseline failure reproduction are complete.
-Implementation, fresh review, and operator verification remain required.
+`ACTIVE`. The exact artifact classification repair is implemented.
+Fresh review and operator verification remain required before landing.
 
 ## Risks and stop conditions
 

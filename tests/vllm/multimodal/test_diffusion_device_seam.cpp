@@ -1046,6 +1046,14 @@ TEST_CASE("ltx2 vae: a device queue whose PLATFORM IS UNREGISTERED is refused by
                  vt::GetOp(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU));
   vt::RegisterOp(vt::OpId::kAdd, missing_type,
                  vt::GetOp(vt::OpId::kAdd, vt::DeviceType::kCPU));
+  // OpRegistered excludes the portable reference tier. GetOp alone could
+  // resolve a fallback and would not prove these native registrations exist.
+  for (const auto op : {vt::OpId::kConv3d, vt::OpId::kLtx2, vt::OpId::kLtx2Vae,
+                        vt::OpId::kAdd}) {
+    CAPTURE(vt::OpName(op));
+    REQUIRE(vt::OpRegistered(op, missing_type));
+    CHECK(vt::GetOp(op, missing_type) == vt::GetOp(op, vt::DeviceType::kCPU));
+  }
   REQUIRE(vt::TryGetBackend(vt::Device{missing_type, 0}) != nullptr);
   REQUIRE_FALSE(vllm::platforms::HasPlatform(missing_type));
 

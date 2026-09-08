@@ -1,7 +1,9 @@
 # KERNEL-CUDA-DECODE-MEGAKERNEL — tile-scheduled persistent decode spike
 
 **Row:** `KERNEL-CUDA-DECODE-MEGAKERNEL` (`kernel-matrix`).
-**Issue:** [#3084](https://github.com/mudler/vllm.cpp/issues/3084).
+**Issues:** [#3084](https://github.com/mudler/vllm.cpp/issues/3084) owns the
+spike; [#3085](https://github.com/mudler/vllm.cpp/issues/3085) owns the record
+gate repair discovered while adding the row.
 **Kind:** roadmap intake and bounded research spike. This spec ships no kernel,
 model path, dependency, benchmark, or user-visible capability.
 
@@ -50,6 +52,8 @@ In scope:
   least two existing kernel families through the proposed ABI.
 - Preserve eager and CUDA Graph fallbacks for every unsupported architecture,
   dtype, model, batch, shape, and quantization arm.
+- Repair the record checker so adding this keyed row does not require a stored
+  cardinality update in another tracked file.
 
 Out of scope:
 
@@ -61,6 +65,9 @@ Out of scope:
   required GGUF k-quant arm.
 - A throughput claim before token correctness and identical-workload A/B gates
   pass.
+- A migration of the shared matrices to one-file-per-row storage. That larger
+  record-surface change remains separate from the narrow derived-at-read-time
+  repair in #3085.
 
 ## References and pins
 
@@ -144,6 +151,34 @@ model, checkpoint, quantized arms, entry point, fallback predicates, scheduling
 policy, ABI ownership, and architecture matrix. It must extend the shared seams
 when necessary instead of bypassing them.
 
+### Gate repair — derive matrix contents at read time
+
+The red result for the first matrix edit was `60 KERNEL rows; expected 59`.
+`scripts/check-agent-record.py` stores each matrix path beside a hand-maintained
+row count. That is a measurement of one file stored in another file, and it
+forces every row addition to edit the same checker. Both properties violate the
+record-surface rules in `AGENTS.md`. The count is also not a key-preservation
+gate: deleting one row and adding another leaves it green.
+
+Issue #3085 removes the stored cardinalities for all matrices, not only the
+kernel value exposed by this row. Matrix paths and prefixes remain declared;
+their rows are parsed and counted only from the files being checked. Every
+structural, duplicate-ID, lifecycle, issue-ownership, spec, anchor, and
+matrix-specific invariant remains active.
+
+Tests that patch or assert the stored number must instead name the guarantee
+they intend to protect. A historically significant row stays protected by an
+exact key assertion and its semantic cell assertions. A new regression fixture
+must show that adding one structurally valid, uniquely keyed row does not
+require any checker constant to change. Negative fixtures must still prove that
+a duplicate key, malformed row, invalid lifecycle transition, missing claim,
+or broken issue/spec ownership fails for its own reason.
+
+The long comments that explain retired cardinality bumps are historical
+evidence. They move intact to one file under `.agents/completed/`; they are not
+deleted or rewritten as current policy. No replacement current count is stored
+there or elsewhere.
+
 ## Tests and gates
 
 This roadmap intake must pass:
@@ -154,6 +189,8 @@ This roadmap intake must pass:
    same row ID, state, scope, pin, and exclusions.
 4. A scratch mutation that removes or changes the matrix row and demonstrates
    that the record check or an explicit exact-row assertion fails.
+5. The focused #3085 suite proving matrix contents are derived at read time and
+   all non-cardinality record guarantees remain load-bearing.
 
 W0 must pass before W1:
 
@@ -196,6 +233,11 @@ W1 must pass before any production proposal:
   identifies a missing primitive and a separate decision measures the cost.
 - **D2 — no ceiling.** A failed first proof records the next traceable
   hypothesis; it never declares the architecture exhausted.
+- **D3 — retire the count, retain the guarantees.** #3085 removes only the
+  cross-file cardinality measurement. It does not turn off parsing, key
+  uniqueness, row shape, lifecycle, issue, claim, spec, anchor, or semantic
+  checks. Historical count commentary moves to `.agents/completed/` because it
+  remains provenance even after it stops controlling the gate.
 
 ## Evidence
 
@@ -220,6 +262,7 @@ complete recipes and hashes.
 ## Owed
 
 Issue [#3084](https://github.com/mudler/vllm.cpp/issues/3084) owns W0 and the
-conditional W1. The row remains `SPIKE` until those results either justify a
-separate production row or falsify the hypothesis. No other open issue is
-created by this intake.
+conditional W1. Issue [#3085](https://github.com/mudler/vllm.cpp/issues/3085)
+closes when the derived-at-read-time record gate and its tests land in this
+integration. The row remains `SPIKE` until W0 and W1 either justify a separate
+production row or falsify the hypothesis.

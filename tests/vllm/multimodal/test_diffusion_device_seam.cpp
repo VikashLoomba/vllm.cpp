@@ -784,6 +784,10 @@ TEST_CASE("ltx2 vae: the video decode's DEVICE ALLOCATIONS are drawn from the sh
 
   // DELTAS, not absolutes: this executable runs other decodes on the same
   // backend, and doctest gives no case order it is safe to depend on.
+  // Discard prior cases' retained blocks before measuring this cold decode.
+  // Keep both decodes below in the same pool so the second still proves reuse.
+  pool.Drain(Backend());
+  REQUIRE(pool.stats().retained_bytes == 0);
   const vllm::DevicePool::Stats before = pool.stats();
   const unsigned allocs_before = Backend().allocs;
 
@@ -952,6 +956,10 @@ TEST_CASE("ltx2 vae: a ZERO-PAD decode is correct on a RECYCLED pool block, twic
   vt::Queue q{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
   vllm::DevicePool& pool = vllm::Pool(Backend());
 
+  // Prior shapes can lend larger blocks and change this fixture's reuse order.
+  // Start its first decode cold; retain its dirty blocks for the second decode.
+  pool.Drain(Backend());
+  REQUIRE(pool.stats().retained_bytes == 0);
   CountingNoise noise_first;
   const vllm::Ltx2VideoFrames dev_first =
       vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,

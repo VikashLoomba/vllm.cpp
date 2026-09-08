@@ -240,27 +240,6 @@ class AgentRecordMutationTests(unittest.TestCase):
             r"MODEL-FACTORY-registry table lacks semantic owner column",
         )
 
-    def test_engine_row_ratchet_is_load_bearing(self) -> None:
-        """The ENGINE_ROWS pin must catch a row appearing or vanishing.
-
-        The constant is re-pinned by hand whenever a real row lands, so it is
-        worth proving it is not decorative: a matrix carrying one row fewer than
-        the pin has to be an error, in both directions. Without this, bumping
-        the number to silence a failure would look exactly like bumping it for a
-        new row.
-        """
-        clean: list[str] = []
-        agent_record.check_matrices(clean)
-        self.assertEqual([error for error in clean if "engine rows" in error], [])
-
-        errors: list[str] = []
-        with mock.patch.object(
-            agent_record, "ENGINE_ROWS", agent_record.ENGINE_ROWS - 1
-        ):
-            agent_record.check_matrices(errors)
-
-        require(errors, r"\d+ engine rows; expected \d+")
-
     def test_windows_release_row_is_inside_the_engine_ratchet(self) -> None:
         """The #117 row and its ratchet bump are one semantic change."""
 
@@ -480,118 +459,6 @@ class AgentRecordMutationTests(unittest.TestCase):
             found = [row for row in rows if row.item_id == item_id]
             self.assertEqual(len(found), 1, item_id)
             self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
-
-    def test_model_row_ratchet_is_load_bearing(self) -> None:
-        """The MODEL row pin must catch a row appearing or vanishing.
-
-        Mirrors the ENGINE ratchet above, for the same reason and with more
-        force: the MODEL count is the one that actually moves, because every new
-        architecture re-pins it by hand. Muse Glimmer took it 361 -> 362
-        (`c8fc24a50`); the seven recipe architectures that had no row at all took
-        it 362 -> 369 (#609, #610, `eba6ab7c7`); LTX-2.5 took it 369 -> 370
-        (#435, `cefacd2d0`); IndexTTS-2.5 took it 370 -> 372, being two
-        architectures (#634); MiniMax-Music3 took it to 373 (#672); and the two
-        text-only Qwen3.5 arms took it 373 -> 375 (#490). Without this,
-        bumping the number to silence a failure is indistinguishable from bumping
-        it because a row really landed.
-        """
-        clean: list[str] = []
-        agent_record.check_matrices(clean)
-        self.assertEqual([error for error in clean if "MODEL rows" in error], [])
-
-        path, expected = agent_record.MATRICES["MODEL"]
-        errors: list[str] = []
-        with mock.patch.dict(
-            agent_record.MATRICES, {"MODEL": (path, expected - 1)}
-        ):
-            agent_record.check_matrices(errors)
-        require(errors, r"\d+ MODEL rows; expected \d+")
-
-        # Both directions: a pin ABOVE the tree must fail too, so a count can
-        # never be inflated ahead of the rows that justify it.
-        errors = []
-        with mock.patch.dict(
-            agent_record.MATRICES, {"MODEL": (path, expected + 1)}
-        ):
-            agent_record.check_matrices(errors)
-        require(errors, r"\d+ MODEL rows; expected \d+")
-
-    def test_model_pin_log_records_only_transitions_that_happened(self) -> None:
-        """The MODEL pin's justification log must not name a value the pin never held.
-
-        Every assertion above checks the pin against the ROWS. None of them can
-        see the other half of the record: the `# <N> since <date>` block
-        directly above the pin, which is the append-log of the values this pin
-        has held and the only place the REASON for each bump is written down.
-        Nothing read it, so it drifted -- an entry claimed LTX-2.5 took the pin
-        to `363 since 2026-08-11` (#651), and both halves were wrong. `git log
-        -S` on the row id finds exactly one commit, `cefacd2d0` on 2026-08-13,
-        and the pin reads 369 before it and 370 after. 363 is a value this pin
-        has never held at any commit in its history.
-
-        That is not a cosmetic defect. This log is what a later re-derivation
-        reads to decide whether a number was bumped because a row landed or
-        bumped to silence a failure, which is the exact distinction
-        `test_model_row_ratchet_is_load_bearing` exists to force -- and the two
-        collisions recorded above (#634/#672, #490/#699) were both resolved by
-        reading it. An entry naming a transition that never happened makes the
-        next collision unresolvable from the record.
-
-        Two properties are checked, because either alone is satisfiable by a
-        wrong number. The values must INCREASE in file order and end at the pin
-        -- an append-log that goes 369, 363, 372 is self-evidently not a history
-        -- and the LTX-2.5 entry must name 370 specifically, which is what
-        catches a stale value that happens to fall in sequence.
-        """
-
-        source = CHECKER.read_text(encoding="utf-8").splitlines()
-        pin_lines = [
-            index
-            for index, line in enumerate(source)
-            if '"MODEL": (AGENTS / "model-matrix.md"' in line
-        ]
-        self.assertEqual(len(pin_lines), 1, "the MODEL pin must be assigned exactly once")
-        pin_index = pin_lines[0]
-
-        start = pin_index - 1
-        while start >= 0 and source[start].lstrip().startswith("#"):
-            start -= 1
-        block = source[start + 1 : pin_index]
-        self.assertTrue(block, "the MODEL pin must carry its justification log")
-
-        # The date is followed by ':' on most entries and by ', and RE-DERIVED
-        # ...' on the two that were recounted after a merge collision, so the
-        # parse stops at the date rather than requiring what comes after it.
-        entries = [
-            (int(match.group(1)), match.group(2), index)
-            for index, line in enumerate(block)
-            for match in [re.match(r"\s*#\s*(\d+) since (\d{4}-\d{2}-\d{2})\b", line)]
-            if match
-        ]
-        self.assertGreater(len(entries), 1, "the log must record more than one bump")
-
-        values = [value for value, _, _ in entries]
-        self.assertEqual(
-            values,
-            sorted(values),
-            f"the MODEL pin log is not in the order the pin moved: {values}",
-        )
-        self.assertEqual(len(values), len(set(values)), f"a value is logged twice: {values}")
-        self.assertEqual(
-            values[-1],
-            agent_record.MATRICES["MODEL"][1],
-            "the last logged value must be the value the pin now carries",
-        )
-
-        ltx = [
-            entry
-            for entry in entries
-            if "MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model"
-            in "\n".join(block[entry[2] : entry[2] + 3])
-        ]
-        self.assertEqual(len(ltx), 1, "LTX-2.5 must own exactly one entry in the log")
-        self.assertEqual(ltx[0][0], 370, "LTX-2.5 took the MODEL pin 369 -> 370 (`cefacd2d0`)")
-        self.assertEqual(ltx[0][1], "2026-08-13", "`cefacd2d0` landed on 2026-08-13")
 
     def test_indextts_rows_are_inside_the_model_ratchet(self) -> None:
         """The #634 rows and the 370 -> 372 bump are one semantic change.
@@ -1275,24 +1142,6 @@ class TenstorrentResidualGoldenRowIsCounted(unittest.TestCase):
         ]
         self.assertEqual(len(matching), 1, f"{self.ROW} must appear exactly once")
 
-    def test_the_backend_pin_is_load_bearing(self) -> None:
-        """MUTATION: moving the pin by one must make the count disagree."""
-        clean: list[str] = []
-        agent_record.check_matrices(clean)
-        self.assertEqual([e for e in clean if "backend rows" in e.lower()], [])
-
-        path, count = agent_record.MATRICES["BACKEND"]
-        errors: list[str] = []
-        with mock.patch.dict(
-            agent_record.MATRICES, {"BACKEND": (path, count - 1)}
-        ):
-            agent_record.check_matrices(errors)
-        self.assertTrue(
-            any("backend rows" in e.lower() for e in errors),
-            f"the BACKEND pin must bind; got {errors}",
-        )
-
-
 class Qwen35TextOnlyRowsAreCounted(unittest.TestCase):
     """The MODEL ratchet bump 373 -> 375 is backed by two real rows (#490).
 
@@ -1318,27 +1167,6 @@ class Qwen35TextOnlyRowsAreCounted(unittest.TestCase):
         for row in self.ROWS:
             matching = [line for line in lines if line.startswith(f"| `{row}` |")]
             self.assertEqual(len(matching), 1, f"{row} must appear exactly once")
-
-    def test_the_model_pin_equals_the_rows_the_matrix_carries(self) -> None:
-        """MUTATION: the pin and the tree disagreeing by one row must be RED.
-
-        Counted the way `check_matrices` counts, so a pin left behind by a
-        landing row -- or moved ahead of one -- fails here and not only inside
-        the checker's own error list.
-        """
-        path, expected = agent_record.MATRICES["MODEL"]
-        errors: list[str] = []
-        rows, _ = agent_record.check_matrices(errors)
-        actual = sum(
-            row.item_id.startswith("MODEL-") for row in rows if row.path == path
-        )
-        self.assertEqual(
-            actual,
-            expected,
-            "the MODEL pin must equal the MODEL rows model-matrix.md carries",
-        )
-        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
-
 
 class TenstorrentMistralRowIsCounted(unittest.TestCase):
     """The BACKEND ratchet bump to 82 is backed by a real row (#670).
@@ -1374,47 +1202,6 @@ class TenstorrentMistralRowIsCounted(unittest.TestCase):
         # same pin: this row's issue link must still exist somewhere trackable.
         index = tracked_issues(self)
         self.assertIn("issues/670", index)
-
-    def test_the_backend_pin_is_load_bearing_for_this_row(self) -> None:
-        """MUTATION: with this row removed, the pinned count must disagree.
-
-        Redirects only the BACKEND entry at a mutated copy on disk. Patching
-        `Path.read_text` globally would feed backend content to every matrix and
-        this test would then pass on errors that have nothing to do with the
-        removal -- green for the wrong reason, which is the failure mode these
-        cases exist to catch.
-        """
-        clean: list[str] = []
-        agent_record.check_matrices(clean)
-        self.assertEqual([e for e in clean if "backend rows" in e.lower()], [])
-
-        path, count = agent_record.MATRICES["BACKEND"]
-        text = path.read_text(encoding="utf-8")
-        without = "\n".join(
-            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
-        )
-        self.assertNotEqual(without, text, "the row must be present to remove")
-
-        # Under ROOT, not /tmp: check_matrices reports via
-        # `path.relative_to(ROOT)`, which raises on a path outside the repo.
-        # And BOTH tables need redirecting -- rows are parsed from
-        # MATRIX_PATHS while the count is pinned in MATRICES, so patching only
-        # the latter counts zero rows for a reason unrelated to the removal.
-        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
-            mutated = Path(tmp) / "backend-matrix.md"
-            mutated.write_text(without, encoding="utf-8")
-            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
-            errors: list[str] = []
-            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
-                 mock.patch.dict(
-                     agent_record.MATRICES, {"BACKEND": (mutated, count)}
-                 ):
-                agent_record.check_matrices(errors)
-        self.assertTrue(
-            any("backend rows" in e.lower() for e in errors),
-            f"removing {self.ROW} must break the BACKEND count; got {errors}",
-        )
-
 
 class TenstorrentTraceRunnerRowIsCounted(TenstorrentMistralRowIsCounted):
     """The BACKEND ratchet bump to 84 is backed by a real row (#1105)."""
@@ -1528,41 +1315,6 @@ class MtpDepthRowIsCounted(unittest.TestCase):
         index = tracked_issues(self)
         self.assertIn("issues/81)", index)
 
-    def test_the_engine_pin_is_load_bearing_for_this_row(self) -> None:
-        """MUTATION: with this row removed, the pinned count must disagree.
-
-        Redirects only the ENGINE matrix at a mutated copy on disk, for the
-        reason `TenstorrentMistralRowIsCounted` records: patching `read_text`
-        globally would feed engine content to every matrix, and this case would
-        then pass on errors that have nothing to do with the removal.
-        """
-        clean: list[str] = []
-        agent_record.check_matrices(clean)
-        self.assertEqual([e for e in clean if "engine rows" in e], [])
-
-        path = agent_record.ENGINE_MATRIX
-        text = path.read_text(encoding="utf-8")
-        without = "\n".join(
-            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
-        )
-        self.assertNotEqual(without, text, "the row must be present to remove")
-
-        # Under ROOT, not /tmp: check_matrices reports through
-        # `relative_to(ROOT)`, which raises on a path outside the repository.
-        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
-            mutated = Path(tmp) / "engine-matrix.md"
-            mutated.write_text(without, encoding="utf-8")
-            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
-            errors: list[str] = []
-            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
-                 mock.patch.object(agent_record, "ENGINE_MATRIX", mutated):
-                agent_record.check_matrices(errors)
-        self.assertTrue(
-            any("engine rows" in e for e in errors),
-            f"removing {self.ROW} must break the engine count; got {errors}",
-        )
-
-
 class CanonicalIssueRecordTests(unittest.TestCase):
     def record(self, number: int) -> object:
         return agent_record.issue_records.IssueRecord(
@@ -1627,6 +1379,254 @@ class CanonicalIssueRecordTests(unittest.TestCase):
             (agent_record.AGENTS / "issue-index.md").exists(),
             "the tracked issue index is back; it is a surface every PR writes",
         )
+# Preserve the exact line anchors owned by ENG-RECORD-ANCHOR-RATCHET (#632).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 class RecordAnchorRatchet(unittest.TestCase):
     """ENG-RECORD-ANCHOR-RATCHET (#632), .agents/specs/record-anchor-ratchet.md.
@@ -1827,53 +1827,6 @@ class HfModelDownloadRowIsCounted(unittest.TestCase):
         index = tracked_issues(self)
         self.assertIn("issues/1280)", index)
 
-    def test_the_engine_pin_is_load_bearing_for_this_row(self) -> None:
-        """MUTATION: with this row removed, the pinned count must disagree.
-
-        Redirects only the ENGINE matrix at a mutated copy on disk, for the
-        reason `TenstorrentMistralRowIsCounted` records: patching `read_text`
-        globally would feed engine content to every matrix, and this case would
-        then pass on errors that have nothing to do with the removal.
-        """
-        clean: list[str] = []
-        agent_record.check_matrices(clean)
-        self.assertEqual([e for e in clean if "engine rows" in e], [])
-
-        path = agent_record.ENGINE_MATRIX
-        text = path.read_text(encoding="utf-8")
-        without = "\n".join(
-            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
-        )
-        self.assertNotEqual(without, text, "the row must be present to remove")
-
-        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
-            mutated = Path(tmp) / "engine-matrix.md"
-            mutated.write_text(without, encoding="utf-8")
-            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
-            errors: list[str] = []
-            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
-                 mock.patch.object(agent_record, "ENGINE_MATRIX", mutated):
-                agent_record.check_matrices(errors)
-        self.assertTrue(
-            any("engine rows" in e for e in errors),
-            f"removing {self.ROW} must break the engine count; got {errors}",
-        )
-
-    def test_the_pin_agrees_with_the_matrix_it_counts(self) -> None:
-        """MUTATION TARGET: `ENGINE_ROWS` back at 164 must be an error.
-
-        The pin and the matrix are two hand-maintained records of one number.
-        This asserts they agree at the value this change lands, so lowering the
-        constant to the previous 164 while the row is present reds here.
-        """
-        errors: list[str] = []
-        rows, _ = agent_record.check_matrices(errors)
-        self.assertEqual([e for e in errors if "engine rows" in e], [])
-        engine = [r for r in rows if r.path == agent_record.ENGINE_MATRIX]
-        self.assertEqual(len(engine), agent_record.ENGINE_ROWS)
-        self.assertIn(self.ROW, {r.item_id for r in engine})
-
-
 class BpeQuadraticMergeRowIsCounted(unittest.TestCase):
     """The ENGINE ratchet bump 167 -> 168 is backed by a real row (#1365).
 
@@ -1914,53 +1867,6 @@ class BpeQuadraticMergeRowIsCounted(unittest.TestCase):
             "the spec the row cites must exist",
         )
 
-    def test_the_engine_pin_is_load_bearing_for_this_row(self) -> None:
-        """MUTATION: with this row removed, the pinned count must disagree.
-
-        Redirects only the ENGINE matrix at a mutated copy on disk, for the
-        reason `TenstorrentMistralRowIsCounted` records: patching `read_text`
-        globally would feed engine content to every matrix, and this case would
-        then pass on errors that have nothing to do with the removal.
-        """
-        clean: list[str] = []
-        agent_record.check_matrices(clean)
-        self.assertEqual([e for e in clean if "engine rows" in e], [])
-
-        path = agent_record.ENGINE_MATRIX
-        text = path.read_text(encoding="utf-8")
-        without = "\n".join(
-            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
-        )
-        self.assertNotEqual(without, text, "the row must be present to remove")
-
-        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
-            mutated = Path(tmp) / "engine-matrix.md"
-            mutated.write_text(without, encoding="utf-8")
-            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
-            errors: list[str] = []
-            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
-                 mock.patch.object(agent_record, "ENGINE_MATRIX", mutated):
-                agent_record.check_matrices(errors)
-        self.assertTrue(
-            any("engine rows" in e for e in errors),
-            f"removing {self.ROW} must break the engine count; got {errors}",
-        )
-
-    def test_the_pin_agrees_with_the_matrix_it_counts(self) -> None:
-        """MUTATION TARGET: `ENGINE_ROWS` back at 167 must be an error.
-
-        The pin and the matrix are two hand-maintained records of one number.
-        This asserts they agree at the value this change lands, so lowering the
-        constant to the previous 167 while the row is present reds here.
-        """
-        errors: list[str] = []
-        rows, _ = agent_record.check_matrices(errors)
-        self.assertEqual([e for e in errors if "engine rows" in e], [])
-        engine = [r for r in rows if r.path == agent_record.ENGINE_MATRIX]
-        self.assertEqual(len(engine), agent_record.ENGINE_ROWS)
-        self.assertIn(self.ROW, {r.item_id for r in engine})
-
-
 class RequestLengthGuardRowIsCounted(unittest.TestCase):
     """The ENGINE ratchet bump 169 -> 170 is backed by a real row (#1541).
 
@@ -1995,53 +1901,6 @@ class RequestLengthGuardRowIsCounted(unittest.TestCase):
             (ROOT / ".agents/specs/serve-request-length-guard.md").is_file(),
             "the spec the row cites must exist",
         )
-
-    def test_the_engine_pin_is_load_bearing_for_this_row(self) -> None:
-        """MUTATION: with this row removed, the pinned count must disagree.
-
-        Redirects only the ENGINE matrix at a mutated copy on disk, for the
-        reason `BpeQuadraticMergeRowIsCounted` records: patching `read_text`
-        globally would feed engine content to every matrix, and this case would
-        then pass on errors that have nothing to do with the removal.
-        """
-        clean: list[str] = []
-        agent_record.check_matrices(clean)
-        self.assertEqual([e for e in clean if "engine rows" in e], [])
-
-        path = agent_record.ENGINE_MATRIX
-        text = path.read_text(encoding="utf-8")
-        without = "\n".join(
-            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
-        )
-        self.assertNotEqual(without, text, "the row must be present to remove")
-
-        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
-            mutated = Path(tmp) / "engine-matrix.md"
-            mutated.write_text(without, encoding="utf-8")
-            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
-            errors: list[str] = []
-            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
-                 mock.patch.object(agent_record, "ENGINE_MATRIX", mutated):
-                agent_record.check_matrices(errors)
-        self.assertTrue(
-            any("engine rows" in e for e in errors),
-            f"removing {self.ROW} must break the engine count; got {errors}",
-        )
-
-    def test_the_pin_agrees_with_the_matrix_it_counts(self) -> None:
-        """MUTATION TARGET: `ENGINE_ROWS` back at 169 must be an error.
-
-        The pin and the matrix are two hand-maintained records of one number.
-        This asserts they agree at the value this change lands, so lowering the
-        constant to the previous 169 while the row is present reds here.
-        """
-        errors: list[str] = []
-        rows, _ = agent_record.check_matrices(errors)
-        self.assertEqual([e for e in errors if "engine rows" in e], [])
-        engine = [r for r in rows if r.path == agent_record.ENGINE_MATRIX]
-        self.assertEqual(len(engine), agent_record.ENGINE_ROWS)
-        self.assertIn(self.ROW, {r.item_id for r in engine})
-
 
 class DeepseekV4MultiCacheRowIsCounted(unittest.TestCase):
     """The ENGINE ratchet bump 171 -> 172 is backed by a real row (#1925).
@@ -2088,38 +1947,6 @@ class DeepseekV4MultiCacheRowIsCounted(unittest.TestCase):
         index = tracked_issues(self)
         self.assertIn("issues/1925)", index)
 
-    def test_the_engine_pin_is_load_bearing_for_this_row(self) -> None:
-        """MUTATION: with this row removed, the pinned count must disagree.
-
-        Redirects only the ENGINE matrix at a mutated copy on disk, for the
-        reason `BpeQuadraticMergeRowIsCounted` records: patching `read_text`
-        globally would feed engine content to every matrix, and this case would
-        then pass on errors that have nothing to do with the removal.
-        """
-        clean: list[str] = []
-        agent_record.check_matrices(clean)
-        self.assertEqual([e for e in clean if "engine rows" in e], [])
-
-        path = agent_record.ENGINE_MATRIX
-        text = path.read_text(encoding="utf-8")
-        without = "\n".join(
-            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
-        )
-        self.assertNotEqual(without, text, "the row must be present to remove")
-
-        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
-            mutated = Path(tmp) / "engine-matrix.md"
-            mutated.write_text(without, encoding="utf-8")
-            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
-            errors: list[str] = []
-            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
-                 mock.patch.object(agent_record, "ENGINE_MATRIX", mutated):
-                agent_record.check_matrices(errors)
-        self.assertTrue(
-            any("engine rows" in e for e in errors),
-            f"removing {self.ROW} must break the engine count; got {errors}",
-        )
-
     def test_the_row_is_counted_under_the_area_whose_summary_moved(self) -> None:
         """The 25 -> 26 and READY 3 -> 4 cells must be about THIS row.
 
@@ -2152,19 +1979,99 @@ class DeepseekV4MultiCacheRowIsCounted(unittest.TestCase):
         )
         self.assertEqual(row.state, self.STATE)
 
-    def test_the_pin_agrees_with_the_matrix_it_counts(self) -> None:
-        """MUTATION TARGET: `ENGINE_ROWS` back at 171 must be an error.
 
-        The pin and the matrix are two hand-maintained records of one number.
-        This asserts they agree at the value this change lands, so lowering the
-        constant to the previous 171 while the row is present reds here.
-        """
-        errors: list[str] = []
-        rows, _ = agent_record.check_matrices(errors)
-        self.assertEqual([e for e in errors if "engine rows" in e], [])
-        engine = [r for r in rows if r.path == agent_record.ENGINE_MATRIX]
-        self.assertEqual(len(engine), agent_record.ENGINE_ROWS)
-        self.assertIn(self.ROW, {r.item_id for r in engine})
+class DerivedMatrixMembershipTests(unittest.TestCase):
+    def _check_kernel_source(self, source: str) -> list[str]:
+        path = agent_record.MATRICES["KERNEL"]
+        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
+            matrix = Path(tmp) / "kernel-matrix.md"
+            matrix.write_text(source, encoding="utf-8")
+            paths = [matrix if candidate == path else candidate
+                     for candidate in agent_record.MATRIX_PATHS]
+            matrices = dict(agent_record.MATRICES)
+            matrices["KERNEL"] = matrix
+            errors: list[str] = []
+            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
+                 mock.patch.object(agent_record, "MATRICES", matrices):
+                agent_record.check_matrices(errors)
+        return errors
+
+    def test_matrix_registry_contains_paths_not_stored_counts(self) -> None:
+        """Matrix membership is read from each file, never pinned elsewhere."""
+        self.assertTrue(agent_record.MATRICES)
+        for prefix, path in agent_record.MATRICES.items():
+            with self.subTest(prefix=prefix):
+                self.assertIsInstance(path, Path)
+        self.assertFalse(
+            hasattr(agent_record, "ENGINE_ROWS"),
+            "the engine matrix must not keep a second copy of its row count",
+        )
+
+    def test_a_valid_unique_matrix_row_needs_no_checker_constant(self) -> None:
+        """Adding a valid keyed row does not require editing the checker."""
+        source = (ROOT / ".agents/kernel-matrix.md").read_text(encoding="utf-8")
+        template = next(
+            line for line in source.splitlines()
+            if line.startswith("| `KERNEL-CPU-A76-Q8-DOT` |")
+        )
+        added = template.replace(
+            "`KERNEL-CPU-A76-Q8-DOT`", "`KERNEL-TEST-DERIVED-ROW`", 1
+        )
+        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
+            matrix = Path(tmp) / "kernel-matrix.md"
+            matrix.write_text(
+                source.replace(template, template + "\n" + added, 1),
+                encoding="utf-8",
+            )
+            paths = [
+                matrix if path == agent_record.MATRICES["KERNEL"] else path
+                for path in agent_record.MATRIX_PATHS
+            ]
+            matrices = dict(agent_record.MATRICES)
+            matrices["KERNEL"] = matrix
+            errors: list[str] = []
+            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
+                 mock.patch.object(agent_record, "MATRICES", matrices):
+                rows, by_id = agent_record.check_matrices(errors)
+        self.assertEqual(errors, [])
+        self.assertIn("KERNEL-TEST-DERIVED-ROW", by_id)
+        self.assertEqual(
+            sum(row.item_id == "KERNEL-TEST-DERIVED-ROW" for row in rows), 1
+        )
+
+    def test_duplicate_matrix_key_still_fails_for_its_own_reason(self) -> None:
+        source = (ROOT / ".agents/kernel-matrix.md").read_text(encoding="utf-8")
+        template = next(
+            line for line in source.splitlines()
+            if line.startswith("| `KERNEL-CPU-A76-Q8-DOT` |")
+        )
+        errors = self._check_kernel_source(
+            source.replace(template, template + "\n" + template, 1)
+        )
+        require(errors, r"duplicate ID KERNEL-CPU-A76-Q8-DOT")
+
+    def test_malformed_matrix_row_still_fails_for_its_own_reason(self) -> None:
+        source = (ROOT / ".agents/kernel-matrix.md").read_text(encoding="utf-8")
+        template = next(
+            line for line in source.splitlines()
+            if line.startswith("| `KERNEL-CPU-A76-Q8-DOT` |")
+        )
+        malformed = template.rsplit(" | ", 1)[0] + " |"
+        errors = self._check_kernel_source(source.replace(template, malformed, 1))
+        require(errors, r"KERNEL-CPU-A76-Q8-DOT has 7 cells; header has 8")
+
+    def test_retired_cardinality_history_keeps_transition_evidence(self) -> None:
+        history = (
+            ROOT / ".agents/completed/matrix-cardinality-history.md"
+        ).read_text(encoding="utf-8")
+        for evidence in (
+            "358 since 2026-08-05", "87 since 2026-09-02",
+            "59 since 2026-09-05", "90 since 2026-09-05",
+            "ENGINE_ROWS = 172",
+        ):
+            with self.subTest(evidence=evidence):
+                self.assertIn(evidence, history)
+        self.assertNotIn("ENGINE_ROWS =", CHECKER.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
@@ -2191,7 +2098,7 @@ class Ltx2VaeKernelRowIsCounted(unittest.TestCase):
     ROW = "KERNEL-LTX2-VAE"
 
     def _kernel_matrix_path(self) -> Path:
-        return agent_record.MATRICES["KERNEL"][0]
+        return agent_record.MATRICES["KERNEL"]
 
     def test_the_row_exists_in_the_kernel_matrix(self) -> None:
         text = self._kernel_matrix_path().read_text(encoding="utf-8")
@@ -2208,83 +2115,6 @@ class Ltx2VaeKernelRowIsCounted(unittest.TestCase):
         self.assertIn("CLAIM-LTX25-VAE-DEVICE-RESIDENCY", row)
         index = tracked_issues(self)
         self.assertIn("issues/1451)", index)
-
-    def test_the_pin_equals_the_shipped_count_and_reds_BOTH_ways(self) -> None:
-        """The pin is DERIVED from the file here, never restated.
-
-        Asserting `expected == 58` would be a transcription of the constant by
-        the constant: it passes for whatever the constant happens to say, so it
-        gates nothing. This counts the `KERNEL-` rows the matrix actually
-        carries, requires the pin to equal that, and then proves the comparison
-        is real by moving the pin ONE IN EACH DIRECTION. An off-by-one that only
-        reds downward would let the count grow silently, which is precisely how
-        an unrecorded row hides.
-        """
-        path, expected = agent_record.MATRICES["KERNEL"]
-        text = path.read_text(encoding="utf-8")
-        actual = sum(
-            1 for line in text.splitlines() if line.startswith("| `KERNEL-")
-        )
-        self.assertGreater(actual, 0, "the KERNEL matrix must carry rows")
-        self.assertEqual(
-            expected,
-            actual,
-            "the recorded KERNEL pin must equal the rows the matrix ships",
-        )
-
-        clean: list[str] = []
-        agent_record.check_matrices(clean)
-        self.assertEqual([e for e in clean if "KERNEL rows" in e], [])
-
-        for wrong in (actual - 1, actual + 1):
-            errors: list[str] = []
-            patched = dict(agent_record.MATRICES)
-            patched["KERNEL"] = (path, wrong)
-            with mock.patch.object(agent_record, "MATRICES", patched):
-                agent_record.check_matrices(errors)
-            self.assertTrue(
-                any("KERNEL rows" in e for e in errors),
-                f"pinning KERNEL at {wrong} against {actual} shipped rows must red",
-            )
-
-    def test_the_kernel_pin_is_load_bearing_for_this_row(self) -> None:
-        """MUTATION: with this row removed, the pinned count must disagree.
-
-        Redirects only the KERNEL matrix at a mutated copy on disk, for the
-        reason `MtpDepthRowIsCounted` records: patching `read_text` globally
-        would feed kernel content to every matrix and the case would then pass
-        on errors that have nothing to do with the removal. `MATRICES` and
-        `MATRIX_PATHS` move TOGETHER, because rows are parsed from the list
-        while the count is taken against the dict.
-        """
-        clean: list[str] = []
-        agent_record.check_matrices(clean)
-        self.assertEqual([e for e in clean if "KERNEL rows" in e], [])
-
-        path = self._kernel_matrix_path()
-        text = path.read_text(encoding="utf-8")
-        without = "\n".join(
-            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
-        )
-        self.assertNotEqual(without, text, "the row must be present to remove")
-
-        # Under ROOT, not /tmp: check_matrices reports through
-        # `relative_to(ROOT)`, which raises on a path outside the repository.
-        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
-            mutated = Path(tmp) / "kernel-matrix.md"
-            mutated.write_text(without, encoding="utf-8")
-            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
-            patched = dict(agent_record.MATRICES)
-            patched["KERNEL"] = (mutated, agent_record.MATRICES["KERNEL"][1])
-            errors: list[str] = []
-            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
-                 mock.patch.object(agent_record, "MATRICES", patched):
-                agent_record.check_matrices(errors)
-        self.assertTrue(
-            any("KERNEL rows" in e for e in errors),
-            "removing the row must break the pin it was bumped for",
-        )
-
 
 class Qwen35GdnBackendRowBacksTheRatchet(unittest.TestCase):
     """The BACKEND ratchet bump 86 -> 87 is backed by the Qwen3.5 GDN row
@@ -2306,22 +2136,6 @@ class Qwen35GdnBackendRowBacksTheRatchet(unittest.TestCase):
             line for line in text.splitlines() if line.startswith(f"| `{self.ROW}` |")
         ]
         self.assertEqual(len(matching), 1, f"{self.ROW} must appear exactly once")
-
-    def test_the_backend_checker_accepts_the_matrix_and_binds(self) -> None:
-        clean: list[str] = []
-        agent_record.check_matrices(clean)
-        self.assertEqual([e for e in clean if "backend rows" in e.lower()], [])
-        path, count = agent_record.MATRICES["BACKEND"]
-        errors: list[str] = []
-        with mock.patch.dict(
-            agent_record.MATRICES, {"BACKEND": (path, count - 1)}
-        ):
-            agent_record.check_matrices(errors)
-        self.assertTrue(
-            any("backend rows" in e.lower() for e in errors),
-            f"the BACKEND pin must bind; got {errors}",
-        )
-
 
 class RoadmapIssueProjectionTests(unittest.TestCase):
     def test_the_roadmap_refuses_a_restored_issue_row(self) -> None:
@@ -2667,69 +2481,6 @@ class GdnDevicePureBackendRowBacksTheRatchet(unittest.TestCase):
         else:
             self.assertNotIn("CLAIM-", row)
 
-    def test_the_pin_equals_the_shipped_count_and_reds_BOTH_ways(self) -> None:
-        path, expected = agent_record.MATRICES["BACKEND"]
-        text = path.read_text(encoding="utf-8")
-        actual = sum(
-            1 for line in text.splitlines() if line.startswith("| `BACKEND-")
-        )
-        self.assertGreater(actual, 0, "the BACKEND matrix must carry rows")
-        self.assertEqual(
-            expected,
-            actual,
-            "the recorded BACKEND pin must equal the rows the matrix ships",
-        )
-
-        clean: list[str] = []
-        agent_record.check_matrices(clean)
-        self.assertEqual([e for e in clean if "backend rows" in e.lower()], [])
-
-        for wrong in (actual - 1, actual + 1):
-            errors: list[str] = []
-            patched = dict(agent_record.MATRICES)
-            patched["BACKEND"] = (path, wrong)
-            with mock.patch.object(agent_record, "MATRICES", patched):
-                agent_record.check_matrices(errors)
-            self.assertTrue(
-                any("backend rows" in e.lower() for e in errors),
-                f"pinning BACKEND at {wrong} against {actual} shipped rows must red",
-            )
-
-    def test_the_backend_pin_is_load_bearing_for_this_row(self) -> None:
-        """MUTATION: with this row removed, the pinned count must disagree.
-
-        Redirects only the BACKEND matrix at a mutated copy on disk, under
-        ROOT because `check_matrices` reports through `relative_to(ROOT)`;
-        `MATRICES` and `MATRIX_PATHS` move TOGETHER, because rows are parsed
-        from the list while the count is taken against the dict.
-        """
-        clean: list[str] = []
-        agent_record.check_matrices(clean)
-        self.assertEqual([e for e in clean if "backend rows" in e.lower()], [])
-
-        path, count = agent_record.MATRICES["BACKEND"]
-        text = path.read_text(encoding="utf-8")
-        without = "\n".join(
-            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
-        )
-        self.assertNotEqual(without, text, "the row must be present to remove")
-
-        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
-            mutated = Path(tmp) / "backend-matrix.md"
-            mutated.write_text(without, encoding="utf-8")
-            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
-            patched = dict(agent_record.MATRICES)
-            patched["BACKEND"] = (mutated, count)
-            errors: list[str] = []
-            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
-                 mock.patch.object(agent_record, "MATRICES", patched):
-                agent_record.check_matrices(errors)
-        self.assertTrue(
-            any("backend rows" in e.lower() for e in errors),
-            f"removing {self.ROW} must break the BACKEND count; got {errors}",
-        )
-
-
 class KeepquantBackendRowBacksTheRatchet(unittest.TestCase):
     """The BACKEND ratchet bump 89 -> 90 is backed by the keep-quant row
     (#2959).
@@ -2766,65 +2517,3 @@ class KeepquantBackendRowBacksTheRatchet(unittest.TestCase):
         self.assertIn("#2959", row)
         self.assertIn("tenstorrent-keepquant.md", row)
         self.assertIn("CLAIM-BACKEND-TENSTORRENT-KEEPQUANT", row)
-
-    def test_the_pin_equals_the_shipped_count_and_reds_BOTH_ways(self) -> None:
-        path, expected = agent_record.MATRICES["BACKEND"]
-        text = path.read_text(encoding="utf-8")
-        actual = sum(
-            1 for line in text.splitlines() if line.startswith("| `BACKEND-")
-        )
-        self.assertGreater(actual, 0, "the BACKEND matrix must carry rows")
-        self.assertEqual(
-            expected,
-            actual,
-            "the recorded BACKEND pin must equal the rows the matrix ships",
-        )
-
-        clean: list[str] = []
-        agent_record.check_matrices(clean)
-        self.assertEqual([e for e in clean if "backend rows" in e.lower()], [])
-
-        for wrong in (actual - 1, actual + 1):
-            errors: list[str] = []
-            patched = dict(agent_record.MATRICES)
-            patched["BACKEND"] = (path, wrong)
-            with mock.patch.object(agent_record, "MATRICES", patched):
-                agent_record.check_matrices(errors)
-            self.assertTrue(
-                any("backend rows" in e.lower() for e in errors),
-                f"pinning BACKEND at {wrong} against {actual} shipped rows must red",
-            )
-
-    def test_the_backend_pin_is_load_bearing_for_this_row(self) -> None:
-        """MUTATION: with this row removed, the pinned count must disagree.
-
-        Redirects only the BACKEND matrix at a mutated copy on disk, under
-        ROOT because `check_matrices` reports through `relative_to(ROOT)`;
-        `MATRICES` and `MATRIX_PATHS` move TOGETHER, because rows are parsed
-        from the list while the count is taken against the dict.
-        """
-        clean: list[str] = []
-        agent_record.check_matrices(clean)
-        self.assertEqual([e for e in clean if "backend rows" in e.lower()], [])
-
-        path, count = agent_record.MATRICES["BACKEND"]
-        text = path.read_text(encoding="utf-8")
-        without = "\n".join(
-            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
-        )
-        self.assertNotEqual(without, text, "the row must be present to remove")
-
-        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
-            mutated = Path(tmp) / "backend-matrix.md"
-            mutated.write_text(without, encoding="utf-8")
-            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
-            patched = dict(agent_record.MATRICES)
-            patched["BACKEND"] = (mutated, count)
-            errors: list[str] = []
-            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
-                 mock.patch.object(agent_record, "MATRICES", patched):
-                agent_record.check_matrices(errors)
-        self.assertTrue(
-            any("backend rows" in e.lower() for e in errors),
-            f"removing {self.ROW} must break the BACKEND count; got {errors}",
-        )

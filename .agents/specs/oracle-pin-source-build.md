@@ -48,6 +48,24 @@ Preserve declared skips. Record any environmental baseline failure separately.
 Implementation records commands, results, mutation failures, and restoration hashes.
 Fresh review and operator verification remain required before landing.
 
+On 8 September 2026, the oracle module passed 27 tests and tools passed 801 tests.
+The pin checker passed 14 oracles. Its self-test passed 49 fixtures.
+Logs: `/tmp/pr2941-oracle-green.log` and `/tmp/pr2941-tools.log`.
+Each of the three mutation runs exited 1 in
+`/tmp/pr2941-mutation-{1,2,3}.log`. The matching new test failed because
+the expected version refusal was absent. A later FlashInfer refusal did not
+mask the missing guard. After each mutation, `git diff --exit-code --
+tools/bench/online_gate.py` exited 0 in the scratch worktree.
+
+## Outcome
+
+The surviving change adds executable comparison coverage without changing a
+version value or comparison. Main's record test remains byte-for-byte equal.
+Replacing that test was rejected because main already preserves its assertions.
+The tests use a derived suffix so they remain independent of future pin values.
+The #2949 comment now refers to the recorded commit segment without duplicating
+the current hash. Fresh review and final operator gates remain pending.
+
 ## Stop conditions
 
 Return `NEEDS_DECISION` if a pin or runtime change becomes necessary.

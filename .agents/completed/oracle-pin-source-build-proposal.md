@@ -3,11 +3,11 @@
 Issue: [#2931](https://github.com/mudler/vllm.cpp/issues/2931)
 Row: `ORACLE-PIN-SOURCE-BUILD`
 Prior art: [#520](https://github.com/mudler/vllm.cpp/issues/520) and
-[`bench-oracle-pin-reconcile.md`](bench-oracle-pin-reconcile.md), which
+[`bench-oracle-pin-reconcile.md`](../specs/bench-oracle-pin-reconcile.md), which
 introduced the assertion this row replaces;
 [#2896](https://github.com/mudler/vllm.cpp/issues/2896) and `5d97007c2`, the
 developer-instructed sync that made it red;
-[`oracle-pin-parity-reconcile.md`](oracle-pin-parity-reconcile.md), the sibling
+[`oracle-pin-parity-reconcile.md`](../specs/oracle-pin-parity-reconcile.md), the sibling
 row over the same record.
 
 ## The failure

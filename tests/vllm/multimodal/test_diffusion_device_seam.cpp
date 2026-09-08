@@ -170,6 +170,12 @@ PartialXpuPlatform& Platform() {
   return platform;
 }
 
+void EnsureRocmPlatformRegistered(vllm::platforms::Platform& fallback) {
+  if (!vllm::platforms::HasPlatform(vt::DeviceType::kROCM)) {
+    vllm::platforms::RegisterPlatform(vt::DeviceType::kROCM, &fallback);
+  }
+}
+
 // Registered into the CUDA slot as well as its own: `CurrentPlatform()` walks
 // {kCUDA, kROCM, kXPU, …} and returns the first REGISTERED entry
 // (src/vllm/platforms/platform.cpp), so without this a CUDA build would resolve
@@ -1009,10 +1015,16 @@ TEST_CASE("ltx2 vae: a device queue whose PLATFORM IS UNREGISTERED is refused by
   // Reproduce HIP static registration on CPU without replacing a real platform.
   // The fixture must still reach the missing-platform refusal when ROCm exists.
   static PartialXpuPlatform registered_rocm(Backend(), vt::DeviceType::kROCM);
-  if (!vllm::platforms::HasPlatform(vt::DeviceType::kROCM)) {
-    vllm::platforms::RegisterPlatform(vt::DeviceType::kROCM, &registered_rocm);
-  }
+  static PartialXpuPlatform other_rocm(Backend(), vt::DeviceType::kROCM);
+  const auto* expected_rocm = vllm::platforms::HasPlatform(vt::DeviceType::kROCM)
+                                  ? &vllm::platforms::GetPlatform(vt::DeviceType::kROCM)
+                                  : &registered_rocm;
+  EnsureRocmPlatformRegistered(registered_rocm);
   REQUIRE(vllm::platforms::HasPlatform(vt::DeviceType::kROCM));
+  CHECK(&vllm::platforms::GetPlatform(vt::DeviceType::kROCM) == expected_rocm);
+  // A second fallback must not replace the CPU fixture or the real HIP platform.
+  EnsureRocmPlatformRegistered(other_rocm);
+  CHECK(&vllm::platforms::GetPlatform(vt::DeviceType::kROCM) == expected_rocm);
 
   // #1904's stated obstacle, made executable. Routing the decode's memory
   // through `DBuf` makes a registered PLATFORM a precondition it did not have

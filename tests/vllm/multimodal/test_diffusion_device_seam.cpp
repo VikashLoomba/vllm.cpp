@@ -1018,28 +1018,39 @@ TEST_CASE("ltx2 vae: a device queue whose PLATFORM IS UNREGISTERED is refused by
   // names the device, the platform registry and the pool, instead of dying
   // inside a lookup three headers down that names none of them.
   //
-  // kROCM, NOT kXPU. The platform registry is process-wide and has no
-  // unregister, so a case that depended on kXPU still being platform-less would
-  // depend on doctest's case order. Nothing in this executable ever registers a
-  // ROCm PLATFORM, so the precondition holds however the cases are scheduled.
-  vt::RegisterBackend(vt::DeviceType::kROCM, &Backend());
+  // Real backends and earlier cases can register platforms. The registry has
+  // no unregister operation, so choose a currently absent non-CPU slot rather
+  // than assuming a particular platform is missing. No available slot is a
+  // fixture failure, never a reason to skip the refusal.
+  vt::DeviceType missing_type = vt::DeviceType::kCPU;
+  for (size_t i = 1; i < vt::kNumDeviceTypes; ++i) {
+    const auto candidate = static_cast<vt::DeviceType>(i);
+    if (!vllm::platforms::HasPlatform(candidate)) {
+      missing_type = candidate;
+      break;
+    }
+  }
+  REQUIRE(missing_type != vt::DeviceType::kCPU);
+  const std::string missing_name = vt::DeviceTypeName(missing_type);
+  CAPTURE(missing_name);
+  vt::RegisterBackend(missing_type, &Backend());
   // EVERY kernel the decode needs is registered, so the platform is the ONLY
   // thing missing. Without this the decode is refused by the op provider before
   // it allocates anything, and the case would pass on a message that has nothing
   // to do with what it claims to gate.
-  vt::RegisterOp(vt::OpId::kConv3d, vt::DeviceType::kROCM,
+  vt::RegisterOp(vt::OpId::kConv3d, missing_type,
                  vt::GetOp(vt::OpId::kConv3d, vt::DeviceType::kCPU));
-  vt::RegisterOp(vt::OpId::kLtx2, vt::DeviceType::kROCM,
+  vt::RegisterOp(vt::OpId::kLtx2, missing_type,
                  vt::GetOp(vt::OpId::kLtx2, vt::DeviceType::kCPU));
-  vt::RegisterOp(vt::OpId::kLtx2Vae, vt::DeviceType::kROCM,
+  vt::RegisterOp(vt::OpId::kLtx2Vae, missing_type,
                  vt::GetOp(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU));
-  vt::RegisterOp(vt::OpId::kAdd, vt::DeviceType::kROCM,
+  vt::RegisterOp(vt::OpId::kAdd, missing_type,
                  vt::GetOp(vt::OpId::kAdd, vt::DeviceType::kCPU));
-  REQUIRE(vt::TryGetBackend(vt::Device{vt::DeviceType::kROCM, 0}) != nullptr);
-  REQUIRE_FALSE(vllm::platforms::HasPlatform(vt::DeviceType::kROCM));
+  REQUIRE(vt::TryGetBackend(vt::Device{missing_type, 0}) != nullptr);
+  REQUIRE_FALSE(vllm::platforms::HasPlatform(missing_type));
 
   const TinyDecoder d = MakeTinyDecoder();
-  vt::Queue q{vt::Device{vt::DeviceType::kROCM, 0}, nullptr};
+  vt::Queue q{vt::Device{missing_type, 0}, nullptr};
   std::string msg;
   try {
     (void)vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh,
@@ -1049,7 +1060,7 @@ TEST_CASE("ltx2 vae: a device queue whose PLATFORM IS UNREGISTERED is refused by
   }
   INFO(msg);
   REQUIRE_FALSE(msg.empty());
-  CHECK(msg.find("rocm") != std::string::npos);
+  CHECK(msg.find(missing_name) != std::string::npos);
   CHECK(msg.find("platform") != std::string::npos);
   CHECK(msg.find("pool") != std::string::npos);
 }

@@ -29,6 +29,20 @@ and absent platform before decoding. Derive the expected device name from the
 chosen type. Preserve the nonempty error, device name, platform, and pool checks.
 The fixture must not invoke a real accelerator.
 
+### Preserve the registered platform by identity
+
+Review of `6a45286c2f861f8d9a851f6deb4590d3763b14c3` found a coverage gap:
+unconditional ROCm registration still passed all 16 focused assertions.
+The guarded fixture is correct, but those assertions do not detect replacement.
+
+Put its single registration guard in a test-only helper accepting a fallback
+platform reference. Call it with two distinct process-lifetime fallbacks.
+The first call fills an absent CPU-test slot or preserves the real HIP platform.
+Check the exact expected pointer, then require the second call to retain it.
+Keep all existing provider and refusal assertions unchanged.
+A separate guarded sentinel setup would move the same blind spot to another
+guard, so use one helper for both absent and present contexts.
+
 ## Tests and gates
 
 Run the existing case after adding the registered-ROCm regression and capture
@@ -39,6 +53,13 @@ to fail its error assertions; restore the source byte-for-byte and rerun.
 Run `scripts/agent-preflight.sh` on the immutable candidate.
 The operator owns the HIP build and execution under a device lease; CPU results
 do not satisfy that device gate. Independent review remains required.
+
+Before the coverage change, reproduce the surviving overwrite mutation in
+scratch. After adding the assertions, the same mutation must fail pointer
+identity. A no-op helper must fail the CPU case's registration precondition.
+Restore scratch bytes and rerun focused green after each mutation. Run all
+three full CPU orders with pooling enabled and with `VT_POOL_BYPASS=1`.
+No registry API, production code, or pool fixture changes belong to this repair.
 
 ## Stop conditions
 

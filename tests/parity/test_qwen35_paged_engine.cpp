@@ -469,6 +469,16 @@ void RunGate(const std::string& golden_subdir, const char* label,
                         << " word uploads DURING the captured e2e (the #2812 "
                            "class — a captured graph reading bytes its replay "
                            "cannot refresh)");
+    // W4a wave-3b-1: the device-reported live trace demand as of the last
+    // capture end (the wave-3a LastTraceBytesForTest pattern), recorded on
+    // both sides of the dense packed-word switch. Under the wave-3b-1c
+    // dynamic-first region policy (TraceRegionSizeFromEnv) tt-metal grows the
+    // capture region to the demand, so the number IS the axis: the measured
+    // command stream, not a carve-out against a fixed size.
+    MESSAGE(label << ": device trace demand at last capture end = "
+                  << vt::tenstorrent::LastTraceBytesForTest()
+                  << " B (dynamic trace region; VT_TT_TRACE_REGION_MB opts "
+                     "into a fixed one)");
   }
 
   // Backend proof: token equality alone does not prove which device ran.
@@ -559,5 +569,30 @@ TEST_CASE("qwen3.5-0.8B GGUF Q4_K_M paged-engine greedy near-tie gate (Tenstorre
              "6121dc517, 532517120 bytes) to run the keep-quant vehicle gate");
   }
   RunGate("qwen35_gguf_q4km", "qwen35-gguf-q4km", std::string(gguf),
+          /*keep_quant=*/true);
+}
+
+// KEEPQUANT W4a (issue #3030): the SAME gate shape on the 27B dense arm —
+// unsloth's Qwen3.8-27B Q4_K_M GGUF, the checkpoint the 0823 token-gate
+// evidence (docs/bench-evidence/qwen38-27b-q4km-token-gate-20260823.md)
+// measured. This file ships the head tensors (the 15 blk.64.* nextn/MTP
+// tensors) and the loader NAMES what it leaves unread on a spec-off load; the
+// gate loads the trunk through the same production surface and proves the
+// keep-quant decode set end to end at 27B scale. The oracle is the pinned
+// llama.cpp b10451 (see .agents/oracles/llama-cpp.md — the executed path is
+// pinned: repack ON, flash-attn enabled, ubatch 512), NOT transformers: the
+// artifact is the quantized file itself, and llama.cpp is the registry's
+// CPU/GGUF k-quant floor for it.
+// Checkpoint-gated: absent VLLM_CPP_QWEN38_27B_GGUF -> loud SKIP.
+TEST_CASE("qwen3.8-27B GGUF Q4_K_M paged-engine greedy near-tie gate (Tenstorrent, checkpoint-gated)") {
+  const char* gguf = std::getenv("VLLM_CPP_QWEN38_27B_GGUF");
+  if (gguf == nullptr || gguf[0] == '\0') {
+    SkipGate("qwen38-gguf-q4km-27b",
+             "VLLM_CPP_QWEN38_27B_GGUF is absent — set it to the local "
+             "Qwen3.8-27B-Q4_K_M.gguf (unsloth/Qwen3.8-27B-GGUF @ fe1e2a23, "
+             "sha256 7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b"
+             "6c6fe169, 17106775008 bytes) to run the 27B keep-quant gate");
+  }
+  RunGate("qwen38_gguf_q4km_27b", "qwen38-gguf-q4km-27b", std::string(gguf),
           /*keep_quant=*/true);
 }

@@ -1,5 +1,10 @@
 # `Glm5NextForConditionalGeneration` (GLM-5.3-Flash)
 
+Current reference: vLLM registered this model on 3 September 2026. The
+[upstream reconciliation](glm5-next-upstream-reconciliation.md) supersedes the
+original no-vLLM premise and port-source priority below. Historical evidence
+remains intact. See `## Now` for the current continuation.
+
 **SCOPING ONLY. NO PRODUCT CODE LANDS UNDER THIS PULL REQUEST.** This document
 and its records are the whole deliverable of the pull request that introduces
 it. Implementation follows in separate `row/MODEL-MM-GLM53-FLASH-W<n>` branches
@@ -42,9 +47,9 @@ IN scope for the campaign this spec plans:
 
 OUT of scope, explicitly:
 
-- Advancing the vLLM parity pin. `555967922` does not reach this architecture
-  and neither does vLLM `main`; see §Oracles. Nothing in this campaign may move
-  `.agents/upstream-sync.md`.
+- Advancing the vLLM parity pin. The current pin `e126687a9a` predates the
+  model's registration at `98ed0856f3`. Nothing in this campaign moves
+  `.agents/upstream-sync.md`. The original `555967922` search remains below.
 - The MTP speculative head (`num_nextn_predict_layers = 1`). It is recorded
   under §Owed and gets its own row when the backbone runs.
 - Any claim of speed parity. There is no denominator: no oracle runs this model
@@ -83,7 +88,25 @@ generates plausible text and is never checked. §Gates decides it.
 
 ## Oracles
 
-Everything in this section was read live on **2026-08-26**.
+### Current reference on 7 September 2026
+
+vLLM [PR #53906](https://github.com/vllm-project/vllm/pull/53906) merged at
+`98ed0856f31fa3aaf5e27464e2b4ef5a8ee6b2f5` on 3 September 2026.
+The campaign's registration stop condition fired. vLLM defines the algorithm,
+defaults, and errors wherever it implements them. The transformers algorithm
+exception expired. Its old evidence remains useful component evidence.
+
+The [reconciliation spec](glm5-next-upstream-reconciliation.md) records exact
+source and test anchors and the next implementation obligations.
+The global pin remains `e126687a9a828d513c01a07cd69f025f27d63280`.
+It lacks this registration. The merged revision is a fixed forward source
+reference, not a gateable model oracle or an accepted parity denominator.
+The real-model build and run remain `PENDING` under #1998.
+
+### Historical oracle survey on 26 August 2026
+
+The rest of this section preserves the original survey. Its statements about
+upstream absence, open pull requests, and available hardware describe that date.
 
 ### vLLM at the parity pin `555967922` — implements NOTHING
 
@@ -223,6 +246,10 @@ That is a statement about the full model. It is NOT a statement that this
 campaign is ungateable; §Gates constructs the gate that is actually reachable.
 
 ## Upstream chain
+
+The following transformers map records the original component implementation.
+Use the [vLLM reconciliation](glm5-next-upstream-reconciliation.md) for new
+ports and reconcile each reached primitive before accepting equivalence.
 
 `transformers` `v5.16.1`, `src/transformers/models/glm5_next/`. The modular file
 is the source of truth and every port-map cell below cites
@@ -5876,6 +5903,20 @@ Debts this row carries, each visible rather than waived:
   the MARGIN are what settle it rather than the token string.
 
 ## Now
+
+`ACTIVE`, 7 September 2026. The vLLM registration stop condition fired on
+3 September. [Reconciliation #3045](glm5-next-upstream-reconciliation.md)
+expires the transformers algorithm exception and identifies the device-port
+source and tests. The global parity pin remains unchanged.
+
+Next, repair routed-expert placement admission under
+[#3019](https://github.com/mudler/vllm.cpp/issues/3019), then complete the
+device forward under [#2410](https://github.com/mudler/vllm.cpp/issues/2410).
+Reconcile the reached vLLM defaults, layouts, and tests in each implementation.
+The real-model oracle gate remains `PENDING` under #1998. No new model run or
+performance result is established by this documentation change.
+
+### Status before the upstream reconciliation
 
 `ACTIVE`, 2026-09-01. **THE KERNEL THAT BLOCKED THIS MODEL'S DEVICE ARM LANDED
 EIGHT DAYS AGO IN ANOTHER ROW, AND NOTHING HERE READ IT.** O19 says the expert

@@ -274,22 +274,33 @@ to make a failure pass.
 
 ## Owed
 
-- MoE grouped keep-quant GEMM (follow-up row; vehicle pickable after W2).
+- MoE grouped keep-quant GEMM — MOVED INTO W4 SCOPE (#3030): the seam
+  exists (`ops.cpp:220`, `weight[E*N,K]`) with a production ROCm kernel
+  (`MatmulBTQuantGroupedKernelRocm`, native Q8_0/Q4_K/Q6_K) fed by the
+  stacked keep-quant tower (`qwen3_5_gguf_weights.cpp:1287`); the TT
+  backend registers only `kMoeSiluMul`. "Vehicle pickable after W2" is
+  literally true.
 - Block-decoding n-gram gather ([#2394](https://github.com/mudler/vllm.cpp/issues/2394)).
 - IQ-family / sub-IQ1_S encodings (unsloth fork formats).
-- The int8-dot perf lever; llama.cpp-comparable throughput numbers.
+- The int8-dot perf lever (#3031); llama.cpp-comparable throughput numbers.
 - `docs/USAGE.md` vehicle pin when the arm first runs end to end (the W3
-  capture leg hashes the local bytes); 27B arm entry at W4.
-- Residency reconciliation (NEEDS_DECISION): the spec's residency thesis
-  expected per-call on-core decode from the resident i32 word shadow and no
-  bf16 twin; W3 ships a host-side decode + bf16 pre-round + single
-  `from_vector<float>` upload per weight (`DecodedWeightShadow` memoizes it
-  per host buffer, dropped in `UnregisterHostBuffer`), because the device-side
-  twin decode OOM-fatalled the vehicle (4,068,474,880 B `ttnn::where`). The
-  word-shadow machinery and `kKeepQuantDecode` stay registered, tested, and
-  capture-guarded, but no production path reads them now. Decide before W4:
-  keep the twin as the shipped path and retire the shadow, or restore
-  on-core decode for the 27B arm where the twin's memory cost is real.
+  capture leg hashes the local bytes); the 27B arm entry LANDED with
+  wave-3b-2, provenance caveat included — the gate-completion half of that
+  pin stays owed to [#3042](https://github.com/mudler/vllm.cpp/issues/3042).
+- The 27B e2e gate, left UNREACHED by wave-3b-2:
+  [#3042](https://github.com/mudler/vllm.cpp/issues/3042) owns it. The
+  committed goldens (`tests/parity/goldens/qwen38_gguf_q4km_27b/`) are
+  lane-ready, and the TT-side run against them closes the gate. Evidence and
+  the next lever: `## W4`, wave-3b-2.
+- Residency reconciliation (RESOLVED BY ARITHMETIC, 2026-09-06, #3030):
+  the twin residency is a 0.8B-only shape. Measured on the pinned 27B
+  artifact: non-expert keep-quant twins need 18.47 GiB, the expert tower
+  32.37 GiB, token_embd's twin 2.37 GiB — against a 32 GB device whose
+  packed total is 15.92 GiB. W4 promotes the word-shadow on-core decode to
+  the production matmul residency and narrows the twin to the embedding
+  gather. The vehicle's OOM history (device-side twin construction,
+  4,068,474,880 B `ttnn::where`) judged twin CONSTRUCTION, not shadow use;
+  the shadow path's per-call decode is compute, not allocation.
 - No eager/ambient TT pair is owed for this arm: the READY gate keys on
   `DecodeCaptureEnabled()` and adjudicates the capture leg; the eager arm is
   covered by the op-level eager decode-equality suites (E1). The ladder's
@@ -298,6 +309,127 @@ to make a failure pass.
 - No manifest.json: the committed golden convention (`qwen3_greedy_0_6b`)
   carries per-arm `.npy` pairs + `p{i}_prompt.i32` only; the recipe lives in
   this Evidence section and the landing commit body.
+
+## W4
+
+Two changes, two pull requests (developer decision 2026-09-06):
+
+**W4a — the 27B arm ([#3030](https://github.com/mudler/vllm.cpp/issues/3030)).**
+(1) RESIDENCY: the flip waves are CANCELLED 2026-09-06 — two falsifications.
+Wave-1's blanket flip OOM'd the vehicle at the tied head's per-call decode
+(4,068,474,880 B `ttnn::where`). Wave-1b's threshold flip (twin above 128M
+elements, shadow decode below) passed focused + suite (59/59, 6704/6704)
+but the vehicle capture demanded 425,754,624 B of trace region against the
+52,428,800 B allocated (TT_FATAL, mesh_trace.cpp:81) — a weight decoded per
+call persists as a bf16 tile inside the captured graph, and replay re-runs
+the decode every step, a throughput regression with no compensating win.
+The twin-for-all diagnostic re-ran the same gate 16/16 PASS 147/147 (11
+strict / 5 near-tie, max 0.188 nats, 0 forward-divergent), isolating the
+cause to the flipped weights. Rejected repairs: trace-region enlargement
+(~18 GB on 27B), capture-mode twins (words would feed only the eager arm —
+dead in production), persistent decode scratch (defeats the arithmetic),
+no-capture fallback (breaks the capture model). Production dense keep-quant
+matmuls KEEP the memoized twin (the landed W3 behavior). Packed-word
+residency pays off only where a kernel consumes the words natively: (2) the TT provider for `vt::MatmulBTQuantGrouped`
+(ops.cpp:220, weight[E*N,K], expert_ids[P]) ports the ROCm reference's
+native packed-word dequant (rocm_grouped_gemm.hip:1456, Q8_0/Q4_K/Q6_K —
+extend to Q5_K with the W3 chain; the 27B pin carries 48 Q5_K tensors).
+E=1 covers dense; E=N covers experts fed by the stacked tower
+(qwen3_5_gguf_weights.cpp:1282). Twins remain for gather-class operands
+(embedding; the vehicle's tied head shares the table). Capture
+compatibility of the grouped arm is wave-3's committed obligation. (3) MTP `blk.64.*` skip/refuse by name. (4) 27B e2e greedy
+near-tie gate, checkpoint-gated opt-in loud-skip (#2811 precedent), goldens
+vs the pinned llama.cpp b10451 oracle, 500-mnat band + 0 forward-divergent.
+(5) `docs/USAGE.md` pin in the same change. CORRECTED 2026-09-07
+(tensor-name scan of the pinned artifact): the 27B is DENSE — arch
+`qwen35`, zero `ffn_*_exps` / `ffn_gate_inp` / `exp_probs` tensors, and
+`blk.0` carries singular `ffn_down`/`ffn_gate`/`ffn_up`. The earlier
+"experts Q4_K ×294" classification was a dtype-only misread; those 294
+Q4_K tensors are dense ffn/attn weights. Memory axis on 27B: the keep-
+quant set beyond the gather class (~14.27 GB packed) cannot exist as
+twins (~42 GB); it is served PACKED through the E=1 arm with a CHUNKED
+slice-decode + accumulate matmul, so the captured graph holds chunk
+buffers and never a whole-weight tile — ≈ 15.92 GB packed + 2.37 GiB
+embedding twin + 2.37 GiB output twin + chunk tiles + activations ≈
+22-23 GB on 32 GB. Replay re-decodes each step: correct, slower;
+throughput is W4b's lever. The E=N expert arm serves the family's MoE
+models (30B-A3B class) and stays staged-owed: no MoE artifact is on disk
+and a ~17-20 GB download needs authority.
+
+**AMENDED 2026-09-07 (fifth): the vehicle capture falsified the chunked
+arm's capture claim at model scale — demand is per CHAIN, not per chunk.**
+Wave-3b-1's vehicle AFTER leg fataled at capture with 444,424,192 B
+demanded of the 52,428,800 B region (mesh_trace.cpp:81) after the two
+device-level defects it exposed were fixed red-first (a chained ROW_MAJOR
+activation reaching `ttnn::matmul` unconverted — `per_core_M = 0` at
+`matmul_program_config.cpp:372`; and the E=1 arm committing ROW_MAJOR into
+the output slot, so replay's tile-padded view overran the buffer,
+`mesh_tensor_impl.hpp:33`; focused 4/4, suite 66/66, 524,428/524,428 after
+both fixes). The demand is ~113 keep-quant weights × ~3.5 MB/chain of
+serialized decode commands — the wave-3a per-chain constant — so chunk
+sizing cannot pay it down; the cost multiplies by chain count. This
+reconciles the third amendment's rejected "trace-region enlargement": that
+rejection sized wave-1b's whole-weight-per-step decode planes (~18 GB);
+the measured quantity here is the command stream (0.44 GB on 0.8B, to be
+measured on 27B). RESOLUTION: the region policy mirrors the pinned
+tt-metal's own practice (`models/demos/utils/trace_region_sizes.py`):
+DYNAMIC (`trace_region_size=0`, the upstream default for unconfigured
+models and deepseek-v3's explicit choice) is tried first on the vehicle;
+if the pre-ITEM-5 overlap hazard reproduces, the fallback is a per-model
+resolved region sized from measured demand (the upstream YAML shape),
+documented in `docs/USAGE.md` beside the demand number, with the fixed
+50 MB (the vLLM plugin's generic value, ITEM 5) as that fallback's
+unspecified-model default. Capture demand stays a MEASURED, reported axis
+(the gate message carries `LastTraceBytesForTest()`) — the axis is the
+number, not the carve-out. Perf guard: the vehicle leg records tokens/s on
+both sides of the switch ("replay re-decodes each step: correct, slower"
+is already the accepted state; W4b owes the lever); a gate that cannot
+complete inside the vehicle timeout is a NEEDS_DECISION stop, not an
+accepted default. The twin-absence policy is unchanged: no whole-weight
+resident decoded shadow on the dense path; decode planes stay per-chain
+transients.
+
+**WAVE-3B-2 LANDED AS A STAGED SLICE (2026-09-07, the coordinator resolved
+the wave's NEEDS_DECISION as LAND AS A STAGED SLICE).** Landed: the
+production MTP drafter skip — the loader's accounting deliberately passes a
+declared head because its tensors ARE enumerated as expected, and the
+trunk-only load then leaves them unread, so `LogQwen3_5GgufMtpHeadSkip`
+prints the skip loud before any weight byte moves: all fifteen `blk.64.*`
+tensors, 289,527,808 B, named in full, suppressed only when speculative
+method `mtp` is configured (`model_loader.cpp`,
+`qwen3_5_gguf_weights.cpp`). The skip message carries the denominator fact:
+the pinned llama.cpp `b10451` oracle ignores the same tensors, so a gate
+against it is matched work only with this skip loud. Landed with it: the
+16-prompt oracle goldens `tests/parity/goldens/qwen38_gguf_q4km_27b/`
+(`greedy_ids.npy`), derived from the byte-identical llama.cpp `b10451`
+denominator harness — the TT-side run against them closes the gate; the
+reachability test `tests/vllm/entrypoints/test_gguf_accounting_reach.cpp`,
+which proves the skip through the PRODUCTION loader accounting rather than a
+hand-built type; the checkpoint-gated TEST_CASE in
+`tests/parity/test_qwen35_paged_engine.cpp`, inert until
+`VLLM_CPP_QWEN38_27B_GGUF` names the artifact; and
+`VT_TT_KEEPQUANT_CHUNK_BYTES` (env-doc allowlisted), the keep-quant chunk
+plane budget — default 256 MiB surveyed on the 0.8B vehicle, empty/unset
+keeps the default, a positive integer is a HARD CAP in bytes that trades
+command-stream length for live memory (the ceil(N/8) trace term otherwise
+forces a 606+ MB head plane whatever the budget says — exactly the alloc
+that died at 27B).
+
+UNREACHED: the 27B e2e gate, owed to
+[#3042](https://github.com/mudler/vllm.cpp/issues/3042). The OOM evidence,
+eight runs: failing allocations 1,073,725,440 B and 134,184,960 B;
+free-at-failure 244 MB → 46 MB → 12.7 MB/bank; ~34 GB allocated against the
+32 GB device with a 3.7 MB largest free block; batch budget 512 fails
+identically, so the demand is not activation-sized; three mitigations tried
+and failed. The residency sits ~11 GB above the ~22-23 GB surveyed design
+residency above. Suspects, named and unmeasured: the 2.5 GB bf16 embed
+twin, f32 plane transients, possible words double-staging. The next lever
+is the device-side allocation trace, not another mitigation.
+
+**W4b — the int8-dot lever ([#3031](https://github.com/mudler/vllm.cpp/issues/3031)).**
+Quantized-domain integer vec_dot behind the same seam; profile-first
+attribution; recorded-only throughput floor. Sequenced after W4a, never
+bundled.
 
 ## Now
 
@@ -314,6 +446,34 @@ carried the Q5_K/Q6_K/Q8_0 decodes and the predicate widening before the
 capture leg and the e2e battery (see the falsification section).
 W3 EVIDENCE COMPLETE on the row branch (see `## Evidence`): capture dump x2
 byte-identity, staging counter 0, READY gate 16/16 PASS (11 strict / 5
-near-tie, 0 forward-divergent), backend proof 0 declines. Pending: fresh
-review, preflight, landing. W4 owed: the int8 lever, the 27B arm, and the
-residency reconciliation in `## Owed`.
+near-tie, 0 forward-divergent), backend proof 0 declines. W3 LANDED
+2026-09-06 (025c6ed90..f98b63867, #3028). W4 scope committed (see `## W4`,
+issues #3030, #3031). AMENDED 2026-09-06 (third): the threshold flip's capture leg
+falsified the mechanism itself (trace region 425,754,624 B vs 52,428,800 B,
+mesh_trace.cpp:81; per-step decode compute at replay; the twin-for-all
+diagnostic ran the same gate 147/147 green). The flip waves are cancelled;
+the branch diff reverted; dense twins are the shipped behavior. W4a(1)
+re-anchors on the TT `kMatmulBTQuantGrouped` provider (wave-2: packed
+tower, native in-kernel dequant, E=1 dense + E=N experts, Q4_K/Q8_0 first,
+Q5_K extension owed, staged slice owed to wave-3 wiring and the 27B gate).
+The 128M threshold dissolves. Wave-2b landed 14e8fe471 (registered set
+{Q4_K,Q5_K,Q6_K,Q8_0}; suite 27,456 green; vehicle 147/147; operator-
+passed; pushed). AMENDED 2026-09-07 (fourth): the 27B is dense
+(tensor-name scan — the ×294 "experts" were a dtype-only misread), so
+the 27B path is the E=1 arm with chunked slice-decode (capture holds
+chunks, never whole weights); the E=N expert arm stays staged-owed
+behind a MoE artifact. Wave-3a = E=1 chunked capture-compatible packed
+dense; wave-3b = 27B wiring + gate + MTP skip + USAGE pin. AMENDED
+2026-09-07 (fifth): the vehicle falsified capture-safety at model scale
+(444,424,192 B = ~113 chains × ~3.5 MB of decode command stream); the
+trace-region policy moves to the pinned tt-metal's dynamic / per-model
+practice, demand stays measured and reported, and wave-3b-1c repairs
+under it. AMENDED 2026-09-07 (sixth): wave-3b-2 LANDS AS A STAGED SLICE
+(the coordinator's NEEDS_DECISION resolution) — production MTP head skip
+by name, byte-identical llama.cpp-b10451 denominator goldens committed,
+reachability test through the production loader accounting,
+`VT_TT_KEEPQUANT_CHUNK_BYTES`, and the `docs/USAGE.md` 27B arm entry. The
+27B e2e gate is UNREACHED — eight OOM runs, ~34 GB allocated against 32 GB
+— and [#3042](https://github.com/mudler/vllm.cpp/issues/3042) owns it (see
+`## Owed` and `## W4`). The row stays `ACTIVE`: W4b and the 27B gate are
+the open scope.

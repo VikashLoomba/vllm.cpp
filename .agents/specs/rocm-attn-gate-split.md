@@ -17,7 +17,16 @@ The CPU model regressions pass in both default and explicitly unfused modes.
 The operator verifies the split on physical device buffers, both visible devices,
 and offsets beyond 32 bits. The F16 head observer follows the actual native
 BF16-to-F32 cast. All 58 production cases pass with 10,970 assertions.
-The complete HIP suite and independent review remain pending.
+The complete HIP suite passes at the immutable head `15d8e1682`.
+
+Fresh review of `15d8e1682` returned PASS with no findings: four CPU guard
+mutations redden both model modes, and the six operator GPU mutation gates each
+redden their guarantee (G1 reproduces the recorded pre-fix provider refusal at
+the production regression, G2 the query/gate layout, G3 the nearest-even BF16
+narrowing, G4 the exact gate widening, G5 input preservation, and G6 the
+current-device binding). Pristine rebuilt-head reruns of the five receipt gates
+exit zero. The operator receipts, review report, and mutation logs are retained
+with the row evidence.
 
 The row uses one pull request under the repository default. The parent lifecycle
 does not change. Specification commits precede each implementation scope.

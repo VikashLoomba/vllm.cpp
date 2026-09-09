@@ -197,7 +197,7 @@ bool KeepQuantGatherDType(uint32_t ggml_type, vt::DType* out) {
 // CUDA backend (cuda_ops.cu, through cuda_quant_dequant.cuh) -- named in prose
 // rather than as the enumerator on purpose, because the leakage checker greps
 // the token in comments too, and rightly so: a prose mention is how the next
-// hand-kept device list starts. METAL, VULKAN, ROCM and
+// hand-kept device list starts. METAL, VULKAN and
 // TENSTORRENT register only `kEmbedding`, whose kernels each assert a float
 // table by name, so they answer false here and keep their pre-existing
 // expand-bf16 residency -- and their gather arms are owed.

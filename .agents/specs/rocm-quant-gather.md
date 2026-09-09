@@ -13,15 +13,19 @@ Spec base: `6db4bef906859e864c82523c01107473f7dcca29`.
 
 ## Now
 
-`PENDING`. This commit defines the ROCm gather change before implementation.
-This row uses one pull request, following the repository default.
-The implementation requires a fresh implementer, fresh mutation review, and an
-operator rerun. No product, GPU, oracle-runtime, or performance result is claimed.
+`ACTIVE`. The native HIP gather and public compressed-embedding path are implemented.
+The operator's final GPU run passed all 15 CTests and the required two-device case.
+The public gate reaches all 19 formats. All 76 operation outputs
+meet the pinned oracle gates, and matching native/primary traces pass.
+The row uses one pull request and retains the reviewed full-attention prerequisite.
 
-The primary plugin's embedding method covers 16 of the 19 admitted local
-formats. Its gfx1100 runtime and upstream fixtures remain `PENDING`.
-The fork's IQ1_XXXS graph and bounded model qualification remain `PENDING`.
-Neither local scalar agreement nor an imported golden satisfies those gates.
+The original 32 primary fixtures await download authority. The primary renderer refuses the exact Q4_0 fixture; both secondary bounded
+models abort on their first decode. Their execution and cache-layout qualification
+remain pending. Local preflight completes with its argument-dependent skips recorded.
+Fresh mutation review and the operator's reviewed-head rerun remain required. The row is not ready to land or become `DONE`.
+
+The [row evidence](../../docs/bench-evidence/rocm-quant-gather/README.md)
+records executing pins, exact recipes, stage hashes, rejected attempts, and limits.
 
 ## Scope
 
@@ -56,7 +60,7 @@ Update this inventory and `Now` together when this child changes state.
 
 | ID | Upstream source | Local anchor | Tests and evidence | Spec | State | Owner | Issue |
 |---|---|---|---|---|---|---|---|
-| `BACKEND-ROCM-QUANT-GATHER` | Plugin `_apply_gguf_embedding`, pinned codec sources | `vt::Embedding`, `KeepQuantGatherDType`, new ROCm gather | Focused and public gates in this spec | This file | `PENDING` | `row/BACKEND-ROCM-QUANT-GATHER` helper, operator verifies | #3093 |
+| `BACKEND-ROCM-QUANT-GATHER` | Plugin `_apply_gguf_embedding`, pinned codec sources | `vt::Embedding`, `KeepQuantGatherDType`, new ROCm gather | Focused and public gates in this spec | This file | `ACTIVE` | `row/BACKEND-ROCM-QUANT-GATHER` helper, operator verifies | #3093 |
 
 ### Complete decoder set
 
@@ -551,6 +555,10 @@ Require the focused test to fail for the intended reason after each mutation.
 7. Replace bf16 rounding with truncation.
 8. Remove the bounds-error record or its reporting.
 9. Remove grid-stride continuation.
+10. Remove the reader's Q8_K trait, then independently mis-size that trait.
+11. Remove the embedding materializer role and independently weaken its default dot guard.
+12. Permit a matrix repack for the embedding role.
+13. Remove the queue-device binding before the error allocation and launch.
 
 The first three mutations must fail the public production test.
 The remaining mutations must fail their named focused cases.
@@ -562,22 +570,30 @@ The operator reruns the final focused and full gates itself after a PASS review.
 
 Report exactly one state per applicable obligation: satisfied, narrowly waived,
 pending a named authority or resource, or failing.
-At specification, the result inventory is:
+The current result inventory is:
 
 | Obligation | Result | Authority or remaining evidence |
 |---|---|---|
-| Committed spec before implementation | Satisfied by this commit | Implementation has not started |
-| All 19 native decoder and error contracts | PENDING | Fresh implementer, gfx1100 mutex |
-| All 19 public production paths | PENDING | Public API fixture and native run |
-| Pinned-oracle model token equality | PENDING | Primary 16, stock MXFP4, fork IQ1_XXXS, 3 identical repeats |
-| Primary plugin operation and bounded-model execution | PENDING | Exact plugin build and gfx1100 run |
-| Original primary fixture coverage | PENDING | Cached files or approved 289,655,872-byte download |
-| Stock secondary execution | PENDING | Exact stock build, decoder and bounded model |
-| IQ1_XXXS fork graph and bounded model | PENDING | Exact fork executable and real model graph |
-| Memory format and identical-tool traces | PENDING | Runtime capture and available profiler |
-| CPU and ROCm regressions, full preflight | PENDING | Implementation head |
-| Fresh mutation review | PENDING | Independent reviewer |
-| Operator verification | PENDING | Operator rerun on reviewed head |
+| Committed spec before implementation | Satisfied | Original spec plus materializer and reader amendments precede product edits |
+| All 19 native decoder and error contracts | Satisfied on sealed native v4 | Nine cases and 11,784 assertions; required two-device case passes 16 assertions |
+| All 19 public production paths | Satisfied on sealed native v4 | 228 completions, 2,850 assertions; all 456 capture files equal the trace run byte-for-byte |
+| Pinned-oracle model token equality | PENDING | Primary 16, stock MXFP4 and fork IQ1_XXXS must emit matching tokens |
+| Primary plugin operation execution | Satisfied | Exact native plugin, 64 synthetic outputs; original tolerances unchanged |
+| Primary bounded-model execution | PENDING | Exact Q4_0 fixture reaches pinned renderer, which refuses Qwen3_5TextConfig before tokens |
+| Original primary fixture coverage | PENDING | Developer authority for the 289,655,872-byte download; no fixtures downloaded |
+| Stock secondary operation execution | Satisfied | Q8_K direct pinned decoder and MXFP4 real GET_ROWS, including applicable stock geometry |
+| Stock secondary bounded model | PENDING | First decode aborts; upstream context padding also differs from required cache geometry |
+| IQ1_XXXS fork operation execution | Satisfied | Real pinned fork GET_ROWS; exact outputs and applicable stock geometry |
+| IQ1_XXXS fork bounded model | PENDING | First decode aborts; requested 64 cells resolve to 256 |
+| Operation memory format and identical-tool traces | Satisfied | Identical rocprofv3 1.3.5; native allocation events and separate primary tensor telemetry |
+| Native model memory format | Satisfied | 228 public engines: 912 BF16 KV reads, 912 two-byte writes, one matching 16,384-byte allocation per engine; allocation role attributed through source |
+| Matched oracle model memory | PENDING | Primary renderer refusal and secondary cache padding/model aborts |
+| CPU regressions | Satisfied | Five CPU targets passed; accelerator-only targets reported three explicit skips |
+| ROCm regressions | Satisfied | Clean HIP build; all 15 CTests executed and passed in sealed native v4 |
+| Applicable local preflight | Satisfied with explicit skips | Full staged driver exits 0 with no failures and five argument-dependent skips; CPU ISA passes separately; final commit classification accompanies the handoff |
+| Combined CUDA/HIP expectation execution | PENDING | No combined build was available for this qualification |
+| Fresh mutation review | PENDING | Independent reviewer on immutable implementation head |
+| Operator verification | PENDING | Operator rerun after final scoped review |
 
 Performance is not an acceptance claim in this correctness row.
 No benchmark ID, throughput ratio, latency claim, or performance ceiling changes.
@@ -605,10 +621,18 @@ It reported no failures and five argument-dependent skips. These were
 `check-arm-isa-build.py`, `check-cpu-isa-build.py`, `check-cuda-fat-gencode.py`,
 `check-pr-size.py`, and `check-triton-aot-multiarch.py`.
 This result is not an all-green preflight. The spec changes no build or product file.
-The staged preflight and explicit change-size check remain required before commit.
+The implementation's final staged preflight exits 0 with no failures and the same five argument-dependent skips.
+The explicit CPU ISA check passes. Final commit classification accompanies the immutable handoff.
 Implementation evidence must add exact source and binary revisions, build commands,
 model and fixture hashes, environment, mutex identity, contention, and exit codes.
 Keep oracle outputs and restoration hashes in this row's evidence directory.
+
+Implementation captures, matching operation traces, oracle output archives, and
+remaining qualification failures are retained in the linked row evidence.
+The first public red was invalidated by the separate full-attention state defect;
+only the subsequent zero-provider-selection result is the intended implementation red.
+Q8_K reader and materializer refusals were then captured in their executing order.
+The queue-device test captured invalid stream use before the binding repair.
 Do not commit downloaded sample GGUF files.
 
 ## Risks and stop conditions

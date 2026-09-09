@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "gguf_builder.h"
+#include "capi/rocm_quant_gather_fixture.h"
 #include "vllm/config/weight_residency.h"
 #include "vllm/model_executor/device_placement.h"
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
@@ -856,6 +857,52 @@ TEST_CASE("the gather table's admission is the DECODER, not the vec_dot") {
   }
 }
 
+TEST_CASE("Q8_K GGUF reader preserves block geometry and packed bytes") {
+  const auto& format = rocm_gather_test::kFormats[8];
+  const TempFile file(rocm_gather_test::BuildModel(format, false));
+  const auto gguf = vllm::GgufFile::Open(file.path());
+  const auto& traits = vllm::GgmlTraits(15);
+  CHECK(traits.block_elems == 256);
+  CHECK(traits.block_bytes == 292);
+  const auto& tensor = gguf.Get("token_embd.weight");
+  CHECK(tensor.ggml_type == 15);
+  CHECK(tensor.shape == std::vector<int64_t>{128, 256});
+  REQUIRE(tensor.nbytes == 128 * 292);
+  const auto packed = rocm_gather_test::PackedTable(format);
+  REQUIRE(packed.size() == tensor.nbytes);
+  CHECK(std::memcmp(tensor.data, packed.data(), tensor.nbytes) == 0);
+}
+
+TEST_CASE("Q8_K embedding loader retains decoder-only blocks and preserves matrix refusal") {
+  // BACKEND-ROCM-QUANT-GATHER (#3093): the ordinary materializer must follow
+  // the tensor role already resolved by the loader, including decoder-only Q8_K.
+  const auto& format = rocm_gather_test::kFormats[8];
+  REQUIRE(format.dtype == vt::DType::kQ8_K);
+  const TempFile file(rocm_gather_test::BuildModel(format, false));
+  const auto gguf = vllm::GgufFile::Open(file.path());
+  const auto config = vllm::HfConfigFromGguf(gguf);
+  auto policy = KeepQuantOn();
+  policy.device = vt::DeviceType::kCPU;
+  const auto& packed = gguf.Get("token_embd.weight");
+  CHECK_FALSE(vllm::KeepQuantDType(packed.ggml_type, nullptr));
+  CHECK(vllm::KeepQuantGatherDType(packed.ggml_type, nullptr));
+  CHECK(vllm::RouteGgufTensor(true, false, false, false,
+          vllm::GgufTensorRole::kMatmulWeight, packed.ggml_type, packed.shape,
+          vt::DeviceType::kCPU) == vllm::GgufResidency::kExpandBf16);
+  CHECK_THROWS_WITH_AS(vllm::OwnGgufQuantBlocks(packed, 128, 256),
+                       doctest::Contains("non-keep-quant encoding"), std::runtime_error);
+  for (const bool cuda_align : {false, true}) {
+    CHECK_THROWS_WITH_AS(vllm::OwnGgufQuantBlocks(packed, 128, 256, 0, nullptr,
+                         !cuda_align, cuda_align, true, vllm::GgufTensorRole::kEmbeddingTable),
+                         doctest::Contains("cannot use a matrix repack"), std::runtime_error);
+  }
+  const auto weights = vllm::LoadQwen3_5DenseFromGguf(gguf, config, &policy);
+  CHECK(weights.embed_tokens.dtype == vt::DType::kQ8_K);
+  CHECK_FALSE(weights.embed_tokens.nk);
+  REQUIRE(weights.embed_tokens.bytes.size() == packed.nbytes);
+  CHECK(std::memcmp(weights.embed_tokens.bytes.data(), packed.data, packed.nbytes) == 0);
+}
+
 TEST_CASE("the gather's DEVICE gate is the OP TABLE, not a hand-kept device list") {
   // KGATHER. `DeviceQuantGatherSupported` is `OpRegistered(kEmbeddingQuant, dev)`
   // and names no device. That is not a style preference: the GGUF loader is the
@@ -883,7 +930,7 @@ TEST_CASE("the gather's DEVICE gate is the OP TABLE, not a hand-kept device list
           vt::OpRegistered(vt::OpId::kEmbeddingQuant, d));
   }
 
-  // The four that have no block-decoding gather in ANY build: each of their
+  // The three that have no block-decoding gather in ANY build: each of their
   // `kEmbedding` kernels asserts a float table by name (e.g. tenstorrent_ops.cpp
   // "tenstorrent kEmbedding: float table, f32/bf16 out"), none registers
   // `kEmbeddingQuant`, and their arms are owed. A backend that registered the
@@ -891,11 +938,16 @@ TEST_CASE("the gather's DEVICE gate is the OP TABLE, not a hand-kept device list
   // into a forward-time throw with the whole model resident — the #523 failure —
   // so this half stays an absolute assertion and not a registry echo.
   for (vt::DeviceType d :
-       {vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN, vt::DeviceType::kROCM,
+       {vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN,
         vt::DeviceType::kTENSTORRENT}) {
     CAPTURE(vt::DeviceTypeName(d));
     CHECK_FALSE(vllm::DeviceQuantGatherSupported(d));
   }
+#ifdef VLLM_CPP_HIP
+  CHECK(vllm::DeviceQuantGatherSupported(vt::DeviceType::kROCM));
+#else
+  CHECK_FALSE(vllm::DeviceQuantGatherSupported(vt::DeviceType::kROCM));
+#endif
 }
 
 TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {

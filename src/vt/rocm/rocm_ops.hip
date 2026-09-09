@@ -1,6 +1,7 @@
 // ROCm op-table registration (BACKEND-ROCM).
 #include "vt/op_provider.h"
 #include "vt/ops.h"
+#include "vt/rocm/rocm_embedding_quant.h"
 
 namespace vt::rocm {
 
@@ -165,6 +166,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernelRocm)));
     RegisterOp(OpId::kEmbedding, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernelRocm)));
+    RegisterOp(OpId::kEmbeddingQuant, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingQuantKernelRocm)));
     RegisterOp(OpId::kMulScalar, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<MulScalarFn>(&MulScalarKernelRocm)));
     RegisterOp(OpId::kSoftCap, DeviceType::kROCM,

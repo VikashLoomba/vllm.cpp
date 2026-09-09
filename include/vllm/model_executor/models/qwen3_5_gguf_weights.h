@@ -94,11 +94,14 @@ namespace vllm {
 // artifact off disk to populate pages nothing will ever look at. Measured: the
 // GLM-5.3 `UD-IQ1_S` load's RSS grew past 48 GiB against a 18.99 GiB resident
 // class, linearly, at the filesystem's read rate, with no plateau.
+// The default role requires a dot kernel. An embedding role requires only a
+// row decoder and refuses matrix repacks. The caller sets embedding metadata.
 OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
                                int64_t k, int64_t row_offset = 0,
                                const GgufFile* mmap_src = nullptr,
                                bool repack = false, bool cuda_align = false,
-                               bool prefault = true);
+                               bool prefault = true,
+                               GgufTensorRole role = GgufTensorRole::kMatmulWeight);
 
 // L6 (keep-f16 residency). Take `n` rows of `k` F16 elements of `tensor`'s raw
 // bytes — starting at row `row_offset` (how a stacked [E, out, in] expert tensor

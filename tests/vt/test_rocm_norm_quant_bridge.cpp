@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 
 #include "vt/rocm/rocm_norm_quant_bridge.h"
@@ -14,6 +15,8 @@ using vt::DType;
 using vt::Device;
 using vt::DeviceType;
 using vt::rocm::detail::NormQuantKey;
+using vt::rocm::detail::NormQuantCaptureState;
+using vt::rocm::detail::NormQuantScratchPool;
 using vt::rocm::detail::NormQuantToken;
 using vt::rocm::detail::NormQuantTokenRegistry;
 
@@ -80,6 +83,35 @@ TEST_CASE("ROCm norm-quant tokens reject a concurrent host thread") {
   other.join();
   CHECK_FALSE(taken.has_value());
   CHECK_FALSE(registry.Take(key).has_value());
+}
+
+TEST_CASE("ROCm norm-quant scratch is queue-owned and capture-safe") {
+  NormQuantScratchPool<uint64_t, int> pool;
+  NormQuantCaptureState capture = NormQuantCaptureState::kNone;
+  int queries = 0;
+  int allocations = 0;
+  std::array<std::byte, 128> first{};
+  std::array<std::byte, 128> second{};
+  auto query = [&](int) {
+    ++queries;
+    return capture;
+  };
+  auto allocate = [&](size_t, int) -> void* {
+    return allocations++ == 0 ? first.data() : second.data();
+  };
+
+  CHECK(pool.Ensure(7, 70, 64, query, allocate) == first.data());
+  CHECK(queries == 1);
+  capture = NormQuantCaptureState::kActive;
+  CHECK(pool.Ensure(7, 70, 64, query, allocate) == first.data());
+  CHECK(queries == 1);
+  CHECK_THROWS_WITH_AS(pool.Ensure(7, 70, 96, query, allocate),
+                       "vt rocm: norm-quant scratch: pre-warm RmsNorm on this queue before graph capture",
+                       std::runtime_error);
+  CHECK_THROWS_WITH_AS(pool.Ensure(8, 70, 64, query, allocate),
+                       "vt rocm: norm-quant scratch: pre-warm RmsNorm on this queue before graph capture",
+                       std::runtime_error);
+  CHECK(allocations == 1);
 }
 
 }  // namespace

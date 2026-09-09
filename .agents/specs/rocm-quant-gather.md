@@ -631,6 +631,37 @@ live primary cache measurements, and matched 16-block native gates.
 
 ## Tests and gates
 
+### Primary report qualification amendment
+
+Issue [#3113](https://github.com/mudler/vllm.cpp/issues/3113) owns the comparator repair from fresh review of `75d92614e84ff428eab49324f3b4fb2aba183ac3`.
+Commit this amendment before changing the comparator or adding its regression tests.
+The scope is `tools/rocm_quant_gather/compare_models.py`, focused Python tests,
+and this row's evidence. Model bytes, workload, pins, and product code remain fixed.
+
+The token matrix and separate memory capture must pass the same qualification.
+Require the exact successful status and reject any exception or traceback field.
+Require both recorded oracle pins and every recorded runtime identity:
+vLLM `0.28.1rc1.dev132+ge126687a9`, plugin `0.0.5+d4c1f0d.gfx1100`,
+Torch `2.12.0+git6bbd260`, Torch revision `6bbd26020da1c6dc198625dfcdd968b1e4e6b1c5`,
+and HIP `7.2.53211`. These values come from the sealed successful captures.
+They qualify this local runtime and do not advance any global oracle pin.
+
+Require identical model and configuration seals, prompt, repeat, resolved BF16,
+and every requested field, including automatic model and KV cache dtypes.
+Reject missing fields and incorrect values in either capture.
+Require a zero cache storage offset and verify that the complete strided view
+fits its storage before checking the existing live allocator bounds.
+Require the same view and storage metadata before and after generation.
+
+Preserve the actual successful Q4_0 token and memory reports as positive controls.
+Synthetic validator cases must be labeled as tests, never as oracle measurements.
+First reproduce the post-generation exception acceptance through `compare`.
+Then test missing and incorrect qualification fields on both report paths,
+including independent exception fields and invalid storage offsets and bounds.
+Mutate each new guard and each qualification call site, require focused failure,
+and restore the source byte-for-byte. Run the focused suite and full preflight.
+The operator owns the complete actual matrix comparison, GPU gates, and publication.
+
 ### Red-first implementation gate
 
 Add the public production test before the native provider.

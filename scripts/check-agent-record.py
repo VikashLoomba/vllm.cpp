@@ -30,108 +30,108 @@ MATRICES = {
 }
 # Citation-preserving padding; retired rationale lives in the completed archive.
 # Do not remove: tracked record anchors predate issue #3085.
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
+@dataclass(frozen=True)
+class ClaimRecord:
+    row_states: dict[str, str | None]
+    lifecycle: str | None
+    path: Path
+    line_no: int
+    strict: bool
+
+    @property
+    def row_ids(self) -> set[str]:
+        return set(self.row_states)
+
+
+NONTERMINAL_CLAIM_STATES = {"ACTIVE", "IMPLEMENTING", "SPIKE"}
+CLAIM_LIFECYCLE_RE = re.compile(r"^\s*`([A-Z][A-Z0-9-]*)`")
+
+def parse_claim_source(
+    path: Path,
+    errors: list[str],
+    claims: dict[str, ClaimRecord],
+    origin: dict[str, str],
+) -> None:
+    header: tuple[str, ...] = ()
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        cells = split_cells(line)
+        if cells and normalize_header(cells[0]) == "claim":
+            header = tuple(normalize_header(cell) for cell in cells)
+            continue
+        if not line.startswith("| `CLAIM-"):
+            continue
+        claim_match = CLAIM_RE.search(cells[0])
+        if claim_match is None:
+            continue
+        claim = claim_match.group(0)
+        if claim in claims:
+            errors.append(
+                f"{path.relative_to(ROOT)}:{line_no}: duplicate active claim "
+                f"{claim} (already declared in {origin[claim]})"
+            )
+            continue
+        row_cell = cells[1] if len(cells) > 1 else ""
+        matches = list(ID_RE.finditer(row_cell))
+        row_states: dict[str, str | None] = {}
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(row_cell)
+            annotation = re.match(r"^`\s*\(([^)]*)\)", row_cell[match.end() : end])
+            state_match = STATE_RE.search(annotation.group(1)) if annotation else None
+            row_states[match.group(0)] = state_match.group(1) if state_match else None
+        state_index = field_index(header, "state")
+        state_cell = cells[state_index] if state_index is not None and state_index < len(cells) else ""
+        lifecycle_match = CLAIM_LIFECYCLE_RE.match(state_cell)
+        origin[claim] = str(path.relative_to(ROOT))
+        claims[claim] = ClaimRecord(
+            row_states=row_states,
+            lifecycle=lifecycle_match.group(1) if lifecycle_match else None,
+            path=path,
+            line_no=line_no,
+            strict=path.parent == AGENTS / "claims",
+        )
+
+
+def claimed_row_ids(claims: dict[str, ClaimRecord], claim: str) -> set[str]:
+    record = claims.get(claim)
+    return record.row_ids if record is not None else set()
+
+
+def check_claim_state_consistency(
+    claims: dict[str, ClaimRecord],
+    by_id: dict[str, ClaimRow],
+    errors: list[str],
+) -> None:
+    for claim, record in claims.items():
+        if not record.strict:
+            continue
+        location = f"{record.path.relative_to(ROOT)}:{record.line_no}"
+        for item_id, annotated_state in record.row_states.items():
+            row = by_id.get(item_id)
+            if row is None:
+                continue
+            if annotated_state is None:
+                errors.append(
+                    f"{location}: claim {claim} does not annotate {item_id} "
+                    "with its matrix lifecycle state"
+                )
+            elif annotated_state != row.state:
+                errors.append(
+                    f"{location}: claim {claim} annotates {item_id} as "
+                    f"{annotated_state}, but matrix state is {row.state}"
+                )
+    for row in by_id.values():
+        if row.state not in {"SPIKE", "ACTIVE"}:
+            continue
+        claim_match = CLAIM_RE.search(row.field("owner"))
+        record = claims.get(claim_match.group(0)) if claim_match is not None else None
+        if record is None or not record.strict or record.lifecycle in NONTERMINAL_CLAIM_STATES:
+            continue
+        lifecycle = record.lifecycle or "<missing>"
+        errors.append(
+            f"{row.path.relative_to(ROOT)}:{row.line_no}: owner {claim_match.group(0)} "
+            f"for live row {row.item_id} has claim lifecycle {lifecycle}, not "
+            "ACTIVE/IMPLEMENTING/SPIKE"
+        )
 #
 #
 #
@@ -1876,26 +1876,26 @@ def claim_sources() -> list[Path]:
     return sources
 
 
-def parse_active_claims(errors: list[str]) -> dict[str, set[str]]:
-    claims: dict[str, set[str]] = {}
+def parse_active_claims(errors: list[str]) -> dict[str, ClaimRecord]:
+    """Read claim rows from the legacy table and per-claim files.
+
+    Per-claim files carry structured row-state annotations and a lifecycle.
+    The legacy table remains readable until its historical rows retire.
+    Duplicate claim IDs still fail across both source types.
+    Row IDs keep the existing ID_RE grammar and multi-row behavior.
+    Structured consistency is checked after the matrices are available.
+
+    The returned record retains its source location for precise diagnostics.
+    It also retains whether the source uses the strict per-claim format.
+    Callers use row_ids when they only need the former membership behavior.
+    The lifecycle is interpreted only for a selected live-row owner.
+    Unknown lifecycle values remain data so the consistency gate can fail.
+    No claim ID or row ID is inferred from prose outside the table cells.
+    """
+    claims: dict[str, ClaimRecord] = {}
     origin: dict[str, str] = {}
     for path in claim_sources():
-        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if not line.startswith("| `CLAIM-"):
-                continue
-            cells = split_cells(line)
-            claim_match = CLAIM_RE.search(cells[0])
-            if claim_match is None:
-                continue
-            claim = claim_match.group(0)
-            if claim in claims:
-                errors.append(
-                    f"{path.relative_to(ROOT)}:{line_no}: duplicate active claim "
-                    f"{claim} (already declared in {origin[claim]})"
-                )
-                continue
-            origin[claim] = str(path.relative_to(ROOT))
-            claims[claim] = set(ID_RE.findall(cells[1])) if len(cells) > 1 else set()
+        parse_claim_source(path, errors, claims, origin)
     return claims
 
 
@@ -1931,7 +1931,7 @@ def check_row_contracts(
                 errors.append(f"{location}: {row.state} row {row.item_id} has no CLAIM-* owner")
             else:
                 claim = claim_match.group(0)
-                if row.item_id not in active_claims.get(claim, set()):
+                if row.item_id not in claimed_row_ids(active_claims, claim):
                     errors.append(
                         f"{location}: owner {claim} does not claim active row {row.item_id} in any claim source"
                     )
@@ -1949,7 +1949,7 @@ def check_row_contracts(
                     f"{location}: DONE row {row.item_id} closing commit {owner} does not exist"
                 )
 
-    for claim, item_ids in active_claims.items():
+    for claim, item_ids in ((claim, record.row_ids) for claim, record in active_claims.items()):
         if not item_ids:
             errors.append(f"active claim {claim} has no stable row IDs")
         for item_id in item_ids:
@@ -1960,7 +1960,7 @@ def check_row_contracts(
                 errors.append(
                     f"active claim {claim} references {item_id} in state {row.state}, not SPIKE/ACTIVE"
                 )
-
+    check_claim_state_consistency(active_claims, by_id, errors)
 
 def check_model_invariants(errors: list[str]) -> None:
     path = AGENTS / "model-matrix.md"

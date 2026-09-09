@@ -807,8 +807,8 @@ class PerClaimFileSource(unittest.TestCase):
         probe = ROOT / ".agents/claims/CLAIM-AGENT-RECORD-PROBE.md"
         probe.write_text(
             "# CLAIM-AGENT-RECORD-PROBE\n\n"
-            "| Claim | Row IDs |\n|---|---|\n"
-            "| `CLAIM-AGENT-RECORD-PROBE` | `ENG-RECORD-CONFLICT-SURFACES` |\n",
+            "| Claim | Row IDs | State |\n|---|---|---|\n"
+            "| `CLAIM-AGENT-RECORD-PROBE` | `ENG-RECORD-CONFLICT-SURFACES` (`ACTIVE`) | `ACTIVE` |\n",
             encoding="utf-8",
         )
         try:
@@ -816,8 +816,9 @@ class PerClaimFileSource(unittest.TestCase):
             claims = agent_record.parse_active_claims(errors)
             self.assertIn("CLAIM-AGENT-RECORD-PROBE", claims)
             self.assertEqual(
-                claims["CLAIM-AGENT-RECORD-PROBE"], {"ENG-RECORD-CONFLICT-SURFACES"}
+                claims["CLAIM-AGENT-RECORD-PROBE"].row_ids, {"ENG-RECORD-CONFLICT-SURFACES"}
             )
+            self.assertEqual(claims["CLAIM-AGENT-RECORD-PROBE"].lifecycle, "ACTIVE")
         finally:
             probe.unlink()
 
@@ -1077,110 +1078,109 @@ class CanonicalIssueRecordTests(unittest.TestCase):
         )
 # Preserve the exact line anchors owned by ENG-RECORD-ANCHOR-RATCHET (#632).
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+class PerClaimStateConsistencyTests(unittest.TestCase):
+    CLAIM = "CLAIM-KERNEL-CUDA-DECODE-MEGAKERNEL"
+    ROW = "KERNEL-CUDA-DECODE-MEGAKERNEL"
+    PATH = ROOT / f".agents/claims/{CLAIM}.md"
+
+    def _row(self):
+        errors: list[str] = []
+        rows, by_id = agent_record.check_matrices(errors)
+        self.assertEqual(errors, [])
+        return by_id[self.ROW]
+
+    def _contract_errors(self, mutated: str) -> list[str]:
+        original = self.PATH.read_bytes()
+        self.PATH.write_text(mutated, encoding="utf-8")
+        try:
+            errors: list[str] = []
+            rows, by_id = agent_record.check_matrices(errors)
+            agent_record.check_row_contracts(rows, by_id, errors)
+        finally:
+            self.PATH.write_bytes(original)
+        self.assertEqual(self.PATH.read_bytes(), original)
+        return errors
+
+    def test_claim_row_annotation_must_match_matrix_state(self) -> None:
+        source = self.PATH.read_text(encoding="utf-8")
+        old = f"`{self.ROW}` (`SPIKE`)"
+        new = f"`{self.ROW}` (`ACTIVE`)"
+        self.assertEqual(source.count(old), 1)
+        errors = self._contract_errors(source.replace(old, new, 1))
+        self.assertEqual(
+            errors,
+            [
+                f".agents/claims/{self.CLAIM}.md:5: claim {self.CLAIM} "
+                f"annotates {self.ROW} as ACTIVE, but matrix state is SPIKE"
+            ],
+        )
+
+    def test_selected_owner_claim_must_have_nonterminal_lifecycle(self) -> None:
+        source = self.PATH.read_text(encoding="utf-8")
+        self.assertEqual(source.count("| `ACTIVE` |"), 1)
+        errors = self._contract_errors(source.replace("| `ACTIVE` |", "| `DONE` |", 1))
+        row = self._row()
+        self.assertEqual(
+            errors,
+            [
+                f".agents/kernel-matrix.md:{row.line_no}: owner {self.CLAIM} for live row "
+                f"{self.ROW} has claim lifecycle DONE, not ACTIVE/IMPLEMENTING/SPIKE"
+            ],
+        )
+
+    def _probe_errors(self, lifecycle: str, row_cell: str) -> list[str]:
+        claim = "CLAIM-AGENT-RECORD-STATE-PROBE"
+        probe = ROOT / f".agents/claims/{claim}.md"
+        probe.write_text(
+            "# claim-state probe\n\n"
+            "| Claim | Row IDs | Agent | Worktree | Branch | Scope | State | Update |\n"
+            "|---|---|---|---|---|---|---|---|\n"
+            f"| `{claim}` | {row_cell} | test | test | test | test | `{lifecycle}` | test |\n",
+            encoding="utf-8",
+        )
+        try:
+            row = with_field(self._row(), "owner", f"`{claim}`")
+            errors: list[str] = []
+            with mock.patch.object(agent_record, "claim_sources", lambda: [probe]):
+                agent_record.check_row_contracts([row], {self.ROW: row}, errors)
+        finally:
+            probe.unlink()
+        return errors
+
+    def test_existing_nonterminal_claim_lifecycles_are_live(self) -> None:
+        for lifecycle in ("ACTIVE", "IMPLEMENTING", "SPIKE"):
+            with self.subTest(lifecycle=lifecycle):
+                self.assertEqual(
+                    self._probe_errors(lifecycle, f"`{self.ROW}` (`SPIKE`)"),
+                    [],
+                )
+
+    def test_missing_claim_row_annotation_is_rejected(self) -> None:
+        errors = self._probe_errors("ACTIVE", f"`{self.ROW}`")
+        self.assertEqual(
+            errors,
+            [
+                ".agents/claims/CLAIM-AGENT-RECORD-STATE-PROBE.md:5: claim "
+                f"CLAIM-AGENT-RECORD-STATE-PROBE does not annotate {self.ROW} "
+                "with its matrix lifecycle state"
+            ],
+        )
+
+    def test_unknown_selected_owner_claim_lifecycle_is_rejected(self) -> None:
+        errors = self._probe_errors("PAUSED", f"`{self.ROW}` (`SPIKE`)")
+        row = self._row()
+        self.assertEqual(
+            errors,
+            [
+                f".agents/kernel-matrix.md:{row.line_no}: owner "
+                "CLAIM-AGENT-RECORD-STATE-PROBE for live row "
+                f"{self.ROW} has claim lifecycle PAUSED, not ACTIVE/IMPLEMENTING/SPIKE"
+            ],
+        )
+
+    def test_actual_roadmap_claim_is_state_consistent(self) -> None:
+        source = self.PATH.read_text(encoding="utf-8")
+        self.assertEqual(self._contract_errors(source), [])
 
 
 

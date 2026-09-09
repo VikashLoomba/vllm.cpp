@@ -17,7 +17,7 @@ The quoted text below is historical evidence only. It does not define issue auth
 
 > Row: `BACKEND-ROCM-ATTN-GATE-SPLIT`
 >
-> The F16 production forward observer identifies an LM-head multiplication solely by its output width in `tests/vllm/test_gguf_keep_quant.cpp::F16ForwardObservation::Observe`. The unchanged gated fixture has four other projection calls with that width. After the missing ROCm AttnGateSplit provider and zero rotary-width handling are repaired, both tied and untied cases report five marked heads against the exact-one assertion.
+> The F16 production forward observer identifies an LM-head multiplication solely by its output width in `tests/vllm/test_gguf_keep_quant.cpp` (`F16ForwardObservation::Observe`). The unchanged gated fixture has four other projection calls with that width. After the missing ROCm AttnGateSplit provider and zero rotary-width handling are repaired, both tied and untied cases report five marked heads against the exact-one assertion.
 >
 > The operator ran the complete frozen HIP target. It reports 58 cases, 57 passing cases, 10,934 passing assertions, and exactly two head-count failures. Retained and expanded F16 logits match and are finite. The frozen evidence is `/home/vikash/.cache/rocm-attn-gate-split-impl/green-focused/gguf-production-full-operator.log`, SHA256 `cf9cd125bce34008bba2bfd0e51f6fbd018facbc552c31e21a5f0f57fdc89d1a`. The command and sealed inputs are retained beside it.
 >

@@ -222,6 +222,9 @@ Authorize a scoped observer repair in `tests/vllm/test_gguf_keep_quant.cpp`.
 Record the output and weight metadata of each real GEMM call.
 Bind the final GEMM output to the device logits returned by the registered
 forward, including its pointer, shape, dtype, and device.
+For a BF16 head, observe the actual native `CastF32` call between those tensors.
+Its source must match the GEMM output. Its destination must match returned logits.
+Keep the direct binding for an F32 head.
 Count marked head calls by that final GEMM's exact physical weight identity.
 Include weight shape, strides, and orientation in the identity.
 This distinguishes unrelated equal-width projections and pooled output addresses.
@@ -231,12 +234,23 @@ Require device logits for this native production gate.
 Keep `marked_heads == 1`, both tied modes, the existing vocabulary, fixture bytes,
 native provider checks, marked GEMM and embedding checks, and all numerical checks.
 Do not increase the count, use a lower bound, or alter model configuration.
-The production head uses `MatmulF32D` and `WrapDeviceLogits` without an intermediate
-copy at `qwen3_5.cpp:9203-9211`.
+The executing dense head uses `DenseLogitsF32D` at `qwen3_5.cpp:3293-3295`.
+Both unchanged GGUF orientations select `MatmulBf16LogitsF32D` at lines 1777-1782.
+That helper computes BF16 logits, then calls `vt::CastF32` for the returned storage.
+The initial direct-only witness failed this binding and retained that failure.
+Its operator log has SHA256
+`cca1ca70954d4f425850b3f92e66450c1b2a754c338a7a882444d4f2dbecb505`.
+The unrelated MTP head at lines 9203-9211 does not establish this executing chain.
+
+Extend the existing test linker interposition in
+`tests/vllm/rocm_f16_native_observer.h` and `tests/CMakeLists.txt` for
+`CastF32KernelRocm`. Invoke the real native function and preserve provider selection.
+Record the call metadata without changing an operand or fixture.
 
 Repeat the unchanged production case after the observer repair.
 In independent scratch mutations, omit its actual final GEMM observation and
-remove that call's F16 marker. Each mutation must fail the production gate.
+remove that call's F16 marker. Independently omit the actual cast observation.
+Each mutation must fail the production gate.
 Restore every source and build byte after each mutation.
 The operator retains GPU authority and independently reruns the reviewed result.
 This amendment precedes the observer implementation in Git.

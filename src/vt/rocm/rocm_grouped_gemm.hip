@@ -1221,7 +1221,7 @@ template <typename OutT, int Fmt>
 __global__ void KQuantGemvMmvqFusedK(OutT* __restrict__ out,
                                      const uint8_t* __restrict__ weight,
                                      const void* __restrict__ a, ActDT adt,
-                                     int64_t a_rs, int64_t n, int64_t nsb,
+                                     int64_t n, int64_t nsb,
                                      size_t w_block_bytes) {
   extern __shared__ unsigned char vt_mmvq_smem[];
   BlockQ8_K* scratch = reinterpret_cast<BlockQ8_K*>(vt_mmvq_smem);
@@ -1568,18 +1568,15 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
         if (fmt == 2) {
           KQuantGemvMmvqFusedK<OutT, 2><<<static_cast<unsigned>(grid), gemv_block,
                                          lds_bytes, s>>>(
-              output, w, a.data, ActDtOf(a.dtype), a.stride[0], n, nsb,
-              w_block_bytes);
+              output, w, a.data, ActDtOf(a.dtype), n, nsb, w_block_bytes);
         } else if (fmt == 1) {
           KQuantGemvMmvqFusedK<OutT, 1><<<static_cast<unsigned>(grid), gemv_block,
                                          lds_bytes, s>>>(
-              output, w, a.data, ActDtOf(a.dtype), a.stride[0], n, nsb,
-              w_block_bytes);
+              output, w, a.data, ActDtOf(a.dtype), n, nsb, w_block_bytes);
         } else {
           KQuantGemvMmvqFusedK<OutT, 0><<<static_cast<unsigned>(grid), gemv_block,
                                          lds_bytes, s>>>(
-              output, w, a.data, ActDtOf(a.dtype), a.stride[0], n, nsb,
-              w_block_bytes);
+              output, w, a.data, ActDtOf(a.dtype), n, nsb, w_block_bytes);
         }
       } else if (fmt == 2) {
         KQuantGemvMmvqK<OutT, 2><<<static_cast<unsigned>(grid), gemv_block, 0, s>>>(

@@ -18,6 +18,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -28,6 +29,7 @@
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/quant.h"
+#include "vt/rocm/rocm_mmvq_policy.h"
 #include "vt/tensor.h"
 
 // Compile the exact scratch policy used by the HIP provider with host fakes.
@@ -43,6 +45,13 @@ using vt::DeviceType;
 using vt::DType;
 using vt::Queue;
 using vt::Tensor;
+
+#if defined(VLLM_CPP_HIP)
+namespace vt::rocm {
+void Q8KResetRouteDispatchCountsForTest();
+uint64_t Q8KRouteDispatchCountForTest(bool grouped, bool candidate);
+}  // namespace vt::rocm
+#endif
 
 namespace {
 
@@ -171,7 +180,210 @@ Tensor DevTensor(void* p, DType dt, const std::vector<int64_t>& shape) {
   return t;
 }
 
+#if defined(VLLM_CPP_HIP)
+class ScopedEnv {
+ public:
+  ScopedEnv(const char* name, const char* value) : name_(name) {
+    if (const char* old = std::getenv(name)) {
+      had_old_ = true;
+      old_ = old;
+    }
+    if (value == nullptr) {
+      ::unsetenv(name);
+    } else {
+      ::setenv(name, value, 1);
+    }
+  }
+
+  ~ScopedEnv() {
+    if (had_old_) {
+      ::setenv(name_.c_str(), old_.c_str(), 1);
+    } else {
+      ::unsetenv(name_.c_str());
+    }
+  }
+
+ private:
+  std::string name_;
+  std::string old_;
+  bool had_old_ = false;
+};
+
+std::vector<uint8_t> EncodeActivation(DType dtype, int64_t elements) {
+  std::vector<float> values(static_cast<size_t>(elements));
+  GenerateData(2.0F, values.size(), values.data());
+  std::vector<uint8_t> encoded(static_cast<size_t>(elements) * sizeof(uint16_t));
+  for (int64_t i = 0; i < elements; ++i) {
+    const uint16_t value =
+        dtype == DType::kBF16 ? vt::F32ToBF16(values[static_cast<size_t>(i)])
+                              : vt::F32ToF16(values[static_cast<size_t>(i)]);
+    std::memcpy(encoded.data() + static_cast<size_t>(i) * sizeof(value), &value,
+                sizeof(value));
+  }
+  return encoded;
+}
+
+std::vector<uint8_t> RunDenseQuant(Backend& gpu, Queue& queue,
+                                   const std::vector<uint8_t>& activation,
+                                   DType activation_dtype,
+                                   const std::vector<uint8_t>& weight,
+                                   DType weight_dtype, DType output_dtype,
+                                   int64_t m, int64_t n, int64_t k) {
+  void* device_activation = gpu.Alloc(activation.size());
+  void* device_weight = gpu.Alloc(weight.size());
+  const size_t output_bytes =
+      static_cast<size_t>(m * n) * (output_dtype == DType::kF32 ? 4 : 2);
+  void* device_output = gpu.Alloc(output_bytes);
+  std::vector<uint8_t> output(output_bytes, 0xA5);
+  gpu.Copy(queue, device_activation, activation.data(), activation.size());
+  gpu.Copy(queue, device_weight, weight.data(), weight.size());
+  gpu.Copy(queue, device_output, output.data(), output.size());
+  Tensor at = DevTensor(device_activation, activation_dtype, {m, k});
+  Tensor wt = DevTensor(device_weight, weight_dtype, {n, k});
+  Tensor ot = DevTensor(device_output, output_dtype, {m, n});
+  vt::MatmulBTQuant(queue, ot, at, wt);
+  gpu.Copy(queue, output.data(), device_output, output.size());
+  gpu.Synchronize(queue);
+  gpu.Free(device_activation);
+  gpu.Free(device_weight);
+  gpu.Free(device_output);
+  return output;
+}
+
+namespace vt_rocm_test_api {
+using vt::rocm::MmvqRouteCounts;
+void ResetMmvq() { vt::rocm::MmvqResetRouteCountsForTesting(); }
+MmvqRouteCounts MmvqCounts() { return vt::rocm::MmvqRouteCountsForTesting(); }
+}  // namespace vt_rocm_test_api
+#endif
+
 }  // namespace
+
+TEST_CASE("ROCm MMVQ route policy keeps the default and gates the fold") {
+  using vt::rocm::detail::MmvqRoute;
+  using vt::rocm::detail::ParseMmvqFoldMaxRows;
+  using vt::rocm::detail::SelectMmvqRoute;
+
+  CHECK(ParseMmvqFoldMaxRows(nullptr) == 512);
+  CHECK(ParseMmvqFoldMaxRows("") == 512);
+  CHECK(ParseMmvqFoldMaxRows("0") == 512);
+  CHECK(ParseMmvqFoldMaxRows("-1") == 512);
+  CHECK(ParseMmvqFoldMaxRows("512x") == 512);
+  CHECK(ParseMmvqFoldMaxRows("999999999999999999999999") == 512);
+  CHECK(ParseMmvqFoldMaxRows("128") == 128);
+
+  CHECK(SelectMmvqRoute(nullptr, nullptr, 1, 256, 4096) ==
+        MmvqRoute::kBaseline);
+  CHECK(SelectMmvqRoute("0", nullptr, 1, 256, 4096) ==
+        MmvqRoute::kBaseline);
+  CHECK(SelectMmvqRoute("1", nullptr, 2, 256, 4096) ==
+        MmvqRoute::kBaseline);
+  CHECK(SelectMmvqRoute("1", nullptr, 1, 256, 4096) ==
+        MmvqRoute::kFused);
+  CHECK(SelectMmvqRoute("1", nullptr, 1, 513, 4096) ==
+        MmvqRoute::kGemv);
+  CHECK(SelectMmvqRoute("1", "128", 1, 128, 4096) ==
+        MmvqRoute::kFused);
+  CHECK(SelectMmvqRoute("1", "128", 1, 129, 4096) ==
+        MmvqRoute::kGemv);
+  CHECK(SelectMmvqRoute("1", nullptr, 1, 256, 32 * 1024) ==
+        MmvqRoute::kFused);
+  CHECK(SelectMmvqRoute("1", nullptr, 1, 256, 32 * 1024 + 1) ==
+        MmvqRoute::kGemv);
+}
+
+#if defined(VLLM_CPP_HIP)
+TEST_CASE("ROCm MMVQ production route is byte-exact for decode dtypes") {
+  if (!HasRocm()) return;
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue queue = gpu.CreateQueue();
+  constexpr int64_t k = 8 * 256;
+  constexpr int64_t nsb = k / 256;
+  constexpr int64_t n = 7;
+
+  for (int case_index : {7, 8, 9}) {
+    const WeightCase& c = kCases[case_index];
+    std::vector<uint8_t> weight = RandomBlocks(c, n * nsb, 0x4D4D5651U);
+    for (DType activation_dtype : {DType::kBF16, DType::kF16}) {
+      std::vector<uint8_t> activation = EncodeActivation(activation_dtype, k);
+      for (DType output_dtype : {DType::kBF16, DType::kF32}) {
+        CAPTURE(std::string(c.name));
+        CAPTURE(static_cast<int>(activation_dtype));
+        CAPTURE(static_cast<int>(output_dtype));
+        std::vector<uint8_t> baseline;
+        {
+          ScopedEnv mmvq("VT_GEMV_MMVQ", nullptr);
+          ScopedEnv fold("VT_GEMV_MMVQ_FOLD_MAX", nullptr);
+          vt_rocm_test_api::ResetMmvq();
+          baseline = RunDenseQuant(gpu, queue, activation, activation_dtype,
+                                   weight, c.dtype, output_dtype, 1, n, k);
+          const auto counts = vt_rocm_test_api::MmvqCounts();
+          CHECK(counts.baseline == 1);
+          CHECK(counts.gemv == 0);
+          CHECK(counts.fused == 0);
+        }
+        {
+          ScopedEnv mmvq("VT_GEMV_MMVQ", "1");
+          ScopedEnv fold("VT_GEMV_MMVQ_FOLD_MAX", nullptr);
+          vt_rocm_test_api::ResetMmvq();
+          const std::vector<uint8_t> candidate =
+              RunDenseQuant(gpu, queue, activation, activation_dtype, weight,
+                            c.dtype, output_dtype, 1, n, k);
+          CHECK(candidate == baseline);
+          const auto counts = vt_rocm_test_api::MmvqCounts();
+          CHECK(counts.baseline == 0);
+          CHECK(counts.gemv == 0);
+          CHECK(counts.fused == 1);
+        }
+      }
+    }
+  }
+
+  gpu.DestroyQueue(queue);
+}
+
+TEST_CASE("ROCm MMVQ production route observes M and fold gates") {
+  if (!HasRocm()) return;
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue queue = gpu.CreateQueue();
+  constexpr int64_t k = 8 * 256;
+  constexpr int64_t nsb = k / 256;
+  const WeightCase& c = kCases[7];
+
+  {
+    constexpr int64_t n = 513;
+    std::vector<uint8_t> activation = EncodeActivation(DType::kBF16, k);
+    std::vector<uint8_t> weight = RandomBlocks(c, n * nsb, 0xF01DU);
+    ScopedEnv mmvq("VT_GEMV_MMVQ", "1");
+    ScopedEnv fold("VT_GEMV_MMVQ_FOLD_MAX", "128");
+    vt_rocm_test_api::ResetMmvq();
+    RunDenseQuant(gpu, queue, activation, DType::kBF16, weight, c.dtype,
+                  DType::kF32, 1, n, k);
+    const auto counts = vt_rocm_test_api::MmvqCounts();
+    CHECK(counts.baseline == 0);
+    CHECK(counts.gemv == 1);
+    CHECK(counts.fused == 0);
+  }
+
+  {
+    constexpr int64_t m = 3;
+    constexpr int64_t n = 7;
+    std::vector<uint8_t> activation = EncodeActivation(DType::kF16, m * k);
+    std::vector<uint8_t> weight = RandomBlocks(c, n * nsb, 0x4D474154U);
+    ScopedEnv mmvq("VT_GEMV_MMVQ", "1");
+    ScopedEnv fold("VT_GEMV_MMVQ_FOLD_MAX", nullptr);
+    vt_rocm_test_api::ResetMmvq();
+    RunDenseQuant(gpu, queue, activation, DType::kF16, weight, c.dtype,
+                  DType::kBF16, m, n, k);
+    const auto counts = vt_rocm_test_api::MmvqCounts();
+    CHECK(counts.baseline == 1);
+    CHECK(counts.gemv == 0);
+    CHECK(counts.fused == 0);
+  }
+
+  gpu.DestroyQueue(queue);
+}
+#endif
 
 TEST_CASE("ROCm quant-dot scratch refuses capture misses and keeps queue ownership") {
   vt::rocm::detail::QuantDotScratchPool<uint64_t, int> pool;
@@ -438,6 +650,12 @@ TEST_CASE(
   Backend& gpu = vt::GetBackend(DeviceType::kROCM);
   Queue gq = gpu.CreateQueue();
   Queue cq{Cpu(), nullptr};
+#if defined(VLLM_CPP_HIP)
+  ScopedEnv mmvq("VT_GEMV_MMVQ", "1");
+  ScopedEnv fold("VT_GEMV_MMVQ_FOLD_MAX", nullptr);
+  vt_rocm_test_api::ResetMmvq();
+  vt::rocm::Q8KResetRouteDispatchCountsForTest();
+#endif
 
   // All ten encodings, decode + prefill shapes, broadcast and per-row arms —
   // the same matrix the CUDA grouped gate runs, over a POISONED output buffer.
@@ -528,5 +746,15 @@ TEST_CASE(
   CHECK(combos ==
         static_cast<int64_t>(std::size(kCases) * std::size(kGroupedShapes)));
   CHECK(combos > 0);
+#if defined(VLLM_CPP_HIP)
+  const auto mmvq_counts = vt_rocm_test_api::MmvqCounts();
+  CHECK(mmvq_counts.baseline == 0);
+  CHECK(mmvq_counts.gemv == 0);
+  CHECK(mmvq_counts.fused == 0);
+  const uint64_t grouped_q8k_routes =
+      vt::rocm::Q8KRouteDispatchCountForTest(true, false) +
+      vt::rocm::Q8KRouteDispatchCountForTest(true, true);
+  CHECK(grouped_q8k_routes == 9);
+#endif
   gpu.DestroyQueue(gq);
 }

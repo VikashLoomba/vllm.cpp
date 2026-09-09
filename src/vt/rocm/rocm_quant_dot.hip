@@ -14,17 +14,58 @@
 // CPU's sequential add), so the gate is the CUDA sibling's gate: INTEGER core
 // bit-exact, final scale within the NMSE band test_ops_quant_dot uses.
 //
-//   * Scratch uses hipMallocAsync (present in ROCm 7.14) with the same retire
-//     -never-free discipline as the CUDA side (graph_safe_scratch.h).
+//   * Scratch uses hipMallocAsync (present in ROCm 7.14) and the shared
+//     grow-only queue ownership used by the other ROCm graph paths.
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+
+#include "vt/grow_only_stream_scratch.h"
+
+namespace vt::rocm::detail {
+
+enum class ScratchCaptureState { kNone, kActive, kInvalidated };
+
+template <typename QueueKey, typename Stream>
+class QuantDotScratchPool {
+ public:
+  // Query capture only when the queue needs a new block. A warm capture reuses
+  // its stable pointer without a host runtime call. A cold capture refuses
+  // before hipMallocAsync can publish graph-owned memory as eager scratch.
+  template <typename QueryCapture, typename Allocate>
+  void* Ensure(QueueKey queue, Stream stream, size_t need,
+               QueryCapture&& query_capture, Allocate&& allocate) {
+    return pool_.Ensure(queue, need, [&](size_t bytes) {
+      const ScratchCaptureState capture = query_capture(stream);
+      if (capture == ScratchCaptureState::kActive) {
+        throw std::runtime_error(
+            "vt rocm: quant-dot scratch: pre-warm MatmulBTQuant on this queue "
+            "before graph capture");
+      }
+      if (capture != ScratchCaptureState::kNone) {
+        throw std::runtime_error(
+            "vt rocm: quant-dot scratch: capture is invalidated; end capture "
+            "before pre-warming MatmulBTQuant");
+      }
+      return allocate(bytes, stream);
+    });
+  }
+
+  size_t CapacityFor(QueueKey queue) const { return pool_.CapacityFor(queue); }
+  void* BlockFor(QueueKey queue) const { return pool_.BlockFor(queue); }
+
+ private:
+  vt::GrowOnlyStreamScratch<QueueKey> pool_;
+};
+
+}  // namespace vt::rocm::detail
+
+#ifndef VT_ROCM_QUANT_DOT_SCRATCH_TEST_ONLY
 #include <hip/hip_runtime.h>
 
-#include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
-#include <stdexcept>
 #include <string>
-#include <unordered_map>
 
 #include "vt/cpu/cpu_quant_blocks.h"         // vt::cpu::Block* struct mirror
                                              // (single source; plain C++)
@@ -33,13 +74,12 @@
                                              // d_iq1xxxs_grid / d_ksigns /
                                              // d_kmask (single source; pure
                                              // __device__ syntax, no CUDA)
-#include "vt/cuda/graph_safe_scratch.h"      // RetireGraphScratch (portable)
 #include "vt/ops.h"
 #include "vt/quant.h"
 
 // Forward declarations: the optimized K-quant GEMM kernels in
-// rocm_grouped_gemm.hip (renamed *Gdn). F1 delegates Q4_K/Q5_K/Q6_K to these
-// to preserve the baseline-optimized path; the new kernels in this file
+// rocm_grouped_gemm.hip (renamed *Gdn). F1 delegates Q8_0/Q4_K/Q5_K/Q6_K to
+// these to preserve the baseline-optimized path; the new kernels in this file
 // handle IQ types and Q2_K/Q3_K that the old code did not support.
 namespace vt::rocm {
 void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a,
@@ -51,32 +91,6 @@ void MatmulBTQuantGroupedKernelRocmGdn(Queue& q, Tensor& out, const Tensor& act,
 
 namespace vt::rocm {
 namespace {
-
-// dtype.cpp F32ToF16 — round-to-nearest-even, subnormals, inf/nan. Used only
-// for the Q8_0 activation scale (the CPU Q8_0 vec_dot's f16 round-trip).
-__device__ inline uint16_t DF32ToF16(float f) {
-  uint32_t u = __float_as_uint(f);
-  uint16_t sign = static_cast<uint16_t>((u >> 16) & 0x8000);
-  int32_t exp = static_cast<int32_t>((u >> 23) & 0xFF) - 127 + 15;
-  uint32_t mant = u & 0x7FFFFF;
-  if (((u >> 23) & 0xFF) == 0xFF)
-    return static_cast<uint16_t>(sign | 0x7C00 | (mant ? 0x200 | (mant >> 13) : 0));
-  if (exp >= 0x1F) return static_cast<uint16_t>(sign | 0x7C00);
-  if (exp <= 0) {
-    if (exp < -10) return sign;
-    mant |= 0x800000;
-    uint32_t shift = static_cast<uint32_t>(14 - exp);
-    uint32_t half = mant >> shift;
-    uint32_t rem = mant & ((1u << shift) - 1);
-    uint32_t mid = 1u << (shift - 1);
-    if (rem > mid || (rem == mid && (half & 1))) ++half;
-    return static_cast<uint16_t>(sign | half);
-  }
-  uint32_t half = static_cast<uint32_t>(exp << 10) | (mant >> 13);
-  uint32_t rem = mant & 0x1FFF;
-  if (rem > 0x1000 || (rem == 0x1000 && (half & 1))) ++half;
-  return static_cast<uint16_t>(sign | half);
-}
 
 // Load one activation element (dtype-decoded, exactly like cpu LoadActF32).
 
@@ -91,9 +105,7 @@ using vt::cpu::BlockQ4_K;
 using vt::cpu::BlockQ5_K;
 using vt::cpu::BlockQ6_K;
 using vt::cpu::BlockQ8_K;
-using vt::cpu::BlockQ8_0;
 using vt::cpu::kQK_K;
-using vt::cpu::kQK8_0;
 
 void CheckHip(hipError_t err, const char* what) {
   if (err != hipSuccess) {
@@ -712,33 +724,35 @@ __global__ void QuantDotGemmGroupedKernel(OutT* __restrict__ out,
 // ---------------------------------------------------------------------------
 // Host wiring: scratch, launches, providers, registrar.
 // ---------------------------------------------------------------------------
-struct StreamScratch {
-  void* buf = nullptr;
-  size_t bytes = 0;
-};
-
-std::mutex& ScratchMutex() {
-  static std::mutex mu;
-  return mu;
-}
-
-StreamScratch& ScratchFor(hipStream_t s) {
-  static std::unordered_map<hipStream_t, StreamScratch> map;
-  return map[s];
-}
-
 void CheckHipLaunch(const char* what) { CheckHip(hipGetLastError(), what); }
 
-void* EnsureScratch(size_t need, hipStream_t s) {
-  std::lock_guard<std::mutex> lock(ScratchMutex());
-  StreamScratch& sc = ScratchFor(s);
-  if (need > sc.bytes) {
-    // Retire (never free): a captured hipGraph may have baked this pointer.
-    vt::cuda::RetireGraphScratch(sc.buf);
-    CheckHip(hipMallocAsync(&sc.buf, need, s), "hipMallocAsync q8_K act scratch");
-    sc.bytes = need;
-  }
-  return sc.buf;
+detail::QuantDotScratchPool<uint64_t, hipStream_t>& ScratchPool() {
+  static detail::QuantDotScratchPool<uint64_t, hipStream_t> pool;
+  return pool;
+}
+
+void* EnsureScratch(Queue& q, size_t need) {
+  hipStream_t s = static_cast<hipStream_t>(q.handle);
+  return ScratchPool().Ensure(
+      q.id, s, need,
+      [](hipStream_t stream) {
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        CheckHip(hipStreamIsCapturing(stream, &capture),
+                 "quant-dot scratch capture query");
+        if (capture == hipStreamCaptureStatusActive) {
+          return detail::ScratchCaptureState::kActive;
+        }
+        if (capture == hipStreamCaptureStatusNone) {
+          return detail::ScratchCaptureState::kNone;
+        }
+        return detail::ScratchCaptureState::kInvalidated;
+      },
+      [](size_t bytes, hipStream_t stream) {
+        void* block = nullptr;
+        CheckHip(hipMallocAsync(&block, bytes, stream),
+                 "hipMallocAsync q8_K act scratch");
+        return block;
+      });
 }
 
 inline ActDT ActDtOf(DType dt) {
@@ -812,112 +826,6 @@ void LaunchGroupedGemm(Tensor& out, const uint8_t* weight, const BlockQ8_K* act,
   }
   CheckHipLaunch("matmul_bt_quant_grouped launch");
 }
-
-
-
-// Q8_0 (legacy 32-block, Q8_0-activation) arm. Self-contained: quantize the
-// activation to Q8_0 on the device, then the Q8_0xQ8_0 integer dot. The dot is
-// the PORTABLE SCALAR form of cpu_quant_dot.cpp VecDotQ8_0Q8_0 (quants.c:400):
-// sumi0 over the first 16 elements, sumi1 over the second, ONE int32 add, then
-// the f16-scale fold — accumulation order preserved for exactness. The CUDA
-// file's __dp4a form is byte-identical to this on a signed-dot target; gfx1100
-// has no signed byte dot, so W1 ships the scalar body.
-// ---------------------------------------------------------------------------
-__global__ void QuantizeQ8_0Kernel(BlockQ8_0* __restrict__ scratch,
-                                   const void* __restrict__ a, ActDT adt,
-                                   int64_t a_rs, int64_t m, int64_t nb) {
-  const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (t >= m * nb) return;
-  const int64_t i = t / nb;
-  const int64_t b = t % nb;
-  const int64_t elem0 = i * a_rs + b * kQK8_0;
-  float amax = 0.0f;
-  for (int j = 0; j < kQK8_0; ++j) {
-    const float av = fabsf(DLoadAct(a, adt, elem0 + j));
-    amax = amax > av ? amax : av;
-  }
-  BlockQ8_0& y = scratch[t];
-  const float d = amax / 127.0f;
-  const float id = d != 0.0f ? 1.0f / d : 0.0f;
-  y.d = DF32ToF16(d);
-  for (int j = 0; j < kQK8_0; ++j) {
-    y.qs[j] = static_cast<int8_t>(roundf(DLoadAct(a, adt, elem0 + j) * id));
-  }
-}
-
-template <typename OutT>
-__global__ void QuantDotGemmQ8_0Kernel(OutT* __restrict__ out,
-                                       const uint8_t* __restrict__ weight,
-                                       const BlockQ8_0* __restrict__ act,
-                                       int64_t m, int64_t n, int64_t nb,
-                                       size_t w_row_bytes) {
-  const int64_t warp = static_cast<int64_t>(blockIdx.x) * (blockDim.x >> 5) +
-                       (threadIdx.x >> 5);
-  if (warp >= m * n) return;
-  const int64_t i = warp / n;
-  const int64_t j = warp % n;
-  const int lane = threadIdx.x & 31;
-  const uint8_t* w_row = weight + static_cast<size_t>(j) * w_row_bytes;
-  const BlockQ8_0* a_row = act + i * nb;
-  float partial = 0.0f;
-  for (int64_t b = lane; b < nb; b += 32) {
-    const BlockQ8_0* wb =
-        reinterpret_cast<const BlockQ8_0*>(w_row + static_cast<size_t>(b) *
-                                                      sizeof(BlockQ8_0));
-    const BlockQ8_0* ab = a_row + b;
-    // CPU order: first half then second half, one add, then scale.
-    int sumi0 = 0;
-    for (int j2 = 0; j2 < kQK8_0 / 2; ++j2)
-      sumi0 += ab->qs[j2] * wb->qs[j2];
-    int sumi1 = 0;
-    for (int j2 = kQK8_0 / 2; j2 < kQK8_0; ++j2)
-      sumi1 += ab->qs[j2] * wb->qs[j2];
-    partial += (sumi0 + sumi1) * (DF16ToF32(wb->d) * DF16ToF32(ab->d));
-  }
-#pragma unroll
-  for (int off = 16; off > 0; off >>= 1)
-    partial += __shfl_down_sync(0xffffffffffffffffull, partial, off);
-  if (lane == 0) {
-    if constexpr (sizeof(OutT) == 4)
-      out[i * n + j] = partial;
-    else
-      out[i * n + j] = DF32ToBF16(partial);
-  }
-}
-
-void MatmulQ8_0Rocm(Tensor& out, const Tensor& a, const Tensor& b,
-                    hipStream_t s) {
-  const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[0];
-  if (m == 0 || n == 0) return;
-  if (k % kQK8_0 != 0)
-    throw std::runtime_error(
-        "vt rocm: matmul_bt_quant Q8_0: K must be a multiple of 32");
-  const int64_t nb = k / kQK8_0;
-  const size_t w_row_bytes = static_cast<size_t>(nb) * sizeof(BlockQ8_0);
-  const size_t act_bytes =
-      static_cast<size_t>(m) * static_cast<size_t>(nb) * sizeof(BlockQ8_0);
-  BlockQ8_0* act = static_cast<BlockQ8_0*>(EnsureScratch(act_bytes, s));
-  {
-    constexpr int kQBlock = 128;
-    const int64_t grid = (m * nb + kQBlock - 1) / kQBlock;
-    QuantizeQ8_0Kernel<<<static_cast<unsigned>(grid), kQBlock, 0, s>>>(
-        act, a.data, ActDtOf(a.dtype), a.stride[0], m, nb);
-    CheckHipLaunch("quantize_q8_0 launch");
-  }
-  constexpr int kWarpsPerBlock = 8;
-  dim3 block(32 * kWarpsPerBlock, 1, 1);
-  const unsigned grid =
-      static_cast<unsigned>((m * n + kWarpsPerBlock - 1) / kWarpsPerBlock);
-  if (out.dtype == DType::kF32)
-    QuantDotGemmQ8_0Kernel<float><<<grid, block, 0, s>>>(
-        static_cast<float*>(out.data), static_cast<const uint8_t*>(b.data),
-        act, m, n, nb, w_row_bytes);
-  else
-    QuantDotGemmQ8_0Kernel<uint16_t><<<grid, block, 0, s>>>(
-        static_cast<uint16_t*>(out.data), static_cast<const uint8_t*>(b.data),
-        act, m, n, nb, w_row_bytes);
-  CheckHipLaunch("matmul_bt_quant Q8_0 launch");
-}
 }  // namespace
 
 // The kROCM provider for OpId::kMatmulBTQuant. Validation already done by
@@ -938,16 +846,13 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a,
   const int64_t m = a.shape[0];
   const int64_t k = a.shape[1];
   const int64_t n = b.shape[0];
-  if (b.dtype == DType::kQ8_0) {
-    MatmulQ8_0Rocm(out, a, b, s);
-    return;
-  }
-
-  // Delegate Q4_K/Q5_K/Q6_K to the optimized kernels in rocm_grouped_gemm.hip
-  // (renamed *Gdn). These have cooperative-warp dispatch and format-specific
-  // templates tuned for gfx1100; the new CUDA-ported kernels in this file are
-  // slower for these types. The new kernels handle IQ types and Q2_K/Q3_K.
-  if (b.dtype == DType::kQ4_K || b.dtype == DType::kQ5_K ||
+  // Delegate Q8_0/Q4_K/Q5_K/Q6_K to the optimized kernels in
+  // rocm_grouped_gemm.hip (renamed *Gdn). These have cooperative-warp dispatch
+  // and format-specific templates tuned for gfx1100; the new CUDA-ported
+  // kernels in this file are slower for these types. The new kernels handle
+  // IQ types and Q2_K/Q3_K.
+  if (b.dtype == DType::kQ8_0 || b.dtype == DType::kQ4_K ||
+      b.dtype == DType::kQ5_K ||
       b.dtype == DType::kQ6_K) {
     MatmulBTQuantKernelRocmGdn(q, out, a, b);
     return;
@@ -972,7 +877,7 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a,
 
   const size_t act_bytes =
       static_cast<size_t>(m) * static_cast<size_t>(nsb) * sizeof(BlockQ8_K);
-  BlockQ8_K* act = static_cast<BlockQ8_K*>(EnsureScratch(act_bytes, s));
+  BlockQ8_K* act = static_cast<BlockQ8_K*>(EnsureScratch(q, act_bytes));
   LaunchQuantizeQ8K(act, a.data, ActDtOf(a.dtype), a.stride[0], m, nsb, s);
 
   const uint8_t* weight = static_cast<const uint8_t*>(b.data);
@@ -1038,7 +943,7 @@ void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
 
   const size_t act_bytes =
       static_cast<size_t>(Pa) * static_cast<size_t>(nsb) * sizeof(BlockQ8_K);
-  BlockQ8_K* qact = static_cast<BlockQ8_K*>(EnsureScratch(act_bytes, s));
+  BlockQ8_K* qact = static_cast<BlockQ8_K*>(EnsureScratch(q, act_bytes));
   LaunchQuantizeQ8K(qact, act.data, ActDtOf(act.dtype), act.stride[0], Pa, nsb,
                     s);
 
@@ -1069,3 +974,5 @@ void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
 // wins depend on static-init order across translation units.
 
 }  // namespace vt::rocm
+
+#endif  // VT_ROCM_QUANT_DOT_SCRATCH_TEST_ONLY

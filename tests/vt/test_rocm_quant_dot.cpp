@@ -30,6 +30,13 @@
 #include "vt/quant.h"
 #include "vt/tensor.h"
 
+// Compile the exact scratch policy used by the HIP provider with host fakes.
+// The provider file excludes kernels in this mode, so CPU-only CI can gate
+// capture ownership without a ROCm runtime.
+#define VT_ROCM_QUANT_DOT_SCRATCH_TEST_ONLY
+#include "../../src/vt/rocm/rocm_quant_dot.hip"
+#undef VT_ROCM_QUANT_DOT_SCRATCH_TEST_ONLY
+
 using vt::Backend;
 using vt::Device;
 using vt::DeviceType;
@@ -38,6 +45,28 @@ using vt::Queue;
 using vt::Tensor;
 
 namespace {
+
+using ScratchCaptureState = vt::rocm::detail::ScratchCaptureState;
+
+struct FakeScratchRuntime {
+  ScratchCaptureState capture = ScratchCaptureState::kNone;
+  int query_result = 0;
+  int queries = 0;
+  int allocations = 0;
+  std::vector<std::vector<uint8_t>> blocks;
+
+  ScratchCaptureState Query(int) {
+    ++queries;
+    if (query_result != 0) throw std::runtime_error("capture query failed");
+    return capture;
+  }
+
+  void* Allocate(size_t bytes, int) {
+    ++allocations;
+    blocks.emplace_back(bytes);
+    return blocks.back().data();
+  }
+};
 
 constexpr double kMaxNmseErr = 5e-4;      // test-backend-ops.cpp:4277 band
 constexpr double kMaxNmseVsCpu = 1e-6;    // integer core exact; scale sum only
@@ -143,6 +172,168 @@ Tensor DevTensor(void* p, DType dt, const std::vector<int64_t>& shape) {
 }
 
 }  // namespace
+
+TEST_CASE("ROCm quant-dot scratch refuses capture misses and keeps queue ownership") {
+  vt::rocm::detail::QuantDotScratchPool<uint64_t, int> pool;
+  FakeScratchRuntime runtime;
+  auto ensure = [&](uint64_t queue, int stream, size_t bytes) {
+    return pool.Ensure(
+        queue, stream, bytes,
+        [&](int value) { return runtime.Query(value); },
+        [&](size_t value, int stream_value) {
+          return runtime.Allocate(value, stream_value);
+        });
+  };
+
+  runtime.capture = ScratchCaptureState::kActive;
+  CHECK_THROWS_WITH_AS(ensure(11, 7, 16), doctest::Contains("pre-warm"),
+                       std::runtime_error);
+  CHECK(runtime.allocations == 0);
+  CHECK(pool.CapacityFor(11) == 0);
+
+  runtime.capture = ScratchCaptureState::kNone;
+  void* warm = ensure(11, 7, 16);
+  REQUIRE(warm != nullptr);
+  CHECK(runtime.allocations == 1);
+  const int queries_after_warm = runtime.queries;
+
+  runtime.capture = ScratchCaptureState::kActive;
+  CHECK(ensure(11, 7, 16) == warm);
+  CHECK(runtime.queries == queries_after_warm);
+  CHECK_THROWS_WITH_AS(ensure(11, 7, 32), doctest::Contains("pre-warm"),
+                       std::runtime_error);
+  CHECK(runtime.allocations == 1);
+  CHECK(pool.BlockFor(11) == warm);
+  CHECK(pool.CapacityFor(11) == 16);
+
+  runtime.capture = ScratchCaptureState::kNone;
+  CHECK(ensure(11, 7, 16) == warm);
+
+  runtime.query_result = 1;
+  CHECK_THROWS_WITH_AS(ensure(13, 8, 16), doctest::Contains("capture query failed"),
+                       std::runtime_error);
+  CHECK(pool.CapacityFor(13) == 0);
+  runtime.query_result = 0;
+
+  // Queue identity owns the allocation. A recycled native stream does not
+  // expose the first queue's graph pointer to a later queue.
+  void* second_queue = ensure(12, 7, 16);
+  CHECK(second_queue != warm);
+  CHECK(pool.BlockFor(11) == warm);
+  CHECK(pool.BlockFor(12) == second_queue);
+}
+
+TEST_CASE("ROCm quant-dot provider preserves scratch across capture and queue reuse") {
+  if (!HasRocm()) {
+    MESSAGE("no ROCm backend registered; quant-dot capture gate PENDING");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  REQUIRE(gpu.SupportsGraphCapture());
+  Queue cq{Cpu(), nullptr};
+  const WeightCase& c = kCases[5];  // Q2_K exercises this provider, not *Gdn.
+  constexpr int64_t n = 2;
+  const int64_t k = 8 * c.block_elems;
+  std::vector<uint8_t> weight =
+      RandomBlocks(c, n * (k / c.block_elems), 0xCAFEU);
+
+  auto cpu_golden = [&](const std::vector<float>& act, int64_t rows) {
+    std::vector<float> out(static_cast<size_t>(rows * n), 0.0F);
+    Tensor at = Tensor::Contiguous(const_cast<float*>(act.data()), DType::kF32,
+                                   Cpu(), {rows, k});
+    Tensor wt = Tensor::Contiguous(weight.data(), DType::kF32, Cpu(), {n, k});
+    wt.dtype = c.dtype;
+    Tensor ot = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {rows, n});
+    vt::MatmulBTQuant(cq, ot, at, wt);
+    return out;
+  };
+  auto check_output = [&](Queue& queue, void* device_out,
+                          const std::vector<float>& expected) {
+    std::vector<float> got(expected.size(), 0.0F);
+    gpu.Copy(queue, got.data(), device_out, got.size() * sizeof(float));
+    gpu.Synchronize(queue);
+    double num = 0.0;
+    double den = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+      num += (got[i] - expected[i]) * (got[i] - expected[i]);
+      den += expected[i] * expected[i];
+    }
+    CHECK((den > 0.0 ? num / den : num) <= kMaxNmseVsCpu);
+  };
+
+  auto exercise_queue = [&](Queue& queue, bool run_replay) {
+    std::vector<float> act(static_cast<size_t>(k));
+    GenerateData(1.0F, act.size(), act.data());
+    void* device_act = gpu.Alloc(act.size() * sizeof(float));
+    void* device_weight = gpu.Alloc(weight.size());
+    void* device_out = gpu.Alloc(static_cast<size_t>(n) * sizeof(float));
+    gpu.Copy(queue, device_act, act.data(), act.size() * sizeof(float));
+    gpu.Copy(queue, device_weight, weight.data(), weight.size());
+    gpu.Synchronize(queue);
+    auto invoke = [&](int64_t rows, void* act_ptr, void* out_ptr) {
+      Tensor at = DevTensor(act_ptr, DType::kF32, {rows, k});
+      Tensor wt = DevTensor(device_weight, c.dtype, {n, k});
+      Tensor ot = DevTensor(out_ptr, DType::kF32, {rows, n});
+      vt::MatmulBTQuant(queue, ot, at, wt);
+    };
+    auto capture_refusal = [&](int64_t rows, void* act_ptr, void* out_ptr) {
+      gpu.BeginCapture(queue);
+      std::string refusal;
+      try {
+        invoke(rows, act_ptr, out_ptr);
+      } catch (const std::runtime_error& error) {
+        refusal = error.what();
+      }
+      void* empty = gpu.EndCaptureGraph(queue);
+      gpu.DestroyGraph(empty);
+      return refusal;
+    };
+
+    CHECK(capture_refusal(1, device_act, device_out).find("pre-warm") !=
+          std::string::npos);
+    if (run_replay) {
+      invoke(1, device_act, device_out);
+      check_output(queue, device_out, cpu_golden(act, 1));
+
+      gpu.BeginCapture(queue);
+      invoke(1, device_act, device_out);
+      void* graph = gpu.EndCaptureGraph(queue);
+
+      GenerateData(2.0F, act.size(), act.data());
+      gpu.Copy(queue, device_act, act.data(), act.size() * sizeof(float));
+      invoke(1, device_act, device_out);  // Eager reuse before first replay.
+      check_output(queue, device_out, cpu_golden(act, 1));
+
+      GenerateData(3.0F, act.size(), act.data());
+      gpu.Copy(queue, device_act, act.data(), act.size() * sizeof(float));
+      gpu.ReplayGraph(queue, graph);
+      check_output(queue, device_out, cpu_golden(act, 1));
+
+      std::vector<float> grown_act(static_cast<size_t>(2 * k));
+      GenerateData(4.0F, grown_act.size(), grown_act.data());
+      void* grown_device_act = gpu.Alloc(grown_act.size() * sizeof(float));
+      void* grown_device_out = gpu.Alloc(static_cast<size_t>(2 * n) * sizeof(float));
+      gpu.Copy(queue, grown_device_act, grown_act.data(),
+               grown_act.size() * sizeof(float));
+      gpu.Synchronize(queue);
+      CHECK(capture_refusal(2, grown_device_act, grown_device_out).find("pre-warm") !=
+            std::string::npos);
+      gpu.Free(grown_device_act);
+      gpu.Free(grown_device_out);
+      gpu.DestroyGraph(graph);
+    }
+    gpu.Free(device_act);
+    gpu.Free(device_weight);
+    gpu.Free(device_out);
+  };
+
+  Queue first = gpu.CreateQueue();
+  exercise_queue(first, true);
+  gpu.DestroyQueue(first);
+  Queue replacement = gpu.CreateQueue();
+  exercise_queue(replacement, false);
+  gpu.DestroyQueue(replacement);
+}
 
 TEST_CASE("ROCm keep-quant GEMM == CPU reference and f64 dequant (Q8_K family)") {
   if (!HasRocm()) {

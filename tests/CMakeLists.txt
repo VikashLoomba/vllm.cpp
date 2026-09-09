@@ -2645,6 +2645,10 @@ vllm_cpp_add_test(test_rocm_arch vt/test_rocm_arch.cpp)
 # the SYNCHRONISATION is gated on a CPU-only runner with no accelerator.
 vllm_cpp_add_test(test_grow_only_stream_scratch vt/test_grow_only_stream_scratch.cpp)
 target_include_directories(test_grow_only_stream_scratch PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# The ROCm quant-dot device cases skip without HIP. Its scratch policy is
+# compiled with host fakes so capture ownership remains gated in CPU-only CI.
+vllm_cpp_add_test(test_rocm_quant_dot vt/test_rocm_quant_dot.cpp)
+target_include_directories(test_rocm_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # #785 P1 host package (fixture/oracle/trace classifier). CPU-only.
 vllm_cpp_add_test(test_ops_paged_attn_sharedk_wmma_p1
   vt/test_ops_paged_attn_sharedk_wmma_p1.cpp)
@@ -2666,12 +2670,6 @@ vllm_cpp_add_test(test_rocm_fp8_kv_cache vt/test_rocm_fp8_kv_cache.cpp)
 # the multiply, matching the CPU oracle RoundThrough and upstream vLLM silu_kernel.
 # Self-skipping without a ROCm device, mirroring test_rocm_backend.cpp guard.
 vllm_cpp_add_test(test_ops_rocm_silu_rounding vt/test_ops_rocm_silu_rounding.cpp)
-# KERNEL-QUANT-CIQ-GEMM-ROCM: the ROCm keep-quant GEMM (kROCM provider for
-# kMatmulBTQuant/kMatmulBTQuantGrouped). Gates the device dequant-in-kernel dot
-# against the CPU keep-quant oracle + an f64 dequant reference on the ten
-# Q8_K-family encodings. Skips coherently with no AMD GPU.
-vllm_cpp_add_test(test_rocm_quant_dot vt/test_rocm_quant_dot.cpp)
-target_include_directories(test_rocm_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # #785 P1 GPU product-seam witness. Executable only — NOT add_test.
 # Ordinary CTest must not see this target. Runner fail-closes on 77/nonzero.
 add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu

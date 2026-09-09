@@ -267,6 +267,11 @@ An empty vocabulary accepts no nonempty request.
 The shared `vt::Embedding` checks remain authoritative for ranks, shapes,
 dtypes, contiguity, whole block rows, and device equality.
 Keep floating gather dispatch unchanged.
+Bind the native gather to `queue.device.index` before allocating its error
+record or launching work. A different ambient HIP device must not redirect
+the allocation, launch, or cleanup. The two-device regression keeps the queue
+and tensors on device 0, selects ambient device 1, and checks rows, bounds,
+and recovery. Fresh review removes this binding and requires that gate to fail.
 
 ### Loader and production reachability
 
@@ -411,14 +416,15 @@ Commit this amendment before changing either newly scoped product file:
 
 The first native focused run passed 4 of 6 targets. The public test reached
 Q8_K after the first 8 formats matched their dense controls. Its first Q8_K
-load returned status 2. The native decoder suite separately passed all 11,698
+load returned status 2, without a readable error capture. The native decoder suite separately passed all 11,698
 value assertions, but its empty-shape fixture failed during tensor construction.
 That malformed test fixture requires a metadata view with zero dimensions.
 
 `LoadEmbedAndHead` already selects `KeepQuantGatherDType` through the shared
 residency policy. It then calls `OwnGgufQuantBlocks`, whose guard at line 89
 requires `KeepQuantDType`. The latter requires a dot kernel and refuses Q8_K.
-This mismatch prevents the row's declared decoder-only format from loading.
+This downstream guard would refuse the decoder-only format after the reader
+accepts it. That materializer failure was a source hypothesis at this amendment.
 `git log -S 'VT_CHECK(KeepQuantDType(tensor.ggml_type'` identifies commit
 `429e19d6a` as the guard's introduction.
 
@@ -447,6 +453,32 @@ Both files reside under the row's external evidence directory
 `/home/vikash/.cache/rdna3-gather-impl/evidence/`.
 The operator verified unchanged source, archive, and executable hashes around
 the run. The Q8_K public load had 1,108 passing assertions before its failure.
+
+### Q8_K reader amendment
+
+The new loader-focused red identifies the first executing refusal:
+`GgufFile::OpenOne` rejects GGML type 15 at `gguf_reader.cpp:506`, because
+`FindGgmlTraits` has no entry for it. The result is exit 1 after one passing
+fixture assertion. The log is `materializer-loader-red.log` in the same
+external evidence directory. The materializer guard remains a separate
+downstream hypothesis until the reader accepts the file.
+
+The operator approved this additional scope on 9 September 2026 UTC:
+`src/vllm/model_executor/model_loader/gguf_reader.cpp`. Commit this amendment
+before changing that file. Add exactly the existing Q8_K geometry for GGML
+type 15: 256 elements and 292 bytes per block. Stock llama.cpp pin
+`10bf611e533d81f739128304991c5e133c6aebd8`, `ggml/src/ggml-common.h:370-376`,
+defines `block_q8_K` as a float delta, 256 signed bytes, and 16 signed 16-bit
+sums. This is already the geometry in `vt::DType::kQ8_K`.
+
+Keep all other traits byte-for-byte equal. Preserve unknown-type refusals,
+overflow checks, span checks, and whole-block divisibility. This amendment
+does not add a shared dtype or change a matrix dtype set. Add the reader
+regression in `tests/vllm/test_gguf_keep_quant.cpp`, checking geometry and
+original packed bytes through `GgufFile::Open`. Fresh review deletes the
+type-15 entry and mis-sizes its geometry independently. Both mutations must
+fail a meaningful gate. After adding the trait, rerun the loader-focused red
+to identify the materializer failure before changing that guard.
 
 ## Tests and gates
 

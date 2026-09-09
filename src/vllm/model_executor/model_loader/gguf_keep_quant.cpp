@@ -136,11 +136,17 @@ bool KeepNvfp4DType(uint32_t ggml_type) { return ggml_type == 40; }
 bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
   switch (dev) {
     case vt::DeviceType::kROCM:
-      // src/vt/rocm/rocm_grouped_gemm.hip implements exactly these on both the
-      // grouped and non-grouped arms; Q4_0/Q2_K/Q3_K/IQ2_*/IQ3_*/MXFP4 are
-      // owed (recorded in .agents/specs/rocm-gg-keep-quant.md).
+      // rocm_grouped_gemm.hip implements Q8_0/Q4_K/Q5_K/Q6_K, while
+      // rocm_quant_dot.hip adds the seven Q8_K-activation formats below on
+      // both grouped and non-grouped arms. IQ4_XS remains with #3029 and is
+      // not admitted by this row; Q4_0/IQ2_XS/IQ3_S/IQ4_XS/MXFP4 stay on the
+      // named expand-or-refuse path.
       return dt == vt::DType::kQ8_0 || dt == vt::DType::kQ4_K ||
-             dt == vt::DType::kQ5_K || dt == vt::DType::kQ6_K;
+             dt == vt::DType::kQ5_K || dt == vt::DType::kQ6_K ||
+             dt == vt::DType::kIQ2_XXS || dt == vt::DType::kIQ3_XXS ||
+             dt == vt::DType::kQ2_K || dt == vt::DType::kQ3_K ||
+             dt == vt::DType::kIQ2_S || dt == vt::DType::kIQ1_S ||
+             dt == vt::DType::kIQ1_XXXS;
     case vt::DeviceType::kTENSTORRENT:
       // KEEPQUANT W3: the P150 is discrete with no CPU fallback tier, so this
       // arm admits exactly what src/vt/tenstorrent/tenstorrent_ops.cpp has a

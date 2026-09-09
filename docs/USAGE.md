@@ -853,8 +853,9 @@ skips with that refusal quoted.
   to inspect or override the architecture-scoped quantizer during
   troubleshooting.
 - On ROCm, GGUF mixture-of-experts checkpoints compute on the quantized
-  expert blocks (Q8_0, Q4_K, Q5_K, Q6_K) instead of being dequantized to
-  bf16 at load time.
+  expert blocks (Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ3_XXS,
+  IQ2_S, IQ1_S, IQ1_XXXS) instead of being dequantized to bf16 at load time.
+  IQ4_XS remains separate work in #3029.
 - On ROCm, mixture-of-experts models run the shared-expert gate and both
   expert-combine steps on device. Before these ops were registered the
   engine refused with `no kernel for op` on that path.

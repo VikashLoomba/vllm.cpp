@@ -3,7 +3,9 @@
 **Row:** `KERNEL-CUDA-DECODE-MEGAKERNEL` (`kernel-matrix`).
 **Issues:** [#3084](https://github.com/mudler/vllm.cpp/issues/3084) owns the
 spike; [#3085](https://github.com/mudler/vllm.cpp/issues/3085) owns the record
-gate repair discovered while adding the row.
+gate repair discovered while adding the row; and
+[#3099](https://github.com/mudler/vllm.cpp/issues/3099) owns the claim-state
+consistency repair found by the final roadmap review.
 **Kind:** roadmap intake and bounded research spike. This spec ships no kernel,
 model path, dependency, benchmark, or user-visible capability.
 
@@ -179,6 +181,15 @@ evidence. They move intact to one file under `.agents/completed/`; they are not
 deleted or rewritten as current policy. No replacement current count is stored
 there or elsewhere.
 
+The final roadmap review exposed one adjacent ownership defect after the
+per-row claim existed. A claim's `Row IDs` cell annotates each owned row with
+its lifecycle state, and the claim has its own lifecycle column. The checker
+read only the row ID. Issue #3099 must parse both values, require the annotated
+row state to equal the matrix state, and require a claim used by a `SPIKE` or
+`ACTIVE` row to be active. Focused mutations must change `SPIKE` to `ACTIVE` in
+the annotation and `ACTIVE` to `DONE` in the claim column; each must fail for
+its own mismatch.
+
 ## Tests and gates
 
 This roadmap intake must pass:
@@ -191,6 +202,8 @@ This roadmap intake must pass:
    that the record check or an explicit exact-row assertion fails.
 5. The focused #3085 suite proving matrix contents are derived at read time and
    all non-cardinality record guarantees remain load-bearing.
+6. The focused #3099 suite proving matrix state, claim row-state annotation,
+   and active claim lifecycle agree.
 
 W0 must pass before W1:
 
@@ -264,5 +277,7 @@ complete recipes and hashes.
 Issue [#3084](https://github.com/mudler/vllm.cpp/issues/3084) owns W0 and the
 conditional W1. Issue [#3085](https://github.com/mudler/vllm.cpp/issues/3085)
 closes when the derived-at-read-time record gate and its tests land in this
-integration. The row remains `SPIKE` until W0 and W1 either justify a separate
-production row or falsify the hypothesis.
+integration. Issue [#3099](https://github.com/mudler/vllm.cpp/issues/3099)
+closes when claim-state consistency and both negative fixtures land. The row
+remains `SPIKE` until W0 and W1 either justify a separate production row or
+falsify the hypothesis.

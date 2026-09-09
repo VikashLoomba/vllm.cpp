@@ -1320,7 +1320,7 @@ void* Q8KSetKernelExecutionWitnessForTest(void* device_counts) {
   return previous;
 }
 
-void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   EnsureQueueDevice(q);
   const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[0];
   if (m == 0 || n == 0) return;
@@ -1446,14 +1446,17 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
     Check(hipGetLastError(), "K-quant gemm");
     return;
   }
-  throw std::runtime_error("vt rocm: matmul_bt_quant: unsupported weight dtype (ported: Q8_0/Q4_K/Q5_K/Q6_K; owed: Q4_0/Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ3_S/IQ2_S/MXFP4 -- the loader pre-filters to the ported set, so reaching here is a bug)");
+  throw std::runtime_error(
+      "vt rocm: internal GDN matmul_bt_quant provider received an unsupported weight dtype "
+      "(GDN-owned: Q8_0/Q4_K/Q5_K/Q6_K; wrapper-owned: Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/IQ1_S/IQ1_XXXS; "
+      "unimplemented: Q4_0/Q5_0/IQ2_XS/IQ4_NL/IQ3_S/IQ4_XS/MXFP4 -- the ROCm wrapper must delegate only the GDN-owned set)");
 }
 
 
 // kMatmulBTQuantGrouped for ROCm: Q8_0 / Q4_K / Q6_K natively (the formats the
 // target GDN-MoE GGUFs carry); anything else throws loudly (never a silent
 // CPU-pointer deref on a discrete card).
-void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
+void MatmulBTQuantGroupedKernelRocmGdn(Queue& q, Tensor& out, const Tensor& act,
                                     const Tensor& weight, const Tensor& expert_ids) {
   EnsureQueueDevice(q);
   const int64_t P = out.shape[0], n = out.shape[1], k = act.shape[1];
@@ -1515,8 +1518,9 @@ void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
   }
 
   throw std::runtime_error(
-      "vt rocm: matmul_bt_quant_grouped: unsupported weight dtype (ported: Q8_0/Q4_K/Q5_K/Q6_K; "
-      "owed: Q4_0/Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/MXFP4 -- the loader pre-filters, so reaching here is a bug)");
+      "vt rocm: internal GDN matmul_bt_quant_grouped provider received an unsupported weight dtype "
+      "(GDN-owned: Q8_0/Q4_K/Q5_K/Q6_K; wrapper-owned: Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/IQ1_S/IQ1_XXXS; "
+      "unimplemented: Q4_0/Q5_0/IQ2_XS/IQ4_NL/IQ3_S/IQ4_XS/MXFP4 -- the ROCm wrapper must delegate only the GDN-owned set)");
 }
 
 }  // namespace vt::rocm

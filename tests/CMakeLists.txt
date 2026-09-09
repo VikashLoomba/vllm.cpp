@@ -2645,6 +2645,10 @@ vllm_cpp_add_test(test_rocm_arch vt/test_rocm_arch.cpp)
 # the SYNCHRONISATION is gated on a CPU-only runner with no accelerator.
 vllm_cpp_add_test(test_grow_only_stream_scratch vt/test_grow_only_stream_scratch.cpp)
 target_include_directories(test_grow_only_stream_scratch PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# The ROCm quant-dot device cases skip without HIP. Its scratch policy is
+# compiled with host fakes so capture ownership remains gated in CPU-only CI.
+vllm_cpp_add_test(test_rocm_quant_dot vt/test_rocm_quant_dot.cpp)
+target_include_directories(test_rocm_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # #785 P1 host package (fixture/oracle/trace classifier). CPU-only.
 vllm_cpp_add_test(test_ops_paged_attn_sharedk_wmma_p1
   vt/test_ops_paged_attn_sharedk_wmma_p1.cpp)

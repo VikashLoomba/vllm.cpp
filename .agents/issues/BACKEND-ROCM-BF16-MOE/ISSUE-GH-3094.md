@@ -45,3 +45,11 @@ outstanding. The separate compiled residual-normalization gap belongs to
 `BACKEND-ROCM`, [#3103](https://github.com/mudler/vllm.cpp/issues/3103).
 The [row spec](../../specs/rocm-bf16-moe.md) records the measured results and
 remaining obligations.
+
+Fresh review found three gaps in the implementation's tests. The scoped repair
+adds provider-subset checks, malformed-descriptor cases, and accepted numeric modes.
+All ten CPU survivor mutations and four GPU survivor mutations fail their intended assertions.
+The GPU controls pass, and an additional mutation detects FP32 precision loss in weighted down and shared combine.
+The staged preflight passes with 619/619 host units compiled.
+Fresh scoped review remains pending.
+The repair does not change product arithmetic or the established production token failure.

@@ -297,3 +297,65 @@ TEST_CASE("ROCm weighted down and preweighted combine isolate null streams by de
     }
   }
 }
+
+TEST_CASE("ROCm native MoE weighted down preserves F32 output and mapped per-pair routes") {
+  RequireDevice();
+  Queue queue;
+  auto& q = queue.value;
+  // Rows: [1,2], [3,-1], [-2,4], [5,-2]. Expert matrices are
+  // [[2,1],[-1,3]] and [[1,-2],[4,1]]. The FP32 arithmetic is exact.
+  const std::array<uint16_t, 8> x = {
+      0x3f80, 0x4000, 0x4040, 0xbf80, 0xc000, 0x4080, 0x40a0, 0xc000};
+  const std::array<uint16_t, 4> first = {0x4000, 0x3f80, 0xbf80, 0x4040};
+  const std::array<uint16_t, 4> second = {0x3f80, 0xc000, 0x4080, 0x3f80};
+  const std::array<int32_t, 4> selections = {1, 0, 0, 1}, mapping = {2, 0, 2, 1};
+  const std::array<float, 4> routes = {0.501953125f, 0.25f, 0.125f, 0.75f};
+  Buffer a(q, DType::kBF16, {4, 2}, x.data());
+  Buffer w0(q, DType::kBF16, {2, 2}, first.data()), w1(q, DType::kBF16, {2, 2}, second.data());
+  const std::array<int64_t, 2> pointers = {
+      reinterpret_cast<int64_t>(w0.tensor().data), reinterpret_cast<int64_t>(w1.tensor().data)};
+  Buffer wp(q, DType::kI64, {2}, pointers.data()), ids(q, DType::kI32, {4}, selections.data());
+  Buffer map(q, DType::kI32, {4}, mapping.data()), route(q, DType::kF32, {4}, routes.data());
+  // Mapped expert results [14,8], [0,7], [-8,10], [-1,-7], multiplied
+  // by each pair's route. Route 0 is 257/512, so its FP32 results must retain
+  // bits that BF16 output rounds away. No expected value calls another MoE operation.
+  const std::vector<float> expected = {7.02734375f, 4.015625f, 0.0f, 1.75f,
+                                       -1.0f, 1.25f, -0.75f, -5.25f};
+  const std::vector<uint16_t> expected_bf16 = {
+      0x40e1, 0x4080, 0x0000, 0x3fe0, 0xbf80, 0x3fa0, 0xbf40, 0xc0a8};
+  for (DType dtype : {DType::kF32, DType::kBF16}) {
+    CAPTURE(dtype);
+    Buffer output(q, dtype, {4, 2});
+    vt::MoeGroupedGemmBf16Weighted(q, output.tensor(), a.tensor(), ids.tensor(),
+                                  &map.tensor(), wp.tensor(), route.tensor());
+    if (dtype == DType::kF32)
+      CHECK(output.Download<float>(q) == expected);
+    else
+      CHECK(output.Download<uint16_t>(q) == expected_bf16);
+    output.CheckGuard(q);
+  }
+}
+
+TEST_CASE("ROCm native MoE combines BF16 shared inputs into both output types") {
+  RequireDevice();
+  Queue queue;
+  auto& q = queue.value;
+  // Expert sums: [0.5,2.25] and [3.5,1]. Scale by 0.5, then add
+  // shared rows [129/512,-1/8] and [-1/2,2], giving [257/512,1] and [1.25,2.5].
+  // FP32 retains 257/512. BF16 rounds that halfway value to the even neighbor 0.5.
+  const std::array<uint16_t, 8> weighted = {
+      0x3f80, 0x4000, 0xbf00, 0x3e80, 0x4040, 0xbf80, 0x3f00, 0x4000};
+  const std::array<uint16_t, 4> shared = {0x3e81, 0xbe00, 0xbf00, 0x4000};
+  Buffer values(q, DType::kBF16, {2, 2, 2}, weighted.data());
+  Buffer share(q, DType::kBF16, {2, 2}, shared.data());
+  for (DType dtype : {DType::kF32, DType::kBF16}) {
+    CAPTURE(dtype);
+    Buffer output(q, dtype, {2, 2});
+    vt::MoeCombinePreweighted(q, output.tensor(), values.tensor(), &share.tensor(), 0.5f);
+    if (dtype == DType::kF32)
+      CHECK(output.Download<float>(q) == std::vector<float>{0.501953125f, 1.0f, 1.25f, 2.5f});
+    else
+      CHECK(output.Download<uint16_t>(q) == std::vector<uint16_t>{0x3f00, 0x3f80, 0x3fa0, 0x4020});
+    output.CheckGuard(q);
+  }
+}

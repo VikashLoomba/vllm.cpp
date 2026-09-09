@@ -25,10 +25,11 @@ The first proved residual-normalization difference belongs to
 Attention and head-output differences also require resolution before acceptance.
 
 All 60 original upstream component cases pass on both runtimes.
-All implementer mutations detect their intended defects.
-A fresh reviewer tests the immutable implementation. The operator reruns
-the declared hardware gate after review. Performance is not accepted before
-the complete production token gate passes.
+Initial fresh review found three missing test witnesses at `94b8bb0ec`.
+The scoped repair covers provider subsets, malformed descriptors, and accepted
+weighted and shared numeric modes. Fresh scoped review and the final operator
+gate remain pending. Performance is not accepted before the complete production
+token gate passes.
 
 ## Problem and scope
 
@@ -532,6 +533,108 @@ modules and their allocation/store dtypes. Their SHA256 values are
 `9850ee49c93bb82ddfca1a811fb422337c33ea09335e749fbf3c42dfcaa0400a` and
 `8531cb41f0168d27455b2dc8062a57d5db7afd4e0822013332f398bbf2239c65`.
 The operator independently reran the algebra witness and checked every manifest hash.
+
+## Test repair after fresh review
+
+Fresh review of `94b8bb0ec67eff82d2860cdda1069e4b0a64bac8` found three P2
+coverage gaps. Static review found no additional arithmetic defect.
+The review report remains at
+`/home/vikash/.cache/rdna3-moe-review/evidence/review-findings.md`.
+The repair worktree is `/home/vikash/vllm.cpp-rdna3-moe-repair1`.
+Its evidence root is `/home/vikash/.cache/rdna3-moe-repair1/evidence`.
+These paths identify retained measurements. They are not environment defaults.
+
+The repair changes two test files and this row's records. Product sources,
+CMake, original fixtures, and tolerances remain unchanged.
+`protected-before.json` records the product and original archive hashes.
+
+### Added witnesses
+
+The shared contract test checks all 32 availability subsets of the five providers.
+It uses uniquely named XPU stubs and the existing provider-disable seam.
+Each subset verifies every `OpRegistered` result before checking the complete set.
+The cases include the empty set, the legacy-only set, and each missing provider.
+The test never dispatches a stub or changes a production device's providers.
+
+Malformed descriptors change one property per subcase.
+The new cases cover route rank, stride, and device, and weighted down's common validator.
+They cover both combine tensors' strides and devices.
+Shared-input cases cover rank, both dimensions, stride, and device.
+Each case requires its specific validation error before provider dispatch.
+
+Weighted numeric cases use both output dtypes, nonidentity row maps, and per-pair routes.
+A route of 257/512 produces exact FP32 values that BF16 output must narrow.
+The shared-input case adds BF16 values into both output types.
+Its FP32 result retains 257/512; BF16 rounds that halfway value to 0.5.
+Fixed expected values come from exact rational arithmetic, independent of the provider.
+`numeric-witness-v2.json` retains that calculation and the counterexamples.
+
+### Repair verification
+
+The repair recreates the reviewer's retained mutations in fresh sources and archives.
+The new tests supply the red gates. The unchanged product supplies the green controls.
+The CPU mutation set reports ten intended failures across ten distinct binaries.
+The conjunction-to-disjunction mutation fails all 30 partial provider subsets.
+Each of the nine descriptor mutations fails its corresponding error assertion.
+`cpu-mutations/results.json` records commands, filters, exit statuses, and hashes.
+Each mutation keeps its changed source and archive in a separate directory.
+The original product sources and archives stay unchanged.
+
+A clean CPU configuration and build pass the six declared regressions:
+model registry, grow-only scratch, provider metadata, native descriptors,
+MoE operations, and grouped router. The coordinator independently confirms
+72 passing cases and 2910 assertions in `cpu-operator-results.json`.
+The model-registry executable retains its previously disabled `can_initialize` case.
+No added contract case skips. Commands and results are retained in
+`cpu-configure.log`, `cpu-build.log`, `cpu-test-rebuild.log`, and `cpu-positive.log`.
+The focused CTest command is:
+
+```sh
+ctest --test-dir build-repair-cpu --output-on-failure -R '^(test_model_registry|test_grow_only_stream_scratch|test_op_provider|test_moe_bf16_native_contract|test_ops_moe|test_ops_moe_router_grouped)$'
+```
+
+HIP test compilation preserves the original compiler options and relinks the
+unchanged production archive. Its SHA256 is
+`a9f57617d3ef79029b2529b216bb370cbd2fc41fa89b1f3f992c5a9c0a7433eb`.
+This is a test relink, not a new full HIP product build.
+The first GPU batch passes its three controls and detects all four review survivors.
+Its frozen sources, commands, binaries, and operator receipts remain under `hip/`
+and `hip-mutations/`. The second version strengthens F32 precision witnesses.
+The second version passes all three positive controls: 219 contract assertions,
+72 weighted-mode assertions, and 42 shared-mode assertions.
+All four review survivors fail their intended assertions.
+An additional FP32-store narrowing mutation fails both precision witnesses.
+`gpu-v2/hip-mutations/run-recipes.json` retains each command and binary hash.
+`operator-results.json` and `operator-input-audit.json` in that directory
+record the coordinator's results and unchanged source, archive, and binary hashes.
+No implementer GPU execution occurred. The coordinator runs all hardware commands
+under `flock -n -F /home/vikash/gpu.lock` with the recorded visible-device environment.
+
+The pre-edit full preflight exits 1 with 619/619 host units compiled.
+Its only failure is an unchanged symbol-anchor fixture inheriting the parent Git repository.
+The isolated rerun passes all 22 tests.
+The staged gate uses `GIT_CEILING_DIRECTORIES` to isolate those temporary repositories.
+It also uses `GIT_CONFIG_GLOBAL=/dev/null` for the known onboarding fixture.
+An external Python wrapper appends `--jobs 4` only to `check-tree-compiles.py`.
+All other checker arguments remain unchanged.
+The seven NumPy suites use the existing isolated package directory.
+The staged full preflight exits 0 with 619/619 host units compiled.
+`staged-preflight.log` and `staged-preflight.exit` retain the complete result.
+Its five argument-required skips have the dispositions recorded here.
+The final receipt-only record edits receive focused record, anchor, and command checks.
+
+The CPU and HIP compile databases pass the x86 ISA audit.
+Exact path classification uses the immutable repair commit. Its result is retained
+in `path-classification.log` before handoff.
+ARM, CUDA fat-binary, and CUDA Triton AOT audits are narrowly waived:
+this test repair produces none of those artifacts.
+Fresh scoped review and the operator's final verification remain pending.
+
+The original 60 upstream cases and production-token evidence remain authoritative
+for the unchanged implementation. This test repair does not rerun that oracle matrix.
+The exact model gate remains failing at six generated positions across three repeats.
+Agreement between all 216 native and legacy tokens does not establish oracle parity.
+No performance result is accepted, and the row remains `ACTIVE`.
 
 ## Owed
 

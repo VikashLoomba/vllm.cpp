@@ -40,6 +40,8 @@
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
+#include "vllm/model_executor/models/model_registry.h"
+#include "support/test_env.h"
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -2717,4 +2719,29 @@ TEST_CASE("#2516: a plan that places NOTHING never overrides the engine") {
   CHECK(rocm.Route(IqTower("blk.3.ffn_gate_exps.weight"),
                    vllm::GgufTensorRole::kStackedExpertWeight) ==
         vllm::GgufResidency::kExpandBf16);
+}
+
+// BACKEND-ROCM-F16-WEIGHTS (#3092): enter through the registered GGUF loader.
+// A kernel-only F16 change cannot satisfy this admission test.
+TEST_CASE("ROCm F16 production registry retains the embedding table") {
+  vllm_test::UnsetEnv("VT_CPU_REF");
+  vllm_test::UnsetEnv("VT_GGUF_KEEP_F16");
+  vllm_test::UnsetEnv("VT_GGUF_KEEP_QUANT");
+  for (bool tied : {false, true}) {
+    CAPTURE(tied);
+    const DenseDims d;
+    const TempFile file(BuildDenseF16Gguf(d, tied));
+    const vllm::GgufFile gguf = vllm::GgufFile::Open(file.path());
+    const auto config = vllm::HfConfigFromGguf(gguf);
+    REQUIRE(config.torch_dtype == "bfloat16");
+    auto loaded = vllm::ModelRegistry::Load(
+        config, vllm::ModelSource::FromGguf(gguf, vt::DeviceType::kROCM));
+    const auto* embedding = loaded->shared_embed_tokens();
+    REQUIRE(embedding != nullptr);
+    REQUIRE_MESSAGE(embedding->dtype == vt::DType::kF16,
+                    "the default ROCm registry must retain eligible F16 storage");
+    REQUIRE(embedding->bytes.size() == gguf.Get("token_embd.weight").nbytes);
+    CHECK(std::memcmp(embedding->bytes.data(), gguf.Get("token_embd.weight").data,
+                      embedding->bytes.size()) == 0);
+  }
 }

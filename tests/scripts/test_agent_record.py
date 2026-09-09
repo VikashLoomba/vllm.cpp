@@ -1327,37 +1327,37 @@ class CanonicalIssueRecordTests(unittest.TestCase):
 # Preserve tracked line anchors into this test module after issue #3085.
 # The retired cardinality rationale is hash-bound in the completed archive.
 #
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
-#
+class SpikeOwnerContractTests(unittest.TestCase):
+    """A SPIKE needs a live claim independently of an ACTIVE row."""
+
+    def test_spike_requires_claim_owner(self) -> None:
+        parse_errors: list[str] = []
+        rows, _ = agent_record.check_matrices(parse_errors)
+        self.assertEqual(parse_errors, [])
+        by_id = {row.item_id: row for row in rows}
+
+        baseline_errors: list[str] = []
+        agent_record.check_row_contracts(rows, by_id, baseline_errors)
+        self.assertEqual(baseline_errors, [])
+
+        spike = next(
+            row
+            for row in rows
+            if row.state == "SPIKE" and row.path.name == "kernel-matrix.md"
+        )
+        self.assertEqual(spike.state, "SPIKE")
+        without_owner = with_field(spike, "owner", "-")
+        errors = validate_mutation(rows, without_owner)
+        location = f"{spike.path.relative_to(ROOT)}:{spike.line_no}"
+        self.assertEqual(
+            errors,
+            [
+                f"{location}: SPIKE row {spike.item_id} "
+                "has no CLAIM-* owner"
+            ],
+        )
+
+
 #
 #
 #

@@ -2562,6 +2562,7 @@ endif()
 # C ABI (M3.5 Task 1): the C++ test drives the public C API over a synthetic
 # engine via the internal MakeEngineHandle hook (reached under src/).
 vllm_cpp_add_test(test_capi capi/test_capi.cpp)
+vllm_cpp_add_test(test_capi_qwen35_full_attn_state capi/test_qwen35_full_attn_state.cpp)
 target_include_directories(test_capi PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(test_capi PRIVATE
   PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e"

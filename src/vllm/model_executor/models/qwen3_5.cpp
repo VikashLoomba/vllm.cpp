@@ -5650,7 +5650,8 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
     vt::RmsNorm(d.q, dkn2d, Reshape(kf, {T * Hkv, Dh}), dkw,
                 vt::RmsNormArgs{eps, true});
     DBuf dpos(d, DType::kI32, {T}, positions.data());
-    vt::RopeNeox(d.q, dq3.t(), dk3.t(), dpos.t(), vt::RopeArgs{base, rot});
+    // A resolved zero rotary width preserves the normalized query/key bytes.
+    if (rot != 0) vt::RopeNeox(d.q, dq3.t(), dk3.t(), dpos.t(), vt::RopeArgs{base, rot});
   }
   Tensor qn3 = dq3.t();
   Tensor kn3 = dk3.t();
@@ -5822,7 +5823,8 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
     Tensor dkn2d = Reshape(dk3.t(), {T * Hkv, Dh});
     vt::RmsNorm(d.q, dkn2d, Reshape(kf, {T * Hkv, Dh}), dkw,
                 vt::RmsNormArgs{eps, true});
-    vt::RopeNeox(d.q, dq3.t(), dk3.t(), sdi.positions.t(), vt::RopeArgs{base, rot});
+    // Keep negative-width validation in the shared primitive. Only zero is no work.
+    if (rot != 0) vt::RopeNeox(d.q, dq3.t(), dk3.t(), sdi.positions.t(), vt::RopeArgs{base, rot});
   }
   Tensor qn3 = dq3.t();
   Tensor kn3 = dk3.t();

@@ -2888,23 +2888,62 @@ namespace {
 struct F16ForwardObservation {
   vt::MatmulFn nn = nullptr, bt = nullptr;
   vt::EmbeddingFn embedding = nullptr;
-  int marked_gemms = 0, marked_heads = 0, marked_embeddings = 0;
-  int64_t vocab = 0;
+  struct Gemm {
+    vt::Tensor output, weight;
+    bool transposed;
+  };
+  std::vector<Gemm> gemms;
+  struct Cast { vt::Tensor output, input; };
+  std::vector<Cast> casts;
+  int marked_gemms = 0, marked_embeddings = 0;
   static F16ForwardObservation* active;
   static void Nn(vt::Queue& q, vt::Tensor& out, const vt::Tensor& a, const vt::Tensor& b) {
-    Observe(b, false);
     active->nn(q, out, a, b);
+    Observe(out, b, false);
   }
   static void Bt(vt::Queue& q, vt::Tensor& out, const vt::Tensor& a, const vt::Tensor& b) {
-    Observe(b, true);
     active->bt(q, out, a, b);
+    Observe(out, b, true);
   }
-  static void Observe(const vt::Tensor& b, bool bt) {
+  static void Observe(const vt::Tensor& out, const vt::Tensor& b, bool bt) {
+    // Native F16 conversion recursively invokes a prepared GEMM. Record after
+    // it returns so the completed outer call retains the model's weight marker.
+    active->gemms.push_back({out, b, bt});
     if (!b.weight_value_dtype) return;
     CHECK(b.dtype == vt::DType::kF16);
     CHECK(b.weight_value_dtype == vt::DType::kBF16);
     ++active->marked_gemms;
-    if (b.shape[bt ? 0 : 1] == active->vocab) ++active->marked_heads;
+  }
+  static bool SameTensor(const vt::Tensor& a, const vt::Tensor& b) {
+    if (a.data != b.data || a.device != b.device || a.dtype != b.dtype ||
+        a.rank != b.rank || a.weight_value_dtype != b.weight_value_dtype) return false;
+    for (int i = 0; i < a.rank; ++i) {
+      if (a.shape[i] != b.shape[i] || a.stride[i] != b.stride[i]) return false;
+    }
+    return true;
+  }
+  int MarkedHeads(const vt::Tensor& logits) const {
+    REQUIRE_FALSE(gemms.empty());
+    // Earlier projections can share this head's width or a recycled output
+    // address. Follow the actual BF16-to-F32 cast into returned logits (#3112).
+    const auto& head = gemms.back();
+    if (head.output.dtype == vt::DType::kBF16) {
+      REQUIRE_FALSE(casts.empty());
+      REQUIRE(SameTensor(casts.back().input, head.output));
+      REQUIRE(SameTensor(casts.back().output, logits));
+    } else {
+      REQUIRE(SameTensor(head.output, logits));
+    }
+    int count = 0;
+    for (const auto& call : gemms) {
+      if (call.weight.weight_value_dtype && call.transposed == head.transposed &&
+          SameTensor(call.weight, head.weight)) ++count;
+    }
+    return count;
+  }
+  static void Widen(vt::Queue& q, vt::Tensor& out, const vt::Tensor& in) {
+    active->casts.push_back({out, in});
+    rocm_f16_test::RealCastF32(q, out, in);
   }
   static void Gather(vt::Queue& q, vt::Tensor& out, const vt::Tensor& table,
                       const vt::Tensor& ids) {
@@ -2915,7 +2954,7 @@ struct F16ForwardObservation {
     }
     active->embedding(q, out, table, ids);
   }
-  explicit F16ForwardObservation(int64_t vocabulary) : vocab(vocabulary) {
+  F16ForwardObservation() {
     const auto device = vt::DeviceType::kROCM;
     nn = rocm_f16_test::RealNn;
     REQUIRE(vt::GetOp(vt::OpId::kMatmul, device) == reinterpret_cast<void*>(rocm_f16_test::WrapNn));
@@ -2923,17 +2962,21 @@ struct F16ForwardObservation {
     REQUIRE(vt::GetOp(vt::OpId::kMatmulBT, device) == reinterpret_cast<void*>(rocm_f16_test::WrapBt));
     embedding = rocm_f16_test::RealEmbedding;
     REQUIRE(vt::GetOp(vt::OpId::kEmbedding, device) == reinterpret_cast<void*>(rocm_f16_test::WrapEmbedding));
-    for (auto op : {vt::OpId::kMatmul, vt::OpId::kMatmulBT, vt::OpId::kEmbedding})
+    REQUIRE(vt::GetOp(vt::OpId::kCastF32, device) == reinterpret_cast<void*>(rocm_f16_test::WrapCastF32));
+    for (auto op : {vt::OpId::kMatmul, vt::OpId::kMatmulBT, vt::OpId::kEmbedding,
+                    vt::OpId::kCastF32})
       REQUIRE(std::string(vt::GetOpProviderStats(op, device).last_selected) == vt::kNativeProviderName);
     active = this;
     rocm_f16_test::on_nn = Nn;
     rocm_f16_test::on_bt = Bt;
     rocm_f16_test::on_embedding = Gather;
+    rocm_f16_test::on_cast_f32 = Widen;
   }
   ~F16ForwardObservation() {
     rocm_f16_test::on_nn = nullptr;
     rocm_f16_test::on_bt = nullptr;
     rocm_f16_test::on_embedding = nullptr;
+    rocm_f16_test::on_cast_f32 = nullptr;
     active = nullptr;
   }
 };
@@ -2980,30 +3023,29 @@ std::vector<float> F16RegistryForward(const vllm::GgufFile& gguf, bool keep) {
   attention.slot_mapping = {0, 1, 2}; attention.causal = true;
   const vllm::v1::GDNAttentionMetadata gdn;
   std::vector<vllm::GdnStateCache> states;
-  F16ForwardObservation observe(config.vocab_size);
+  F16ForwardObservation observe;
   vllm::ModelForwardInput input{ids, positions, attention, gdn, caches, states,
                                 config, queue, logits_indices};
   input.num_reqs = 1;
   const auto output = vllm::ModelRegistry::Forward(*loaded, input);
   backend.Synchronize(queue);
+  REQUIRE(output.on_device());
+  REQUIRE(output.device_tensor.dtype == vt::DType::kF32);
+  REQUIRE(output.rows == 3);
+  REQUIRE(output.vocab == config.vocab_size);
+  const int marked_heads = observe.MarkedHeads(output.device_tensor);
   if (keep) {
     CHECK(observe.marked_embeddings == 1);
-    CHECK(observe.marked_heads == 1);
+    CHECK(marked_heads == 1);
     CHECK(observe.marked_gemms >= 7 * config.num_hidden_layers + 1);
   } else {
     CHECK(observe.marked_embeddings == 0);
+    CHECK(marked_heads == 0);
     CHECK(observe.marked_gemms == 0);
   }
   std::vector<float> result(static_cast<size_t>(3 * config.vocab_size));
-  if (output.on_device()) {
-    REQUIRE(output.device_tensor.dtype == vt::DType::kF32);
-    REQUIRE(output.rows == 3);
-    backend.Copy(queue, result.data(), output.device_tensor.data, result.size() * sizeof(float));
-    backend.Synchronize(queue);
-  } else {
-    REQUIRE(output.host.size() == result.size());
-    result = output.host;
-  }
+  backend.Copy(queue, result.data(), output.device_tensor.data, result.size() * sizeof(float));
+  backend.Synchronize(queue);
   return result;
 }
 }  // namespace

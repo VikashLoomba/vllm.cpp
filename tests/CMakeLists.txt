@@ -557,6 +557,10 @@ vllm_cpp_add_test(test_qwen35_paged_forward vllm/models/test_qwen35_paged_forwar
 # GDN-MOE-BF16-OUT (#1168): the MoE forward's GDN output-activation dtype probe
 # lives in the not-installed qwen3_5_internal.h, beside the other detail:: seams.
 target_include_directories(test_qwen35_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test_qwen35_zero_rope_unfused COMMAND test_qwen35_paged_forward
+  "--test-case=qwen35 zero rotary*")
+set_tests_properties(test_qwen35_zero_rope_unfused PROPERTIES
+  ENVIRONMENT "VT_FUSE_ATTN_PREAMBLE=0")
 # GDN-MOE-BF16-OUT (#1168), fresh-review repair. `GdnOutDType()` caches its
 # getenv in a function-local static, so one process observes exactly ONE value of
 # VT_GDN_OUT_BF16 and a single run cannot tell a resolver that READS the lever
@@ -2662,6 +2666,17 @@ if(VLLM_CPP_HIP)
 # Plain C++ (no HIP header): every assertion goes through the vt:: seam. Each
 # case no-ops when the build has HIP but the box has no AMD GPU.
 vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
+# HIP runtime queries prove allocation provenance and stream capture for split.
+vllm_cpp_add_test(test_rocm_attn_gate_split vt/test_rocm_attn_gate_split.cpp)
+target_compile_definitions(test_rocm_attn_gate_split PRIVATE __HIP_PLATFORM_AMD__)
+# Resource-specific cases run in separate processes so a missing second device
+# or insufficient memory reports its own skip without hiding the ordinary gate.
+add_test(NAME test_rocm_attn_gate_split_device_binding COMMAND test_rocm_attn_gate_split
+  --no-skip "--test-case=ROCm split binds*")
+add_test(NAME test_rocm_attn_gate_split_large_index COMMAND test_rocm_attn_gate_split
+  --no-skip "--test-case=ROCm split indexes*")
+set_tests_properties(test_rocm_attn_gate_split_device_binding
+  test_rocm_attn_gate_split_large_index PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 vllm_cpp_add_test(test_rocm_f16_weights vt/test_rocm_f16_weights.cpp)
 add_test(NAME test_rocm_f16_graph_dedup COMMAND test_rocm_f16_weights
   "--test-case=ROCm F16 graph handles*")
@@ -2688,7 +2703,8 @@ foreach(_f16_observed_target test_rocm_f16_model test_gguf_keep_quant)
   target_link_options(${_f16_observed_target} PRIVATE
     "LINKER:--wrap=_ZN2vt4rocm16MatmulKernelRocmERNS_5QueueERNS_6TensorERKS3_S6_"
     "LINKER:--wrap=_ZN2vt4rocm18MatmulBTKernelRocmERNS_5QueueERNS_6TensorERKS3_S6_"
-    "LINKER:--wrap=_ZN2vt4rocm19EmbeddingKernelRocmERNS_5QueueERNS_6TensorERKS3_S6_")
+    "LINKER:--wrap=_ZN2vt4rocm19EmbeddingKernelRocmERNS_5QueueERNS_6TensorERKS3_S6_"
+    "LINKER:--wrap=_ZN2vt4rocm17CastF32KernelRocmERNS_5QueueERNS_6TensorERKS3_")
 endforeach()
 vllm_cpp_add_test(test_rocm_fp8_kv_cache vt/test_rocm_fp8_kv_cache.cpp)
 # BACKEND-ROCM silu-gate dtype rounding repair (#2889 silu item, #1954): the

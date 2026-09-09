@@ -12,14 +12,15 @@ Spec base: `4137b96369467e925bfdf0738e5bad013c89b58f`.
 
 ## Now
 
-`SPIKE`. This committed specification precedes implementation. The operator
-reproduced the missing native split provider through the unchanged F16 registered
-forward. Static inspection identifies a subsequent zero-width RoPE refusal.
-The operator measured exact split values and zero-width identity through the
-primary operation's default dispatch. Both local repairs remain pending.
+`ACTIVE`. Native split and the two zero-width model guards are implemented.
+The CPU model regressions pass in both default and explicitly unfused modes.
+The operator verifies the split on physical device buffers, both visible devices,
+and offsets beyond 32 bits. The F16 head observer follows the actual native
+BF16-to-F32 cast. All 58 production cases pass with 10,970 assertions.
+The complete HIP suite and independent review remain pending.
 
 The row uses one pull request under the repository default. The parent lifecycle
-does not change. A fresh implementer follows this specification after its commit.
+does not change. Specification commits precede each implementation scope.
 The operator owns every GPU invocation and independently reruns the reviewed gate.
 
 ## Scope
@@ -220,6 +221,9 @@ The current implementer did not author that observer.
 
 Authorize a scoped observer repair in `tests/vllm/test_gguf_keep_quant.cpp`.
 Record the output and weight metadata of each real GEMM call.
+Record completed calls after native conversion recursion returns.
+`rocm_matmul_hipblaslt.hip:594` and line 665 invoke prepared GEMMs without the
+original marker. Completion order preserves the original outer head operand.
 Bind the final GEMM output to the device logits returned by the registered
 forward, including its pointer, shape, dtype, and device.
 For a BF16 head, observe the actual native `CastF32` call between those tensors.
@@ -321,6 +325,77 @@ production operation, or a required change outside the authorized files.
 Continue independent split work when an additional operation needs scope review.
 Do not stop at an implementation finding that a fresh implementer can repair.
 
+## Implementation evidence
+
+All implementation artifacts are under
+`/home/vikash/.cache/rocm-attn-gate-split-impl` on the measured host.
+The implementer builds in the linked worktree
+`/home/vikash/vllm.cpp-rocm-attn-gate-split-impl`.
+The original implementation base is `9b3ce386849854f75092ef51288b362acbfcc3d3`.
+Spec commits `a6c288a5f` and `8bb7b5439` precede their respective observer repairs.
+The implementer runs CPU commands only. The operator owns all HIP execution.
+
+The CPU and HIP builds use Ninja, Release, tests enabled, and examples disabled.
+CUDA, Metal, Vulkan, Tenstorrent, the server, and bundled BoringSSL are disabled.
+HIP uses `/opt/rocm/lib/llvm/bin/clang++` and `gfx1100`.
+The builds use `cmake --build build-split-cpu -- -j4` and
+`cmake --build build-split-hip -- -j4`.
+Both complete builds exit zero. Frozen requests retain both `CMakeCache.txt`
+and `compile_commands.json` with their SHA256 values.
+
+| Gate | Measured result and retained evidence |
+|---|---|
+| SPLIT-G0 | The original eight-process measurement remains authoritative, including both explicit HIP rotation failures and the model-configuration limitation |
+| SPLIT-G1 red | `red/operator-receipt.json` records the smallest split and registered F16 forward both failing at the missing provider before product edits |
+| SPLIT-G1 green | `green-repaired/operator-receipt.json` records 974 ordinary assertions, 60 device-binding assertions, and 15 large-index assertions passing |
+| SPLIT-G2 red | `cpu-red-receipt.json` binds both original unconditional model refusals, in default and unfused modes, to the exact new test source |
+| SPLIT-G2 green | `cpu-green-qwen-default.log` and `cpu-green-qwen-unfused.log` each record 14 passing cases and 835 passing assertions |
+| SPLIT-G3 | `green-complete/operator-receipt.json` records all five focused commands passing, including 58 production cases and 10,970 assertions |
+| SPLIT-G4 CPU | Pristine CTest has 716 tests and candidate CTest has 717 tests; both exit 8 with only the two existing Qwen3 `anchor_ok` failures |
+| SPLIT-G4 HIP | Full build passes; `full-hip-complete/request.json` seals 4,851 inputs for complete operator CTest, which remains pending |
+| SPLIT-G5 | The implementer's CPU mutations fail as required; operator HIP mutations, fresh review, and independent operator verification remain pending |
+
+The complete CPU commands use `ctest --test-dir build-split-cpu --output-on-failure -j4`.
+Both runs set `GIT_CONFIG_GLOBAL=/dev/null`, an isolated `TMPDIR` and Git ceiling,
+and the existing NumPy-only `PYTHONPATH`.
+`cpu-full-comparison.json` records identical failure messages and the same pinned
+Qwen3 checkpoint. The existing CPU #3102 failure remains `FAILING`.
+This comparison does not waive the existing HIP #3070 or #3105 failures.
+
+`mutations-cpu/corrected-link-results.json` records a passing scratch control
+and 12 detected mutations. Each model path independently loses its zero guard,
+admits negative widths, loses each normalization call, and corrupts each normalized
+query or key. `mutations-cpu/restoration.json` verifies the original source,
+archive, object, and executable bytes remain unchanged.
+The initial scratch links accidentally retained the original whole-archive option.
+Their apparent passes are void and retained as `void-original-link-receipt.json`.
+The corrected links replace both archive references and detect every defect.
+The independent direct-primitive zero mutation also fails its two dtype controls.
+
+The captured upstream split fixture is `tests/fixtures/rocm_attn_gate_split`.
+Its generator runs the pinned active runtime with seed 13 and every specified
+token/head pair. `cases.bin` contains 3,440,640 bytes with SHA256
+`dca91b8782df22399751c4b5f729e8742ac5a7e094dc963be0fb6b64e98cc605`.
+The manifest has SHA256
+`64adbfcd2552ffbb12655e835d665585da30833e8a0f209e030c1882aeb7a6cc`.
+The local F32 gate remains a storage adaptation, and this row makes no speed claim.
+
+The pre-edit preflight passes with the existing five argument-dependent skips.
+The CPU ISA audit passes with `build-split-cpu/compile_commands.json`.
+The candidate preflight finds one malformed imported symbol citation for #3112.
+The corrected citation passes `scripts/check-symbol-anchors.py`.
+The candidate preflight exits 1 for that original citation failure, although its
+later automatic checker pass sees the corrected citation. Tree compilation passes.
+The final preflight rerun and remaining applicable range checks stay pending.
+No pending check is a pass.
+
+The final production log has SHA256
+`0211aab99387f025ddbd52049919f3aee641a088358d845c9f2eb951c03dcd2b`.
+The operator verifies 4,159 input and request hashes before and after execution.
+The earlier direct-output and recursive-inner-weight observer failures remain
+retained beside their receipts. The standalone model driver's no-argument
+invocation exits 77 with usage text and proves no model behavior.
+
 ## Inventory
 
 The canonical spec scan owns this child record. No parent matrix or roadmap
@@ -328,6 +403,6 @@ lifecycle changes. Update this table and `Now` together when the child moves.
 
 | ID | Upstream source | Local anchor | Tests and evidence | Spec | State | Owner | Issue |
 |---|---|---|---|---|---|---|---|
-| `BACKEND-ROCM-ATTN-GATE-SPLIT` | vLLM `e126687a9a`, `qwen3_next.py:424-443`, rotary `base.py:178-200` and HIP launcher | `vt::AttnGateSplit`, `vt::RopeNeox`, `FullAttnBlockPaged` | SPLIT-G0 through SPLIT-G5 and retained production red | This file | `SPIKE` | Fresh implementer, fresh reviewer, operator verification | #3106 |
+| `BACKEND-ROCM-ATTN-GATE-SPLIT` | vLLM `e126687a9a`, `qwen3_next.py:424-443`, rotary `base.py:178-200` and HIP launcher | `vt::AttnGateSplit`, `vt::RopeNeox`, `FullAttnBlockPaged` | SPLIT-G0 through SPLIT-G5 and retained production red | This file | `ACTIVE` | Fresh implementer, fresh reviewer, operator verification | #3106 |
 
 Add `Outcome` only when the complete production repair reaches `DONE`.

@@ -137,6 +137,7 @@ void RmsNormGatedKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor
                             const Tensor& w, const RmsNormGatedArgs& args);
 void SigmoidGateBf16KernelRocm(Queue& q, Tensor& out, const Tensor& attn,
                                const Tensor& gate);
+void AttnGateSplitKernelRocm(Queue& q, Tensor& query, Tensor& gate, const Tensor& packed);
 // BACKEND-ROCM-EXL3 (rocm_exl3.hip): the fused EXL3 trellis linear, transcribed
 // from the PORTABLE CPU reference (cpu_exl3_kernels.cpp / cpu_exl3_dequant.cpp)
 // and not from the CUDA kernel, whose 90 KiB shared-memory budget, m16n8k16 mma,
@@ -289,6 +290,8 @@ struct Registrar {
     RegisterOp(OpId::kSigmoidGateBf16, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<SigmoidGateBf16Fn>(&SigmoidGateBf16KernelRocm)));
+    RegisterOp(OpId::kAttnGateSplit, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<AttnGateSplitFn>(&AttnGateSplitKernelRocm)));
     RegisterOp(OpId::kExl3Gemm, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<Exl3GemmFn>(&Exl3GemmKernelRocm)));
     RegisterOp(

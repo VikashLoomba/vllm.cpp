@@ -1718,6 +1718,7 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_rmsnorm.hip
     src/vt/rocm/rocm_embedding.hip
     src/vt/rocm/rocm_dense_basic.hip
+    src/vt/rocm/rocm_attn_gate_split.hip
     src/vt/rocm/rocm_matmul_hipblaslt.hip
     src/vt/rocm/rocm_paged_attn.hip
     src/vt/rocm/rocm_gemma4_experts.hip
@@ -1746,6 +1747,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_rmsnorm.hip
       src/vt/rocm/rocm_embedding.hip
       src/vt/rocm/rocm_dense_basic.hip
+      src/vt/rocm/rocm_attn_gate_split.hip
       src/vt/rocm/rocm_matmul_hipblaslt.hip
       src/vt/rocm/rocm_paged_attn.hip
       src/vt/rocm/rocm_gemma4_experts.hip

@@ -71,6 +71,24 @@ struct Registration {
 } registration;
 int provider_calls = 0;
 void FakeGemm(Queue&, Tensor&, const Tensor&, const Tensor&) { ++provider_calls; }
+constexpr const char* kFakeEmbeddingProvider = "f16-contract-embedding-unsupported";
+int embedding_provider_calls = 0;
+void FakeEmbedding(Queue&, Tensor&, const Tensor&, const Tensor&) {
+  ++embedding_provider_calls;
+}
+struct EmbeddingProviderRegistration {
+  EmbeddingProviderRegistration() {
+    vt::RegisterOpProvider(vt::OpId::kEmbedding, DeviceType::kROCM,
+                          {kFakeEmbeddingProvider, 10000, nullptr,
+                           reinterpret_cast<void*>(&FakeEmbedding)});
+    vt::DisableOpProvider(kFakeEmbeddingProvider, true);
+  }
+} embedding_provider_registration;
+struct ScopedEmbeddingProvider {
+  const bool was_disabled = vt::OpProviderDisabled(kFakeEmbeddingProvider);
+  ScopedEmbeddingProvider() { vt::DisableOpProvider(kFakeEmbeddingProvider, false); }
+  ~ScopedEmbeddingProvider() { vt::DisableOpProvider(kFakeEmbeddingProvider, was_disabled); }
+};
 }  // namespace
 
 TEST_CASE("F16 weight metadata survives ownership, shape views, slices, and aliases") {
@@ -221,4 +239,20 @@ TEST_CASE("F16 weight marker rejects illegal operands and unsupported providers 
     q.device = Device{DeviceType::kROCM, 0}; a.device = q.device; b.device = q.device; out.device = q.device;
     vt::DisableOpProvider(fake.name, true);
   }
+}
+
+TEST_CASE("F16 marked embedding rejects unsupported providers before execution") {
+  uint16_t table_bytes[9]{};
+  int32_t id_bytes[2]{0, 2};
+  float out_bytes[6]{};
+  Queue q{Device{DeviceType::kROCM, 0}, nullptr};
+  Tensor table = Tensor::Contiguous(table_bytes, DType::kF16, q.device, {3, 3});
+  Tensor ids = Tensor::Contiguous(id_bytes, DType::kI32, q.device, {2});
+  Tensor out = Tensor::Contiguous(out_bytes, DType::kF32, q.device, {2, 3});
+  ScopedEmbeddingProvider provider;
+  const int before = embedding_provider_calls;
+  table.weight_value_dtype = DType::kBF16;
+  CHECK_THROWS_WITH(vt::Embedding(q, out, table, ids),
+                    doctest::Contains("weight_value_dtype requires the native ROCm provider"));
+  CHECK(embedding_provider_calls == before);
 }

@@ -30,4 +30,21 @@ The quoted text below is historical evidence only. It does not define issue auth
 
 ## Resolution
 
--
+The local repair adds mutation-sensitive coverage for explicit registry dtype
+refusal, unsupported embedding providers, and both ordinary GEMM compute
+override guards. It integrates reviewed prerequisite
+`6a7bcb77637e66df34429208e3a4055e0945a875` from #3098 and PR #3101.
+The row spec records the exact evidence and remaining gates. The issue stays
+open until the work lands. Full-suite baseline failures, oracle limitations,
+fresh review, and the final operator gate remain explicit obligations.
+The integrated explicit-head fixture reaches a missing native ROCm
+`AttnGateSplit` provider. Issue #3106 owns that backend gap. F16-G3 remains
+failing with the unchanged fixture and expected successful forward.
+
+The repaired CPU suite passes 703 tests, skips 12, and retains only #3102
+out of 716. The operator's complete HIP suite passes 692 tests, skips 12,
+and fails 20 of 724. Nineteen failures exactly match the pristine baseline;
+the remaining failure is #3106. The added public prerequisite test passes.
+The staged preflight executes every supplied gate successfully and compiles
+678 translation units. Its five argument-dependent skips and explicit
+check dispositions are recorded in the spec. The row remains active.

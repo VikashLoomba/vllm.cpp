@@ -6,11 +6,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "support/test_env.h"
@@ -23,6 +25,34 @@
 namespace {
 using vt::DType;
 using vt::Tensor;
+
+class ScopedF16Env {
+ public:
+  ScopedF16Env(const char* name, const char* value) : name_(name) {
+    const char* old = std::getenv(name);
+    had_value_ = old != nullptr;
+    if (old != nullptr) old_value_ = old;
+    vllm_test::SetEnv(name, value);
+  }
+  ~ScopedF16Env() {
+    if (!had_value_) {
+      vllm_test::UnsetEnv(name_);
+    } else {
+#if defined(_WIN32)
+      vllm_test::SetEnv(name_, old_value_);
+#else
+      // Preserve an empty POSIX value as distinct from an absent variable.
+      if (::setenv(name_, old_value_.c_str(), 1) != 0) std::terminate();
+#endif
+    }
+  }
+  ScopedF16Env(const ScopedF16Env&) = delete;
+  ScopedF16Env& operator=(const ScopedF16Env&) = delete;
+ private:
+  const char* name_;
+  bool had_value_ = false;
+  std::string old_value_;
+};
 
 struct DeviceRun {
   vt::Backend& backend = vt::GetBackend(vt::DeviceType::kROCM);
@@ -372,13 +402,33 @@ TEST_CASE("ROCm F16 queue ordering and captured scratch survive later growth") {
     GemmCase(other, true, 4, 17, 19, DType::kBF16, DType::kF16, DType::kF32, DType::kBF16);
     for (float value : run.Download(first)) CHECK(value == 6.f);
   }
-  for (const char* override : {"16f", "16bf"}) {
-    vllm_test::SetEnv("VT_ROCM_GEMM_COMPUTE", override);
-    b.weight_value_dtype.reset();
-    CHECK_THROWS_WITH(vt::MatmulBT(run.queue, first, a, b),
-                       doctest::Contains("VT_ROCM_GEMM_COMPUTE="));
+}
+
+TEST_CASE("ROCm F16 ordinary NN and BT refuse unsupported compute overrides") {
+  REQUIRE(vt::rocm::DeviceAvailable());
+  DeviceRun run;
+  Tensor a = run.Make(DType::kBF16, 1, 3);
+  Tensor b = run.Make(DType::kF16, 3, 3);
+  Tensor out = run.Make(DType::kF32, 1, 3);
+  run.Upload(a, {1.f, 2.f, 3.f});
+  run.Upload(b, std::vector<float>(9, 1.0009765625f));
+  // Unmarked F16 B keeps this BF16/F16 pair outside the allowed 16bf arm.
+  REQUIRE_FALSE(b.weight_value_dtype.has_value());
+  for (bool bt : {false, true}) {
+    CAPTURE(bt);
+    for (const char* compute : {"16f", "16bf"}) {
+      CAPTURE(std::string(compute));
+      ScopedF16Env override("VT_ROCM_GEMM_COMPUTE", compute);
+      auto call = [&] {
+        if (bt) vt::MatmulBT(run.queue, out, a, b);
+        else vt::Matmul(run.queue, out, a, b);
+      };
+      const char* refusal = std::strcmp(compute, "16f") == 0
+          ? "ROCm ordinary GEMM refuses VT_ROCM_GEMM_COMPUTE=16f: F32 scalars required"
+          : "ROCm ordinary GEMM refuses VT_ROCM_GEMM_COMPUTE=16bf for this input pair";
+      CHECK_THROWS_WITH(call(), doctest::Contains(refusal));
+    }
   }
-  vllm_test::UnsetEnv("VT_ROCM_GEMM_COMPUTE");
 }
 
 TEST_CASE("ROCm F16 scratch releases after repeated queue destruction") {

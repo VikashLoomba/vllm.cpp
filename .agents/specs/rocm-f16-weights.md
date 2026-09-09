@@ -329,13 +329,13 @@ implementation, then focused green and the full gate.
 | ID | Requirement | Current result |
 |---|---|---|
 | F16-G1 | Spec committed before implementation, issue and row agree | Satisfied by this spec commit |
-| F16-G2 | Focused red, focused green, and registered CPU/HIP tests | FAILING baseline CPU/HIP suites (#3070, #3102, #3105) and explicit-head dependency #3098; focused checks pass |
-| F16-G3 | Default public-load and registered-forward reachability | PENDING explicit-head forward after #3098; public retained-weight execution observed |
+| F16-G2 | Focused red, focused green, and registered CPU/HIP tests | FAILING baseline CPU/HIP suites (#3070, #3102, #3105) and missing native `AttnGateSplit` (#3106); three repaired guards pass |
+| F16-G3 | Default public-load and registered-forward reachability | FAILING explicit-head forward at missing native ROCm `AttnGateSplit` (#3106); public retained-weight execution observed |
 | F16-G4 | Identical-artifact active-pin oracle and exact token gate | FAILING arithmetic comparison and D1 repeatability; identical-GGUF plugin run remains PENDING |
 | F16-G5 | Same-tool executed dtype and dispatch traces | PENDING identical-GGUF primary execution; native/materialized traces captured with existing dtype/policy differences retained |
 | F16-G6 | Same-binary A/B and oracle speed, latency, and memory | PENDING F16-G4 |
 | F16-G7 | Fresh immutable-head mutation review and operator rerun | PENDING reviewed head |
-| F16-G8 | Full repository preflight, no skipped applicable gates | PENDING final head |
+| F16-G8 | Full repository preflight, no skipped applicable gates | PENDING final operator head; repair preflight and explicit build-check dispositions recorded below |
 
 ### Run the model and compare values
 
@@ -826,6 +826,113 @@ owning engine and quantization rows. Both implementer and operator checks prove
 that every unrelated row remains byte-identical; the record checker returns to
 its unchanged 28-stale/5-broken baseline. No checker or baseline was changed.
 
+### Review coverage repair and prerequisite integration
+
+Fresh review of `822ee510cc13fb9e10657da93bb3b941c0700b55` found three
+coverage gaps. It found no new product defect in those three guarantees.
+The repair enters unsupported model dtypes through `ModelRegistry::Load`,
+enters unsupported embedding providers through `vt::Embedding`, and tests
+ordinary NN and BT compute overrides independently of graph capture.
+
+The registry cases accept `bfloat16`, `bf16`, and an empty dtype. They reject
+explicit `float16` and `float32` with the registered loader's full diagnostic.
+Removing only that registry guard fails both new refusal assertions.
+The embedding case installs a fake provider that cannot consume the weight
+marker. Removing only its provider guard fails the refusal and callback-count
+assertions. The provider callback must remain uncalled.
+Both cases use scoped environment or provider restoration. An independent
+same-process driver covers originally absent, empty, and nonempty environment
+values and both original provider states. All five restoration cases pass.
+
+The NN and BT cases each reject `VT_ROCM_GEMM_COMPUTE=16f` and `16bf` by name.
+Their mutation removes only the NN guard and leaves BT unchanged. Under the
+GPU mutex, the operator runs both on physical gfx1100. Only the two NN refusal
+assertions fail in the mutant. The unchanged control passes six assertions.
+`operator-focused/nn-compute-refusal-mutant-receipt.json` records log SHA256
+`252a9909abbb07e6cab726acce3293964302c4541ec93316575848d63def1414`.
+The corresponding control log SHA256 is
+`f00e896bebad60db7e12e37c13559f0ea37b9e7be482b8060438606ed1edb716`.
+The operator reruns both CPU mutants and controls and verifies every frozen
+source and input before and after all six runs.
+
+This branch integrates the reviewed prerequisite
+`6a7bcb77637e66df34429208e3a4055e0945a875`, tracked by #3098 and PR #3101.
+The integration preserves this branch's F16 `ResidentWeight` metadata changes.
+Its `qwen3_5.cpp` bytes match an independent three-way application of the
+prerequisite delta from `6db4bef906859e864c82523c01107473f7dcca29`.
+All five prerequisite test files match the reviewed prerequisite exactly.
+Nine shared keyed records, containing 922 rows, remain byte-identical.
+The operator independently verifies these comparisons.
+
+The complete HIP GGUF target now passes 57 of 58 cases and all 10,455
+completed assertions. Its remaining case reaches a further existing ROCm refusal: no native
+`AttnGateSplit` provider. The explicit-head fixture retains its real gated
+attention and reaches `qwen3_5.cpp:5634`. It cannot finish that forward.
+`operator-focused/gguf-keep-quant-control-receipt.json` records exit one and
+log SHA256 `f4d682bdfa800b80c7e25d75b51c31f00a0d3168579534a3e25fff2fda84752a`.
+F16-G3 remains failing. The fixture and its expected outcome are unchanged.
+Issue #3106 owns this provider gap under `BACKEND-ROCM`.
+
+Repair evidence is under `/home/vikash/.cache/rdna3-f16-repair1`.
+`integration/receipt.json` and
+`prerequisite-integration-operator-audit.json` retain the integration checks.
+`mutations/registry-dtype-refusal/recipe.json` and
+`mutations/embedding-provider-guard/recipe.json` record the private archive,
+source mutation, exact commands, red exit, and byte-exact restoration.
+`cpu-focused/registry-final-receipt.json` records four passing registry cases
+and 107 assertions. The complete CPU contract suite passes six cases and
+240 assertions. The complete Qwen27, Qwen35, graph, and model-registry CPU
+targets pass. `state-restore/receipt.json` records the restoration driver.
+
+The private CPU and HIP build directories reuse only independently hashed,
+unchanged donor objects. Their compiler flags match after path normalization.
+Every changed translation unit is freshly compiled. Every registered executable
+is relinked against the current archive. `donor-reuse.json`, the build receipts,
+and `diagnostics-final/receipt.json` retain that provenance. The full CTest
+recipe includes the versioned shared library required by the ABI export check.
+The first private harness omitted that target; its failure remains recorded,
+and `shared-library-final/receipt.json` records the successful correction.
+
+After the runner expectation correction, the complete CPU suite passes 703
+tests, skips 12, and fails one of 716. The sole failure remains #3102, with
+both original token-anchor diagnostics unchanged. `cpu-full-final/receipt.json`
+records the serial command, exit eight, and log SHA256
+`f96608c90d4e7ba19d25c71fd307f254c97a185ce90ef04899ebbecef7c78571`.
+`cpu-full-final/summary.json` links the exact baseline comparison.
+The additional CPU skip is the HIP-only public prerequisite test.
+
+The operator runs every registered HIP test with both devices visible, provider
+statistics enabled, and graph dedup disabled. Of 724 tests, 692 pass, 12 skip,
+and 20 fail. The added public full-attention completion target passes.
+All 19 baseline failures retain the exact normalized error lines and doctest
+case and assertion summaries. The remaining GGUF failure is the native
+`AttnGateSplit` refusal owned by #3106. Baseline ownership waives no gate.
+`frozen-v2/operator-full/results.json` records the mutex, environment, serial
+CTest command, exit eight, and log SHA256
+`f9b103624eeb4b70b59e633db6bd96417e4b13a9f7992d075303b3c438343007`.
+The operator comparison has SHA256
+`9fc27383f62597710f4813091f66d764892139159c6b797f372625eadc1ce0af`.
+It verifies all 4,157 source files and 1,006 declared inputs before and after.
+The implementer independently verifies all 19 comparison entries and that hash.
+
+The final staged preflight exits zero. Every executed gate passes, and all
+678 in-scope translation units compile in 270.9 seconds. The complete command
+and environment are in `preflight-final-staged.json`; its log SHA256 is
+`6532355dac5ee2c2d513bfd8dffc8d1408f129b0b462f5b79229a74a874ba8f9`.
+The generic sweep skips five argument-dependent checks. The explicit x86 ISA
+audit passes against `build-repair-cpu/compile_commands.json`. Exact-range
+classification supplies PR #3095 and the immutable repair head.
+ARM ISA, CUDA fat-gencode, and Triton AOT audits have no applicable configured
+artifact in this CPU/HIP repair. No architecture-specific instruction unit,
+CUDA gencode setting, or Triton artifact changes. These dispositions do not
+claim a completely green generic preflight. Final owned-record checks run
+after adding this evidence; source and build inputs remain unchanged.
+
+Fresh review of the final repair commit and the operator's final gate remain
+required. The row stays `ACTIVE`. Native D1 and primary repeatability failures,
+the identical-GGUF plugin refusal, and the traced dtype and policy differences
+retain their earlier dispositions. This repair accepts no performance result.
+
 ## Work breakdown
 
 1. Commit this spec and the scoped issue and inventory records.
@@ -890,9 +997,16 @@ full-runtime operations need their own owning issue before that scope expands.
   paged-token anchor failure. [The owning model spec](first-additive-model-qwen3-dense.md)
   owes the matched active-pin diagnosis and reviewed correction.
 - [#3098](https://github.com/mudler/vllm.cpp/issues/3098) owns the existing
-  Qwen3.5 full-attention-only forward refusal encountered by the explicit-head
-  fixture. This row preserves that fixture and does not introduce synthetic GDN
-  layers to bypass the refusal.
+  Qwen3.5 full-attention-only consumer checks integrated from reviewed PR #3101.
+  It retains the pinned primary GGUF refusal and owns the test-only correction
+  to the runner's obsolete refusal expectation.
+- [#3106](https://github.com/mudler/vllm.cpp/issues/3106), owned by
+  `BACKEND-ROCM`, tracks the missing native `AttnGateSplit` provider reached
+  after that prerequisite. The unchanged F16 fixture omits
+  `rope.dimension_count`, resolves rotary width zero, and enters the unfused
+  `FullAttnBlockPaged` preamble. Its explicit-head forward remains failing.
+  A separately committed backend spec and reviewed provider implementation
+  must close this gap. This repair changes neither the fixture nor the provider.
 - [#3100](https://github.com/mudler/vllm.cpp/issues/3100) owns the existing ROCm
   backend allocation and queue device-binding gap. This row's two-device test
   verifies the three scoped operations with independently verified allocations.

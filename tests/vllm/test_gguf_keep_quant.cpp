@@ -2727,29 +2727,81 @@ TEST_CASE("#2516: a plan that places NOTHING never overrides the engine") {
         vllm::GgufResidency::kExpandBf16);
 }
 
+namespace {
+class ScopedF16Env {
+ public:
+  ScopedF16Env(const char* name, const char* value) : name_(name) {
+    const char* old = std::getenv(name);
+    had_value_ = old != nullptr;
+    if (old != nullptr) old_value_ = old;
+    vllm_test::SetEnv(name, value);
+  }
+  ~ScopedF16Env() {
+    if (!had_value_) {
+      vllm_test::UnsetEnv(name_);
+    } else {
+#if defined(_WIN32)
+      vllm_test::SetEnv(name_, old_value_);
+#else
+      // Preserve an empty POSIX value as distinct from an absent variable.
+      if (::setenv(name_, old_value_.c_str(), 1) != 0) std::terminate();
+#endif
+    }
+  }
+  ScopedF16Env(const ScopedF16Env&) = delete;
+  ScopedF16Env& operator=(const ScopedF16Env&) = delete;
+ private:
+  const char* name_;
+  bool had_value_ = false;
+  std::string old_value_;
+};
+}  // namespace
+
 // BACKEND-ROCM-F16-WEIGHTS (#3092): enter through the registered GGUF loader.
 // A kernel-only F16 change cannot satisfy this admission test.
 TEST_CASE("ROCm F16 production registry retains the embedding table") {
-  vllm_test::UnsetEnv("VT_CPU_REF");
-  vllm_test::UnsetEnv("VT_GGUF_KEEP_F16");
-  vllm_test::UnsetEnv("VT_GGUF_KEEP_QUANT");
+  ScopedF16Env cpu_ref("VT_CPU_REF", nullptr);
+  ScopedF16Env keep_f16("VT_GGUF_KEEP_F16", nullptr);
+  ScopedF16Env keep_quant("VT_GGUF_KEEP_QUANT", nullptr);
   for (bool tied : {false, true}) {
     CAPTURE(tied);
     const DenseDims d;
     const TempFile file(BuildDenseF16Gguf(d, tied));
     const vllm::GgufFile gguf = vllm::GgufFile::Open(file.path());
-    const auto config = vllm::HfConfigFromGguf(gguf);
+    auto config = vllm::HfConfigFromGguf(gguf);
     REQUIRE(config.torch_dtype == "bfloat16");
-    auto loaded = vllm::ModelRegistry::Load(
-        config, vllm::ModelSource::FromGguf(gguf, vt::DeviceType::kROCM));
-    const auto* embedding = loaded->shared_embed_tokens();
-    REQUIRE(embedding != nullptr);
-    REQUIRE_MESSAGE(embedding->dtype == vt::DType::kF16,
-                    "the default ROCm registry must retain eligible F16 storage");
-    REQUIRE(embedding->weight_value_dtype == vt::DType::kBF16);
-    REQUIRE(embedding->bytes.size() == gguf.Get("token_embd.weight").nbytes);
-    CHECK(std::memcmp(embedding->bytes.data(), gguf.Get("token_embd.weight").data,
-                      embedding->bytes.size()) == 0);
+    for (const char* dtype : {"bfloat16", "bf16", ""}) {
+      CAPTURE(std::string(dtype));
+      config.torch_dtype = dtype;
+      auto loaded = vllm::ModelRegistry::Load(
+          config, vllm::ModelSource::FromGguf(gguf, vt::DeviceType::kROCM));
+      const auto* embedding = loaded->shared_embed_tokens();
+      REQUIRE(embedding != nullptr);
+      REQUIRE_MESSAGE(embedding->dtype == vt::DType::kF16,
+                      "the default ROCm registry must retain eligible F16 storage");
+      REQUIRE(embedding->weight_value_dtype == vt::DType::kBF16);
+      REQUIRE(embedding->bytes.size() == gguf.Get("token_embd.weight").nbytes);
+      CHECK(std::memcmp(embedding->bytes.data(), gguf.Get("token_embd.weight").data,
+                        embedding->bytes.size()) == 0);
+    }
+  }
+}
+
+TEST_CASE("ROCm F16 production registry refuses incompatible model values") {
+  ScopedF16Env cpu_ref("VT_CPU_REF", nullptr);
+  ScopedF16Env keep_f16("VT_GGUF_KEEP_F16", nullptr);
+  ScopedF16Env keep_quant("VT_GGUF_KEEP_QUANT", nullptr);
+  const DenseDims d;
+  const TempFile file(BuildDenseF16Gguf(d));
+  const auto gguf = vllm::GgufFile::Open(file.path());
+  auto config = vllm::HfConfigFromGguf(gguf);
+  for (const char* dtype : {"float16", "float32"}) {
+    CAPTURE(std::string(dtype));
+    config.torch_dtype = dtype;
+    CHECK_THROWS_WITH(vllm::ModelRegistry::Load(
+        config, vllm::ModelSource::FromGguf(gguf, vt::DeviceType::kROCM)),
+        doctest::Contains("Qwen3.5 retained F16 GGUF: this forward resolves BF16 model values; "
+                          "an unsupported model dtype cannot silently select BF16 semantics"));
   }
 }
 

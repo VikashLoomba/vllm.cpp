@@ -4,6 +4,8 @@ Row: `BACKEND-ROCM-ATTN-GATE-SPLIT`.
 
 Issue: [#3106](https://github.com/mudler/vllm.cpp/issues/3106).
 
+In-flow test repair: [#3112](https://github.com/mudler/vllm.cpp/issues/3112).
+
 Parent: `BACKEND-ROCM`. Branch: `row/BACKEND-ROCM-ATTN-GATE-SPLIT`.
 
 Spec base: `4137b96369467e925bfdf0738e5bad013c89b58f`.
@@ -198,6 +200,46 @@ The downstream operations are already registered: both RMSNorm calls,
 `SigmoidGateBf16`. Their applicable F32/BF16 operands match the existing provider
 contracts. This static check does not establish successful execution. Retain
 any next actual refusal and repair it through the same scoped review process.
+
+### Identify the actual F16 output head
+
+The operator's first candidate run completes both F16 forwards and exposes an
+observer defect in `tests/vllm/test_gguf_keep_quant.cpp::F16ForwardObservation`.
+Its width comparison counts four attention projections and the output head.
+Both tied modes report five against the unchanged exact-one assertion.
+The log records 58 cases, 57 passing cases, and 10,934 passing assertions.
+No retained-versus-expanded numerical assertion fails.
+
+The frozen operator log is
+`/home/vikash/.cache/rocm-attn-gate-split-impl/green-focused/gguf-production-full-operator.log`,
+SHA256 `cf9cd125bce34008bba2bfd0e51f6fbd018facbc552c31e21a5f0f57fdc89d1a`.
+Its adjacent receipt binds the commands and source inputs before and after
+execution. This is the original failing result for #3112.
+`git log -S'marked_heads'` attributes the observer to `822ee510c`.
+The current implementer did not author that observer.
+
+Authorize a scoped observer repair in `tests/vllm/test_gguf_keep_quant.cpp`.
+Record the output and weight metadata of each real GEMM call.
+Bind the final GEMM output to the device logits returned by the registered
+forward, including its pointer, shape, dtype, and device.
+Count marked head calls by that final GEMM's exact physical weight identity.
+Include weight shape, strides, and orientation in the identity.
+This distinguishes unrelated equal-width projections and pooled output addresses.
+It also preserves tied embedding weights without guessing their loader addresses.
+
+Require device logits for this native production gate.
+Keep `marked_heads == 1`, both tied modes, the existing vocabulary, fixture bytes,
+native provider checks, marked GEMM and embedding checks, and all numerical checks.
+Do not increase the count, use a lower bound, or alter model configuration.
+The production head uses `MatmulF32D` and `WrapDeviceLogits` without an intermediate
+copy at `qwen3_5.cpp:9203-9211`.
+
+Repeat the unchanged production case after the observer repair.
+In independent scratch mutations, omit its actual final GEMM observation and
+remove that call's F16 marker. Each mutation must fail the production gate.
+Restore every source and build byte after each mutation.
+The operator retains GPU authority and independently reruns the reviewed result.
+This amendment precedes the observer implementation in Git.
 
 ## Tests and gate order
 

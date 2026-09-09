@@ -50,7 +50,7 @@ Completion Run(const std::string& path, const std::vector<int32_t>& prompt,
   model.model_path = path.c_str();
   model.device = 0;  // Public AUTO in a HIP-only build, measured by provider stats.
   model.block_size = 16;
-  model.num_blocks = 4;
+  model.num_blocks = 16;
   model.max_model_len = 64;
   model.max_num_seqs = 1;
   model.kv_cache_dtype = "auto";

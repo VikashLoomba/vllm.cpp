@@ -9,6 +9,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -85,10 +86,11 @@ void Gather(int argc, char** argv) {
               ids.size(), packed.size(), output.size() * sizeof(float));
 }
 
-void Model(int argc, char** argv) {
-  if (argc < 4) throw std::runtime_error("model MODEL_GGUF TOKEN_ID...");
+void Model(int argc, char** argv, bool capture) {
+  const int first_token = capture ? 4 : 3;
+  if (argc <= first_token) throw std::runtime_error("model[-capture] MODEL_GGUF [OUTPUT_PREFIX] TOKEN_ID...");
   std::vector<llama_token> prompt;
-  for (int i = 3; i < argc; ++i) prompt.push_back(std::stoi(argv[i]));
+  for (int i = first_token; i < argc; ++i) prompt.push_back(std::stoi(argv[i]));
   llama_backend_init();
   auto model_params = llama_model_default_params();
   model_params.n_gpu_layers = 0;
@@ -110,17 +112,35 @@ void Model(int argc, char** argv) {
   std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> sampler(llama_sampler_init_greedy(), &llama_sampler_free);
   auto batch = llama_batch_get_one(prompt.data(), static_cast<int32_t>(prompt.size()));
   std::vector<llama_token> generated;
+  std::vector<float> logits;
+  const int32_t vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+  if (vocab != 128) throw std::runtime_error("bounded model vocabulary changed");
+  generated.reserve(4);
+  logits.reserve(4 * static_cast<size_t>(vocab));
   for (int step = 0; step < 4; ++step) {
     if (llama_decode(context.get(), batch) != 0) throw std::runtime_error("pinned oracle decode failed");
+    const float* values = llama_get_logits_ith(context.get(), -1);
+    if (!values) throw std::runtime_error("oracle returned no logits");
+    for (int32_t i = 0; i < vocab; ++i) {
+      if (!std::isfinite(values[i])) throw std::runtime_error("oracle returned nonfinite logits");
+      logits.push_back(values[i]);
+    }
     const llama_token token = llama_sampler_sample(sampler.get(), context.get(), -1);
     generated.push_back(token);
     batch = llama_batch_get_one(&generated.back(), 1);
   }
-  std::printf("ORACLE model=%s context=64 kv_k=bf16 kv_v=bf16 concurrency=1 greedy=true ignore_eos=true tokens=",
-              argv[2]);
+  std::printf("ORACLE model=%s requested_context=64 physical_context=%u kv_k=bf16 kv_v=bf16 concurrency=1 greedy=true ignore_eos=true tokens=",
+              argv[2], llama_n_ctx(context.get()));
   for (auto token : generated) std::printf(" %d", token);
   std::printf("\n");
   std::printf("ORACLE system=%s\n", llama_print_system_info());
+  if (capture) {
+    const std::string prefix(argv[3]);
+    Write((prefix + "-logits-f32.bin").c_str(), logits.data(), logits.size() * sizeof(float));
+    std::string ids;
+    for (auto token : generated) ids += std::to_string(token) + "\n";
+    Write((prefix + "-tokens.txt").c_str(), ids.data(), ids.size());
+  }
 }
 
 }  // namespace
@@ -128,8 +148,9 @@ void Model(int argc, char** argv) {
 int main(int argc, char** argv) {
   try {
     if (argc > 1 && std::string(argv[1]) == "gather") Gather(argc, argv);
-    else if (argc > 1 && std::string(argv[1]) == "model") Model(argc, argv);
-    else throw std::runtime_error("choose gather or model");
+    else if (argc > 1 && std::string(argv[1]) == "model") Model(argc, argv, false);
+    else if (argc > 1 && std::string(argv[1]) == "model-capture") Model(argc, argv, true);
+    else throw std::runtime_error("choose gather, model, or model-capture");
     return 0;
   } catch (const std::exception& error) {
     std::fprintf(stderr, "ORACLE FAILED: %s\n", error.what());

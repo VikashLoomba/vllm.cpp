@@ -21,13 +21,13 @@ The row uses one pull request and retains the reviewed full-attention prerequisi
 
 The original 32 primary fixtures await download authority. The corrected primary
 launch emits four tokens from the exact Q4_0 fixture with normal compilation and
-graph capture. The complete oracle token matrix remains pending. Both pristine
-secondary bounded models abort on their first decode. The committed amendment
-below scopes the configuration repairs, matched physical cache allocation, and
-secondary allocation overlay. Its implementation and qualification remain pending.
-The earlier native gates retain their measured four-block configuration.
-The earlier implementation preflight retains its argument-dependent skips.
-The amended head still requires its final staged preflight.
+graph capture. The complete primary token matrix remains pending.
+The bounded secondary overlays execute all 12 model requests and match native tokens.
+Both pristine and overlay binaries preserve all 24 recurrent-control completions and logits.
+The amended native gate passes all 228 public engines with 16 physical blocks.
+The live primary observer measures a 65,536-byte BF16 cache with the same physical capacity.
+Identical-tool model traces and final staged preflight remain required.
+The earlier four-block measurements and argument-dependent preflight skips remain archived.
 Fresh mutation review and the operator's reviewed-head rerun remain required. The row is not ready to land or become `DONE`.
 
 The [row evidence](../../docs/bench-evidence/rocm-quant-gather/README.md)
@@ -625,6 +625,9 @@ immutable head, and have the operator rerun the final gates.
 
 The [amendment evidence](../../docs/bench-evidence/rocm-quant-gather/oracle-amendment/README.md)
 retains the primary launch progression, CPU RoPE probe, receipts, and hashes.
+The [qualification evidence](../../docs/bench-evidence/rocm-quant-gather/oracle-qualification/README.md)
+retains the implementation's runtime failures, secondary overlays, recurrent controls,
+live primary cache measurements, and matched 16-block native gates.
 
 ## Tests and gates
 
@@ -718,20 +721,20 @@ The current result inventory is:
 |---|---|---|
 | Committed spec before implementation | Satisfied | Original spec and materializer/reader amendments precede product edits; bounded-oracle amendment precedes its harness implementation |
 | All 19 native decoder and error contracts | Satisfied on sealed native v4 | Nine cases and 11,784 assertions; required two-device case passes 16 assertions |
-| All 19 public production paths | PENDING at amended cache capacity | Earlier sealed v4 passed 228 completions and 2,850 assertions at four blocks; rerun at 16 blocks |
-| Pinned-oracle model token equality | PENDING | Primary 16, stock MXFP4 and fork IQ1_XXXS must emit matching tokens |
+| All 19 public production paths | Satisfied | Sealed matched16 run passes 228 completions and 2,850 assertions at 16 physical blocks |
+| Pinned-oracle model token equality | PENDING | All 12 stock MXFP4 and fork IQ1_XXXS requests match native; 96 primary requests remain required |
 | Primary plugin operation execution | Satisfied | Exact native plugin, 64 synthetic outputs; original tolerances unchanged |
 | Primary bounded-model execution | Satisfied for Q4_0 only | Operator v5 emits four tokens with normal compilation and graph capture; full token matrix remains pending |
 | Original primary fixture coverage | PENDING | Developer authority for the 289,655,872-byte download; no fixtures downloaded |
 | Stock secondary operation execution | Satisfied | Q8_K direct pinned decoder and MXFP4 real GET_ROWS, including applicable stock geometry |
-| Stock secondary bounded model | PENDING | Pristine first decode aborts; scoped allocation overlay requires runtime qualification |
+| Stock secondary bounded model | Satisfied with bounded overlay | Six MXFP4 requests match native; pristine/overlay recurrent tokens and logits remain exact |
 | IQ1_XXXS fork operation execution | Satisfied | Real pinned fork GET_ROWS; exact outputs and applicable stock geometry |
-| IQ1_XXXS fork bounded model | PENDING | Pristine first decode aborts; scoped allocation overlay requires runtime qualification |
+| IQ1_XXXS fork bounded model | Satisfied with bounded overlay | Six IQ1_XXXS requests match native; pristine/overlay recurrent tokens and logits remain exact |
 | Operation memory format and identical-tool traces | Satisfied | Identical rocprofv3 1.3.5; native allocation events and separate primary tensor telemetry |
-| Native model memory format | PENDING at amended cache capacity | Earlier 228 engines prove BF16 at four blocks and 16,384 bytes; retain evidence and recapture 65,536-byte payload |
-| Matched oracle model memory | PENDING | Primary resolves 16 blocks; identical-tool runtime layout/allocation measurements and secondary execution remain required |
-| CPU regressions | Satisfied | Five CPU targets passed; accelerator-only targets reported three explicit skips |
-| ROCm regressions | Satisfied | Clean HIP build; all 15 CTests executed and passed in sealed native v4 |
+| Native model memory format | Satisfied at amended cache capacity | All 228 runtime allocations report BF16, 16 physical blocks, and 65,536-byte payload; independent model traces remain required below |
+| Matched oracle model memory | PENDING | Live primary tensor and allocator block measure 65,536 bytes; identical-tool backing-allocation measurements remain required |
+| CPU regressions | Satisfied | Amended CPU build passes six tests and explicitly skips two ROCm-only tests |
+| ROCm regressions | Satisfied | Clean HIP build; all 15 CTests and required two-device case pass in sealed matched16 run |
 | Applicable local preflight | PENDING on amended head | Earlier implementation staged driver exits 0 with five argument-dependent skips and CPU ISA passes; rerun on the amended implementation |
 | Combined CUDA/HIP expectation execution | PENDING | No combined build was available for this qualification |
 | Fresh mutation review | PENDING | Independent reviewer on immutable implementation head |

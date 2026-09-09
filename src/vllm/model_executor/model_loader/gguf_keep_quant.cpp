@@ -139,8 +139,8 @@ bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
       // rocm_grouped_gemm.hip implements Q8_0/Q4_K/Q5_K/Q6_K, while
       // rocm_quant_dot.hip adds the seven Q8_K-activation formats below on
       // both grouped and non-grouped arms. IQ4_XS remains with #3029 and is
-      // not admitted by this row; Q4_0/IQ2_XS/IQ3_S/IQ4_XS/MXFP4 stay on the
-      // named expand-or-refuse path.
+      // not admitted by this row; Q4_0/Q5_0/IQ2_XS/IQ4_NL/IQ3_S/IQ4_XS/
+      // MXFP4 stay on the named expand-or-refuse path.
       return dt == vt::DType::kQ8_0 || dt == vt::DType::kQ4_K ||
              dt == vt::DType::kQ5_K || dt == vt::DType::kQ6_K ||
              dt == vt::DType::kIQ2_XXS || dt == vt::DType::kIQ3_XXS ||
@@ -432,13 +432,12 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(vt::DeviceType dev) {
 // this GEMM have a `vec_dot` for this encoding", so for a PLACED routed-expert
 // tower it is a question about the placement device, not about the engine.
 //
-// Measured, on GLM-5.3 `UD-IQ1_S` on `strix:gpu0`: `DeviceKeepQuantSupported`
-// serves {Q8_0, Q4_K, Q5_K, Q6_K} on ROCm, so all 228 IQ1_S/IQ3_XXS/IQ2_XXS/
-// IQ4_XS/Q2_K/Q3_K towers routed `kExpandBf16` and `LoadStackedExperts` refused
-// the load by name -- for towers whose bytes never reach the GPU at all (that
-// model reads a tower only through `GlmExpertSlice`, never through
-// `ResidentWeight`) and which the installed plan had already sent to the CPU,
-// whose `vec_dot` table covers every one of those six encodings.
+// On GLM-5.3 `UD-IQ1_S`, five of the six expert formats now stay quantized on
+// ROCm: IQ1_S/IQ3_XXS/IQ2_XXS/Q2_K/Q3_K. IQ4_XS still routes
+// `kExpandBf16`, so `LoadStackedExperts` can refuse a load for a tower whose
+// bytes never reach the GPU (the model reads a tower only through
+// `GlmExpertSlice`, never through `ResidentWeight`) and which the installed
+// plan has already sent to the CPU. The CPU `vec_dot` table covers all six.
 //
 // THIS IS #1136 AND #2406 ONE SEAM FURTHER ALONG. Both were the same shape: a
 // residency decision resolved against a device other than the one that would

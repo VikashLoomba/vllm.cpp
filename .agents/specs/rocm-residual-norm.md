@@ -340,7 +340,7 @@ The broad #41 ownership does not make the implementations complete.
 
 This row owns #3103 directly. The related BF16 MoE row keeps its complete token gate open.
 No performance or token requirement is waived by native/legacy agreement.
-The operator must assign separate scoped issues/specs for attention and head repairs before their implementation.
+The assigned scoped issues for the attention and head repairs are #3115 (decode attention and Q/K preamble parity) and #3116 (the BF16 LM-head output boundary), both on the BF16 MoE row, filed from the six-position disposition analysis of commit `cc9d4f565`.
 The parent `BACKEND-ROCM` issue #41 retains router debt until its scoped repair is assigned.
 
 ## Implementation and evidence

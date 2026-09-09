@@ -48,4 +48,12 @@ The quoted text below is historical evidence only. It does not define issue auth
 
 ## Resolution
 
--
+The scoped implementation passes public completion through both default and
+callback sampling arms. The operator reproduced the independent red and reran
+all public and focused CPU gates. The implementer completed 30 mutation checks.
+
+The exact GGUF attempt on pinned vLLM refuses the text-only engine configuration
+before generating a token. The owning [specification](../../specs/qwen35-full-attn-state.md)
+records the source hashes, commands, logs, and pending G4 obligation. Fresh
+review and the final operator gate remain pending. Keep this issue open until
+qualified work lands.

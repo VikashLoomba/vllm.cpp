@@ -22,8 +22,10 @@ class NormQuantScratchPool {
  public:
   template <typename QueryCapture, typename Allocate>
   void* Ensure(QueueKey queue, Stream stream, size_t bytes,
-               QueryCapture&& query_capture, Allocate&& allocate) {
-    return pool_.Ensure(queue, bytes, [&](size_t allocation_bytes) {
+               QueryCapture&& query_capture, Allocate&& allocate,
+               size_t* capacity = nullptr) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    void* block = pool_.Ensure(queue, bytes, [&](size_t allocation_bytes) {
       const NormQuantCaptureState capture = query_capture(stream);
       if (capture == NormQuantCaptureState::kActive) {
         throw std::runtime_error(
@@ -37,12 +39,21 @@ class NormQuantScratchPool {
       }
       return allocate(allocation_bytes, stream);
     });
+    if (capacity != nullptr) *capacity = pool_.CapacityFor(queue);
+    return block;
   }
 
-  size_t CapacityFor(QueueKey queue) const { return pool_.CapacityFor(queue); }
-  void* BlockFor(QueueKey queue) const { return pool_.BlockFor(queue); }
+  size_t CapacityFor(QueueKey queue) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pool_.CapacityFor(queue);
+  }
+  void* BlockFor(QueueKey queue) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pool_.BlockFor(queue);
+  }
 
  private:
+  mutable std::mutex mutex_;
   vt::GrowOnlyStreamScratch<QueueKey> pool_;
 };
 
@@ -112,7 +123,7 @@ struct NormQuantCounts {
   uint64_t consumers_standalone = 0;
 };
 
-void* NormQuantProducerScratch(Queue& q, size_t bytes,
+void* NormQuantProducerScratch(Queue& q, size_t bytes, size_t* scratch_capacity,
                                uint64_t* scratch_generation);
 void NormQuantRecordProducer(Queue& q, const void* activation, int64_t rows,
                              int64_t hidden, int64_t row_stride, DType dtype,

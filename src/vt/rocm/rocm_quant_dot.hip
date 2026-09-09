@@ -76,6 +76,7 @@ class QuantDotScratchPool {
                                              // __device__ syntax, no CUDA)
 #include "vt/ops.h"
 #include "vt/quant.h"
+#include "vt/rocm/rocm_norm_quant_bridge.h"
 
 // Forward declarations: the optimized K-quant GEMM kernels in
 // rocm_grouped_gemm.hip (renamed *Gdn). F1 delegates Q8_0/Q4_K/Q5_K/Q6_K to
@@ -857,6 +858,7 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a,
     MatmulBTQuantKernelRocmGdn(q, out, a, b);
     return;
   }
+  NormQuantInvalidate(q);
 
   WType w{};
   if (!IsRocmKeepQuantSupported(b.dtype, &w)) {
@@ -904,6 +906,7 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a,
 void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
                                     const Tensor& weight,
                                     const Tensor& expert_ids) {
+  NormQuantInvalidate(q);
   hipStream_t s = static_cast<hipStream_t>(q.handle);
   const int64_t P = out.shape[0];
   const int64_t n = out.shape[1];

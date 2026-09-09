@@ -37,10 +37,12 @@
 
 #include "vt/grow_only_stream_scratch.h"
 #include "vt/ops.h"
+#include "vt/rocm/rocm_act_quant.h"
 #include "vt/rocm/rocm_arch.h"
 #include "vt/rocm/rocm_device_bind.h"
 #include "vt/rocm/rocm_f16_codec.h"
 #include "vt/rocm/rocm_mmvq_policy.h"
+#include "vt/rocm/rocm_norm_quant_bridge.h"
 #include "vt/rocm/rocm_runtime.h"
 
 // Block layouts — the single source of truth (ggml-common.h mirrors).
@@ -57,11 +59,7 @@ using vt::cpu::BlockQ6_K;
 using vt::cpu::kQK8_0;
 using vt::cpu::kQK_K;
 
-enum class ActDT : int { kF32 = 0, kF16 = 1, kBF16 = 2 };
 using Q8KKernelWitnessCount = unsigned long long;
-inline ActDT ActDtOf(DType dt) {
-  return dt == DType::kF32 ? ActDT::kF32 : dt == DType::kF16 ? ActDT::kF16 : ActDT::kBF16;
-}
 
 // ---- device numeric helpers ----
 // The four half/bfloat16 conversions moved to `vt/rocm/rocm_f16_codec.h`
@@ -69,18 +67,6 @@ inline ActDT ActDtOf(DType dt) {
 // the trellis decode. They are unchanged, and they are still the bit-exact
 // transcriptions of `vt::F16ToF32` / `vt::F32ToF16` rather than the hardware
 // conversion intrinsics; a second copy is what moving them avoided.
-__device__ inline int DNearestInt(float fval) {
-  float val = fval + 12582912.0f;
-  int i = __float_as_int(val);
-  return (i & 0x007fffff) - 0x00400000;
-}
-__device__ inline float DLoadAct(const void* base, ActDT dt, int64_t idx) {
-  switch (dt) {
-    case ActDT::kF32: return static_cast<const float*>(base)[idx];
-    case ActDT::kF16: return DF16ToF32(static_cast<const uint16_t*>(base)[idx]);
-    default: return DBF16ToF32(static_cast<const uint16_t*>(base)[idx]);
-  }
-}
 __device__ __forceinline__ int GetIntB2(const int8_t* qs, int i32) {
   const uint16_t* x16 = reinterpret_cast<const uint16_t*>(qs);
   return static_cast<int>(x16[2 * i32 + 0]) | (static_cast<int>(x16[2 * i32 + 1]) << 16);
@@ -120,37 +106,6 @@ __global__ void QuantizeQ8_0K(BlockQ8_0* __restrict__ scratch, const void* __res
     const float x0 = DLoadAct(a, adt, elem0 + j) * id;
     y.qs[j] = static_cast<int8_t>(roundf(x0));
   }
-}
-
-// The shared body keeps the fused MMVQ prologue byte-identical to the legacy
-// activation quantizer.
-__device__ inline void QuantQ8KSBlock(BlockQ8_K& y, const void* __restrict__ a,
-                                      ActDT adt, int64_t elem0) {
-  float mx = 0.0f, amax = 0.0f;
-  for (int j = 0; j < kQK_K; ++j) {
-    const float x = DLoadAct(a, adt, elem0 + j);
-    if (const float ax = fabsf(x); ax > amax) {
-      amax = ax;
-      mx = x;
-    }
-  }
-  if (amax == 0.0f) {
-    y.d = 0.0f;
-    for (int j = 0; j < kQK_K; ++j) y.qs[j] = 0;
-    for (int g = 0; g < kQK_K / 16; ++g) y.bsums[g] = 0;
-    return;
-  }
-  const float iscale = -127.0f / mx;
-  for (int j = 0; j < kQK_K; ++j) {
-    const int v = DNearestInt(iscale * DLoadAct(a, adt, elem0 + j));
-    y.qs[j] = static_cast<int8_t>(v < 127 ? v : 127);
-  }
-  for (int g = 0; g < kQK_K / 16; ++g) {
-    int sum = 0;
-    for (int ii = 0; ii < 16; ++ii) sum += y.qs[g * 16 + ii];
-    y.bsums[g] = static_cast<int16_t>(sum);
-  }
-  y.d = 1.0f / iscale;
 }
 
 // Q8_K (thread-per-256-superblock): cuda_quant_dot.cu QuantizeQ8KKernel.
@@ -1433,6 +1388,13 @@ bool Q6KSmallPrivateEnabled() {
 std::atomic<uint64_t> g_mmvq_route_baseline{0};
 std::atomic<uint64_t> g_mmvq_route_gemv{0};
 std::atomic<uint64_t> g_mmvq_route_fused{0};
+detail::NormQuantScratchPool<uint64_t, hipStream_t> g_norm_quant_scratch;
+detail::NormQuantTokenRegistry g_norm_quant_tokens;
+std::atomic<uint64_t> g_norm_quant_generation{0};
+std::atomic<uint64_t> g_norm_quant_producers{0};
+std::atomic<uint64_t> g_norm_quant_reused{0};
+std::atomic<uint64_t> g_norm_quant_standalone{0};
+std::atomic<const void*> g_norm_quant_last_scratch{nullptr};
 
 }  // namespace
 
@@ -1446,6 +1408,107 @@ MmvqRouteCounts MmvqRouteCountsForTesting() {
   return {g_mmvq_route_baseline.load(std::memory_order_relaxed),
           g_mmvq_route_gemv.load(std::memory_order_relaxed),
           g_mmvq_route_fused.load(std::memory_order_relaxed)};
+}
+
+void* NormQuantProducerScratch(Queue& q, size_t bytes, size_t* scratch_capacity,
+                               uint64_t* scratch_generation) {
+  EnsureQueueDevice(q);
+  g_norm_quant_tokens.Reset();
+  *scratch_generation =
+      g_norm_quant_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+  const hipStream_t stream = static_cast<hipStream_t>(q.handle);
+  void* scratch = g_norm_quant_scratch.Ensure(
+      q.id, stream, bytes,
+      [](hipStream_t value) {
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        Check(hipStreamIsCapturing(value, &capture),
+              "norm-quant scratch capture query");
+        if (capture == hipStreamCaptureStatusActive) {
+          return detail::NormQuantCaptureState::kActive;
+        }
+        if (capture == hipStreamCaptureStatusNone) {
+          return detail::NormQuantCaptureState::kNone;
+        }
+        return detail::NormQuantCaptureState::kInvalidated;
+      },
+      [](size_t allocation_bytes, hipStream_t value) {
+        void* block = nullptr;
+        Check(hipMallocAsync(&block, allocation_bytes, value),
+              "norm-quant scratch grow");
+        return block;
+      },
+      scratch_capacity);
+  return scratch;
+}
+
+void NormQuantRecordProducer(Queue& q, const void* activation, int64_t rows,
+                             int64_t hidden, int64_t row_stride, DType dtype,
+                             void* scratch, size_t scratch_bytes,
+                             uint64_t scratch_generation) {
+  detail::NormQuantKey key{activation,
+                           rows,
+                           hidden,
+                           row_stride,
+                           dtype,
+                           q.device,
+                           q.id,
+                           q.handle,
+                           std::this_thread::get_id()};
+  g_norm_quant_tokens.Record(detail::NormQuantToken{
+      key, scratch, scratch_bytes, scratch_generation});
+  g_norm_quant_last_scratch.store(scratch, std::memory_order_release);
+  g_norm_quant_producers.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool NormQuantTakeConsumer(Queue& q, const void* activation, int64_t rows,
+                           int64_t hidden, int64_t row_stride, DType dtype,
+                           const void** scratch) {
+  const detail::NormQuantKey key{activation,
+                                 rows,
+                                 hidden,
+                                 row_stride,
+                                 dtype,
+                                 q.device,
+                                 q.id,
+                                 q.handle,
+                                 std::this_thread::get_id()};
+  const std::optional<detail::NormQuantToken> token =
+      g_norm_quant_tokens.Take(key);
+  const size_t required =
+      hidden > 0 && hidden % kQK_K == 0 && rows > 0
+          ? static_cast<size_t>(rows) * static_cast<size_t>(hidden / kQK_K) *
+                sizeof(BlockQ8_K)
+          : 0;
+  if (token.has_value() && required > 0 && token->scratch != nullptr &&
+      token->scratch_bytes >= required &&
+      token->scratch_generation ==
+          g_norm_quant_generation.load(std::memory_order_acquire)) {
+    *scratch = token->scratch;
+    g_norm_quant_reused.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  g_norm_quant_standalone.fetch_add(1, std::memory_order_relaxed);
+  return false;
+}
+
+void NormQuantInvalidate(Queue&) { g_norm_quant_tokens.Reset(); }
+
+NormQuantCounts NormQuantCountsForTesting() {
+  return {g_norm_quant_producers.load(std::memory_order_relaxed),
+          g_norm_quant_reused.load(std::memory_order_relaxed),
+          g_norm_quant_standalone.load(std::memory_order_relaxed)};
+}
+
+void NormQuantResetForTesting() {
+  g_norm_quant_tokens.Reset();
+  g_norm_quant_last_scratch.store(nullptr, std::memory_order_release);
+  g_norm_quant_producers.store(0, std::memory_order_relaxed);
+  g_norm_quant_reused.store(0, std::memory_order_relaxed);
+  g_norm_quant_standalone.store(0, std::memory_order_relaxed);
+}
+
+const void* NormQuantLastScratchForTesting() {
+  return g_norm_quant_last_scratch.load(std::memory_order_acquire);
 }
 
 // Warps that cooperate on one output row of the dense K-quant GEMM. 1 selects
@@ -1529,6 +1592,7 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
   dim3 block(32, kWarpsPerBlock);
   const uint8_t* w = static_cast<const uint8_t*>(b.data);
   if (b.dtype == DType::kQ8_0) {
+    NormQuantInvalidate(q);
     if (k % kQK8_0 != 0) throw std::runtime_error("vt rocm: matmul_bt_quant Q8_0: K%32!=0");
     const int64_t nb = k / kQK8_0;
     BlockQ8_0* qact = static_cast<BlockQ8_0*>(EnsureQuantScratch(
@@ -1590,6 +1654,7 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
       }
     };
     if (mmvq_route == detail::MmvqRoute::kFused) {
+      NormQuantInvalidate(q);
       g_mmvq_route_fused.fetch_add(1, std::memory_order_relaxed);
       if (out.dtype == DType::kF32) {
         launch_mmvq(float{}, nullptr);
@@ -1600,10 +1665,17 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
       return;
     }
 
-    BlockQ8_K* qact = static_cast<BlockQ8_K*>(EnsureQuantScratch(
-        static_cast<size_t>(m) * nsb * sizeof(BlockQ8_K), s));
-    LaunchQ8KQuantizer(qact, a.data, ActDtOf(a.dtype), a.stride[0], m, nsb, s,
-                       Q8KProductionRoute::kDense, q.device.index);
+    BlockQ8_K* qact = nullptr;
+    const void* produced_scratch = nullptr;
+    if (NormQuantTakeConsumer(q, a.data, m, k, a.stride[0], a.dtype,
+                              &produced_scratch)) {
+      qact = static_cast<BlockQ8_K*>(const_cast<void*>(produced_scratch));
+    } else {
+      qact = static_cast<BlockQ8_K*>(EnsureQuantScratch(
+          static_cast<size_t>(m) * nsb * sizeof(BlockQ8_K), s));
+      LaunchQ8KQuantizer(qact, a.data, ActDtOf(a.dtype), a.stride[0], m, nsb,
+                         s, Q8KProductionRoute::kDense, q.device.index);
+    }
     if (mmvq_route == detail::MmvqRoute::kGemv) {
       g_mmvq_route_gemv.fetch_add(1, std::memory_order_relaxed);
       if (out.dtype == DType::kF32) {
@@ -1716,8 +1788,9 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
 // target GDN-MoE GGUFs carry); anything else throws loudly (never a silent
 // CPU-pointer deref on a discrete card).
 void MatmulBTQuantGroupedKernelRocmGdn(Queue& q, Tensor& out, const Tensor& act,
-                                    const Tensor& weight, const Tensor& expert_ids) {
+                                       const Tensor& weight, const Tensor& expert_ids) {
   EnsureQueueDevice(q);
+  NormQuantInvalidate(q);
   const int64_t P = out.shape[0], n = out.shape[1], k = act.shape[1];
   if (P == 0 || n == 0) return;
   const int64_t Pa = act.shape[0];

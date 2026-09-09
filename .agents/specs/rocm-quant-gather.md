@@ -19,9 +19,15 @@ The public gate reaches all 19 formats. All 76 operation outputs
 meet the pinned oracle gates, and matching native/primary traces pass.
 The row uses one pull request and retains the reviewed full-attention prerequisite.
 
-The original 32 primary fixtures await download authority. The primary renderer refuses the exact Q4_0 fixture; both secondary bounded
-models abort on their first decode. Their execution and cache-layout qualification
-remain pending. Local preflight completes with its argument-dependent skips recorded.
+The original 32 primary fixtures await download authority. The corrected primary
+launch emits four tokens from the exact Q4_0 fixture with normal compilation and
+graph capture. The complete oracle token matrix remains pending. Both pristine
+secondary bounded models abort on their first decode. The committed amendment
+below scopes the configuration repairs, matched physical cache allocation, and
+secondary allocation overlay. Its implementation and qualification remain pending.
+The earlier native gates retain their measured four-block configuration.
+The earlier implementation preflight retains its argument-dependent skips.
+The amended head still requires its final staged preflight.
 Fresh mutation review and the operator's reviewed-head rerun remain required. The row is not ready to land or become `DONE`.
 
 The [row evidence](../../docs/bench-evidence/rocm-quant-gather/README.md)
@@ -327,10 +333,15 @@ Run this same public path for all 19 admitted formats.
 Load with public `device=0` in a HIP-only build and retain default compressed residency.
 The ABI defines automatic selection as 0 and has no explicit ROCm device value.
 Require measured ROCm provider selection before accepting the automatic selection.
-Set `block_size=16`, `num_blocks=4`, `max_model_len=64`, and `max_num_seqs=1`.
+Set `block_size=16`, `num_blocks=16`, `max_model_len=64`, and `max_num_seqs=1`.
 Set `kv_cache_dtype="auto"` and require its resolved cache storage to be bf16.
-The one-layer KV payload is 16,384 bytes, excluding allocation alignment and block metadata.
-Use the same block geometry and cache storage in each executing oracle.
+The one-layer KV payload is 65,536 bytes, excluding allocation alignment and block metadata.
+Match physical capacity and cache storage in each executing oracle. The primary
+and native pools reserve one of their 16 blocks, leaving 240 usable cells.
+Stock and fork llama.cpp pad the requested context of 64 to 256 cells.
+Their cache is contiguous and has no equivalent native page-layout requirement.
+Keep requested context, prompts, and generation lengths unchanged. Report each
+engine's resolved capacity separately; do not call its logical limit identical.
 
 Use two pre-tokenized prompts: `[1, 0, 63, 127, 63]` and `[1, 127, 0, 127]`.
 Their lengths are 5 and 4. Do not insert tokenizer special tokens in either oracle.
@@ -484,6 +495,137 @@ type-15 entry and mis-sizes its geometry independently. Both mutations must
 fail a meaningful gate. After adding the trait, rerun the loader-focused red
 to identify the materializer failure before changing that guard.
 
+### Bounded oracle configuration and allocation amendment
+
+The operator approved this scope on 9 September 2026 UTC under issue #3093.
+Commit this amendment before a fresh implementer changes the capture harness.
+The original generated GGUF files, 19 codecs, projections, prompts, sampling,
+three repeats, four generated tokens, and logical native/primary limit remain fixed.
+The amendment changes configuration and unused-input allocation bookkeeping.
+It authorizes no decoder, model arithmetic, tokenizer, or shared loader repair.
+
+#### Primary configuration
+
+The plugin's `weights_adapter/qwen3_5.py:38-42` maps the text model type to
+`Qwen3_5ForConditionalGeneration`. Its `config_parser.py:43-53` and
+`weights_adapter/qwen3_5.py:225` restore that architecture during configuration
+and loading. Overriding the architecture field alone cannot survive that chain.
+Use the pinned vLLM `model_class_overrides` argument with this exact mapping:
+
+```python
+{"Qwen3_5ForConditionalGeneration":
+ "vllm.model_executor.models.qwen3_5:Qwen3_5ForCausalLM"}
+```
+
+At the active pin, `vllm/config/model.py:319-325` defines this development
+argument and lines 1032-1055 apply it in the front end and workers.
+`vllm/model_executor/models/registry.py:202` already registers that text class.
+Its definition in `models/qwen3_5.py:325-451` uses the same Qwen3.5 model,
+forward path, and weight loader. Record the development argument as a harness
+adaptation. Preserve the default compiler, graph capture, and kernel dispatch.
+Do not add a vision configuration or change the oracle source.
+
+Pass `hf_overrides={"partial_rotary_factor": 1.0}`. The unchanged GGUF requests
+rotary width 64 with head width 64 and sections `[16, 8, 8, 0]`.
+The pinned `vllm/transformers_utils/configs/qwen3_5.py:86` defaults the top-level
+factor to 0.25. The executing Transformers `modeling_rope_utils.py:787-788`
+copies that factor over the nested value during normalization. The original
+configuration therefore resolves rotary width 16 and fails its section check.
+The explicit top-level factor preserves the existing model geometry.
+The retained CPU probe demonstrates both resolutions using the executing image.
+
+#### Physical cache capacity
+
+The pinned `vllm/v1/core/kv_cache_utils.py:2288-2309` allocates the requested
+physical blocks and subtracts one null block for admission. Four blocks of 16
+leave 48 usable tokens and cannot admit `max_model_len=64`.
+The v4 primary attempt proves this refusal after successful model loading,
+normal compilation, and graph capture. The secondary pins independently pad
+context to 256 in `src/llama-context.cpp:288` for stock and line 285 for the fork.
+
+Use 16 physical blocks of 16 in the native public test and primary harness.
+This matches the secondary physical payload of
+`256 * 1 * (64 + 64) * 2 = 65,536` bytes for BF16 K and V.
+Native `LoadedEngine::ResolveNumBlocks` accepts explicit block counts;
+`vllm::v1::BlockPool` reserves the null block. No product change is needed for 16 blocks.
+Keep the earlier four-block measurements with their original values and mark
+them superseded for matched oracle memory. Do not relabel or delete their traces.
+The existing issue #2719, owned by `KV-SIZING`, tracks the separate native
+admission gap. This row neither repairs that gap nor claims it closed.
+
+The operator's v5 Q4_0 attempt exits 0 and emits `[47, 19, 4, 20]` for the first
+prompt and repeat. The unchanged GGUF SHA256 is
+`663597e28852d64097f7a67542675e4575ee158d3c5e6e2143aadd1b4188f4af`.
+Its resolved dtype is BF16 and its cache reports 16 blocks and 256 cells.
+The operator verified 2,500 inputs before and after the run. This proves one
+bounded execution. It does not prove the remaining formats, repeats, token
+equality, or observed cache tensor layout and allocation bytes.
+
+#### Secondary allocation overlay
+
+Keep pristine source trees and binaries for both recorded secondary pins.
+The stock and fork create an unused recurrent copy input for this one-layer,
+full-attention model. Stock `src/llama-graph.cpp:3397-3416` creates `s_copy`;
+lines 3481-3489 attach hybrid inputs even though no recurrent layer consumes it.
+The fork has the corresponding functions at lines 3379 and 3463.
+The graph allocator allocates graph leaves and nodes. Its input setter later
+writes the unallocated tensor. Stock `src/llama-context.cpp:1379-1380` explicitly
+documents this unused-input failure; the existing model logs reach its buffer
+assertion on the first decode. The allocation diagnosis still requires a runtime
+red/green witness that identifies `s_copy`.
+
+Build separate row-owned overlay copies of the exact pins. In
+`llm_graph_context::build_inp_mem_hybrid`, retain the recurrent copy input as a
+graph leaf with `ggml_build_forward_expand(gf, inp_rs->s_copy)` after creation.
+This scopes one allocation repair to each pinned `src/llama-graph.cpp`.
+Keep the buffer assertion and all existing input writes. A blanket null-buffer
+skip could hide a required recurrent input and is not an admissible repair.
+Do not change weights, codec arithmetic, graph computation, or model topology.
+
+Qualify this overlay only for the bounded synthetic model in this row.
+Record pristine pin, exact patch, patched-source digest, build flags, executable
+and linked-library digests, model hashes, and runtime outputs. Describe every
+model result as the pinned secondary plus that named overlay. The independent
+codec gates continue to execute pristine binaries and must preserve their output
+hashes. No global oracle pin or gateability record changes. Issue #933 still
+owns the published 2.4T fork qualification.
+
+Capture the pristine model failure and overlay success on identical inputs.
+Run both prompts three times through fresh engines for stock MXFP4 and fork
+IQ1_XXXS. Require exact token equality to native and repeated-run agreement.
+Run a control with an actual recurrent layer on each pristine and overlay
+binary; require identical tokens and logits. A controlled hybrid-input test may
+exercise recurrent state instead if no suitable model is available, but it must
+consume the recurrent copy tensor and verify state values through graph reuse.
+No missing control can become a source-only pass. A fresh reviewer removes the
+retained leaf and requires the bounded-model failure to return. Independently
+verify the unchanged recurrent path and pristine codec output hashes.
+
+#### Scoped implementation and verification
+
+The fresh implementer may change `tools/rocm_quant_gather/primary_model.py`,
+`tools/rocm_quant_gather/secondary.cpp`, and row-owned capture, patch, comparison,
+and evidence files. They may set 16 blocks in
+`tests/capi/test_rocm_embedding_quant.cpp`, preserving its public ABI entry and
+all fixture bytes. An additional public-ABI capture runner is allowed if needed;
+it must use `include/vllm.h` and preserve that test's complete workload.
+No shared product file or checker semantics enters this amendment.
+
+Retain meaningful failing primary and secondary launches, then capture focused
+green with these corrections. Rerun all 19 public formats and dense controls at
+16 blocks. Compare all 16 primary model formats, stock MXFP4, and fork IQ1_XXXS
+on both prompts and all repeats. The Q8_K decoder-only adaptation remains exact.
+Measure native and oracle model memory with the same tool, recording actual
+cache dtype, physical payload, layout, reserved capacity, and allocation overhead
+separately. A config string alone cannot establish this memory gate.
+Fresh review removes the registry and RoPE corrections independently, checks
+that incorrect cache capacity fails comparison, and mutates the secondary leaf
+as described above. Run focused and full gates, obtain PASS review on an
+immutable head, and have the operator rerun the final gates.
+
+The [amendment evidence](../../docs/bench-evidence/rocm-quant-gather/oracle-amendment/README.md)
+retains the primary launch progression, CPU RoPE probe, receipts, and hashes.
+
 ## Tests and gates
 
 ### Red-first implementation gate
@@ -574,23 +716,23 @@ The current result inventory is:
 
 | Obligation | Result | Authority or remaining evidence |
 |---|---|---|
-| Committed spec before implementation | Satisfied | Original spec plus materializer and reader amendments precede product edits |
+| Committed spec before implementation | Satisfied | Original spec and materializer/reader amendments precede product edits; bounded-oracle amendment precedes its harness implementation |
 | All 19 native decoder and error contracts | Satisfied on sealed native v4 | Nine cases and 11,784 assertions; required two-device case passes 16 assertions |
-| All 19 public production paths | Satisfied on sealed native v4 | 228 completions, 2,850 assertions; all 456 capture files equal the trace run byte-for-byte |
+| All 19 public production paths | PENDING at amended cache capacity | Earlier sealed v4 passed 228 completions and 2,850 assertions at four blocks; rerun at 16 blocks |
 | Pinned-oracle model token equality | PENDING | Primary 16, stock MXFP4 and fork IQ1_XXXS must emit matching tokens |
 | Primary plugin operation execution | Satisfied | Exact native plugin, 64 synthetic outputs; original tolerances unchanged |
-| Primary bounded-model execution | PENDING | Exact Q4_0 fixture reaches pinned renderer, which refuses Qwen3_5TextConfig before tokens |
+| Primary bounded-model execution | Satisfied for Q4_0 only | Operator v5 emits four tokens with normal compilation and graph capture; full token matrix remains pending |
 | Original primary fixture coverage | PENDING | Developer authority for the 289,655,872-byte download; no fixtures downloaded |
 | Stock secondary operation execution | Satisfied | Q8_K direct pinned decoder and MXFP4 real GET_ROWS, including applicable stock geometry |
-| Stock secondary bounded model | PENDING | First decode aborts; upstream context padding also differs from required cache geometry |
+| Stock secondary bounded model | PENDING | Pristine first decode aborts; scoped allocation overlay requires runtime qualification |
 | IQ1_XXXS fork operation execution | Satisfied | Real pinned fork GET_ROWS; exact outputs and applicable stock geometry |
-| IQ1_XXXS fork bounded model | PENDING | First decode aborts; requested 64 cells resolve to 256 |
+| IQ1_XXXS fork bounded model | PENDING | Pristine first decode aborts; scoped allocation overlay requires runtime qualification |
 | Operation memory format and identical-tool traces | Satisfied | Identical rocprofv3 1.3.5; native allocation events and separate primary tensor telemetry |
-| Native model memory format | Satisfied | 228 public engines: 912 BF16 KV reads, 912 two-byte writes, one matching 16,384-byte allocation per engine; allocation role attributed through source |
-| Matched oracle model memory | PENDING | Primary renderer refusal and secondary cache padding/model aborts |
+| Native model memory format | PENDING at amended cache capacity | Earlier 228 engines prove BF16 at four blocks and 16,384 bytes; retain evidence and recapture 65,536-byte payload |
+| Matched oracle model memory | PENDING | Primary resolves 16 blocks; identical-tool runtime layout/allocation measurements and secondary execution remain required |
 | CPU regressions | Satisfied | Five CPU targets passed; accelerator-only targets reported three explicit skips |
 | ROCm regressions | Satisfied | Clean HIP build; all 15 CTests executed and passed in sealed native v4 |
-| Applicable local preflight | Satisfied with explicit skips | Full staged driver exits 0 with no failures and five argument-dependent skips; CPU ISA passes separately; final commit classification accompanies the handoff |
+| Applicable local preflight | PENDING on amended head | Earlier implementation staged driver exits 0 with five argument-dependent skips and CPU ISA passes; rerun on the amended implementation |
 | Combined CUDA/HIP expectation execution | PENDING | No combined build was available for this qualification |
 | Fresh mutation review | PENDING | Independent reviewer on immutable implementation head |
 | Operator verification | PENDING | Operator rerun after final scoped review |

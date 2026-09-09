@@ -132,16 +132,19 @@ The source allocates four pages of `16 * 1 * (64 + 64) * 2 = 4096` bytes each.
 The allocator-to-KV attribution uses that source chain: CSV does not expose kernel argument pointers.
 The observed cache template dtype and byte counts are preserved separately from this attribution.
 `public-model-trace-captures.tar.gz` retains complete profiler CSVs, completion captures, and the scratch capture audit.
-This establishes native BF16 cache storage; matching oracle model memory remains pending.
+This establishes native BF16 cache storage at the original four-block setting.
+The committed oracle amendment requires 16 blocks and a new matched memory capture.
+The original traces retain their measured values.
 
-## Remaining qualifications
+## Initial qualification failures
 
 The stock and fork bounded model attempts both abort on their first decode before emitting tokens.
 The observed assertion is `ggml-backend.cpp:194::GGML_ASSERT(buffer)` through hybrid memory input setup.
 An unused recurrent input is the source-based hypothesis, not a proven object-allocation diagnosis.
 Their context request of 64 resolves to 256 cache cells through the pinned upstream padding rule.
-Their BF16 KV payload is therefore 65,536 bytes, against the spec's requested 16,384 bytes.
-That configuration adaptation and both model executions remain pending under issue #3093.
+Their BF16 KV payload is therefore 65,536 bytes, against the original spec's 16,384 bytes.
+The committed amendment matches that physical capacity in the native and primary
+arms. Both secondary model executions still require qualification under issue #3093.
 The fork's independent real 2.4T qualification remains owed under issue #933.
 
 The primary model attempt uses this row's exact Q4_0 fixture, SHA256
@@ -152,7 +155,11 @@ The second attempt supplies writable task-local cache paths without changing the
 It reaches the pinned renderer and refuses `Qwen3_5TextConfig` where `Qwen3_5Config` is required.
 It emits no tokens. The full traceback and sealed recipe preserve that actual model refusal.
 The operator checked 340 input files before and after the second attempt.
-No further model adaptation is approved; this gate remains pending under issue #3093.
+That refusal predates the approved configuration amendment. The corrected v5
+launch emits four tokens from the unchanged Q4_0 fixture with normal compilation
+and graph capture. The [amendment evidence](oracle-amendment/README.md) retains
+the intervening RoPE and cache-admission failures, successful launch, and receipts.
+The full token matrix and matched model memory remain pending under issue #3093.
 The final v4 operator audit confirms all 456 completion files equal the traced run byte-for-byte.
 All 33 sealed source, library, and executable files remained unchanged during v4.
 The row stays active until model execution, original fixtures, fresh mutation review,

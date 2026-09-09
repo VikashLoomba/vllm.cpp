@@ -867,7 +867,7 @@ The operator independently verifies these comparisons.
 The complete HIP GGUF target now passes 57 of 58 cases and all 10,455
 completed assertions. Its remaining case reaches a further existing ROCm refusal: no native
 `AttnGateSplit` provider. The explicit-head fixture retains its real gated
-attention and reaches `qwen3_5.cpp:5634`. It cannot finish that forward.
+attention and reaches `FullAttnBlockPaged` at `qwen3_5.cpp:5813`. It cannot finish that forward.
 `operator-focused/gguf-keep-quant-control-receipt.json` records exit one and
 log SHA256 `f4d682bdfa800b80c7e25d75b51c31f00a0d3168579534a3e25fff2fda84752a`.
 F16-G3 remains failing. The fixture and its expected outcome are unchanged.

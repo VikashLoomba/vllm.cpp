@@ -190,6 +190,26 @@ row state to equal the matrix state, and require a claim used by a `SPIKE` or
 the annotation and `ACTIVE` to `DONE` in the claim column; each must fail for
 its own mismatch.
 
+A complete read-only inventory at `03cfbdb85` found 60 claim files and 63
+recognized row references. Fifty-seven annotations already match. The six
+pre-existing mismatches are a finite migration, not an allowlist:
+
+- `CLAIM-MODEL-GLM-MOE-DSA`, `CLAIM-MODEL-MUSIC3-W0`, and
+  `CLAIM-SERVE-RECIPE-ARGS` annotate their live `ACTIVE` owner rows as `SPIKE`.
+- `CLAIM-ROCM-GEMMA4-GETBLAS-DUALSLOT`,
+  `CLAIM-ROCM-GEMMA4-INDEXED-MAX-T`, and
+  `CLAIM-ROCM-GEMMA4-PREFILL-PEER-HELPER` reference the `ACTIVE`
+  `BACKEND-ROCM` row without a lifecycle annotation. They are not its selected
+  owner, but the claim syntax must still be complete.
+
+The #3099 implementation changes those six annotations to `ACTIVE` in the same
+commit that turns on the general check. It does not change their separate claim
+lifecycle columns. The repository currently uses `ACTIVE`, `IMPLEMENTING`, and
+`SPIKE` as nonterminal claim states; each counts as live when a matrix row names
+the claim as owner. `DONE` does not. An unknown claim state fails instead of
+silently becoming live. Tests must cover one matching example of each existing
+nonterminal state, the two review mutations above, and a missing annotation.
+
 ## Tests and gates
 
 This roadmap intake must pass:

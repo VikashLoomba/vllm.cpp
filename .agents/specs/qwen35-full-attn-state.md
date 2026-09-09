@@ -41,6 +41,25 @@ kernels, new graph backends, new speculative modes, checkpoint downloads,
 package installation, continuous integration changes, and global oracle pins.
 The fix has no dependency on the separate gfx1100 provider changes.
 
+### Runner regression amendment
+
+On 9 September 2026 UTC, integration testing found an obsolete expectation in
+`tests/vllm/v1/worker/test_runner.cpp`. Its full-attention-only step case still
+expects the forward's former GDN refusal. The reviewed consumer checks now
+allow that same unchanged fixture to execute successfully.
+
+The operator authorizes a test-only correction under #3098. Require successful
+execution, a valid sampled token with request feedback, and populated attention
+state while recurrent state remains absent. Preserve the fixture's geometry,
+weights, prompt, empty layer types, and single full-attention cache group.
+This amendment changes no runner allocation, group topology, or product code.
+
+Capture the current assertion failure before editing. Run the corrected focused
+case and the complete runner suite. In a scratch build, restore the dense
+forward's unconditional GDN metadata requirement. The corrected case must fail
+at that original refusal. Restore all source and archive bytes after the
+mutation. Fresh review and operator verification remain required.
+
 ## Inventory
 
 This per-row inventory owns the child identity through the canonical spec scan.

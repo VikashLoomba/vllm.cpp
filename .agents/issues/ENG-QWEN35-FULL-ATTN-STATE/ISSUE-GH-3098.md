@@ -63,3 +63,11 @@ before generating a token. The owning [specification](../../specs/qwen35-full-at
 records the source hashes, commands, logs, and pending G4 obligation. Fresh
 review and the final operator gate remain pending. Keep this issue open until
 qualified work lands.
+
+The full-attention runner regression now requires successful execution and
+sampled-token feedback instead of the former GDN refusal. Its focused case
+passes 18 assertions and the complete CPU runner suite passes 41 cases and
+1914 assertions. Restoring unconditional dense GDN validation fails the new
+case at the original refusal. The scoped spec amendment precedes this test-only
+repair; runner allocation, group topology, fixtures, and product code stay
+unchanged. The specification records the exact red, green, and mutation evidence.

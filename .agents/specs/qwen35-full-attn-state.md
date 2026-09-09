@@ -554,6 +554,37 @@ Fresh scoped review and the final operator gate remain pending.
 G4 retains the pinned engine refusal. This test repair adds no oracle waiver,
 GPU replay numerical claim, or performance claim.
 
+### Runner completion expectation repair
+
+The committed amendment `78c7441bd26db62904c18f6c105dd64dac265e77` precedes
+this test edit. The unchanged pre-repair case returns one because it expects
+an exception from a successful forward. The focused red log SHA256 is
+`0750d5cb6e1cedda4e690e8340d3331790193604c04fb99ceffbfeca4c865641`.
+
+The repaired case passes 18 assertions. It checks the actual prompt, produced
+logit row and request counts, changed attention-cache bytes in both layers,
+an in-range sampled token, and token feedback into the admitted request.
+The GDN group, caches, and metadata remain absent. The fixture bytes and
+all production source remain unchanged by this repair.
+The complete CPU runner suite passes 41 cases and 1914 assertions.
+
+Evidence is under `/home/vikash/.cache/rdna3-f16-repair1/runner-repair`.
+`obsolete-expectation-red.json`, `build-receipt.json`, `focused-green.json`,
+and `full-green.json` pin the source, private CPU and HIP binaries, exact
+commands, and logs. The corrected test source SHA256 is
+`8b70d78678245776737965cd461123b62716ed1d2cf130d604234e67519f09b2`.
+
+The separate scratch mutation restores only the dense entry's unconditional
+GDN validation. The repaired runner case returns one at the original
+`gdn_meta.num_actual_tokens must equal T` refusal. Its two assertions contain
+one setup pass and one intended failure. The mutation log SHA256 is
+`dd4585b2a527b262ba3447444a48566144f56c30ffc99419719eb69ea4e68d83`.
+`../mutations/runner-gdn-consumer/recipe.json` records the fresh archive copy,
+compile and link arguments, mutant binary, and byte-exact scratch restoration.
+The original production source and archive hashes remain unchanged.
+Fresh scoped review and the final operator gate remain required. The pinned
+GGUF primary refusal retains its existing G4 disposition.
+
 ## Risks and stop conditions
 
 - `NEEDS_CONTEXT`: the frozen fixture bytes, pinned runtime, or source cannot

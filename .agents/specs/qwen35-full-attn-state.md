@@ -487,6 +487,54 @@ G4 remains `PENDING` on the operator's pinned GGUF runtime capability.
 The implementation does not substitute a model or oracle. Issue #3098 retains
 ownership of this gate, independent review, and the final operator gate.
 
+### First-offset and ordering coverage repair
+
+Fresh review of `25bea3e67597f6700fc1f2e9cfb5269948338c6d` found two missing
+negative cases in `FullAttnGraphShapeGuards`. Deleting the first-offset check
+or the ordering check independently left the existing focused suites green.
+The reviewer found no product defect for this finding.
+
+The repair adds distinct subcases for both dense and MoE graph `Step` methods.
+The first-offset case uses `{1,1}` with one request. The ordering case uses
+`{0,2,1,3}` with three requests and matching token, slot, sequence, and block
+arrays. Both cases retain empty GDN metadata and the existing exception checks.
+All production bytes remain unchanged from the reviewed implementation.
+
+Repair evidence on 9 September 2026 UTC is under
+`/home/vikash/.cache/qwen35-full-attn-state-repair1/evidence`.
+The linked worktree is `/home/vikash/vllm.cpp-qwen35-full-attn-state-repair1`.
+The repaired test source has SHA256
+`b8f5d330fd2d6436e19e9573406adda85cb6fd1ce1736332536b1da5df403ba5`.
+The normal graph executable has SHA256
+`0af438e83c0c15b66860e95dd6ea47660555387a5fc9d6716ee34a5b1d0c5d80`.
+
+Each deleted-guard mutant returns 1 for each sibling's corresponding new
+subcase. Each failure reports that the expected exception did not occur.
+An unchanged address-sanitized control passes both complete shape cases.
+Every mutation uses a scratch source and a fresh copy of this worktree's
+CPU archive. Production and test restoration hashes match after every run.
+The mutation manifest has SHA256
+`5248b0efd6fc9e0cf465aed89a36c87933f8dca0e9cbec71e07bbb157d0d6607`.
+It records exact compile, link, and run arguments, binary hashes, and logs.
+The external recipe is
+`/home/vikash/.cache/qwen35-full-attn-state-repair1/run-mutations.py`, SHA256
+`9bb055dbdcbc070ecd9ce06e21968d44328e14552ecd6759f44da4b61c2804cf`.
+
+The four complete CPU suites listed under G2 and G3 pass in `cpu-green.log`.
+The complete graph suite passes 16 cases and 1558 assertions in `graph-green.log`.
+Configure and build arguments match the earlier CPU recipe, with at most
+`-j 4` and this repair worktree's paths. Temporary files stay outside the
+worktree, and `GIT_CONFIG_GLOBAL=/dev/null` isolates Git fixtures.
+
+The full preflight before edits returns 0. The staged preflight uses the same
+NumPy path and external compile-scheduler wrapper as the implementation gate.
+The repair handoff records the staged result and exact-range checks.
+The explicit CPU instruction-set audit passes against this worktree's
+`build-full-attn-cpu/compile_commands.json`.
+Fresh scoped review and the final operator gate remain pending.
+G4 retains the pinned engine refusal. This test repair adds no oracle waiver,
+GPU replay numerical claim, or performance claim.
+
 ## Risks and stop conditions
 
 - `NEEDS_CONTEXT`: the frozen fixture bytes, pinned runtime, or source cannot

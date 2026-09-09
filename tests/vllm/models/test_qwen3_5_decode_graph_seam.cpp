@@ -1102,8 +1102,21 @@ void FullAttnGraphShapeGuards(const HfConfig& c, const Weights& w) {
     am.query_start_loc.back() = 2;
     expected = "query offsets";
   }
+  SUBCASE("query offsets start after zero") {
+    am.query_start_loc = {1, 1};
+    am.query_start_loc_cpu = am.query_start_loc;
+    expected = "query offsets";
+  }
+  SUBCASE("query offsets descend inside the batch") {
+    am = FullAttnDecodeMeta(3, 0);
+    am.query_start_loc = {0, 2, 1, 3};
+    am.query_start_loc_cpu = am.query_start_loc;
+    expected = "query offsets";
+  }
   REQUIRE(expected != nullptr);
-  CHECK_THROWS_WITH_AS(graph.Step({11}, {0}, am, {}, pool.attn_kv, pool.gdn_state),
+  const std::vector<int32_t> ids(static_cast<size_t>(am.num_actual_tokens), 11);
+  const std::vector<int32_t> positions(static_cast<size_t>(am.num_actual_tokens), 0);
+  CHECK_THROWS_WITH_AS(graph.Step(ids, positions, am, {}, pool.attn_kv, pool.gdn_state),
                        doctest::Contains(expected), std::runtime_error);
 }
 

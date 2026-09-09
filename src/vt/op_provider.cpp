@@ -522,6 +522,12 @@ const char* OpNameImpl(OpId op) {
       return "FusedNormRope";
     case OpId::kMoeGroupedGemmBf16GateUpSilu:
       return "MoeGroupedGemmBf16GateUpSilu";
+    case OpId::kMoeGroupedGemmBf16GateUpSiluNative:
+      return "MoeGroupedGemmBf16GateUpSiluNative";
+    case OpId::kMoeGroupedGemmBf16Weighted:
+      return "MoeGroupedGemmBf16Weighted";
+    case OpId::kMoeCombinePreweighted:
+      return "MoeCombinePreweighted";
     case OpId::kLaguna:
       return "Laguna";
     case OpId::kMarlinDenseGemm:

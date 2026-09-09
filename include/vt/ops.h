@@ -825,6 +825,11 @@ enum class OpId : uint8_t {
   // blocks * BlockElems}. Decode-only (BACKEND-TENSTORRENT-KEEPQUANT W1);
   // the dot provider and the keep-quant predicate arm ride W2.
   kKeepQuantDecode,
+  // Explicit native BF16 MoE numerics. The legacy grouped signatures and
+  // FP32 gate/up intermediates remain unchanged for existing callers.
+  kMoeGroupedGemmBf16GateUpSiluNative,
+  kMoeGroupedGemmBf16Weighted,
+  kMoeCombinePreweighted,
   kCount
 };
 
@@ -2187,6 +2192,12 @@ using MoeGroupedGemmBf16Fn =
 using MoeGroupedGemmBf16GateUpSiluFn =
     void (*)(Queue&, Tensor& /*out*/, const Tensor& /*act*/, const Tensor& /*expert_ids*/,
              const Tensor* /*row_map*/, const Tensor& /*gate_ptrs*/, const Tensor& /*up_ptrs*/);
+using MoeGroupedGemmBf16GateUpSiluNativeFn = MoeGroupedGemmBf16GateUpSiluFn;
+using MoeGroupedGemmBf16WeightedFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, const Tensor&,
+             const Tensor& /*route_weights*/);
+using MoeCombinePreweightedFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor* /*shared*/, float /*routed_scale*/);
 // kMatmulBTQuantGrouped: out[P,N], act[P,K] (f32/bf16), weight[E*N,K] block-quant,
 // expert_ids[P] i32 — weight row for (p,n) is expert_ids[p]*N + n.
 using MatmulBTQuantGroupedFn =
@@ -3236,6 +3247,28 @@ void MoeGroupedGemmBf16(Queue& q, Tensor& out, const Tensor& act, const Tensor& 
 void MoeGroupedGemmBf16GateUpSilu(Queue& q, Tensor& out, const Tensor& act,
                                   const Tensor& expert_ids, const Tensor* row_map,
                                   const Tensor& gate_ptrs, const Tensor& up_ptrs);
+
+// Native BF16 boundaries from vLLM e126687a9a, triton_moe.py:388-527 and
+// activation_kernels.cu:44,165-177: BF16 gate/up, BF16 SiLU, BF16 product.
+// Uses the same pointer-array layout and validation as the legacy sibling.
+void MoeGroupedGemmBf16GateUpSiluNative(Queue& q, Tensor& out, const Tensor& act,
+                                      const Tensor& expert_ids, const Tensor* row_map,
+                                      const Tensor& gate_ptrs, const Tensor& up_ptrs);
+
+// Grouped dot with one FP32 route weight per pair, multiplied BEFORE output
+// conversion (fused_moe.py:593-610 at the same pin). Output is BF16 or FP32.
+void MoeGroupedGemmBf16Weighted(Queue& q, Tensor& out, const Tensor& act,
+                               const Tensor& expert_ids, const Tensor* row_map,
+                               const Tensor& weight_ptrs, const Tensor& route_weights);
+
+// Sum already weighted BF16 expert_out[T,top_k,H] in FP32, then narrow to the
+// BF16/FP32 output. No second route-weight multiplication. Optional shared[T,H]
+// is BF16/FP32 and is added after routed_scale, matching the legacy shared term.
+void MoeCombinePreweighted(Queue& q, Tensor& out, const Tensor& expert_out,
+                           const Tensor* shared = nullptr, float routed_scale = 1.0f);
+
+// Select the complete native sequence through provider availability.
+bool MoeGroupedBf16NativeAvailable(DeviceType device);
 
 // MoeGroupedGemmNvfp4Marlin (lift of vLLM moe_wna16_marlin_gemm, ops.cu:543 —
 // the Marlin W4A16 kernel vLLM selects for the 35B's NVFP4 MoE experts). One

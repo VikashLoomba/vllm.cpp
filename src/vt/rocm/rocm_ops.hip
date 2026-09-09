@@ -85,6 +85,15 @@ void ApplyLogitBiasKernelRocm(Queue& q, Tensor& logits, const Tensor& rows, cons
                               const Tensor& biases);
 // Companion MoE-path op (same TU): elementwise silu(gate)*up.
 void MoeSiluMulKernelRocm(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up);
+void MoeGroupedGemmBf16KernelRocm(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                  const Tensor*, const Tensor&);
+void MoeGroupedGemmBf16GateUpSiluKernelRocm(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                           const Tensor*, const Tensor&, const Tensor&);
+void MoeGroupedGemmBf16GateUpSiluNativeKernelRocm(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                                 const Tensor*, const Tensor&, const Tensor&);
+void MoeGroupedGemmBf16WeightedKernelRocm(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                          const Tensor*, const Tensor&, const Tensor&);
+void MoeCombinePreweightedKernelRocm(Queue&, Tensor&, const Tensor&, const Tensor*, float);
 // MoE-path combine/gate ops (rocm_moe_chain.hip): shared-expert gate and the
 // weighted expert combinations.
 void SharedExpertGateKernelRocm(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl);
@@ -248,6 +257,21 @@ struct Registrar {
                    static_cast<ApplyTokenMaskFn>(&ApplyTokenMaskKernelRocm)));
     RegisterOp(OpId::kMoeSiluMul, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<MoeSiluMulFn>(&MoeSiluMulKernelRocm)));
+    RegisterOp(OpId::kMoeGroupedGemmBf16, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeGroupedGemmBf16Fn>(
+                   &MoeGroupedGemmBf16KernelRocm)));
+    RegisterOp(OpId::kMoeGroupedGemmBf16GateUpSilu, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeGroupedGemmBf16GateUpSiluFn>(
+                   &MoeGroupedGemmBf16GateUpSiluKernelRocm)));
+    RegisterOp(OpId::kMoeGroupedGemmBf16GateUpSiluNative, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeGroupedGemmBf16GateUpSiluNativeFn>(
+                   &MoeGroupedGemmBf16GateUpSiluNativeKernelRocm)));
+    RegisterOp(OpId::kMoeGroupedGemmBf16Weighted, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeGroupedGemmBf16WeightedFn>(
+                   &MoeGroupedGemmBf16WeightedKernelRocm)));
+    RegisterOp(OpId::kMoeCombinePreweighted, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeCombinePreweightedFn>(
+                   &MoeCombinePreweightedKernelRocm)));
     RegisterOp(OpId::kSharedExpertGate, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<SharedExpertGateFn>(&SharedExpertGateKernelRocm)));

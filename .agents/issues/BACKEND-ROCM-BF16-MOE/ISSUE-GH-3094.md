@@ -36,4 +36,12 @@ The quoted text below is historical evidence only. It does not define issue auth
 
 ## Resolution
 
--
+Native ROCm grouped BF16 providers and the shared Qwen3 MoE dispatch are
+implemented on `row/BACKEND-ROCM-BF16-MOE`. Legacy arithmetic, native BF16
+boundaries, graph replay, independent streams, and two-device launches pass
+their focused gates. The issue remains open: the exact production token gate
+fails at six generated positions, and review and performance acceptance remain
+outstanding. The separate compiled residual-normalization gap belongs to
+`BACKEND-ROCM`, [#3103](https://github.com/mudler/vllm.cpp/issues/3103).
+The [row spec](../../specs/rocm-bf16-moe.md) records the measured results and
+remaining obligations.

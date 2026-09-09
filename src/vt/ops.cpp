@@ -903,7 +903,8 @@ void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor&
       q, out, act, expert_ids, row_map, packed_ptrs, scale_ptrs, scale2s);
 }
 
-void MoeGroupedGemmBf16(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
+namespace {
+void ValidateMoeGroupedGemmBf16(Queue& q, const Tensor& out, const Tensor& act, const Tensor& expert_ids,
                         const Tensor* row_map, const Tensor& weight_ptrs) {
   VT_CHECK(out.rank == 2 && act.rank == 2, "moe_grouped_gemm_bf16: out/act must be rank-2");
   const int64_t p = out.shape[0], e = weight_ptrs.shape[0];
@@ -925,11 +926,18 @@ void MoeGroupedGemmBf16(Queue& q, Tensor& out, const Tensor& act, const Tensor& 
                  row_map->device == q.device,
              "moe_grouped_gemm_bf16: row_map must be contiguous i32 [P] on the queue device");
   }
+}
+}  // namespace
+
+void MoeGroupedGemmBf16(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
+                        const Tensor* row_map, const Tensor& weight_ptrs) {
+  ValidateMoeGroupedGemmBf16(q, out, act, expert_ids, row_map, weight_ptrs);
   reinterpret_cast<MoeGroupedGemmBf16Fn>(GetOp(OpId::kMoeGroupedGemmBf16, q.device.type))(
       q, out, act, expert_ids, row_map, weight_ptrs);
 }
 
-void MoeGroupedGemmBf16GateUpSilu(Queue& q, Tensor& out, const Tensor& act,
+namespace {
+void ValidateMoeGroupedGemmBf16GateUpSilu(Queue& q, const Tensor& out, const Tensor& act,
                                   const Tensor& expert_ids, const Tensor* row_map,
                                   const Tensor& gate_ptrs, const Tensor& up_ptrs) {
   VT_CHECK(out.rank == 2 && act.rank == 2,
@@ -956,9 +964,66 @@ void MoeGroupedGemmBf16GateUpSilu(Queue& q, Tensor& out, const Tensor& act,
                  row_map->device == q.device,
              "moe_grouped_gemm_bf16_gate_up_silu: row_map must be contiguous i32 [P] on the device");
   }
+}
+}  // namespace
+
+void MoeGroupedGemmBf16GateUpSilu(Queue& q, Tensor& out, const Tensor& act,
+                                  const Tensor& expert_ids, const Tensor* row_map,
+                                  const Tensor& gate_ptrs, const Tensor& up_ptrs) {
+  ValidateMoeGroupedGemmBf16GateUpSilu(q, out, act, expert_ids, row_map, gate_ptrs, up_ptrs);
   reinterpret_cast<MoeGroupedGemmBf16GateUpSiluFn>(
       GetOp(OpId::kMoeGroupedGemmBf16GateUpSilu, q.device.type))(q, out, act, expert_ids, row_map,
                                                                 gate_ptrs, up_ptrs);
+}
+
+void MoeGroupedGemmBf16GateUpSiluNative(Queue& q, Tensor& out, const Tensor& act,
+                                      const Tensor& expert_ids, const Tensor* row_map,
+                                      const Tensor& gate_ptrs, const Tensor& up_ptrs) {
+  ValidateMoeGroupedGemmBf16GateUpSilu(q, out, act, expert_ids, row_map, gate_ptrs, up_ptrs);
+  reinterpret_cast<MoeGroupedGemmBf16GateUpSiluNativeFn>(
+      GetOp(OpId::kMoeGroupedGemmBf16GateUpSiluNative, q.device.type))(
+      q, out, act, expert_ids, row_map, gate_ptrs, up_ptrs);
+}
+
+void MoeGroupedGemmBf16Weighted(Queue& q, Tensor& out, const Tensor& act,
+                               const Tensor& expert_ids, const Tensor* row_map,
+                               const Tensor& weight_ptrs, const Tensor& route_weights) {
+  ValidateMoeGroupedGemmBf16(q, out, act, expert_ids, row_map, weight_ptrs);
+  VT_CHECK(route_weights.rank == 1 && route_weights.Numel() == out.shape[0] &&
+               route_weights.dtype == DType::kF32 && route_weights.IsContiguous() &&
+               route_weights.device == q.device,
+           "moe_grouped_gemm_bf16_weighted: route_weights must be contiguous f32 [P] on the device");
+  reinterpret_cast<MoeGroupedGemmBf16WeightedFn>(
+      GetOp(OpId::kMoeGroupedGemmBf16Weighted, q.device.type))(
+      q, out, act, expert_ids, row_map, weight_ptrs, route_weights);
+}
+
+void MoeCombinePreweighted(Queue& q, Tensor& out, const Tensor& expert_out,
+                           const Tensor* shared, float routed_scale) {
+  VT_CHECK(out.rank == 2 && expert_out.rank == 3 &&
+               expert_out.shape[0] == out.shape[0] && expert_out.shape[2] == out.shape[1],
+           "moe_combine_preweighted: expert_out [T,K,H] must match out [T,H]");
+  VT_CHECK(expert_out.dtype == DType::kBF16 && IsOutFloat(out.dtype),
+           "moe_combine_preweighted: expert_out must be bf16, out must be f32/bf16");
+  VT_CHECK(expert_out.IsContiguous() && out.IsContiguous() &&
+               expert_out.device == q.device && out.device == q.device,
+           "moe_combine_preweighted: contiguous tensors on the queue device required");
+  if (shared != nullptr) {
+    VT_CHECK(shared->rank == 2 && shared->shape[0] == out.shape[0] &&
+                 shared->shape[1] == out.shape[1] && IsOutFloat(shared->dtype) &&
+                 shared->IsContiguous() && shared->device == q.device,
+             "moe_combine_preweighted: shared must be f32/bf16 [T,H] on the queue device");
+  }
+  reinterpret_cast<MoeCombinePreweightedFn>(
+      GetOp(OpId::kMoeCombinePreweighted, q.device.type))(q, out, expert_out, shared, routed_scale);
+}
+
+bool MoeGroupedBf16NativeAvailable(DeviceType device) {
+  return OpRegistered(OpId::kMoeGroupedGemmBf16, device) &&
+         OpRegistered(OpId::kMoeGroupedGemmBf16GateUpSilu, device) &&
+         OpRegistered(OpId::kMoeGroupedGemmBf16GateUpSiluNative, device) &&
+         OpRegistered(OpId::kMoeGroupedGemmBf16Weighted, device) &&
+         OpRegistered(OpId::kMoeCombinePreweighted, device);
 }
 
 void MoeGroupedGemmNvfp4Marlin(Queue& q, Tensor& c, const Tensor& a, const Tensor& b_q_weight,

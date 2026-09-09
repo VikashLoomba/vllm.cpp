@@ -6992,11 +6992,22 @@ DBuf MoeBlockBf16Cuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   // trips), prefill reuses the tuned grouped GEMM twice + the identical silu-mul.
   // BIT-IDENTICAL to the old sequence. Then the grouped down GEMM (act = per-pair
   // silu output, identity row-map). expert_out lands as [T,top_k,H] contiguous —
-  // exactly what MoeCombine consumes.
+  // exactly what MoeCombine consumes. Native BF16 providers round gate/up and
+  // SiLU before multiplication, then apply route weights before down narrowing.
+  // Existing callers keep the legacy FP32 intermediate compatibility contract.
+  const bool native_bf16 = vt::MoeGroupedBf16NativeAvailable(d.q.device.type);
   DBuf dact(d, DType::kBF16, {P, I});
-  vt::MoeGroupedGemmBf16GateUpSilu(d.q, dact.t(), dh, eids, &dtok, dgate_ptrs, dup_ptrs);
+  if (native_bf16)
+    vt::MoeGroupedGemmBf16GateUpSiluNative(d.q, dact.t(), dh, eids, &dtok, dgate_ptrs, dup_ptrs);
+  else
+    vt::MoeGroupedGemmBf16GateUpSilu(d.q, dact.t(), dh, eids, &dtok, dgate_ptrs, dup_ptrs);
   DBuf ddown(d, DType::kBF16, {P, H});
-  vt::MoeGroupedGemmBf16(d.q, ddown.t(), dact.t(), eids, nullptr, ddown_ptrs);
+  if (native_bf16) {
+    const Tensor weights = Reshape(dtw.t(), {P});
+    vt::MoeGroupedGemmBf16Weighted(d.q, ddown.t(), dact.t(), eids, nullptr, ddown_ptrs, weights);
+  } else {
+    vt::MoeGroupedGemmBf16(d.q, ddown.t(), dact.t(), eids, nullptr, ddown_ptrs);
+  }
   Tensor expert_out = Reshape(ddown.t(), {T, top_k, H});
 
   // Shared expert (SEAM GAP #3): Coder has none (shared_expert_intermediate_size
@@ -7006,7 +7017,10 @@ DBuf MoeBlockBf16Cuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   std::optional<DBuf> shared;
   if (has_shared) shared.emplace(SharedExpert(d, w, cfg, dh, T, false));
   DBuf dout(d, DType::kBF16, {T, H});
-  vt::MoeCombine(d.q, dout.t(), expert_out, dtw.t(), has_shared ? &shared->t() : nullptr);
+  if (native_bf16)
+    vt::MoeCombinePreweighted(d.q, dout.t(), expert_out, has_shared ? &shared->t() : nullptr);
+  else
+    vt::MoeCombine(d.q, dout.t(), expert_out, dtw.t(), has_shared ? &shared->t() : nullptr);
   return dout;
 }
 
@@ -7195,7 +7209,8 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   // LAYOUT-GUARDED (MoeBf16FastLayoutOk): only the [K,N] Matmul-B (`nk == false`)
   // orientation the grouped kernel can read; nk=true producers (35B MTP) fall
   // through to the reference loop.
-  if (!fp4 && vt::OpRegistered(vt::OpId::kMoeGroupedGemmBf16, d.q.device.type) && MoeBf16FastEnabled() &&
+  if (!fp4 && vt::OpRegistered(vt::OpId::kMoeGroupedGemmBf16, d.q.device.type) &&
+      vt::OpRegistered(vt::OpId::kMoeGroupedGemmBf16GateUpSilu, d.q.device.type) && MoeBf16FastEnabled() &&
       !w.expert_gate.empty() && MoeBf16FastLayoutOk(w, cfg))
     return MoeBlockBf16Cuda(d, w, cfg, dh, T);
 

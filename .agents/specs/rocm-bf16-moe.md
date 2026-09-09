@@ -16,13 +16,19 @@ The operator does not merge it without separate developer authorization.
 
 ## Now
 
-State: `SPIKE`. Source assessment is complete. Implementation and hardware gates
-are `PENDING`. This spec does not claim a measured MoE execution on the oracle.
+State: `ACTIVE`. Native providers reach the registered Qwen3 MoE forward path on
+`gfx1100`. The legacy grouped suites and eight native boundary, graph, stream,
+and two-device cases pass. The pinned production token gate remains **failing**:
+six generated positions differ across three repeated length-33, concurrency-2 runs.
+The first proved residual-normalization difference belongs to
+[#3103](https://github.com/mudler/vllm.cpp/issues/3103), under `BACKEND-ROCM`.
+Attention and head-output differences also require resolution before acceptance.
 
-The coordinating operator dispatches a fresh implementer from the committed spec.
-The implementer first captures a failing production reachability test on `gfx1100`.
-A fresh reviewer then tests the immutable implementation through negative mutations.
-The operator reruns the declared hardware gate before accepting the result.
+All 60 original upstream component cases pass on both runtimes.
+All implementer mutations detect their intended defects.
+A fresh reviewer tests the immutable implementation. The operator reruns
+the declared hardware gate after review. Performance is not accepted before
+the complete production token gate passes.
 
 ## Problem and scope
 
@@ -60,13 +66,13 @@ Line numbers refer to those revisions, before implementation changes them.
 
 | Stable ID | Upstream source | Local anchor | Required test and evidence | State |
 |---|---|---|---|---|
-| `ROCM-BF16-MOE-GROUPED` | `vllm/model_executor/layers/fused_moe/fused_moe.py:299-610,763-910` | `include/vt/ops.h:3198-3238`, new `src/vt/rocm/rocm_moe_grouped_bf16.hip` | Native grouped suite, oracle buffers, provider selection, generated kernel | `SPIKE` |
-| `ROCM-BF16-MOE-GATEUP` | `vllm/model_executor/layers/fused_moe/experts/triton_moe.py:388-409,487-527`, `csrc/libtorch_stable/activation_kernels.cu:44,165-177` | `MoeGroupedGemmBf16GateUpSilu`, shared numeric descriptor | BF16 boundary fixtures, legacy byte comparison, native oracle comparison | `SPIKE` |
-| `ROCM-BF16-MOE-WEIGHTED-DOWN` | `vllm/model_executor/layers/fused_moe/fused_moe.py:593-610`, `csrc/libtorch_stable/moe/moe_align_sum_kernels.cu:395-459` | Shared grouped down and `MoeCombine` descriptors | Weight-before-narrowing and no-double-weight mutations | `SPIKE` |
-| `ROCM-BF16-MOE-FORWARD` | `vllm/model_executor/models/qwen3_moe.py:199-237` | `src/vllm/model_executor/models/qwen3_moe_registry.cpp:63-86`, `src/vllm/model_executor/models/qwen3_5.cpp:6869-7010,7198` | `ModelRegistry::Load` and `ModelRegistry::Forward`, token gate, call-site mutation | `SPIKE` |
+| `ROCM-BF16-MOE-GROUPED` | `vllm/model_executor/layers/fused_moe/fused_moe.py:299-610,763-910` | `include/vt/ops.h:3198-3238`, `src/vt/rocm/rocm_moe_grouped_bf16.hip` | `test_ops_moe_grouped_bf16`, `test_rocm_moe_grouped_bf16`, oracle buffers and generated kernel | `ACTIVE` |
+| `ROCM-BF16-MOE-GATEUP` | `vllm/model_executor/layers/fused_moe/experts/triton_moe.py:388-409,487-527`, `csrc/libtorch_stable/activation_kernels.cu:44,165-177` | `MoeGroupedGemmBf16GateUpSiluNative` and legacy typed sibling | `test_ops_moe_grouped_bf16_gate_up_silu`, exact BF16 witnesses, `test_rocm_moe_upstream` | `ACTIVE` |
+| `ROCM-BF16-MOE-WEIGHTED-DOWN` | `vllm/model_executor/layers/fused_moe/fused_moe.py:593-610`, `csrc/libtorch_stable/moe/moe_align_sum_kernels.cu:395-459` | `MoeGroupedGemmBf16Weighted`, `MoeCombinePreweighted` | `test_rocm_moe_grouped_bf16`, route-before-narrowing witness and combine checks | `ACTIVE` |
+| `ROCM-BF16-MOE-FORWARD` | `vllm/model_executor/models/qwen3_moe.py:199-237` | `src/vllm/model_executor/models/qwen3_moe_registry.cpp:63-86`, `src/vllm/model_executor/models/qwen3_5.cpp:6869-7010,7198` | `test_rocm_moe_bf16` through load/forward, provider statistics, exact tokens and call-site mutation | `ACTIVE` |
 
 All inventory items belong to this spec and `ISSUE-GH-3094`.
-The required tests and evidence are planned obligations, not completed measurements.
+The implementation evidence below distinguishes measured results from remaining gates.
 
 ## Upstream contract
 
@@ -444,6 +450,89 @@ native backend capability ships. Document a changed command or configuration in
 `docs/USAGE.md` only if the implementation changes that public surface.
 This row's spec commit makes no shipped capability claim and owes no public rewrite.
 
+## Implementation evidence, 2026-09-09
+
+The implementation starts from committed spec `9202e4c4edc4cf6ef9b3e8da66431effb0fbcee5`.
+Its isolated worktree is `/home/vikash/vllm.cpp-rdna3-moe-impl`.
+The paths below identify this measured run; they are not environment defaults.
+Evidence root: `build-rdna3-moe-hip/evidence/` in that worktree.
+The operator holds `/home/vikash/gpu.lock` for every GPU invocation.
+The measured device is a Radeon 7900 XTX, `gfx1100`.
+Native compilation uses HIP `7.15.26333`, Clang 23, and `-ffp-contract=off`.
+The pinned oracle reports Torch `2.12.0+git6bbd260` and HIP `7.2.53211`.
+
+### Design and executing oracle
+
+The shared API adds three typed siblings: native gate/up, weighted down, and
+preweighted combine. The existing typed signatures and legacy arithmetic remain
+unchanged. Capability selection requires all five grouped/native providers.
+The HIP implementation uses one deterministic reduction per output and no scratch
+allocation. A device scope selects the queue's device and restores the caller's
+ambient device. The stream always comes from that queue.
+
+The pinned production engine selects `TritonExperts` in both layers.
+Captured gate/up and down inputs, weights, and outputs are BF16 with two-byte
+elements. Gate/up weight strides are `[32768,128,1]`; down strides are
+`[16384,128,1]`. The captured MoE kernel uses `BLOCK_SIZE_M=32`,
+`BLOCK_SIZE_N=64`, `BLOCK_SIZE_K=128`, and `SPLIT_K=1` for the small fixture.
+Its generated `fused_moe_kernel.amdgcn` contains BF16 WMMA instructions.
+Native offload code and the compile command are retained in `native-generated/`.
+
+The fixture export preserves the committed generator, including its tensor order:
+
+| Artifact | Bytes | SHA256 |
+|---|---:|---|
+| `config.json` | 719 | `321926020ada026d8dd85f74543dd12b6426301706b4e1f4fbca60a44b871cea` |
+| `model.safetensors` | 1123330 | `96cd7f30fee496c69782af2813e438e47d7b026598b0f20a05049c522b279af8` |
+
+The final cohort harness uses pinned `LLM.sleep(level=0)`, `enqueue`, scheduling
+wake-up, and `wait_for_completion`. It records the authoritative internal/external
+request-ID mapping and asserts the actual prefill and decode batches for every run.
+`oracle-selection-6/production.json` has SHA256
+`f3d27a95ba71bddcae38c3defc21bf3f3ff32ba9373a09faf949ead68b74d7ad`.
+Earlier oracle attempts and the initial uncoordinated scheduling result remain
+in evidence. They do not supply the final matched-cohort denominator.
+
+### Measured gates and remaining work
+
+| Gate | Result and evidence |
+|---|---|
+| Red before implementation | Satisfied. `production-red-2.log` has four missing registration/selection failures and 27960 passing assertions. Its executable SHA256 is `25dfd4e7e58dbe6069c6d1ea20c00ae7249687336645c04389845ceede0e83ae`. |
+| CPU build and shared regressions | Satisfied. Six tests pass: model registry, grow-only scratch, provider metadata, native descriptor validation, MoE operations, and grouped router. Log: `/home/vikash/.cache/rdna3-moe-impl/cpu-native-tests.log`. |
+| HIP build and legacy arithmetic | Satisfied. Both existing grouped suites pass on ROCm: 7 cases/19 assertions and 3 cases/6 assertions, with no skips. Logs: `test_ops_moe_grouped_bf16-native-1.log` and `test_ops_moe_grouped_bf16_gate_up_silu-native-1.log`. |
+| Native numeric boundaries, streams, capture, and devices | Satisfied. `native-boundary-3.log` records 8 cases/2804 assertions, no skips, with devices 0 and 1 visible. It covers opposite ambient device state for native gate/up, weighted down and combine. Executable SHA256: `8bae75c8506b08f2444ed0a4b8379b837608b9261baccdef3c71a97ad0408a33`. |
+| Scratch-only allocation and retirement mutations | Narrowly waived for this scratch-free implementation. No allocation, free, capacity publication, retired block, or scratch key exists in these providers. Graph replay after larger shapes and concurrent streams still run. |
+| Original upstream component cases | Satisfied. All 60 cases pass on both runtimes, including M=32768/K=511 and M=40000/K=1024 graph cases. The unchanged pinned test supplies seed 7, BF16 fixtures, both padding modes and original tolerances. Raw padded source storage and logical exported strides are retained separately in `upstream-all-2` and its range directories. `upstream-all-2-complete-operator-summary.json` independently checks all 120 case/stage results; its SHA256 is `b5c9d8259ae6c4701ad92647f5e61bdda7ba1ef6e2a2fd6ecb8a9edf99a4af04`. |
+| Production provider selection | Satisfied. All three new operations have positive native selections, no declines, no fallbacks, and no CPU selections. The existing two registrations are present. |
+| Exact production tokens | Failing. Length 33/concurrency 2/request 0 ends with native `[63,69]` versus oracle `[118,66]` on all three repeats. The remaining workloads match. `production-native-1.log` records 28030 passing assertions and three failing whole-sequence comparisons. `baseline-production-tokens-comparison.json` verifies that the pre-implementation legacy path emits the same native tokens on all 18 workloads. This unchanged baseline does not waive exact-token acceptance. |
+| CPU descriptor negative mutations | Satisfied. All nine mutations in `cpu-contract-mutations-2/results.json` fail their intended descriptor or capability assertion. Original source and archive hashes remain equal after each run. The first preparation linked the unchanged CPU whole archive, so that invalid probe is preserved and excluded. |
+| Implementer negative mutations | Satisfied. The operator ran all 20 isolated mutations in `negative-mutations-1/run-recipes.json`; every intended defect was detected, with no survivor or timeout. Original source, archive and executable hashes remain unchanged. Each of the eight production mutations adds its specific provider failure beyond the existing token failures. Filtered component mutations select one test with nonzero assertions. `operator-results.json` and per-case receipts preserve the commands and failures. |
+| Full staged preflight | Satisfied for executed checks: exit 0, no failures, and 619/619 affected host translation units compiled. The report lists 12 explicit skips, reconciled below; it does not print an all-green claim. Log: `/home/vikash/.cache/rdna3-moe-impl/staged-preflight-1.log`. |
+| Supplementary preflight suites | Satisfied. All seven NumPy-dependent suites pass using the existing NumPy 2.1.3 package through task-local links. Both CPU and HIP build databases pass the x86 ISA audit. The first full-site Python path exposed installed vLLM metadata to fake-runtime tests; that failed environment attempt is preserved and excluded. |
+| ARM and CUDA build audits | Narrowly waived for this gfx1100 change: no ARM build, CUDA fat binary, or CUDA Triton AOT artifact is produced. The native HIP build and generated gfx1100 object supply backend build evidence. |
+| Frozen-head PR path, trailers and style | Pending the local implementation commit and the operator's exact-SHA pre-push checks. |
+| Fresh review and final operator gate | Pending the fresh reviewer and coordinating operator at the immutable implementation head. |
+| Paired traces, throughput, latency and memory | Failing acceptance prerequisite: exact production tokens do not pass. No performance result or floor is accepted. |
+
+Four additional scratch replays use original captured production MoE inputs,
+expert IDs, BF16 weights and route weights for both layers at L33/C1 and L33/C2.
+All pass the original absolute tolerance of 0.02. Activated outputs differ in
+3/1/5/1 BF16 words, weighted down in 7/0/22/1, and final sums in 2/0/10/1.
+Maximum final difference is `6.103515625e-05`. The final comparator is a CPU
+reconstruction of the sum of captured weighted BF16 down values. It is not an
+observed final Triton tensor. These scratch runs isolate expert arithmetic;
+they do not replace the original upstream cases or exact production tokens.
+
+Paired dense captures locate differences before the new experts. The first QKV
+input, weights and output match exactly. Attention output first differs at row 1.
+Row 0 attention projection remains exact, but post-attention normalization differs
+in 33 of 128 values. `norm-gap-handoff/handoff.md` and its manifest preserve the
+complete executing compiled lifetime for #3103, including all six generated
+modules and their allocation/store dtypes. Their SHA256 values are
+`9850ee49c93bb82ddfca1a811fb422337c33ea09335e749fbf3c42dfcaa0400a` and
+`8531cb41f0168d27455b2dc8062a57d5db7afd4e0822013332f398bbf2239c65`.
+The operator independently reran the algebra witness and checked every manifest hash.
+
 ## Owed
 
 No new unowned issue is introduced by this spec.
@@ -452,6 +541,19 @@ The origin issue keeps its existing single owner in
 implementation closes it. That owner links here for the implementation handoff.
 The new row owns its tracking issue directly.
 Grouped routing and correction-bias work stays under `BACKEND-ROCM`, issue #41.
+
+- [#3100](https://github.com/mudler/vllm.cpp/issues/3100), owned by
+  `BACKEND-ROCM`, tracks shared resource operations that ignore their device index.
+  The two-device test selects the resource device in its host setup, checks pointer
+  ownership, and then launches each provider with the opposite ambient device.
+  This isolates the new provider's device contract without changing shared allocation.
+- [#3103](https://github.com/mudler/vllm.cpp/issues/3103), owned by
+  `BACKEND-ROCM`, tracks the compiled Qwen3 MoE residual-normalization lifetime.
+  The paired row-zero witness reproduces all 128 native and oracle values separately.
+  The native path rounds the residual before variance; the compiled oracle elides
+  the post-attention residual store and materializes the next input-norm residual.
+  Every materialized residual remains BF16. This row does not change that shared
+  normalization path. Its production token gate remains failing.
 
 ## Stop conditions
 

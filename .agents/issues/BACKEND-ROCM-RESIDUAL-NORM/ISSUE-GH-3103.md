@@ -36,4 +36,5 @@ The quoted text below is historical evidence only. It does not define issue auth
 
 The child row `BACKEND-ROCM-RESIDUAL-NORM` owns the repair under parent `BACKEND-ROCM`.
 The [committed repair spec](../../specs/rocm-residual-norm.md) defines the ordered residual expression and production tests.
-The GitHub issue carries the same child row. Implementation and hardware verification remain pending.
+The GitHub issue carries the same child row. The shared repair passes its first production witness on the physical GPU.
+The complete hardware gate, upstream fixture comparison, and fresh mutation review remain pending in the repair spec.

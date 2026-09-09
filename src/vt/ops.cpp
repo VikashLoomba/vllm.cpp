@@ -1,9 +1,11 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 #include "vt/ops.h"
+#include "vt/recipes.h"
 #include "vt/paged_attn_route.h"  // W10 repair (#1865): the uniform-spec shape guard
 
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -1111,6 +1113,88 @@ void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                                                                     residual);
 }
 
+void ResidualRmsNorm(Queue& q, Tensor& out, const Tensor& a, const Tensor& base,
+                     const Tensor* delta, const Tensor& weight,
+                     const ResidualRmsNormArgs& args, Tensor* residual_out) {
+  const auto& desc = args.descriptor;
+  VT_CHECK(desc.expression == ResidualNormExpr::kAdd ||
+               desc.expression == ResidualNormExpr::kDeltaPlusAdd,
+           "residual_rmsnorm: invalid expression order");
+  const bool triple = desc.expression == ResidualNormExpr::kDeltaPlusAdd;
+  VT_CHECK(triple == (delta != nullptr), "residual_rmsnorm: expression operand count mismatch");
+  VT_CHECK(desc.materialize_residual == (residual_out != nullptr),
+           "residual_rmsnorm: materialization descriptor/output mismatch");
+  VT_CHECK(!desc.output_alias_delta || triple,
+           "residual_rmsnorm: output alias requires a delta operand");
+  VT_CHECK(!desc.residual_alias_base || desc.materialize_residual,
+           "residual_rmsnorm: base alias requires residual materialization");
+  VT_CHECK(std::isfinite(args.eps) && args.eps >= 0.0f,
+           "residual_rmsnorm: epsilon must be finite and nonnegative");
+  VT_CHECK(a.rank == 2 && a.shape[0] >= 0 && a.shape[1] > 0,
+           "residual_rmsnorm: expected nonnegative rows and positive hidden width");
+  VT_CHECK(q.device.index >= 0, "residual_rmsnorm: queue device index must be nonnegative");
+  const auto row_bytes = [&](const Tensor& tensor) -> size_t {
+    VT_CHECK(tensor.rank == 2 && tensor.shape[0] == a.shape[0] &&
+                 tensor.shape[1] == a.shape[1], "residual_rmsnorm: row shape mismatch");
+    VT_CHECK(tensor.dtype == DType::kBF16, "residual_rmsnorm: BF16 activation/output required");
+    VT_CHECK(tensor.device == q.device, "residual_rmsnorm: queue/tensor device mismatch");
+    VT_CHECK(tensor.stride[1] == 1 && tensor.stride[0] >= tensor.shape[1],
+             "residual_rmsnorm: unit inner stride and nonoverlapping rows required");
+    if (tensor.shape[0] == 0) return 0;
+    const auto rows = static_cast<uint64_t>(tensor.shape[0]);
+    const auto width = static_cast<uint64_t>(tensor.shape[1]);
+    const auto stride = static_cast<uint64_t>(tensor.stride[0]);
+    const uint64_t max_elements = std::numeric_limits<size_t>::max() / sizeof(uint16_t);
+    VT_CHECK(width <= max_elements && (rows - 1) <= (max_elements - width) / stride,
+             "residual_rmsnorm: row storage span overflow");
+    const size_t bytes = static_cast<size_t>((rows - 1) * stride + width) * sizeof(uint16_t);
+    const uintptr_t start = reinterpret_cast<uintptr_t>(tensor.data);
+    VT_CHECK(start != 0 && start % alignof(uint16_t) == 0 &&
+                 start <= std::numeric_limits<uintptr_t>::max() - bytes,
+             "residual_rmsnorm: invalid or unaligned row data");
+    return bytes;
+  };
+  const size_t a_bytes = row_bytes(a), base_bytes = row_bytes(base), out_bytes = row_bytes(out);
+  const size_t delta_bytes = delta == nullptr ? 0 : row_bytes(*delta);
+  const size_t res_bytes = residual_out == nullptr ? 0 : row_bytes(*residual_out);
+  VT_CHECK(weight.rank == 1 && weight.shape[0] == a.shape[1] && weight.stride[0] == 1 &&
+               weight.dtype == DType::kBF16 && weight.device == q.device,
+           "residual_rmsnorm: gamma must be contiguous BF16 [H] on the queue device");
+  const uintptr_t w_start = reinterpret_cast<uintptr_t>(weight.data);
+  const auto w_width = static_cast<uint64_t>(weight.shape[0]);
+  VT_CHECK(w_width <= std::numeric_limits<size_t>::max() / sizeof(uint16_t),
+           "residual_rmsnorm: gamma storage span overflow");
+  const size_t w_bytes = static_cast<size_t>(w_width) * sizeof(uint16_t);
+  VT_CHECK(w_start != 0 && w_start % alignof(uint16_t) == 0 &&
+               w_start <= std::numeric_limits<uintptr_t>::max() - w_bytes,
+           "residual_rmsnorm: invalid or unaligned gamma data");
+  const auto overlaps = [](const Tensor& lhs, size_t lhs_bytes,
+                            const Tensor& rhs, size_t rhs_bytes) {
+    const uintptr_t left = reinterpret_cast<uintptr_t>(lhs.data);
+    const uintptr_t right = reinterpret_cast<uintptr_t>(rhs.data);
+    return lhs_bytes != 0 && rhs_bytes != 0 && left < right + rhs_bytes && right < left + lhs_bytes;
+  };
+  const auto same_view = [](const Tensor& lhs, const Tensor& rhs) {
+    return lhs.data == rhs.data && lhs.stride[0] == rhs.stride[0];
+  };
+  for (const auto& input : {std::pair<const Tensor*, size_t>{&a, a_bytes},
+                            {&base, base_bytes}, {delta, delta_bytes}, {&weight, w_bytes}}) {
+    if (input.first == nullptr) continue;
+    VT_CHECK(!overlaps(out, out_bytes, *input.first, input.second) ||
+                 (input.first == delta && desc.output_alias_delta && same_view(out, *delta)),
+             "residual_rmsnorm: normalized output overlaps a read-only input");
+    if (residual_out != nullptr)
+      VT_CHECK(!overlaps(*residual_out, res_bytes, *input.first, input.second) ||
+                   (input.first == &base && desc.residual_alias_base && same_view(*residual_out, base)),
+               "residual_rmsnorm: residual output overlaps a read-only input");
+  }
+  VT_CHECK(residual_out == nullptr || !overlaps(out, out_bytes, *residual_out, res_bytes),
+           "residual_rmsnorm: outputs must not overlap");
+  if (a.shape[0] == 0) return;
+  reinterpret_cast<ResidualRmsNormFn>(GetOp(OpId::kResidualRmsNorm, q.device.type))(
+      q, out, a, base, delta, weight, args, residual_out);
+}
+
 void RmsNormGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                   const RmsNormGroupArgs& args) {
   VT_CHECK(x.rank == 2 && out.rank == 2 && weight.rank == 1,
@@ -1166,6 +1250,24 @@ void FusedChainCompositeImpl(Queue& q, const FusedRecipe& r, const FusedBinding&
   for (int s = 0; s < r.n; ++s) {
     const FStep& st = r.steps[s];
     switch (st.op) {
+      case FOp::kResidualRmsNorm: {
+        VT_CHECK(!add_pending, "fused_chain: residual expression cannot consume a pending add");
+        const bool triple = st.residual_norm.expression == ResidualNormExpr::kDeltaPlusAdd;
+        VT_CHECK(st.nin == (triple ? 4 : 3), "fused_chain: residual expression input count");
+        VT_CHECK((st.out2 != kNoOperand) == st.residual_norm.materialize_residual,
+                 "fused_chain: residual expression materialization mismatch");
+        VT_CHECK(st.reduce == FReduce::kMeanSquare && !st.gemma && !st.sigmoid_gate &&
+                     !st.norm_full_width, "fused_chain: invalid residual expression modifiers");
+        Tensor* out = FusedOp(b, st.out, "fused_chain: null residual norm output");
+        Tensor* a = FusedOp(b, st.in[0], "fused_chain: null residual expression a");
+        Tensor* base = FusedOp(b, st.in[1], "fused_chain: null residual expression base");
+        Tensor* delta = triple ? FusedOp(b, st.in[2], "fused_chain: null delta") : nullptr;
+        Tensor* weight = FusedOp(b, st.in[triple ? 3 : 2], "fused_chain: null residual gamma");
+        Tensor* residual = st.out2 == kNoOperand ? nullptr : FusedOp(b, st.out2, "fused_chain: null materialized residual");
+        ResidualRmsNorm(q, *out, *a, *base, delta, *weight,
+                        ResidualRmsNormArgs{p.eps, st.residual_norm}, residual);
+        break;
+      }
       case FOp::kAdd:
         // Residual-add producing the residual stream: fold into the next kRmsNorm.
         VT_CHECK(st.nin == 2 && st.out == st.in[1],
@@ -1364,6 +1466,28 @@ void FusedChain(Queue& q, const FusedRecipe& recipe, const FusedBinding& binding
     return;
   }
   FusedChainComposite(q, recipe, binding, params);
+}
+
+void FusedChain(Queue& q, Tensor& out, const Tensor& a, const Tensor& base,
+                const Tensor* delta, const Tensor& weight,
+                const ResidualRmsNormArgs& args, Tensor* residual_out) {
+  FusedBinding binding{};
+  binding.n = 6;
+  binding.op[0] = const_cast<Tensor*>(&a);
+  binding.op[1] = const_cast<Tensor*>(&base);
+  binding.op[2] = const_cast<Tensor*>(delta);
+  binding.op[3] = const_cast<Tensor*>(&weight);
+  binding.op[4] = &out;
+  binding.op[5] = residual_out;
+  // Preserve mismatched optional arguments until the typed validation can reject
+  // them. A recipe cannot silently hide an unexpected delta or residual output.
+  VT_CHECK((delta != nullptr) == (args.descriptor.expression == ResidualNormExpr::kDeltaPlusAdd),
+           "fused_chain: residual expression operand count mismatch");
+  VT_CHECK((residual_out != nullptr) == args.descriptor.materialize_residual,
+           "fused_chain: residual expression materialization mismatch");
+  FusedParams params{};
+  params.eps = args.eps;
+  FusedChain(q, ResidualRmsNormRecipe(args.descriptor), binding, params);
 }
 
 void FusedChain(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, Tensor* residual,

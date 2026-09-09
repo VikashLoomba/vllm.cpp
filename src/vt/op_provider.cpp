@@ -292,6 +292,8 @@ const char* OpNameImpl(OpId op) {
       return "Matmul";
     case OpId::kRmsNorm:
       return "RmsNorm";
+    case OpId::kResidualRmsNorm:
+      return "ResidualRmsNorm";
     case OpId::kSiluAndMul:
       return "SiluAndMul";
     case OpId::kRopeNeox:

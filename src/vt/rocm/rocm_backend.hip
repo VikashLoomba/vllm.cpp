@@ -215,6 +215,10 @@ class RocmBackend final : public Backend {
   int DeviceCapabilityMajor() const override { return major_; }
   int DeviceCapabilityMinor() const override { return minor_; }
 
+  ResidualNormPolicy GetResidualNormPolicy() const override {
+    return ResidualNormPolicy::kCompiledExpression;
+  }
+
   // Both branches satisfy the >= 64B contract Backend::Alloc owes StepArena:
   // hipMalloc aligns to at least 256 bytes as cudaMalloc does, and managed
   // allocations are at least page-granular.

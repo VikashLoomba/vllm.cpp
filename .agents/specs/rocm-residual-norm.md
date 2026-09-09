@@ -10,10 +10,10 @@ The implementation pull request closes #3103 when its required gates pass and it
 
 ## Now
 
-State: `SPIKE`. This commit records the shared repair before implementation.
-The saved production inputs prove a residual-normalization mismatch on `gfx1100`.
-A fresh implementer starts from this committed specification and captures the smallest red test.
-The related MoE production token gate remains failing at six generated positions.
+State: `SPIKE`. The shared repair is implemented and the focused production witness passes on `gfx1100`.
+The committed specification precedes both the captured red and the implementation.
+The complete hardware gate and fresh mutation review remain required before acceptance.
+The related MoE production token gate remains open; its baseline failed at six generated positions.
 No performance result is accepted before the complete declared token gate passes.
 
 ## Problem and scope
@@ -39,7 +39,7 @@ Those gaps still require implementation in the enclosing parity campaign.
 
 | Stable ID | Upstream source | Local anchor | Tests and evidence | State |
 |---|---|---|---|---|
-| `ROCM-RESIDUAL-EXPR-NORM` | `vllm/ir/ops/layernorm.py::fused_add_rms_norm`, generated `ckic6h6`, `ctj2x6`, and `c5slugd` kernels | `src/vt/rocm/rocm_rmsnorm.hip::RmsNormRowKernel`, new typed shared sibling | Captured row-zero values and ordered-expression cases | `SPIKE` |
+| `ROCM-RESIDUAL-EXPR-NORM` | `vllm/ir/ops/layernorm.py::fused_add_rms_norm`, generated `ckic6h6`, `ctj2x6`, and `c5slugd` kernels | `src/vt/rocm/rocm_residual_rmsnorm.hip::ResidualRmsNormRowKernel`, `vt::ResidualRmsNorm` | Captured row-zero values and ordered-expression cases | `SPIKE` |
 | `ROCM-RESIDUAL-EXPR-FUSION` | Executed normalization partitions described below | `include/vt/fused_recipe.h::FStep`, `src/vt/ops.cpp::FusedChainCompositeImpl` | Composite/native equivalence and boundary mutations | `SPIKE` |
 | `ROCM-RESIDUAL-EXPR-FORWARD` | `vllm/model_executor/models/qwen3_moe.py::Qwen3MoeDecoderLayer` | `src/vllm/model_executor/models/qwen3_moe.cpp::RunMoeLayer`, `ForwardLayers` | Registered loader/forward witness, full token gate, lifetime and wiring mutations | `SPIKE` |
 
@@ -339,6 +339,77 @@ This row owns #3103 directly. The related BF16 MoE row keeps its complete token 
 No performance or token requirement is waived by native/legacy agreement.
 The operator must assign separate scoped issues/specs for attention and head repairs before their implementation.
 The parent `BACKEND-ROCM` issue #41 retains router debt until its scoped repair is assigned.
+
+## Implementation and evidence
+
+The implementation base is the committed spec `9ec19f80b600c9e713f7297638186e986c67a4d1`.
+`ResidualNormDesc` distinguishes the two ordered expressions and optional BF16 residual materialization.
+The typed operation validates every tensor and permitted exact alias before dispatch.
+`FStep` admits four inputs, and the composite realizes the explicit residual opcode through that operation.
+The CPU reference does not select the production policy.
+The ROCm backend selects the compiled expression; CPU and CUDA retain the materialized policy.
+`RunMoeLayer` consumes the retained attention owner immediately after MoE and transfers the next normalized BF16 buffer's ownership.
+The final norm omits residual output. No persistent FP32 activation or residual is introduced.
+
+The native kernel uses a deterministic 256-lane FP32 reduction and reloads original operands before each store.
+All variance reads finish before any permitted output alias is written.
+Wide rows, padded row strides, and tails use the same arithmetic and ownership contract.
+The launcher selects the queue's device and stream and restores the caller's ambient device.
+The operation allocates no storage during graph capture.
+
+### Red before implementation
+
+Evidence root: `/home/vikash/.cache/residual-norm-impl`.
+The `red-freeze` manifest pins unchanged product blobs, tests, model bytes, linked libraries, compiler flags, and binaries.
+The CPU red exited 1 with 33 failures among 128 assertions.
+Its binary SHA256 is `c5745f016d2033ec1da40d6b98cc29803c3f757d583f81bb9eb85665c97dabbf`.
+The operator's production red exited 1 with 33 failures among 400 assertions.
+Every captured attention, residual, and gamma word matched the primary before the failed norm comparison.
+The production binary SHA256 is `f932a6c7b49c96111fb1868bf043287c69c7c4375beebcf4dd14535b42249024`.
+The operator log SHA256 is `3baba8756846635e085587a99443e3b6c3d3268351fda356f9135809eb8fc49d`.
+
+### Focused green and later primary observation
+
+The operator ran `green-freeze-1/command.json` and `component-command.json` on the same physical GPU under the required mutex.
+The production witness passed all 399 assertions, including 128 exact primary norm words.
+Its binary SHA256 is `aa38607e0b88202e2d65e45f76c790b7f18c2bd6dd3cb62662c91892f6f56e00`.
+The component gate passed 10,700 CPU and native ROCm assertions without a device skip.
+Its binary SHA256 is `102f34696d79be728dd8c196087f05857c8b91fcc01a2994e6ec1f8fdb705aad`.
+The operator verified 60 sealed inputs before and after those runs in `green-freeze-1/operator-receipts.json`.
+The production log SHA256 is `e94ea05e06acc04408e37a73ede8bf7acc24071ec132d011755fb5534d6e0d53`.
+The component log SHA256 is `63e2cfcf065030259deda3a59cf521db66bcead298d643e7d0b46b3837d1736a`.
+
+The `oracle-probe-v3` observer wraps original compiled launches with unchanged arguments and verifies their source ASTs.
+It observes post-attention, next-input, final, and Q/K preamble launches in L33/C1/R0 and L33/C2/R0.
+The operator verified ten capture records, 64 binary payloads, and every read-only input before and after the launches.
+All 18 production cohorts, 216 tokens, and every logprob matched the paired observation-disabled control.
+The observer script SHA256 is `789138a38dc2db167656356b4ffa18cab8e4141a3b96fb5f24f93bdd9f242512`.
+The operator log SHA256 is `220ce248825706013fdaa0a640a5b5acd522d8e6d31f9fcc43244036ef3224a5`.
+`oracle-probe-v3/operator-output-checks.json` records the independent comparison.
+The actual next residual, next norm, and final norm first-row bytes are embedded with full-payload and slice hashes in `tests/support/residual_norm_later_fixture.h`.
+The earlier v1 AST-parser failure and v2 singleton-stride serialization failure remain preserved beside the successful v3 evidence.
+Neither failed observer is evidence for a primary arithmetic result.
+
+### Test applicability and remaining gates
+
+`tests/vt/residual_norm_upstream.py` executes the pinned core and IR normalization tests and exports their original BF16 fixtures.
+It preserves both residual modes, every token count and width, row strides, device count, seed zero, epsilons, and original tolerances.
+The C++ operation consumes the exported original native references and compares direct and shared-fusion dispatch exactly.
+Weightless normalization is represented by an explicit unit BF16 gamma; plain normalization uses a zero base.
+Torch registration and opcheck execute in the exporter. C++ validates its own descriptor and ownership rules.
+F16/F32 activation modes are outside this measured BF16 policy and are explicitly refused, never silently skipped.
+The new API has no variance-size override, Gemma modifier, or partial-width norm mode.
+
+The six focused CPU suites, including the existing Qwen3 MoE forward control, pass after adding the later witnesses.
+`cpu-green-5.log` records that run. External upstream fixtures require `VT_RESIDUAL_NORM_UPSTREAM`; absence is reported as unexecuted.
+The complete upstream export, expanded hardware tests, complete token gate in both fusion modes, staged preflight, and fresh mutation review remain pending at this evidence checkpoint.
+
+The ROCm platform keeps `support_static_graph_mode()` false at this base in `src/vllm/platforms/rocm.cpp:91`.
+Production registry decode therefore does not enter the graph driver.
+The existing ROCm graph row owns that platform exclusion; this repair does not change it.
+The new operation's hardware gate covers capture and repeated replay with live BF16 operands on both devices.
+It also checks two queues, ambient-device restoration, wrong-device streams, and a blocked nondefault stream.
+No production graph claim is inferred from that component gate.
 
 ## Stop conditions
 

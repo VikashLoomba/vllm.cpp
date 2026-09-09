@@ -830,6 +830,7 @@ enum class OpId : uint8_t {
   kMoeGroupedGemmBf16GateUpSiluNative,
   kMoeGroupedGemmBf16Weighted,
   kMoeCombinePreweighted,
+  kResidualRmsNorm,
   kCount
 };
 
@@ -877,6 +878,11 @@ struct DropinProbeArgs {
 struct RmsNormArgs {
   float eps = 1e-6f;
   bool gemma = false;  // weight applied as (1 + w), GemmaRMSNorm style
+};
+
+struct ResidualRmsNormArgs {
+  float eps = 1e-6f;
+  ResidualNormDesc descriptor{};
 };
 
 // Ungated GROUP RMS norm args (vt::RmsNormGroup). A SIBLING of RmsNormArgs, not
@@ -2294,6 +2300,10 @@ using Exl3MoeMlpFn = void (*)(Queue&, Tensor&, const Tensor&, const Exl3MoeExper
                               const Exl3MoeRouting&, const Exl3MoeTemps&, const Exl3MoeArgs&);
 using RmsNormFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
+using ResidualRmsNormFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*a*/,
+                                   const Tensor& /*base*/, const Tensor* /*delta*/,
+                                   const Tensor& /*weight*/, const ResidualRmsNormArgs&,
+                                   Tensor* /*residual_out*/);
 // Ungated group RMS norm (vt::RmsNormGroup). Same operand order as RmsNormFn
 // minus the residual, which this op does not carry because its upstream has no
 // residual arm and a knob nobody can set is a divergence with extra steps.
@@ -3354,6 +3364,22 @@ void MoeRelu2(Queue& q, Tensor& out, const Tensor& x);
 // upstream bf16 need bf16-eps tolerance on the non-gemma path.
 void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
              const RmsNormArgs& args, Tensor* residual = nullptr);
+
+// Compiled BF16 expression: normalize a+base or delta+(a+base), in FP32,
+// multiplying gamma before the single BF16 output conversion. An optional
+// residual output stores the same unrounded expression as BF16. It is never
+// reloaded for normalization. Inputs/output are rank-2 with unit inner stride
+// and nonoverlapping rows. Gamma is contiguous BF16 [H]. Empty rows are legal.
+// Only descriptor-permitted exact aliases can modify an input. No persistent
+// FP32 activation is needed. Other activation/gamma dtypes are refused.
+void ResidualRmsNorm(Queue& q, Tensor& out, const Tensor& a, const Tensor& base,
+                     const Tensor* delta, const Tensor& weight,
+                     const ResidualRmsNormArgs& args, Tensor* residual_out = nullptr);
+
+// The same typed operation through the shared recipe/composite seam.
+void FusedChain(Queue& q, Tensor& out, const Tensor& a, const Tensor& base,
+                const Tensor* delta, const Tensor& weight,
+                const ResidualRmsNormArgs& args, Tensor* residual_out = nullptr);
 
 // UNGATED PER-GROUP RMS NORM — `Qwen4ExpTextRMSNorm` (transformers v5.16.0
 // `models/qwen4_exp/modeling_qwen4_exp.py:158-181`), the `group_size is not

@@ -3189,6 +3189,11 @@ vllm_cpp_add_test(test_ops_moe_grouped_bf16_gate_up_silu
                   vt/test_ops_moe_grouped_bf16_gate_up_silu.cpp)
 vllm_cpp_add_test(test_ops_moe_nongated_relu2 vt/test_ops_moe_nongated_relu2.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm vt/test_ops_rmsnorm.cpp)
+vllm_cpp_add_test(test_ops_residual_rmsnorm vt/test_ops_residual_rmsnorm.cpp)
+if(VLLM_CPP_HIP)
+  target_compile_definitions(test_ops_residual_rmsnorm PRIVATE __HIP_PLATFORM_AMD__=1)
+  target_compile_definitions(test_rocm_moe_bf16 PRIVATE __HIP_PLATFORM_AMD__=1)
+endif()
 vllm_cpp_add_test(test_ops_rmsnorm_weight_dtype vt/test_ops_rmsnorm_weight_dtype.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm_quant_fp8_weight_dtype
                   vt/test_ops_rmsnorm_quant_fp8_weight_dtype.cpp)

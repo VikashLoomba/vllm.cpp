@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 #include "rocm_moe_fixture.h"
+#include "support/residual_norm_fixture.h"
+#include "support/residual_norm_test.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"
@@ -21,6 +23,73 @@
 namespace {
 using namespace rocm_moe_fixture;
 vt::MoeRouterTopKFn native_router = nullptr;
+vt::RmsNormFn native_norm = nullptr;
+vt::ResidualRmsNormFn native_expression = nullptr;
+bool observe_residual = false;
+int observed_norm_calls = 0;
+std::vector<uint16_t> observed_attention, observed_residual, observed_gamma, observed_post;
+std::vector<uint16_t> observed_first;
+struct ExpressionRecord {
+  vt::ResidualRmsNormArgs args;
+  std::vector<uint16_t> a, base, delta, gamma, norm, residual;
+  uintptr_t attention_pointer = 0;
+};
+std::vector<ExpressionRecord> observed_expressions;
+std::vector<uint16_t> ReadRow(vt::Queue& q, const vt::Tensor& tensor) {
+  REQUIRE(tensor.dtype == vt::DType::kBF16);
+  REQUIRE(tensor.Numel() >= 128);
+  std::vector<uint16_t> row(128);
+  auto& backend = vt::GetBackend(q.device);
+  backend.Copy(q, row.data(), tensor.data, row.size() * sizeof(uint16_t));
+  backend.Synchronize(q);
+  return row;
+}
+void CaptureResidualNorm(vt::Queue& q, vt::Tensor& out, const vt::Tensor& x,
+                         const vt::Tensor& weight, const vt::RmsNormArgs& args,
+                         vt::Tensor* residual) {
+  const bool legacy = vt::GetBackend(q.device).GetResidualNormPolicy() ==
+                      vt::ResidualNormPolicy::kMaterialized;
+  const bool capture = observe_residual && legacy && observed_norm_calls++ == 3;
+  if (capture) {
+    REQUIRE(residual != nullptr);
+    observed_attention = ReadRow(q, x);
+    observed_residual = ReadRow(q, *residual);
+    observed_gamma = ReadRow(q, weight);
+  }
+  native_norm(q, out, x, weight, args, residual);
+  if (capture) observed_post = ReadRow(q, out);
+  if (observe_residual && !legacy && observed_first.empty()) observed_first = ReadRow(q, out);
+}
+void CaptureExpression(vt::Queue& q, vt::Tensor& out, const vt::Tensor& a,
+                        const vt::Tensor& base, const vt::Tensor* delta,
+                        const vt::Tensor& weight, const vt::ResidualRmsNormArgs& args,
+                        vt::Tensor* residual_out) {
+  const bool first = observe_residual && observed_norm_calls++ == 0;
+  ExpressionRecord record;
+  if (observe_residual) {
+    record.args = args;
+    record.a = ReadRow(q, a); record.base = ReadRow(q, base);
+    record.gamma = ReadRow(q, weight);
+    record.attention_pointer = reinterpret_cast<uintptr_t>(a.data);
+    if (delta != nullptr) record.delta = ReadRow(q, *delta);
+  }
+  if (first) {
+    observed_attention = ReadRow(q, a);
+    observed_residual = ReadRow(q, base);
+    observed_gamma = ReadRow(q, weight);
+  }
+  native_expression(q, out, a, base, delta, weight, args, residual_out);
+  if (first) observed_post = ReadRow(q, out);
+  if (observe_residual) {
+    record.norm = ReadRow(q, out);
+    if (residual_out != nullptr) record.residual = ReadRow(q, *residual_out);
+    CHECK(ReadRow(q, a) == record.a);
+    CHECK(ReadRow(q, weight) == record.gamma);
+    if (!args.descriptor.residual_alias_base) CHECK(ReadRow(q, base) == record.base);
+    if (delta != nullptr && !args.descriptor.output_alias_delta) CHECK(ReadRow(q, *delta) == record.delta);
+    observed_expressions.push_back(std::move(record));
+  }
+}
 nlohmann::json* current_routes = nullptr;
 void CaptureRoutes(vt::Queue& q, vt::Tensor& weights, vt::Tensor& indices,
                     const vt::Tensor& logits, const vt::MoeRouterTopKArgs& args,
@@ -62,7 +131,8 @@ struct QueueGuard {
   ~QueueGuard() { backend.DestroyQueue(queue); }
 };
 
-nlohmann::json Generate(const std::filesystem::path& fixture, int length, int concurrency) {
+nlohmann::json Generate(const std::filesystem::path& fixture, int length, int concurrency,
+                        int steps = 8) {
   auto config = vllm::LoadHfConfig((fixture / "config.json").string());
   std::vector<vllm::SafetensorsFile> shards;
   shards.push_back(vllm::SafetensorsFile::Open((fixture / "model.safetensors").string()));
@@ -96,7 +166,7 @@ nlohmann::json Generate(const std::filesystem::path& fixture, int length, int co
   current_routes = &routes;
   Buffer sampled(backend, static_cast<size_t>(concurrency) * sizeof(int64_t));
   auto ids = Tensor(sampled.data, vt::DType::kI64, q.device, {concurrency});
-  for (int step = 0; step < 8; ++step) {
+  for (int step = 0; step < steps; ++step) {
     const int count = step == 0 ? length : 1;
     const int previous = step == 0 ? 0 : length + step - 1;
     std::vector<int32_t> tokens, positions, gather;
@@ -148,6 +218,68 @@ nlohmann::json Generate(const std::filesystem::path& fixture, int length, int co
           {"logits", logits}, {"expert_ids", routes}};
 }
 }  // namespace
+
+TEST_CASE("ROCm residual row zero matches the compiled primary through production forward") {
+  using namespace residual_norm_fixture;
+  const char* directory = std::getenv("VT_ROCM_MOE_FIXTURE");
+  REQUIRE(directory != nullptr);
+  native_norm = reinterpret_cast<vt::RmsNormFn>(
+      vt::GetOp(vt::OpId::kRmsNorm, vt::DeviceType::kROCM));
+  vt::RegisterOpProvider(vt::OpId::kRmsNorm, vt::DeviceType::kROCM,
+      {"test-residual-row-observer", 100, nullptr,
+       reinterpret_cast<void*>(static_cast<vt::RmsNormFn>(&CaptureResidualNorm))});
+  native_expression = reinterpret_cast<vt::ResidualRmsNormFn>(
+      vt::GetOp(vt::OpId::kResidualRmsNorm, vt::DeviceType::kROCM));
+  vt::RegisterOpProvider(vt::OpId::kResidualRmsNorm, vt::DeviceType::kROCM,
+      {"test-residual-expression-observer", 100, nullptr,
+       reinterpret_cast<void*>(static_cast<vt::ResidualRmsNormFn>(&CaptureExpression))});
+  observe_residual = true;
+  observed_norm_calls = 0;
+  observed_first.clear(); observed_expressions.clear();
+  Generate(directory, 33, 2, 1);
+  observe_residual = false;
+  CHECK(observed_attention == std::vector<uint16_t>(kAttention.begin(), kAttention.end()));
+  CHECK(observed_residual == std::vector<uint16_t>(kResidual.begin(), kResidual.end()));
+  CHECK(observed_gamma == std::vector<uint16_t>(kGamma.begin(), kGamma.end()));
+  REQUIRE(observed_post.size() == kPostNorm.size());
+  int different = 0;
+  for (size_t j = 0; j < kPostNorm.size(); ++j) {
+    CAPTURE(j);
+    different += observed_post[j] != kPostNorm[j];
+    CHECK(observed_post[j] == kPostNorm[j]);
+  }
+  MESSAGE("Compared 128 production post-attention BF16 words with the compiled primary; differences: ", different);
+  CHECK(observed_first == std::vector<uint16_t>(kFirstNorm.begin(), kFirstNorm.end()));
+  REQUIRE(observed_expressions.size() == 4);
+  auto checkpoint = vllm::SafetensorsFile::Open((std::filesystem::path(directory) / "model.safetensors").string());
+  const std::vector<std::string> weights{
+      "model.layers.0.post_attention_layernorm.weight", "model.layers.1.input_layernorm.weight",
+      "model.layers.1.post_attention_layernorm.weight", "model.norm.weight"};
+  for (size_t i = 0; i < observed_expressions.size(); ++i) {
+    CAPTURE(i);
+    const auto& record = observed_expressions[i];
+    const bool triple = i % 2 == 1;
+    CHECK(record.args.descriptor.expression == (triple ? vt::ResidualNormExpr::kDeltaPlusAdd : vt::ResidualNormExpr::kAdd));
+    CHECK(record.args.descriptor.materialize_residual == (i == 1));
+    const auto& gamma = checkpoint.Get(weights[i]);
+    REQUIRE(gamma.dtype == "BF16");
+    const auto* words = reinterpret_cast<const uint16_t*>(gamma.data);
+    CHECK(record.gamma == std::vector<uint16_t>(words, words + 128));
+    std::vector<uint16_t> expected_residual;
+    const auto expected = residual_norm_test::Reference(record.a, record.base,
+        triple ? &record.delta : nullptr, record.gamma, 1, 128, 128,
+        record.args.eps, &expected_residual);
+    CHECK(record.norm == expected);
+    if (i == 1) CHECK(record.residual == expected_residual);
+    else CHECK(record.residual.empty());
+    if (triple) {
+      CHECK(record.a == observed_expressions[i - 1].a);
+      CHECK(record.base == observed_expressions[i - 1].base);
+      CHECK(record.attention_pointer == observed_expressions[i - 1].attention_pointer);
+    }
+  }
+  CHECK(observed_expressions[2].base == observed_expressions[1].residual);
+}
 
 TEST_CASE("ROCm BF16 MoE enters native providers through the production registry") {
   const char* directory = std::getenv("VT_ROCM_MOE_FIXTURE");

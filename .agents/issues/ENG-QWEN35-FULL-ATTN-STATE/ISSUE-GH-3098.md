@@ -52,6 +52,12 @@ The scoped implementation passes public completion through both default and
 callback sampling arms. The operator reproduced the independent red and reran
 all public and focused CPU gates. The implementer completed 30 mutation checks.
 
+Fresh review found missing negative coverage for the first query offset and
+internal offset ordering. The test repair covers both graph siblings.
+Each independent guard deletion now fails its corresponding new subcase.
+The unchanged control and four complete focused CPU suites pass.
+The specification records this repair's hashes, commands, and evidence.
+
 The exact GGUF attempt on pinned vLLM refuses the text-only engine configuration
 before generating a token. The owning [specification](../../specs/qwen35-full-attn-state.md)
 records the source hashes, commands, logs, and pending G4 obligation. Fresh

@@ -8,9 +8,11 @@ Parent: `BACKEND-ROCM`. Base: `6db4bef906859e864c82523c01107473f7dcca29`.
 
 ## Now
 
-`READY` for a fresh implementation from this committed spec. This commit defines
-the contract and records the source inspection. No implementation or GPU result
-is claimed. The parent row remains `ACTIVE`.
+`ACTIVE`. The implementation retains F16 storage through the Qwen3.5 dense
+registry and executes the three ordinary ROCm operations with explicit value
+conversion. Focused ownership and physical gfx1100 checks pass. The complete
+model and full-suite gates remain failing, as recorded under evidence below.
+The parent row remains `ACTIVE`.
 
 The change uses one pull request. Commit this spec before implementation. The
 operator owns the GPU, reviews the returned evidence, and reruns the gates.
@@ -281,7 +283,6 @@ correct output while the graph remains active and release after its last owner.
 Exercise the single-graph and graph-handle APIs, including deduplication.
 Record the red result on the initial implementation before repairing ownership.
 
-
 ## Tests to port
 
 Port the applicable ordinary fallback case from
@@ -328,10 +329,10 @@ implementation, then focused green and the full gate.
 | ID | Requirement | Current result |
 |---|---|---|
 | F16-G1 | Spec committed before implementation, issue and row agree | Satisfied by this spec commit |
-| F16-G2 | Focused red, focused green, and registered CPU/HIP tests | PENDING implementation |
-| F16-G3 | Default public-load and registered-forward reachability | PENDING implementation |
-| F16-G4 | Identical-artifact active-pin oracle and exact token gate | PENDING model run |
-| F16-G5 | Same-tool executed dtype and dispatch traces | PENDING paired traces |
+| F16-G2 | Focused red, focused green, and registered CPU/HIP tests | FAILING baseline CPU/HIP suites (#3070, #3102, #3105) and explicit-head dependency #3098; focused checks pass |
+| F16-G3 | Default public-load and registered-forward reachability | PENDING explicit-head forward after #3098; public retained-weight execution observed |
+| F16-G4 | Identical-artifact active-pin oracle and exact token gate | FAILING arithmetic comparison and D1 repeatability; identical-GGUF plugin run remains PENDING |
+| F16-G5 | Same-tool executed dtype and dispatch traces | PENDING identical-GGUF primary execution; native/materialized traces captured with existing dtype/policy differences retained |
 | F16-G6 | Same-binary A/B and oracle speed, latency, and memory | PENDING F16-G4 |
 | F16-G7 | Fresh immutable-head mutation review and operator rerun | PENDING reviewed head |
 | F16-G8 | Full repository preflight, no skipped applicable gates | PENDING final head |
@@ -459,6 +460,372 @@ host, toolchain, active oracle identity, and exclusive device ownership.
 Use the configured fleet lease where applicable and the configured mutex on a
 non-fleet device. This spec authoring task runs no GPU work.
 
+## Evidence from 9 September 2026
+
+Evidence files are retained under the implementation worktree's ignored
+`build-rocm-f16-evidence` directory. Each operator receipt records its command,
+environment, executable hash, mutex boundary, and exit status. Source snapshots
+preserve harness revisions whose paths were subsequently rebuilt. Measurements
+below do not establish a performance result or close an unresolved gate.
+
+### Red and component checks
+
+The installed `hipblasGemmEx` probe tested all nine F16, BF16, and F32 input
+pairs at M=6, N=128, K=64. It used F32 compute, F32 scalars, and the default
+algorithm. `blas-probe-run.log` records the result for both requested output types.
+
+| A and B | BF16 output | F32 output |
+|---|---|---|
+| F16 and F16 | Not supported, status 7 | Success, value 64 |
+| BF16 and BF16 | Success, value 64 | Success, value 64 |
+| F32 and F32 | Not supported, status 7 | Success, value 64 |
+| Each unequal input pair | Not supported, status 7 | Not supported, status 7 |
+
+The implementation therefore uses homogeneous F16 directly only with F32 output.
+Marked BF16-value weights convert before the existing BF16 dispatch. Other mixed
+pairs widen exactly to F32, after any declared BF16 weight rounding. A requested
+BF16 output uses a temporary F32 result when the homogeneous input type requires
+that adaptation. Ordinary `VT_ROCM_GEMM_COMPUTE=16f` is refused by name, because
+these calls supply F32 scalars. The `16bf` override requires effective BF16 inputs.
+
+Commit `760c8dd7e27781430b909c3679790c52fe332182` added the production admission
+test and fixed token fixture before implementation. Its focused admission test
+failed because the registry returned BF16 where retained F16 was required.
+`production-admission-focused-red.log` preserves that original failure. The first
+red invocation omitted the authorized external `TMPDIR`. Its temporary fixture
+was removed by the test destructor. Later invocations use the external directory.
+
+A clean rebuild of that commit reproduced the same failure with a hashed binary.
+`production-admission-red-reproduced-v1-command.json` records the command and
+SHA256 `a3469163bb8f27c9274b8e81e9bad7fa8ffef5f1e19732e9c236ae69f5b9f408`.
+The implementation's focused admission test passed 10 assertions. Its complete
+CPU GGUF suite passed 56 cases and 10,417 assertions. The ownership and dispatch
+contract passed 3 cases and 111 assertions.
+
+The operator ran `test_rocm_f16_weights` on gfx1100. The five-case revision
+passed 27,680 assertions, including graph replay after scratch growth and
+interleaved streams. Its binary SHA256 is
+`d730e89f49fb1bd35bb6ef59e7235c63e79631fc22456c0900c1f69ae3fa7d65`.
+`hip-f16-focused-streams-operator-receipt.json` records that run.
+
+`test_rocm_f16_device` passed NN, BT, and embedding on each of two visible
+gfx1100 devices. The test allocates and verifies each operand on the intended
+device, then changes the ambient device before entering the ordinary operation.
+Each operation leaves its queue's device current and returns the required values.
+`hip-f16-two-device-v2-operator-receipt.json` records binary SHA256
+`67e7758e66f716bd5412fdda8bbd38d7cdbbe6b2d26a749d6d3154f18cbf9da6`.
+This scope excludes the existing backend allocation issue #3100.
+
+The pinned upstream ordinary fallback ran on the operator's gfx1100 device.
+`oracle-primitive-v1-operator-receipt.json` records the actual F16 `[6,64]`
+activation, `[128,64]` weight, and `[6,128]` result. The raw F16 arrays have
+combined SHA256
+`dbb7f33c2a2c163d06f2129aa31cef108321d5142bbaf37eec3ff194548f6ca8`.
+The committed `upstream-fallback.json` retains those arrays. Its capture script
+preserves the upstream fallback-selection mocks and `atol=rtol=1e-3`.
+Seed 0 makes the original random fixture reproducible. The C++ adaptation
+compares NN and BT after the spec's required output rounding. An additional
+comparison checks unrounded F32 accumulation. The operator's six-case run
+passed 27,692 assertions, recorded in `hip-f16-upstream-fixture-v3-operator-receipt.json`.
+Its binary SHA256 is
+`a7471e7928698c20f96d739446942ba78e79713646668eb76422cfabd603c108`.
+
+### Scratch lifetime and negative checks
+
+The original scratch registry retained each destroyed queue's allocation. The
+operator's four-queue red test retained 8,192 bytes in four entries. The graph
+handle red test retained 33,024 bytes after graph destruction, and the single
+slot red test accumulated four entries. Numeric replay assertions still passed.
+The original binaries, logs, and receipts remain under `snapshots/lifetime-red-v1`.
+
+Commit `e076a533e20935ebfcf829005ce66e59f1d34292` amended the scope before the
+lifetime repair. Queue and graph owners now share each referenced allocation.
+Eager growth releases an unreferenced old slab. Destroying a queue removes its
+entry; captured graphs keep their own allocations until their final owner ends.
+The last owner binds the allocation device, calls `hipFree`, and restores the
+ambient device. The pool releases owners outside its registry lock.
+
+The operator ran the nine-case lifetime revision: 28,151 assertions passed with
+zero skips. Its frozen binary SHA256 is
+`3b2d801a71e754f1bfc79e1b6cd9dd2cecaf57b699922b8272d7b6cfb6a516a3`.
+A separate process with graph deduplication enabled passed its case's 97
+assertions; its runtime reports two graphs sharing one executable. The graph
+case retains a shared slab through two handles, destroys the source queue,
+replays on another queue, and releases the allocation only after both handles
+end. The single-slot case replaces four graphs without cumulative retention.
+Receipts reside beside `lifetime-green-v1/manifest.json`.
+
+A test-only linker observer calls the real HIP allocator and records successful
+frees with allocation generation IDs. The assertions verify physical release
+independently of the product's byte counters. The two-device test verifies
+release restores the caller's ambient device. Its strengthened observer also
+records actual pointer provenance and the device current at the real free call;
+that revision's six-operation control passed under `lifetime-green-v2`.
+The final ten-case control passed 28,234 assertions. It includes an unwarmed
+capture-growth refusal that leaves capture usable for a subsequent operation.
+Its binary SHA256 is
+`44c016115552a79426ec39771862fddec8e8a085f9e5f07ef89f03e4a8bedb8f`.
+
+The CPU mutation runs remove twelve distinct ownership, residency, validation,
+provider, and production-admission guarantees. Every corrected mutation fails
+at runtime, with byte-identical restoration recorded under `mutations-cpu-v1`
+and `mutations-cpu-v2`. The first header mutation experiment selected the
+original weak inline definition at link time and was not a valid mutation.
+The corrected ordering records the chosen object in its link map and includes
+a passing unmodified control. No compiler or test tolerance was weakened.
+
+HIP mutation recipes under `mutations-hip-v1`, `mutations-hip-v2`, and
+`mutations-hip-v3` separately remove physical free, weight rounding, F32
+activation precision, each K=0 zero fill, embedding ID width, operation device
+binding, and release device binding or restoration. Each recipe records the
+source, exact compile and link commands, binary hash, and byte-exact restoration.
+The operator detected all 18 recorded negative invocations, including separate
+graph-deduplication arms, in `lifetime-and-numeric-mutations-operator-results.json`.
+Each failed at the intended numeric, physical-ownership, or device guarantee.
+The capture-growth mutant first failed the expected-error assertion and then
+aborted during cleanup; the abort alone is not its mutation evidence.
+
+The physical-free-only mutation ran separately. It removed only `hipFree` while
+leaving owner removal and byte counters intact. The three-case run passed 449
+assertions and failed ten physical-free assertions. Its log SHA256 is
+`ce325e2f7ddd166c3229689d025d7b0eee33a3e82e8c97814b0bacece06fc6a1`,
+retained with the operator receipt under `mutations-hip-v1/omit-physical-free`.
+These are implementer mutation checks executed by the operator. Fresh review of
+the immutable implementation remains F16-G7.
+
+### Model artifacts and the primary run
+
+The stock converter produced `Qwen3.5-0.8B-F16.gguf`, 1,557,662,528 bytes,
+with SHA256
+`758b5299b027120c3608c43777a89257724d46e26eefac2a8aaad512be15b53f`.
+The file contains 335 tensors, comprising 195 F16 tensors and 140 F32 tensors.
+`qwen35-08b-source-manifest.json` pins all 13 source files. Conversion validation
+compares every emitted tensor's name, shape, storage dtype, and bytes with the
+stock converter. Its mapping accounts for 320 text tensors, 15 MTP tensors,
+and 153 source vision tensors omitted from this text GGUF.
+
+The first-party plugin does not run this text-only GGUF at the recorded pin.
+The complete HF configuration requires the missing vision projector. The exact
+text configuration instead reaches a conditional-generation registration that
+requires `Qwen3_5Config`, but receives `Qwen3_5TextConfig`. The failed actual
+runs remain in `oracle-tokens-cap1-v2-operator-receipt.json` and
+`oracle-gguf-text-v4-cap1-operator-receipt.json`. No plugin code, architecture
+override after plugin selection, or substitute projector was introduced.
+
+The spec's permitted arithmetic materialization uses the pinned plugin's exact
+name mapper and weight transformations. The operator independently checked all
+320 emitted tensors against the GGUF and adapter. The plugin excludes the
+15 MTP tensors from this text path. `operator-verify-materialization-v1-receipt.json`
+records the successful check. `materialization-v1.json` retains every source and
+destination name, dtype, shape, transformation, and content hash. The resulting
+`model.safetensors` SHA256 is
+`b27fbf8cb5d35406b4fce084bdda1ec10de8fb5e3d48f647edc1ebf325fa740e`.
+Its exact text configuration, with the native causal-LM architecture, has SHA256
+`9530fc375d6751919be82999e46ff9c5d8bc9c3e5d6d678bf2e9d7d220347600`.
+
+`oracle-materialized-v5-cap1-operator-receipt.json` records the actual active-pin
+BF16 production run, with eager enforcement disabled. Both oracle repeats of
+F16-P16 match the native 32 generated IDs exactly. Both oracle repeats of
+F16-P128 are stable, but differ from native at 31 of 64 positions. F16-D1
+differs between oracle repeats at 31 of 32 positions. Its repeatability assertion
+fails. These observations establish neither a distributional gate nor token parity.
+
+The native public API executes the retained embedding table and marked ordinary
+GEMMs. A test-only linker wrapper observes actual native provider calls and invokes
+their original implementations. The first observation harness attempted duplicate
+provider registration, which preserves the first registration and cannot observe
+the calls. Its failed result and source remain under `snapshots/observer-v1`.
+The corrected wrapper verifies its selected function before measurement.
+
+The corrected public run emits every capacity-one request but fails D1
+repeatability. Its KEEP_F16=0 comparison uses the same binary and matches every
+token in all six runs. D1 differs between native repeats at 28 of 32 positions.
+F16-P16 and F16-P128 remain stable. `public-cap1-keep-ab-v2-comparison.json`
+retains this comparison. KEEP_F16=0 alone does not establish a pre-existing bug,
+because that binary still contains the implementation.
+
+An untouched HIP library was built from clean commit `760c8dd7e27781430b909c3679790c52fe332182`.
+A separate diagnostic harness uses only baseline-compatible observation fields.
+Its adaptation removes unavailable new metadata observations and preserves the
+public request parameters, repetitions, assertions, and production calls.
+`build-hip-baseline-harness-v3-command.json` records library SHA256
+`92f77b07e5cdfc5870117b1098a1b10ae2a09101e6d76fb4d81c90ab2a849c1b`
+and binary SHA256
+`45f7ffee0a0653187adbcf38a71b6aa203541c4ee811ab93c212c4e8e4eb466f`.
+`public-baseline-cap1-v3-operator-receipt.json` records the unchanged baseline's
+same D1 repeatability failure. All six baseline token arrays equal both feature
+arms, as recorded in `public-baseline-v3-vs-keep0-v2-operator.json`. The feature's
+retained-storage choice therefore does not cause these observed differences.
+
+Four fresh-process active-pin diagnostics each run one D1 request with the same
+production configuration. Two record scheduler observations; two omit that
+instrumentation. All four emit the same 32 IDs, `[198, 1]` repeated 16 times.
+`oracle-diagnostic-v6-four-fresh-operator-summary.json` retains this control.
+It does not replace or relax the committed repeated-engine workload.
+
+### Capacity-four and current memory observations
+
+The original F16-C4 matrix completed twice in each arm: native KEEP_F16=0,
+native KEEP_F16=1, untouched baseline, and the active-pin materialized primary.
+Every arm was repeatable. All eight requests and 256 generated IDs matched
+exactly. `capacity-four-baseline-comparison-operator.json` and
+`capacity-four-primary-comparison-operator.json` retain the operator's independent
+comparisons. The current public observer binary SHA256 is
+`2e4fda0905334765389653f6781ed79cf0b2c7abc381bc1405b2e2c914dd55a7`;
+`capacity-four-v1/manifest.json` pins it beside the unchanged baseline and fixture.
+
+The actual schedules differ. For example, KEEP_F16=1 begins its repeats with
+48 then 19 tokens, and 16 then 49 tokens; the primary begins with all 64 prompt
+tokens. Each reaches batches of four decode tokens. Exact tokens therefore do
+not establish matching invocation counts or a throughput comparison.
+
+The native retained-weight arm observed 12,342 marked ordinary GEMMs across
+F16-C4. Its scratch capacity and retained allocation were each 536,870,912 bytes
+(512 MiB), with a 508,559,360-byte high-water request and one active queue. The
+KEEP_F16=0 control reported zero marked GEMMs and zero F16 scratch. Both arms
+reported 2,013,340,416 uploaded device bytes and zero instrumented host-copy
+bytes. These counters do not measure total RSS or establish a peak-memory win.
+The extra scratch must remain part of any later memory comparison.
+
+The current capacity-one observer preserves counters before its unchanged D1
+repeatability failure. It observed 47,872 marked GEMMs and the same 512 MiB
+scratch allocation and high-water request. The exact native and primary logs,
+commands, and exits remain in
+`capacity-four-and-current-observer-operator-results.json`. F16-C4 passes its
+arithmetic subcase; the D1/P128 and identical-GGUF failures still hold F16-G4 open.
+No speed, latency, memory ratio, or invocation-parity result is accepted.
+
+### Executed dtype and dispatch traces
+
+The operator traced the unchanged capacity-four requests and both repeats with
+rocprofv3 1.3.5, revision `6b0e43f341195e203754e08f850e437ff2fc09f9`.
+Both arms use the same hashed profiler prefix, copied from existing files and
+mounted read-only. The prefix contains no HIP, HSA, hipRTC, or BLAS runtime.
+`g5-traces-v1/manifest.json` records its complete file and symlink set.
+The application runtimes retain their existing versions and libraries.
+
+The first oracle run is insufficient for API coverage: its forked worker inherits
+profiler PID 1, and the parent overwrites the worker API and JSON outputs.
+All first-run files remain preserved. The bounded repair uses vLLM's supported
+`VLLM_WORKER_MULTIPROC_METHOD=spawn`, per-process filenames, and CSV-only output.
+This is a profiling process-launch adaptation, not a performance denominator.
+The observer adds real PIDs; model options, graph mode, sampling, every input ID,
+and both repeats stay unchanged. The worker finishes writing before shutdown.
+
+The repaired oracle worker is PID 227. Its 248,920 runtime API events cover all
+35,343 kernel and 239 memory-copy correlation IDs, with zero missing joins.
+Parent and helper processes have separate compiler-only files. The implementer
+and operator independently verify that all 256 generated IDs match the traced
+native KEEP0/1 arms and the earlier primary run. The operator audit is
+`g5-traces-v2/oracle/operator-trace-token-audit.json`, SHA256
+`8c08d00475c161d1311dbbcfc953952e09370b3352bb89e96d753b9407b67abc`.
+
+The raw primitive trace executes 18 `rocblas_gemm_ex` calls with F16 A/B,
+F32 C/D, and F32 compute. The marked model adds 12,155 conversion launches and
+65 `EmbeddingKernel<unsigned short, __hip_bfloat16, int>` launches.
+The expanded arm instead uses BF16 embedding storage. Both native model arms
+execute the same BLAS dtype groups: 306 BF16-output calls and 5,460 F32-output
+calls, each with BF16 A/B and F32 compute. These calls use the standard algorithm,
+solution index zero, no flags, and `atomics_not_allowed`.
+
+The materialized primary executes 799 traced BLAS calls with BF16 A/B/C/D,
+F32 compute, the standard algorithm, solution index zero, no flags, and
+`atomics_allowed`. Both arms execute BF16 `wvSplitK` specializations, with
+different resolved templates and invocation counts. The audit retains every
+full kernel name, cast/gather name, BLAS dtype tuple, and call count in
+`g5-traces-v1/initial-dtype-dispatch-audit.json` and
+`g5-traces-v2/dtype-dispatch-audit.json`. F32 alpha/beta types follow the executed
+compute type under the rocBLAS ABI (`rocblas-functions.h:21706`); they are not a
+separate scalar field emitted by rocprof. The trace does not erase the existing
+F32-output, atomics-policy, scheduling, or template differences. No invocation
+parity or timing result is accepted. The identical-GGUF plugin trace remains
+pending that primary path's execution; the materialized adaptation is explicit.
+
+### Preserve existing view descriptors
+
+An implementer check found that the shared metadata helper rejected empty and
+zero-extent `OwnedTensor::View()` descriptors. The isolated CPU regression passes
+all three cases on pristine `760c8dd7e` and fails all three on the implementation
+before repair. `empty-view-v1/results.json` pins both binaries, libraries, source,
+and exact commands. The registered regression fails for the same rank check.
+
+The correction permits rank-zero and zero-extent descriptors. It preserves the
+existing distinction: a default `OwnedTensor::Numel()` is zero, while its rank-zero
+`vt::Tensor` view has the empty product of one. Shape, strides, byte count, data,
+device, and dtype match the baseline. The focused CPU gates pass after repair.
+The metadata test separately carries `repacked`, `q8_0_aligned`, and
+`elem_kn_repacked` through ownership, borrowing, shape views, and valid slices.
+Six scratch mutations remove each flag from `OwnedTensor` and `Tensor` views;
+every mutant fails its corresponding assertion. `mutations-cpu-v3/summary.json`
+records exit one for all six and byte-exact restoration of source and archive.
+
+The operator reran the corrected HIP metadata, primitives/lifetimes, graph dedup,
+and two-device targets: all four pass. Input and output hash checks preserve the
+same sources, archive, and executables. The receipt is
+`empty-view-v1/hip-focused-operator-receipt.json`; log SHA256 is
+`313eaaf053de3f8a97829d244c0943d94a9ceefe88928fef3fd4ce74d42fd615`.
+
+### Full suites
+
+The complete CPU and HIP builds passed with at most four compile jobs.
+The full CPU CTest run registered 715 tests. It passed 703, skipped 11,
+and failed `test_qwen3_paged_engine`. That test failed two assertions against
+the unchanged Qwen3-0.6B token anchor. For `The capital of France is`, generated
+position 5 is 15344 where the fixture expects 9625. The KV-boundary case fails
+that same prompt before its separate boundary exercise.
+
+A clean baseline build and an independent operator rerun reproduce both failures.
+`cpu-paged-baseline-v1-command.json` and its operator receipt record binary SHA256
+`46c8a80062219b0135b25ef0668de9b79232fd8f1cf6c173fe4194d8fa6aaf9d`.
+Issue #3102 owns the diagnosis under `MODEL-TEXT-qwen3-qwen3-for-causal-lm`.
+The anchor, assertion, and model row lifecycle remain unchanged.
+
+The post-correction full CPU rerun produces the same 703 passes, 11 skips,
+and one failing target out of 715. `empty-view-v1/cpu-full-command.json`
+records its rebuilt archive, exact serial command, exit eight, and hashed log.
+The metadata correction introduces no additional CPU suite failure.
+
+The 11 CPU skips are retained in `ctest-cpu-full-v1.log`. They require an
+unavailable accelerator or model asset. The operator completed the pre-correction
+HIP suite: 691 passed, 12 skipped, and 20 failed out of 723. Its protected inputs
+remained unchanged; `full-hip-ctest-v1/operator-receipt.json` retains log SHA256
+`ca572d1ed024bf9e53ded34ac377567e5305a2b9aaee6fbee3dcc1f6b4569dc8`.
+The new explicit-head case still fails on the separately owned #3098 dependency.
+The operator reran all 19 remaining targets against a pristine HIP build under
+identical device visibility and serial scheduling. Every failed test name,
+normalized error line, and doctest case/assertion summary matches the feature
+run. `full-hip-baseline-v1/operator-comparison.json` records the 19/19 match;
+the baseline log SHA256 is
+`abd5ec9157b4e3d553782d2251348dc23eeb70dc4374586359d21fd271a627cb`.
+The existing #3070 owns the backend suite groups; this gfx1100 run does not
+satisfy its Strix-specific gate. The HIP Qwen3 anchor failure is distinct from
+the CPU failure: `Once upon a time,` generates 264 at position 9 where the
+ROCm anchor expects 279. Both standard and boundary cases reproduce it, with
+72 of 74 assertions passing. Issue #3105 owns this separate gfx1100 diagnosis.
+Fresh immutable-head review remains pending. The staged preflight finished with exit zero, no failed gates, and all 677 in-scope
+translation units compiled. Its five argument-required skips are Arm ISA, CPU
+ISA, CUDA fat-gencode, PR classification, and Triton AOT multiarch. The explicit
+x86 ISA audit passed against the actual CPU build. The attempted Arm audit of
+that x86 database fails its expected Arm flags and supplies no Arm build evidence.
+PR classification still requires the immutable implementation commit. No skipped
+applicable gate is counted as satisfied.
+
+`preflight-lifetime-v2-command.sh`, its log, and its exit file preserve the
+complete invocation. The final operator rerun must cover the reviewed head.
+
+The final post-correction staged preflight also exits zero, with no failing
+gates and 677 of 677 translation units compiled in 268.8 seconds. It retains
+the same five argument-required skips and is not counted as a fully green
+preflight. `preflight-empty-view-v1-command.sh`, its exit file, and log SHA256
+`2b8d47439eed4c800961f58c651cfdc03c02655a02aadf959e2dd6142c33265c` preserve this run.
+The final scoped record and authored `Now` checks pass after the trace evidence
+and owned baseline issues are added. Fresh review and the operator's final
+immutable-head gate remain required.
+The three source citations shifted by this implementation were repaired in their
+owning engine and quantization rows. Both implementer and operator checks prove
+that every unrelated row remains byte-identical; the record checker returns to
+its unchanged 28-stale/5-broken baseline. No checker or baseline was changed.
+
 ## Work breakdown
 
 1. Commit this spec and the scoped issue and inventory records.
@@ -497,6 +864,38 @@ full-runtime operations need their own owning issue before that scope expands.
 
 ## Owed
 
+- [#2773](https://github.com/mudler/vllm.cpp/issues/2773), owned by
+  `BACKEND-ROCM`, owes diagnosis of this fixture's unchanged-baseline F16-D1
+  repeated-engine failure and F16-P128 primary comparison mismatch. The inputs
+  are the committed workload hash
+  `907e5f88ded44d10ef4fd44a32b6aa7bae80e7a858a6ddf64a03e63f62a29114`,
+  GGUF hash `758b5299b027120c3608c43777a89257724d46e26eefac2a8aaad512be15b53f`,
+  and derived primary model hash
+  `b27fbf8cb5d35406b4fce084bdda1ec10de8fb5e3d48f647edc1ebf325fa740e`.
+  That issue's earlier safetensors evidence did not test this materialization
+  or establish the cause of these observations. F16-G4 remains failing or
+  pending as measured; ownership does not waive parity.
+- [#3070](https://github.com/mudler/vllm.cpp/issues/3070), owned by
+  `BACKEND-ROCM`, tracks the existing full HIP suite groups: missing native
+  operations, quantization admission, placement and scratch assumptions, and
+  async-scheduler expectations. The same async group includes
+  `test_qwen3_dense_async_serving`. The gfx1100 baseline pairing here does not
+  close that issue's separate Strix gate or authorize changes to unrelated rows.
+- [#3105](https://github.com/mudler/vllm.cpp/issues/3105), owned by
+  `BACKEND-ROCM`, tracks the reproduced gfx1100 HIP Qwen3 paged-token anchor
+  failure. Its prompt, generated position, actual ID, and expected ID differ
+  from the separately owned CPU #3102 failure.
+- [#3102](https://github.com/mudler/vllm.cpp/issues/3102), owned by
+  `MODEL-TEXT-qwen3-qwen3-for-causal-lm`, tracks the reproduced baseline CPU
+  paged-token anchor failure. [The owning model spec](first-additive-model-qwen3-dense.md)
+  owes the matched active-pin diagnosis and reviewed correction.
+- [#3098](https://github.com/mudler/vllm.cpp/issues/3098) owns the existing
+  Qwen3.5 full-attention-only forward refusal encountered by the explicit-head
+  fixture. This row preserves that fixture and does not introduce synthetic GDN
+  layers to bypass the refusal.
+- [#3100](https://github.com/mudler/vllm.cpp/issues/3100) owns the existing ROCm
+  backend allocation and queue device-binding gap. This row's two-device test
+  verifies the three scoped operations with independently verified allocations.
 - [#2542](https://github.com/mudler/vllm.cpp/issues/2542), owned by
   `MODEL-MM-QWEN4-EXP` and the `Owed` section of
   [the RMSNorm dtype spec](rmsnorm-gamma-dtype-twins.md), tracks the existing
@@ -518,7 +917,7 @@ full-runtime operations need their own owning issue before that scope expands.
 
 | ID | Upstream source | Local anchor | Tests and evidence | Spec | State | Owner | Issue |
 |---|---|---|---|---|---|---|---|
-| `BACKEND-ROCM-F16-WEIGHTS` | vLLM `e126687a9a` ordinary ROCm GEMM and parameter conversion, GGUF plugin `d4c1f0d082` | `MatmulKernelRocm`, `MatmulBTKernelRocm`, `EmbeddingKernelRocm`, `GgufLoadPolicy::FromEnv` | F16-G1 through F16-G8 above, implementation evidence pending | [This spec](rocm-f16-weights.md) | `READY` | Fresh helper, operator verification | [#3092](https://github.com/mudler/vllm.cpp/issues/3092) |
+| `BACKEND-ROCM-F16-WEIGHTS` | vLLM `e126687a9a` ordinary ROCm GEMM and parameter conversion, GGUF plugin `d4c1f0d082` | `MatmulKernelRocm`, `MatmulBTKernelRocm`, `EmbeddingKernelRocm`, `GgufLoadPolicy::FromEnv` | F16-G1 through F16-G8 and dated evidence above | [This spec](rocm-f16-weights.md) | `ACTIVE` | Fresh helper, operator verification | [#3092](https://github.com/mudler/vllm.cpp/issues/3092) |
 
 This per-row inventory is the canonical child record, discovered from the spec
 glob. The parent backend-matrix retains its existing state and content.

@@ -1144,21 +1144,7 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
   // them -- it kept a private copy, so the fix never reached it. That is the
   // off-framework-model hazard the decode-framework-routing audit names.
   if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
-    Tensor t = MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype,
-                          d.q.device, shape);
-    // CIQ G7: carry the i8mm-repack marker from the OwnedTensor to the vt::Tensor
-    // the GEMM actually sees. This is the ONLY host->kernel weight-tensor
-    // construction on the CPU forward (MakeTensor drops it by default), so
-    // without this the kernel reads repacked bytes as a plain q8_0 weight ->
-    // garbage. Only ever true on the CPU keep-quant path (a staged device never
-    // repacks), so it is inert everywhere else.
-    t.repacked = w.repacked;
-    // Same reasoning for the elementwise [N,K] -> [K,N] repack: without this the
-    // kernel would read transposed bytes as a plain [N,K] weight. Set only on
-    // this CPU-resident construction, which is exactly where MatmulBTKernel
-    // consumes it; a staged device weight is never elem-repacked.
-    t.elem_kn_repacked = w.elem_kn_repacked;
-    return t;
+    return w.ViewOn(const_cast<uint8_t*>(w.bytes.data()), d.q.device, shape);
   }
   // AUDIT GUARD (KERNEL-GEMM-CPU-TILED lever 2). Only the CPU MatmulBTKernel
   // honours elem_kn_repacked, and the staging path below uploads bytes verbatim
@@ -1286,8 +1272,7 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
       if (aliased) {
         // NOT `load_stats::AddDeviceUpload`: nothing was uploaded. Issue #150's
         // counter measures bytes moved host->device, and this branch moves none.
-        return MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype, d.q.device,
-                          shape);
+        return w.ViewOn(const_cast<uint8_t*>(w.bytes.data()), d.q.device, shape);
       }
     }
     // A MISALIGNED BORROW, or the `VT_QWEN35_ALIAS_HOST_WEIGHTS=0` A/B, reaches
@@ -1311,7 +1296,7 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
     // costs a second full copy of the model out of the same unified RAM.
     AdoptDeviceBytesAsHost(d.b, w);
   }
-  return MakeTensor(w.d_dev.get(), w.dtype, d.q.device, shape);
+  return w.ViewOn(w.d_dev.get(), d.q.device, shape);
 }
 
 }  // namespace (closed so the bridge below has EXTERNAL linkage; the unnamed

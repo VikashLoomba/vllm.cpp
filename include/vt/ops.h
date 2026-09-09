@@ -2628,6 +2628,9 @@ Fn GetTypedOp(OpId op, DeviceType device) {
 
 // out[M,N] = a[M,K] @ b[K,N]; a/b float dtypes (f32/f16/bf16), out f32 or
 // bf16, f32 accumulation, all contiguous, same device.
+// Optional B/table weight_value_dtype preserves F16 storage while applying the
+// resolved BF16/F32 model values on the native ROCm ordinary GEMM/gather path.
+// Activations, outputs, ID operands, other providers, and other storage reject it.
 void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 
 // Test-only ABI probe: a tiny adapter binds Queue/Tensor metadata to a raw

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 // CheckConvCommon asks the BACKEND whether it can address a compressed
@@ -24,6 +25,29 @@ namespace {
 // them at once with zero call-site edits.
 bool IsFloat(DType d) { return d == DType::kF32 || d == DType::kF16 || d == DType::kBF16; }
 bool IsOutFloat(DType d) { return d == DType::kF32 || d == DType::kBF16; }
+// Retained model values are scoped to ordinary weights, never activations.
+void ValidateWeightValues(const Tensor& weight, const Tensor& other,
+                          const Tensor& out, const Queue& q) {
+  VT_CHECK(!other.weight_value_dtype && !out.weight_value_dtype,
+           "weight_value_dtype is invalid on activation, ID, or output operands");
+  if (!weight.weight_value_dtype) return;
+  VT_CHECK(weight.dtype == DType::kF16 &&
+               (*weight.weight_value_dtype == DType::kBF16 ||
+                *weight.weight_value_dtype == DType::kF32),
+           "weight_value_dtype requires F16 storage with BF16 or F32 values");
+  VT_CHECK(q.device.type == DeviceType::kROCM,
+           "weight_value_dtype requires the native ROCm provider");
+}
+
+void* ResolveWeightOp(OpId op, const Queue& q, const Tensor& weight) {
+  void* fn = GetOp(op, q.device.type);
+  if (weight.weight_value_dtype) {
+    const char* selected = GetOpProviderStats(op, q.device.type).last_selected;
+    VT_CHECK(selected && std::strcmp(selected, kNativeProviderName) == 0,
+             "weight_value_dtype requires the native ROCm provider");
+  }
+  return fn;
+}
 }  // namespace
 
 ScalarTypeId ToScalarType(DType dtype) {
@@ -116,6 +140,7 @@ WorkspaceKey MakeWorkspaceKey(const Queue& q, OpId op, WorkspaceSlot slot) {
 }
 
 void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+  ValidateWeightValues(b, a, out, q);
   VT_CHECK(a.rank == 2 && b.rank == 2 && out.rank == 2, "matmul: rank-2 tensors required");
   VT_CHECK(a.shape[1] == b.shape[0], "matmul: inner dims mismatch");
   VT_CHECK(out.shape[0] == a.shape[0] && out.shape[1] == b.shape[1],
@@ -126,7 +151,7 @@ void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
            "matmul: contiguous tensors required");
   VT_CHECK(a.device == b.device && a.device == out.device && a.device == q.device,
            "matmul: device mismatch");
-  reinterpret_cast<MatmulFn>(GetOp(OpId::kMatmul, q.device.type))(q, out, a, b);
+  reinterpret_cast<MatmulFn>(ResolveWeightOp(OpId::kMatmul, q, b))(q, out, a, b);
 }
 
 void DropinProbe(Queue& q, Tensor& out, const Tensor& in,
@@ -149,6 +174,7 @@ void DropinProbe(Queue& q, Tensor& out, const Tensor& in,
 }
 
 void MatmulBT(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+  ValidateWeightValues(b, a, out, q);
   // GGUF compute-in-quant (QUANT-GGUF-CIQ-GEMM work row G4). A block-quantized
   // weight is NOT an elementwise tensor — it has no per-element stride and
   // cannot be read by kMatmulBT — but it IS in exactly the [N, K] orientation
@@ -185,7 +211,7 @@ void MatmulBT(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
            "matmul_bt: contiguous weight and output required");
   VT_CHECK(a.device == b.device && a.device == out.device && a.device == q.device,
            "matmul_bt: device mismatch");
-  reinterpret_cast<MatmulFn>(GetOp(OpId::kMatmulBT, q.device.type))(q, out, a, b);
+  reinterpret_cast<MatmulFn>(ResolveWeightOp(OpId::kMatmulBT, q, b))(q, out, a, b);
 }
 
 // vt::MatmulBTQuant — see ops.h. Validation mirrors MatmulBT except for the
@@ -1520,6 +1546,7 @@ void Add(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
 }
 
 void Embedding(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids) {
+  ValidateWeightValues(table, ids, out, q);
   VT_CHECK(table.rank == 2 && ids.rank == 1 && out.rank == 2, "embedding: bad ranks");
   VT_CHECK(out.shape[0] == ids.shape[0] && out.shape[1] == table.shape[1],
            "embedding: output shape mismatch");
@@ -1556,7 +1583,7 @@ void Embedding(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids) {
   // here -- GetOp throws naming the op and the device -- rather than dispatch
   // into a kernel that would assert on the dtype one frame later.
   const OpId op = IsBlockQuant(table.dtype) ? OpId::kEmbeddingQuant : OpId::kEmbedding;
-  reinterpret_cast<EmbeddingFn>(GetOp(op, q.device.type))(q, out, table, ids);
+  reinterpret_cast<EmbeddingFn>(ResolveWeightOp(op, q, table))(q, out, table, ids);
 }
 
 void RopeNeox(Queue& q, Tensor& q_states, Tensor& k_states, const Tensor& positions,

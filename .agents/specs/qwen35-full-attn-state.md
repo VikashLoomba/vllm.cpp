@@ -10,15 +10,15 @@ Spec base: `6db4bef906859e864c82523c01107473f7dcca29`.
 
 ## Now
 
-`PENDING`. This specification precedes implementation. The row uses one pull
-request under the repository default. A fresh implementer works from this
-committed specification. A fresh reviewer mutates the immutable implementation,
-and the operator reruns its gates. The operator publishes the pull request.
-The current task does not authorize merging it.
+`ACTIVE`. The consumer-based implementation passes public completion and the
+focused CPU suites. The operator independently reproduced the red result and
+reran the public and CPU gates. The row uses one pull request under the
+repository default. Specification commit `f62e4d7db0a2e1fb7d0e0a3cb5dad7072f182690`
+precedes implementation.
 
-Public completion fails before any quantized gather provider runs. Runtime
-correctness, oracle execution, and implementation review remain `PENDING`.
-This row makes no performance claim and establishes no performance floor.
+Pinned oracle execution, the final gate, and fresh implementation review remain
+`PENDING`. The current task does not authorize merging. This row makes no
+performance claim and establishes no performance floor.
 
 ## Scope
 
@@ -49,7 +49,7 @@ together when this child changes state.
 
 | ID | Upstream source | Local anchor | Tests and evidence | Spec | State | Owner | Issue |
 |---|---|---|---|---|---|---|---|
-| `ENG-QWEN35-FULL-ATTN-STATE` | Pinned `Qwen3_5DecoderLayer` and `GPUModelRunner.get_kv_cache_spec` | `CheckDensePagedForward`, `CheckPagedForward`, `BuildFullAttnStepDevInputs`, both graph `Step` methods | G0 to G5 | This file | `PENDING` | Row helper, fresh reviewer, operator verification | #3098 |
+| `ENG-QWEN35-FULL-ATTN-STATE` | Pinned `Qwen3_5DecoderLayer` and `GPUModelRunner.get_kv_cache_spec` | `CheckDensePagedForward`, `CheckPagedForward`, `BuildFullAttnStepDevInputs`, both graph `Step` methods | G0 to G5 | This file | `ACTIVE` | Row helper, fresh reviewer, operator verification | #3098 |
 
 ## Diagnosis and source anchors
 
@@ -188,12 +188,12 @@ prompts sequentially and record the actual scheduling and token budgets.
 
 | Gate | Required result | Current result |
 |---|---|---|
-| G0: independent red | New public regression on pristine product base fails at GDN validation after load | `PENDING`: operator reproduction exists, row-owned test is owed |
-| G1: public completion | Both prompts produce four tokens in three fresh-engine repeats, native ROCm provider executes | `PENDING`: operator GPU run |
-| G2: consumer distinction | Dense and MoE production routes accept no-GDN state and reject damaged real-GDN state | `PENDING`: fresh implementer |
-| G3: graph preparation | Both drivers cover cold, capture, persistent staging, and replay routing with no GDN consumers | `PENDING`: fresh implementer and operator |
-| G4: pinned oracle | Same dense artifact and all six fresh-engine runs, exact token IDs, finite logits, preserved dtypes | `PENDING`: operator runtime execution |
-| G5: review and full gate | Focused gates, mutations, full preflight, fresh review, and operator rerun | `PENDING`: implementation |
+| G0: independent red | New public regression on pristine product base fails at GDN validation after load | Satisfied: operator reproduced the row-owned failure after public load |
+| G1: public completion | Both prompts produce four tokens in three fresh-engine repeats, native ROCm provider executes | Satisfied: 12 fresh engines, default and callback sampling arms |
+| G2: consumer distinction | Dense and MoE production routes accept no-GDN state and reject damaged real-GDN state | Satisfied: focused suites and independent operator rerun |
+| G3: graph preparation | Both drivers cover cold, capture, persistent staging, and replay routing with no GDN consumers | Satisfied for CPU routing and staging, no GPU replay numerical claim |
+| G4: pinned oracle | Same dense artifact and all six fresh-engine runs, exact token IDs, finite logits, preserved dtypes | `PENDING`: pinned plugin rejects the actual text-only engine configuration |
+| G5: review and full gate | Focused gates, mutations, full preflight, fresh review, and operator rerun | `PENDING`: fresh review and final operator gate |
 
 G0 starts at `vllm_engine_load` and `vllm_complete_tokens` from `include/vllm.h`.
 The test must assert successful load before its expected pre-fix completion
@@ -263,6 +263,230 @@ The log is `/home/vikash/.cache/rdna3-gather-impl/evidence/public-red.log`, SHA2
 `fbd5d684566961d71f31c8b9e58daba8d5303636adb12ceccb164dbe3b220e1d`.
 These are supplied local evidence paths, not environment defaults.
 
+## Implementation evidence
+
+Measurements on 9 September 2026 UTC use the row-owned worktree
+`/home/vikash/vllm.cpp-qwen35-full-attn-state-impl`. Evidence is under
+`/home/vikash/.cache/qwen35-full-attn-state-impl/evidence`. These paths identify
+measured artifacts. They are not environment defaults.
+
+The product source is `qwen3_5.cpp`, SHA256
+`899913b8aeff65a08eb5289f6f08777ee78638e37722f9d8138daff723f8f498`.
+The red source is the unchanged product at specification commit
+`f62e4d7db0a2e1fb7d0e0a3cb5dad7072f182690`. Green snapshots carry that base,
+the exact implementation patch, and every test source hash. The implementation
+commit containing this record makes those bytes reachable from Git.
+
+### Public red and completion
+
+The operator generated the row's fixture and confirmed its 991296-byte size
+and the frozen SHA256. The row-owned red binary has SHA256
+`76c4e04bfb1b2715d4010e11a1d85cb076c7ada8e146094a1419fc0566d6efff`.
+It returned 1 after `public load succeeded`, with 11 passing assertions and
+one failed completion assertion. The error was `GDN state index out of range`.
+`red-snapshot/public-red-operator.log` has SHA256
+`dbf8bb09eccc4d626d0c6cc4a9d97d93738563954dae0aeefa32b9ed5bfd8981`.
+
+The green binary has SHA256
+`14d2fee7f63df4c8ab7721923d429822488e7ac55a058268b9145bd4d5f371a7`.
+The operator ran all 12 fresh engines and passed all 3364 assertions.
+`green-v1-snapshot/public-green-operator.log` has SHA256
+`6318b014c368835a71fe2501444adaf61b3312df178c564d0a0d3fba820f9c4e`.
+The two token sequences were `[47,19,4,20]` and `[11,28,104,78]`.
+Each sequence was identical in three repetitions of both sampling arms.
+
+The callback-free arm retains default device sampling. The callback arm
+observes 512 finite logits per completion. A custom processor stages logits
+through the host at `src/vllm/v1/sample/logits_processor/builtin.cpp::apply_logits_processors`,
+lines 75 to 159. Both arms reach `vt::GreedyArgmax` through the sampler.
+Each run executes one native ROCm embedding prefill, three embedding decodes,
+four cache writes, and four greedy operations. Verified named providers call
+the original native functions. They check bf16 embedding activations and KV
+storage, f32 sampler logits, and i64 sampled IDs. Reference-tier hits do not
+increase. The f32 logits belong to the existing sampler ABI.
+
+Both public commands use the operator's local GPU 0 and mutex:
+
+```sh
+env HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
+  TMPDIR=/home/vikash/.cache/qwen35-full-attn-state-impl/tmp \
+  GIT_CEILING_DIRECTORIES=/home/vikash/.cache/qwen35-full-attn-state-impl/tmp \
+  GIT_CONFIG_GLOBAL=/dev/null \
+  flock -n -F /home/vikash/gpu.lock \
+  /home/vikash/.cache/qwen35-full-attn-state-impl/evidence/green-v1-snapshot/test_capi_qwen35_full_attn_state
+```
+
+Use `red-snapshot` in the executable path for the frozen red command.
+Each snapshot's `manifest.json` contains exact argument arrays and source
+hashes. The operator receipts record execution and restoration checks.
+
+### CPU consumers and graph routing
+
+The implementer and operator passed these complete suites:
+
+| Suite | Test cases passed | Assertions passed |
+|---|---|---|
+| `test_model_registry` | 24 | 993 |
+| `test_qwen27_paged_forward` | 36 | 1406 |
+| `test_qwen35_paged_forward` | 10 | 676 |
+| `test_qwen3_5_decode_graph_seam` | 16 | 1550 |
+
+The registry suite retains one pre-existing skipped case. All new cases run.
+`cpu-green-v1-snapshot/manifest.json` has SHA256
+`575e9695acc9600515050a6ba0ed509795df45f7a128b98c6c303eb87c005183`.
+It freezes all four executables and their source files. The operator's
+per-binary logs, receipts, and `operator-results.json` are beside the manifest.
+
+The no-GDN tests enter both registered forwards for prefill and decode.
+Empty metadata, unused runner metadata, and stale configuration labels all
+reach the loaded layer consumers. Separate negative cases preserve each
+hybrid cache-count, rank, slot-layout, metadata, duplicate, and range guard.
+Existing speculative, prefill, mixed, and padded-state tests remain green.
+
+Both graph drivers cover capture enabled and disabled, asynchronous staging
+enabled and disabled, batches 1 and 3, and three unused metadata forms.
+Six steps cover cold execution, capture, persistent input binding, and replay
+routing. Batch 3 pads to 4. Oversized unused indices contain 4096 entries.
+Each persistent slot binds exactly five generic inputs, with no GDN input.
+
+The dense registry reaches its actual graph driver under the existing CPU
+harness. The MoE registry needs its FP4 capability predicate. Its test uses
+valid small NVFP4 expert tensors and a scoped CPU platform answer. A control
+without that answer stays eager. Both use the existing CPU arithmetic and fake
+graph replay. These cases prove routing and staging, not GPU replay numerics.
+No backend or quantized provider changes.
+
+The shared builder's existing consumers also pass:
+`test_qwen3_5_gguf_mtp`, `test_qwen35_exl3`, and
+`test_qwen3_dflash2_draft`. Their complete CPU run returned 0.
+
+### Build and focused commands
+
+Run from the row worktree. Set `TMPDIR` and `GIT_CEILING_DIRECTORIES` to
+`/home/vikash/.cache/qwen35-full-attn-state-impl/tmp`, and set
+`GIT_CONFIG_GLOBAL=/dev/null` for gate subprocesses. Configure commands were:
+
+```sh
+cmake -S . -B build-full-attn-cpu -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+  -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_HIP=OFF -DVLLM_CPP_VULKAN=OFF \
+  -DVLLM_CPP_METAL=OFF -DVLLM_CPP_MLX=OFF -DVLLM_CPP_TENSTORRENT=OFF \
+  -DVLLM_CPP_TRITON=OFF -DVLLM_CPP_BUILD_EXAMPLES=OFF -DVLLM_CPP_SERVER=OFF
+cmake -S . -B build-full-attn-hip -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+  -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_HIP=ON -DVLLM_CPP_HIP_ARCHITECTURES=gfx1100 \
+  -DVLLM_CPP_VULKAN=OFF -DVLLM_CPP_METAL=OFF -DVLLM_CPP_MLX=OFF \
+  -DVLLM_CPP_TENSTORRENT=OFF -DVLLM_CPP_TRITON=OFF \
+  -DVLLM_CPP_BUILD_EXAMPLES=OFF -DVLLM_CPP_SERVER=OFF
+cmake --build build-full-attn-cpu -j 4 --target test_model_registry \
+  test_qwen27_paged_forward test_qwen35_paged_forward \
+  test_qwen3_5_decode_graph_seam test_capi_qwen35_full_attn_state
+cmake --build build-full-attn-hip -j 4 --target test_capi_qwen35_full_attn_state
+ctest --test-dir build-full-attn-cpu --output-on-failure \
+  -R '^(test_qwen27_paged_forward|test_qwen35_paged_forward|test_qwen3_5_decode_graph_seam|test_model_registry)$'
+cmake --build build-full-attn-cpu -j 4 --target test_qwen3_5_gguf_mtp \
+  test_qwen35_exl3 test_qwen3_dflash2_draft
+ctest --test-dir build-full-attn-cpu --output-on-failure \
+  -R '^(test_qwen3_5_gguf_mtp|test_qwen35_exl3|test_qwen3_dflash2_draft)$'
+```
+
+All configure, final build, and green focused commands returned 0.
+The original CPU red returned 8 from CTest. It detected both intended GDN
+errors. Two valid-hybrid test assertions initially assumed host logits. The
+registered forward returns device logits, so the tests now download them for
+finite-value checks. No product behavior changed for that test correction.
+`cpu-red-snapshot` preserves the original tests, product source, and binaries.
+
+### Implementer mutations
+
+The three address-sanitized baselines pass. All 30 mutations fail their focused
+gates. `mutations/manifest.json` has SHA256
+`9f2cb023ea64af396a2fccbbe83b0dd8fc67a591aed9403c399cfa13f7a515ff`.
+The external recipe `run-mutations.py` has SHA256
+`a0855b588f8d2e7a7286ee9a56b2a0551f8111059537e264127a2f6c9787b3b2`.
+
+Each mutant compiles a separate source copy at `-O0 -g -fsanitize=address`
+and links the row's own CPU archive. The archive starts fresh for each mutant.
+The corresponding baseline uses the same compiler and linker flags.
+`ASAN_OPTIONS=detect_leaks=0:abort_on_error=1` disables unrelated leak reporting.
+No tracked source or normal build output changes. Each manifest entry records
+its command, mutated source hash, binary hash, failed exit, and restoration.
+
+For each sibling, mutations restore unconditional entry validation, force the
+entry's no-consumer branch, remove cache-count validation, and restore the GDN
+eager builder. They independently restore graph validation, GDN padding-size
+restrictions, unused spec classification, and persistent GDN preparation.
+Removing each pre-padding shape check fails. Restoring the unused GDN index
+copy causes an address-sanitizer heap-buffer-overflow in both drivers.
+
+Six shared mutations separately remove rank, paired-slot, cross-layer-slot,
+duplicate, range, and missing-index guarantees. Both registry suites fail
+for each removal. Four further mutations delete each registry's graph and
+eager production call. Each relevant positive gate fails. Fresh independent
+review must repeat the required mutations on the immutable implementation.
+
+### Full gate and build classification
+
+`preflight-start.log` records the full gate before edits.
+`preflight-staged.log` records the staged run before the implementation commit.
+The staged run uses the same temporary-directory and Git isolation as the
+focused tests, plus the existing NumPy dependency path supplied by the operator.
+An external argument wrapper adds `--jobs 4` only to the compile checker.
+It preserves every gate and changes no tracked script.
+
+The generic preflight sweep does not supply every build checker's arguments.
+The x86 CPU ISA audit runs explicitly against
+`build-full-attn-cpu/compile_commands.json` and passes in `cpu-isa-build.log`.
+The exact-range checks supply the recorded product base and implementation
+head, with draft PR 3101 for path classification. Their results belong in
+`range-gates.json` beside the other evidence.
+
+ARM ISA, CUDA fat-binary, and Triton AOT build audits are outside this row's
+configured CPU and HIP builds. The change edits no architecture-specific
+instruction unit, CUDA gencode setting, or Triton artifact. The normal public
+test returns skip code 77 in a CPU-only build because public AUTO requires the
+HIP-only configuration here. The operator's HIP run executes every assertion.
+GPU graph replay numerics remain unclaimed. G4 and fresh review remain pending.
+
+### Pinned oracle refusal
+
+The operator ran the actual first engine against the unchanged dense GGUF.
+The engine returned 1 before becoming usable and emitted no tokens. The
+exception reports `Qwen3_5Config` required and `Qwen3_5TextConfig` received.
+The executing rejection is in upstream
+`vllm/multimodal/processing/context.py::InputProcessingContext.get_hf_config`,
+line 140, called by `vllm/model_executor/models/qwen3_5.py::Qwen3_5ProcessingInfo.get_hf_config`,
+line 108.
+The complete traceback is preserved in the report and operator log.
+
+The runtime reports vLLM `0.28.1rc1.dev132+ge126687a9`, PyTorch
+`2.12.0+git6bbd260`, HIP `7.2.53211`, and plugin
+`0.0.5+d4c1f0d.gfx1100`. The script supplies only local HF text metadata and
+explicit token IDs. Model geometry, tensor bytes, inactive SSM keys, and MRoPE
+sections match the frozen fixture. Production graph mode remains requested
+with `enforce_eager=False`. No registry, model, or plugin correction is applied.
+
+`oracle-exact-gguf-v1-command.json` records the exact Docker argument arrays,
+image digest, read-only runtime and plugin mounts, nonroot user, private
+2 GiB IPC allocation, offline settings, and GPU 0 mutex. Each of its six
+commands starts a new process and engine. The operator stopped after the first
+refusal, because the remaining five commands cannot supply missing runtime
+capability. No token, finite-logit, resolved-dtype, or GPU graph result is claimed
+for the oracle.
+
+The attempt report `oracle-exact-gguf-v1-p0-r0.json` has SHA256
+`46d714e5fe6577663b0cb266c8d88c9a4a629eb2727314775a5b5dbb605ac2c0`.
+Its operator log has SHA256
+`5244fbca9f48db1bfc6d9817d823fcc4e1fe1a48a89f1c04c216ad1a5db4cdc6`.
+The script SHA256 is
+`504162e44ba828249a1a825bf2053f53e7902f168bad3ba515334ff8440a7f3e`.
+The local HF configuration SHA256 is
+`6c4b2c6f3d71b90818730bbfa900a5cbb0a96bd64ab656fd9db8e65111c05638`.
+
+G4 remains `PENDING` on the operator's pinned GGUF runtime capability.
+The implementation does not substitute a model or oracle. Issue #3098 retains
+ownership of this gate, independent review, and the final operator gate.
+
 ## Risks and stop conditions
 
 - `NEEDS_CONTEXT`: the frozen fixture bytes, pinned runtime, or source cannot
@@ -280,7 +504,8 @@ These are supplied local evidence paths, not environment defaults.
 
 ## Owed
 
-Issue #3098 owns implementation, independent red evidence, pinned oracle
-execution, review mutations, and the operator rerun. Record the measured
+Issue #3098 owns the pending pinned oracle execution, fresh review mutations,
+and the final operator gate. Public red, local completion, consumer validation,
+and CPU graph routing have measured evidence above. Record the measured
 outcome and defaults here before changing the row to `DONE`. Keep the issue
 open until the work lands.

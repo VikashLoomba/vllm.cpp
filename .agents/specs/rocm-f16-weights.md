@@ -162,6 +162,8 @@ The implementer's authorized production files are:
 - `src/vt/rocm/rocm_matmul_hipblaslt.hip`,
   `src/vt/rocm/rocm_embedding.hip`, and a new scoped F16 conversion helper
   beneath `src/vt/rocm` when needed.
+- `src/vt/rocm/rocm_backend.hip` for the F16 scratch ownership hooks described
+  below. This extension does not change the backend's allocation device policy.
 - `CMakeLists.txt`, `tests/CMakeLists.txt`, scoped existing or new tests under
   `tests/vt` and `tests/vllm`, and a new token fixture beneath
   `tests/fixtures/rocm_f16_weights` for registration and behavioral coverage.
@@ -242,6 +244,43 @@ combination by name. Do not pass F32 alpha bytes as a 16-bit scalar.
 Embedding converts each selected F16 value according to the marker before the
 requested output conversion. Preserve repeated and boundary IDs, I32 and I64
 IDs, empty inputs, and the current invalid-ID error and bounds behavior.
+
+### Release scratch with its queue and graph owners
+
+The operator approved this amendment on 9 September 2026, before its product
+edits. The first implementation retained one scratch entry for every unique
+queue ID until process exit. Geometric growth bounded an entry, but repeated
+engine creation could accumulate an unbounded number of entries. The existing
+`GrowOnlyStreamScratch` convention cannot supply the required lifecycle bound.
+
+An active queue owns its current scratch allocation. A graph owns every scratch
+allocation referenced by its captured F16 operations. Eager growth releases the
+previous allocation when no graph owns it. Queue destruction releases its entry,
+and graph destruction releases its captured allocation references. The last
+owner releases the allocation after pending device work completes. No permanent
+weight shadow or process-lifetime list of destroyed queues is allowed.
+
+Wire this ownership through the existing ROCm backend lifecycle. Cover queue
+destruction, the single-graph capture and replay slot, the owned graph-handle
+API, and graph deduplication handles. A captured graph must remain valid after
+its source queue is destroyed and when replayed on another live queue. Replacing
+the single-graph slot releases the prior slot's scratch ownership. Do not change
+the public graph handle contract, resource-device policy, or another scratch pool.
+
+Bind allocation release to the allocation's device and preserve the caller's
+ambient device. Define lock ordering so stats, enqueue, growth, queue teardown,
+and graph teardown cannot invert locks. Do not reclaim a slab solely because
+its capture ended, its source queue ended, or a newer eager call uses a larger
+slab. Active graph ownership is independent of queue ownership.
+
+The focused lifecycle test creates a queue, executes mixed GEMM, destroys the
+queue, and verifies that retained bytes return to the starting value. Repeat
+the cycle to expose cumulative retention. A second test captures, grows eagerly,
+destroys the source queue, and replays the graph on another queue. Verify both
+correct output while the graph remains active and release after its last owner.
+Exercise the single-graph and graph-handle APIs, including deduplication.
+Record the red result on the initial implementation before repairing ownership.
+
 
 ## Tests to port
 

@@ -13,6 +13,9 @@ The implementation pull request closes #3103 when its required gates pass and it
 State: `SPIKE`. The shared repair is implemented and the focused production witness passes on `gfx1100`.
 The committed specification precedes both the captured red and the implementation.
 The complete hardware gate and fresh mutation review remain required before acceptance.
+The pinned upstream export passes all 264 cases; native comparison passes 528 CPU/ROCm executions and 22,576 assertions.
+The operator found a blocking-stream setup error in the new nondefault-stream fixture.
+The scoped fixture repair uses an explicitly owned nonblocking stream; its hardware mutation gate remains pending.
 The related MoE production token gate remains open; its baseline failed at six generated positions.
 No performance result is accepted before the complete declared token gate passes.
 
@@ -402,7 +405,10 @@ The new API has no variance-size override, Gemma modifier, or partial-width norm
 
 The six focused CPU suites, including the existing Qwen3 MoE forward control, pass after adding the later witnesses.
 `cpu-green-5.log` records that run. External upstream fixtures require `VT_RESIDUAL_NORM_UPSTREAM`; absence is reported as unexecuted.
-The complete upstream export, expanded hardware tests, complete token gate in both fusion modes, staged preflight, and fresh mutation review remain pending at this evidence checkpoint.
+The operator completed the upstream export: 144 core cases, 60 IR RMS cases, and 60 IR add cases.
+All 1,452 payload hashes are verified, and the native comparison passes 528 CPU/ROCm executions with 22,576 assertions.
+Expanded hardware tests, complete token equality in both fusion modes, staged preflight, and fresh mutation review remain required.
+The original MoE gate still differs at six generated positions in the L33/C2 tail.
 
 The ROCm platform keeps `support_static_graph_mode()` false at this base in `src/vllm/platforms/rocm.cpp:91`.
 Production registry decode therefore does not enter the graph driver.
@@ -410,6 +416,23 @@ The existing ROCm graph row owns that platform exclusion; this repair does not c
 The new operation's hardware gate covers capture and repeated replay with live BF16 operands on both devices.
 It also checks two queues, ambient-device restoration, wrong-device streams, and a blocked nondefault stream.
 No production graph claim is inferred from that component gate.
+
+### Repair the blocked-stream fixture and its invalidated citation
+
+The operator's component run at `94ac5d1742c540fc5cbc2084d0fb74fdfd5dab41` fails before the stream-order check.
+The test requests a backend queue, but `RocmBackend::CreateQueue` uses `hipStreamCreate` and returns flags zero.
+The existing guarantee requires a stream independent of default-stream synchronization.
+The fixture therefore owns an explicit `hipStreamNonBlocking` stream within the existing device scope.
+Its release guard synchronizes the callback before destroying callback state or operands during normal and exceptional exits.
+The flag assertion and real wrong-stream mutation remain required; the backend default does not change.
+
+The added residual descriptor include moves `vt::Backend` to line 23.
+Repair only that citation in the `BACKEND-PLATFORM` matrix row, starting from the complete target file.
+The scoped proof requires every other matrix byte to remain unchanged.
+The [repair evidence](../../docs/bench-evidence/rocm-residual-norm/stream-fixture-repair/README.md)
+retains the operator red, record red/green, compiler recipe, upstream results, and unchanged-product proof.
+The repaired CPU component binary passes six tests and 8,985 assertions, including all 264 upstream cases.
+The hardware fixture, mutation, final preflight, fresh review, and operator rerun remain pending at this checkpoint.
 
 ## Stop conditions
 

@@ -357,7 +357,15 @@ TEST_CASE("ROCm residual RMS norm cannot run ahead of a blocked nondefault strea
   using namespace residual_norm_test;
   const vt::Device device{vt::DeviceType::kROCM, 0};
   DeviceScope scope(device);
-  Queue queue(device); auto& q = queue.q;
+  // The default backend queue uses hipStreamCreate. This witness needs an
+  // independent stream so synchronizing the default stream cannot release it.
+  // The device scope outlives both the owned stream and its queued work.
+  struct Stream {
+    hipStream_t handle = nullptr;
+    ~Stream() { if (handle != nullptr) (void)hipStreamDestroy(handle); }
+  } stream;
+  REQUIRE(hipStreamCreateWithFlags(&stream.handle, hipStreamNonBlocking) == hipSuccess);
+  vt::Queue q{device, stream.handle};
   unsigned flags = 0;
   REQUIRE(hipStreamGetFlags(static_cast<hipStream_t>(q.handle), &flags) == hipSuccess);
   REQUIRE((flags & hipStreamNonBlocking) != 0);
@@ -365,9 +373,15 @@ TEST_CASE("ROCm residual RMS norm cannot run ahead of a blocked nondefault strea
   std::vector<uint16_t> zeros(width), gamma(width, vt::F32ToBF16(1));
   Buffer a(q, zeros, 1, width), base(q, zeros, 1, width), w(q, gamma, -1, width), out(q, zeros, 1, width);
   struct Release {
+    hipStream_t stream;
     std::atomic<bool> ready{false};
-    ~Release() { ready.store(true); }
-  } release;
+    ~Release() {
+      ready.store(true);
+      // Drain the callback before its atomic flag or any operand is destroyed,
+      // including when an assertion or the operation throws before release.
+      (void)hipStreamSynchronize(stream);
+    }
+  } release{stream.handle};
   REQUIRE(hipLaunchHostFunc(static_cast<hipStream_t>(q.handle), [](void* pointer) {
     auto* ready = static_cast<std::atomic<bool>*>(pointer);
     while (!ready->load()) std::this_thread::yield();

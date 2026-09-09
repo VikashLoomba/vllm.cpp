@@ -21,7 +21,7 @@ State: `ACTIVE`. Native providers reach the registered Qwen3 MoE forward path on
 and two-device cases pass. The pinned production token gate remains **failing**:
 six generated positions differ across three repeated length-33, concurrency-2 runs.
 The first proved residual-normalization difference belongs to
-[#3103](https://github.com/mudler/vllm.cpp/issues/3103), under `BACKEND-ROCM`.
+[#3103](https://github.com/mudler/vllm.cpp/issues/3103), under `BACKEND-ROCM-RESIDUAL-NORM`.
 Attention and head-output differences also require resolution before acceptance.
 
 All 60 original upstream component cases pass on both runtimes.
@@ -651,7 +651,7 @@ Grouped routing and correction-bias work stays under `BACKEND-ROCM`, issue #41.
   ownership, and then launches each provider with the opposite ambient device.
   This isolates the new provider's device contract without changing shared allocation.
 - [#3103](https://github.com/mudler/vllm.cpp/issues/3103), owned by
-  `BACKEND-ROCM`, tracks the compiled Qwen3 MoE residual-normalization lifetime.
+  `BACKEND-ROCM-RESIDUAL-NORM` in [its repair spec](rocm-residual-norm.md), tracks the compiled Qwen3 MoE residual-normalization lifetime.
   The paired row-zero witness reproduces all 128 native and oracle values separately.
   The native path rounds the residual before variance; the compiled oracle elides
   the post-attention residual store and materializes the next input-norm residual.

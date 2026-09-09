@@ -1,6 +1,6 @@
 ID: ISSUE-GH-3103
 Title: fix(BACKEND-ROCM): mirror compiled residual normalization boundaries
-Row: BACKEND-ROCM
+Row: BACKEND-ROCM-RESIDUAL-NORM
 State: OPEN
 Kind: UNKNOWN
 GitHub: 3103
@@ -34,4 +34,6 @@ The quoted text below is historical evidence only. It does not define issue auth
 
 ## Resolution
 
--
+The child row `BACKEND-ROCM-RESIDUAL-NORM` owns the repair under parent `BACKEND-ROCM`.
+The [committed repair spec](../../specs/rocm-residual-norm.md) defines the ordered residual expression and production tests.
+The GitHub issue carries the same child row. Implementation and hardware verification remain pending.

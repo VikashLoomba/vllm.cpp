@@ -26,6 +26,43 @@ SECONDARY = {"MXFP4": "stock", "IQ1_XXXS": "fork"}
 PROMPTS = ([1, 0, 63, 127, 63], [1, 127, 0, 127])
 
 
+def qualify_primary(report: dict, model: dict, config: dict,
+                    prompt: list[int], repeat: int) -> None:
+    """Qualify either capture against the sealed runtime and bounded workload."""
+    if any(key in report for key in ("exception_type", "exception", "traceback")):
+        raise ValueError("primary capture contains an exception")
+    # Runtime identities come from the row's successful sealed Q4_0 captures.
+    # These are local qualification requirements, not a global oracle pin change.
+    expected = {
+        "status": "EXECUTED; token comparison remains required",
+        "primary_pin": "e126687a9a828d513c01a07cd69f025f27d63280",
+        "plugin_pin": "d4c1f0d082fc7cd4350da56689109a01c1f29d6c",
+        "vllm": "0.28.1rc1.dev132+ge126687a9",
+        "plugin": "0.0.5+d4c1f0d.gfx1100",
+        "torch": "2.12.0+git6bbd260",
+        "torch_git": "6bbd26020da1c6dc198625dfcdd968b1e4e6b1c5",
+        "hip": "7.2.53211",
+        "model": model, "config": config, "prompt": prompt, "repeat": repeat,
+        "resolved_model_dtype": "torch.bfloat16",
+        "requested": {
+            "model_dtype": "auto from bfloat16 config", "kv_cache_dtype": "auto",
+            "block_size": 16, "num_gpu_blocks_override": 16,
+            "max_model_len": 64, "max_num_seqs": 1, "seed": 0x524F434D,
+            "greedy": True, "ignore_eos": True, "max_tokens": 4,
+            "stop": [], "stop_token_ids": []},
+        "cache_capacity_contract": {
+            "block_size": 16, "physical_blocks": 16, "physical_cells": 256,
+            "reserved_null_blocks": 1, "usable_blocks": 15, "usable_cells": 240,
+            "logical_max_model_len": 64, "bf16_kv_payload_bytes": 65536,
+            "source": "vllm/v1/core/kv_cache_utils.py:2304-2309 at e126687a9a"},
+    }
+    for key, value in expected.items():
+        # JSON comparison preserves the distinction between booleans and numbers,
+        # including prompt IDs and nested sampling fields.
+        if key not in report or json.dumps(report[key], sort_keys=True) != json.dumps(value, sort_keys=True):
+            raise ValueError(f"primary qualification field differs or is missing: {key}")
+
+
 def tokens(path: Path) -> list[int]:
     result = [int(value) for value in path.read_text().split()]
     if len(result) != 4 or any(token < 0 or token >= 128 for token in result):
@@ -69,6 +106,15 @@ def primary_memory(report: dict) -> dict:
                 raise ValueError("primary cache shape and element count differ")
             if tensor["shape"] != [16, 2, 16, 64] or tensor["stride_elements"] != [1024, 16384, 64, 1]:
                 raise ValueError("primary actual cache shape or stride differs")
+            storage_offset = tensor["storage_offset_elements"]
+            if type(storage_offset) is not int:
+                raise ValueError("primary cache storage offset must be an integer")
+            end_element = storage_offset + 1 + sum(
+                (size - 1) * stride for size, stride in zip(tensor["shape"], tensor["stride_elements"]))
+            if storage_offset < 0 or end_element * tensor["element_bytes"] > tensor["storage_bytes"]:
+                raise ValueError("primary strided cache view is outside its storage")
+            if storage_offset != 0:
+                raise ValueError("primary cache view must start at its storage origin")
             allocation = tensor["allocator"]
             if allocation is None or allocation["state"] != "active_allocated":
                 raise ValueError("primary cache storage has no live allocator block")
@@ -81,7 +127,8 @@ def primary_memory(report: dict) -> dict:
     before = result["memory_before_generation"]["cache_tensors"]
     after = result["memory_after_generation"]["cache_tensors"]
     for left, right in zip(before, after):
-        for key in ("storage_address", "storage_bytes", "shape", "stride_elements", "dtype"):
+        for key in ("storage_address", "storage_bytes", "storage_offset_elements", "shape",
+                    "stride_elements", "dtype", "element_bytes", "numel", "payload_bytes"):
             if left[key] != right[key]:
                 raise ValueError("primary physical cache changed during generation")
     return result
@@ -154,21 +201,8 @@ def compare(args) -> dict:
                     path = args.primary / f"{name}-p{p}-r{repeat}.json"
                     report = json.loads(path.read_text())
                     files[str(path)] = seal(path)
-                    if report["model"] != seal(args.fixtures / (name + ".gguf")):
-                        raise ValueError(f"primary used different model bytes: {stem}")
-                    if report["config"] != seal(args.config / "config.json"):
-                        raise ValueError(f"primary used different HF configuration: {stem}")
-                    if report["prompt"] != prompt or report["repeat"] != repeat:
-                        raise ValueError(f"primary used a different request: {stem}")
-                    requested = report["requested"]
-                    expected = {"block_size": 16, "num_gpu_blocks_override": 16,
-                                "max_model_len": 64, "max_num_seqs": 1, "seed": 0x524F434D,
-                                "greedy": True, "ignore_eos": True, "max_tokens": 4,
-                                "stop": [], "stop_token_ids": []}
-                    if any(requested.get(key) != value for key, value in expected.items()):
-                        raise ValueError(f"primary workload or capacity differs: {stem}")
-                    if report["resolved_model_dtype"] != "torch.bfloat16":
-                        raise ValueError(f"primary resolved model dtype differs: {stem}")
+                    qualify_primary(report, seal(args.fixtures / (name + ".gguf")),
+                                    seal(args.config / "config.json"), prompt, repeat)
                     case.update(oracle="primary pinned vLLM and GGUF plugin", oracle_tokens=report["tokens"])
                     if actual != report["tokens"]:
                         raise ValueError(f"native {actual} differs from primary {report['tokens']}: {stem}")
@@ -196,10 +230,9 @@ def compare(args) -> dict:
     # Both gates remain required. The memory capture uses the identical Q4_0
     # workload and must preserve its completion, model, and configuration bytes.
     memory_report = json.loads(args.primary_memory.read_text())
-    if (memory_report["model"] != seal(args.fixtures / "Q4_0.gguf") or
-            memory_report["config"] != seal(args.config / "config.json") or
-            memory_report["prompt"] != PROMPTS[0] or memory_report["repeat"] != 0 or
-            memory_report["tokens"] != first[("Q4_0", 0)][0]):
+    qualify_primary(memory_report, seal(args.fixtures / "Q4_0.gguf"),
+                    seal(args.config / "config.json"), PROMPTS[0], 0)
+    if memory_report["tokens"] != first[("Q4_0", 0)][0]:
         raise ValueError("primary memory capture changed the qualified Q4_0 workload")
     measured_memory = primary_memory(memory_report)
     files[str(args.primary_memory)] = seal(args.primary_memory)

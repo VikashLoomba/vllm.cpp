@@ -397,8 +397,56 @@ The implementation can modify:
 - `docs/FEATURES.md` for the changed ROCm feature statement.
 - This spec, its issue record, and the already linked parent debt entry.
 
-Changing shared model behavior or unrelated production code requires a scope
-review before implementation. It cannot become an incidental gather repair.
+The scoped materializer amendment below authorizes two shared loader files.
+Other shared model behavior and unrelated production code require a scope
+review before implementation.
+
+### Q8_K materializer amendment
+
+The operator approved this amendment on 9 September 2026 UTC under issue #3093.
+Commit this amendment before changing either newly scoped product file:
+
+- `src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp`
+- `include/vllm/model_executor/models/qwen3_5_gguf_weights.h`
+
+The first native focused run passed 4 of 6 targets. The public test reached
+Q8_K after the first 8 formats matched their dense controls. Its first Q8_K
+load returned status 2. The native decoder suite separately passed all 11,698
+value assertions, but its empty-shape fixture failed during tensor construction.
+That malformed test fixture requires a metadata view with zero dimensions.
+
+`LoadEmbedAndHead` already selects `KeepQuantGatherDType` through the shared
+residency policy. It then calls `OwnGgufQuantBlocks`, whose guard at line 89
+requires `KeepQuantDType`. The latter requires a dot kernel and refuses Q8_K.
+This mismatch prevents the row's declared decoder-only format from loading.
+`git log -S 'VT_CHECK(KeepQuantDType(tensor.ggml_type'` identifies commit
+`429e19d6a` as the guard's introduction.
+
+Add an explicit tensor role to `OwnGgufQuantBlocks`. Default the role to
+`kMatmulWeight`, preserving the dot requirement for every existing caller.
+The embedding materializer explicitly selects `kEmbeddingTable`, which checks
+`KeepQuantGatherDType` instead. Preserve packed bytes, orientation, borrowing,
+copying, prefaulting, and every existing matrix repack default. A gather must
+not opt into a matrix repack. Do not change either shared dtype set, add a
+dot kernel, or change any backend capability outside this row.
+
+Add a smallest loader test in `tests/vllm/test_gguf_keep_quant.cpp` using the
+same generated Q8_K model. Require the ordinary loader to retain the original
+packed embedding bytes and `nk=false`. Require the default materializer to
+refuse that decoder-only format and the matrix residency route to expand it.
+Keep the public Q8_K load and completion test as the production gate.
+Fresh review removes the embedding role argument and weakens the default dot
+guard separately. Each mutation must fail its corresponding gate.
+
+The operator's first native run used the manifest
+`native-focused-v1.json`, SHA256
+`496a12c417b9cb95036896da418d74fd8383fc6d1497f0ed94f4e457791bf479`.
+Its log is `native-focused-v1.log`, SHA256
+`2f21277ec55c85cf6cd4abbb669a688bdfab415de13c9bcd0588e6a7854787ac`.
+Both files reside under the row's external evidence directory
+`/home/vikash/.cache/rdna3-gather-impl/evidence/`.
+The operator verified unchanged source, archive, and executable hashes around
+the run. The Q8_K public load had 1,108 passing assertions before its failure.
 
 ## Tests and gates
 

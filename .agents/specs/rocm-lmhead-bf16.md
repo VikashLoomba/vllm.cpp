@@ -179,11 +179,19 @@ would leave those views and host copies invalid" (`.agents/specs/rocm-residual-n
     hidden and weight bytes on every available device and requires the returned F32 logits to equal the primary's
     widened BF16 words element for element, to keep the F32 `[rows, vocab]` shape, and to select the primary's
     argmax. It exits 77 (CTest: Skipped) without `VT_MOE_HEAD_FIXTURE`.
-- Red before implementation: with the seam present but storing F32 (the pre-change behavior, extracted verbatim),
-  the production case reports 128/128 differing words per row at `max|a-c| = 9.23157e-04` (row 0) and
-  `9.72956e-04` (row 1).
-- Mutation (IMP-MUTATE): restore the F32 store inside the production path and require the focused case to redden;
-  restore the file byte for byte and re-verify its sha256.
+  - `the production forward returns BF16 logits` — the call-site case, and the one a reverted call site must
+    redden. It drives `Qwen3MoeModel::Forward` with a degenerate but legal zero-decoder-layer config (embed ->
+    final RMSNorm -> lm_head) and synthetic BF16 weights, so it needs no checkpoint, no capture and no fixture
+    directory, and it requires every logit the sampler would receive to be a BF16 word widened to F32.
+- Red before implementation: with the production projection storing F32 (the pre-change behavior, extracted
+  verbatim), the projection case reports 256/256 differing logits per device at `max_abs = 9.72956e-04`, and the
+  forward case reports 128/128 logits that are not BF16-representable.
+- Mutation (IMP-MUTATE), two independent guarantees, each restored byte for byte and re-verified by sha256:
+  1. Delete the BF16 narrowing and the `vt::CastF32` inside the seam (the pre-change body) — the projection case
+     reddens, 2 `CHECK` failures, one per device; the forward case and the measurement case stay green.
+  2. Revert the forward's call site to the inline F32 `vt::Matmul` — the forward case reddens, 128/128 logits not
+     BF16-representable; the two seam cases stay green, which is exactly the coverage split the two cases exist
+     to make visible.
 - Existing gates that must stay green: `test_rocm_moe_bf16` (needs the operator's GPU and fixture),
   `test_rocm_moe_reference_set`, and the frozen-head preflight.
 
@@ -195,7 +203,7 @@ would leave those views and host copies invalid" (`.agents/specs/rocm-residual-n
 | Red and mutation | The pre-change form reddens the production case; the reviewer reproduces it and restores byte-for-byte. |
 | Preflight | `scripts/agent-preflight.sh --staged` at the implementation head, log under `/home/vikash/.cache/moe-head-bf16/`. |
 | Production token gate | Operator only: the 18-workload membership gate in `tests/vllm/models/test_rocm_moe_bf16.cpp` at the frozen head, with the recorded concurrency-1/-2 reference set. |
-| Reachability | The production forward calls the seam; the operator's run executes it; the reviewer deletes the call site in a scratch copy and confirms what does and does not redden. |
+| Reachability | The production forward calls the seam; the zero-layer case reddens when that call site is reverted, and the operator's run executes it in the real checkpoint path. |
 
 ## Evidence
 

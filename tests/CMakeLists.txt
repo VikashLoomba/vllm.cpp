@@ -1881,6 +1881,13 @@ vllm_cpp_add_test(test_act_dump
   vllm/model_executor/test_act_dump.cpp)
 target_include_directories(test_act_dump PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# BACKEND-ROCM-BF16-MOE (#3116): the LM-head output boundary, replayed over the
+# primary's own captured head input. The fixture is a directory of raw captures,
+# so the case exits 77 (Skipped) without `VT_MOE_HEAD_FIXTURE` rather than
+# reporting a green gate that never ran.
+vllm_cpp_add_test(test_qwen3_moe_lm_head_bf16
+  vllm/model_executor/test_qwen3_moe_lm_head_bf16.cpp)
+
 vllm_cpp_add_test(test_moe_fit_resolver
   vllm/model_executor/test_moe_fit_resolver.cpp)
 target_include_directories(test_moe_fit_resolver PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -3199,6 +3206,9 @@ vllm_cpp_add_test(test_ops_residual_rmsnorm vt/test_ops_residual_rmsnorm.cpp)
 if(VLLM_CPP_HIP)
   target_compile_definitions(test_ops_residual_rmsnorm PRIVATE __HIP_PLATFORM_AMD__=1)
   target_compile_definitions(test_rocm_moe_bf16 PRIVATE __HIP_PLATFORM_AMD__=1)
+  # The head-boundary replay names the ROCm device itself (hipGetDevice /
+  # hipSetDevice around each queue), exactly as the residual siblings do.
+  target_compile_definitions(test_qwen3_moe_lm_head_bf16 PRIVATE __HIP_PLATFORM_AMD__=1)
 endif()
 vllm_cpp_add_test(test_ops_rmsnorm_weight_dtype vt/test_ops_rmsnorm_weight_dtype.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm_quant_fp8_weight_dtype

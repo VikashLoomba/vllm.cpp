@@ -35,6 +35,7 @@
 #include "vllm/model_executor/models/decode_graph_sizes.h"  // DecodeGraphSizes/PadToCaptureSize
 #include "vllm/model_executor/models/dense_attn_block.h"    // shared AttnBlock + device glue
 #include "vllm/model_executor/models/device_pool.h"         // DevicePool/Pool/ActivePool (shared)
+#include "vllm/model_executor/models/lm_head_projection.h"  // lm_head::Project (#3116)
 #include "vllm/model_executor/models/qwen3_5_internal.h"    // detail::EndExpertStreamStep
 #include "vllm/model_executor/device_placement.h"
 #include "vllm/model_executor/moe_placement_seam.h"
@@ -293,13 +294,9 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
     GatherRows(d, dgather.ptr(), final_normalized, logits_indices, H);
     src = dgather.t();
   }
-  const int64_t n_out = src.shape[0];
-  DBuf logits(d, DType::kF32, {n_out, vocab});
-  if (tied)
-    vt::MatmulBT(d.q, logits.t(), src, lm);
-  else
-    vt::Matmul(d.q, logits.t(), src, lm);
-  return logits;
+  // The head projection and its OUTPUT DTYPE live on one seam (#3116) so the
+  // boundary a focused test replays is the boundary this forward runs.
+  return lm_head::Project(d, src, lm, tied);
 }
 
 // Full eager forward body: embed (host token_ids) then the capturable layer

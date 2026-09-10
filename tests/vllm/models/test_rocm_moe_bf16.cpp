@@ -1,8 +1,10 @@
 // vllm.cpp original. Native ROCm BF16 MoE production gate (#3094).
 // The checkpoint enters through ModelRegistry::Load and every step through Forward.
 #include <doctest/doctest.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -396,4 +398,1094 @@ TEST_CASE("ROCm BF16 MoE enters native providers through the production registry
     CHECK(vt::GetOpProviderStats(op, vt::DeviceType::kCPU).selections == 0);
   }
   vt::EnableOpProviderCallStats(false);
+}
+
+// ---------------------------------------------------------------------------
+// BACKEND-ROCM-BF16-MOE (#3115): the native attention boundary.
+//
+// The first attention output of L33/C2/R0 layer 0 differs from the pinned
+// primary's by 2902 of 8448 bf16 words, and the captured numbers alone do not
+// separate two candidate causes:
+//
+//   (a) the Q/K PREAMBLE. The primary keeps normalized Q/K in FP32 through RoPE
+//       and narrows at the store; the native block narrows to bf16 before RoPE
+//       (dense_attn_block.h:637-653).
+//   (b) the KERNEL ARITHMETIC. The primary's executing arm is Triton
+//       (prefix_prefill.py, selected because the ROCm custom predicate needs
+//       gqa_ratio >= 3 and this fixture has qg == 1) and narrows the softmax
+//       probabilities to the V dtype before tl.dot (prefix_prefill.py:471). The
+//       native ROCm arm keeps them f32 (rocm_paged_attn.hip:527-531), and its
+//       D128/QG1 dispatch has no query-length gate, so the 33-token prefill runs
+//       through the decode-geometry kernel (rocm_paged_attn.hip:445,2037-2041).
+//
+// This instrument separates them with native bytes. It (i) captures the native
+// boundary from the unchanged production path, (ii) replays the PRIMARY's own
+// captured Q/K/V through the same native op at the primary's cache geometry so
+// the kernel term is measured on identical inputs, and (iii) runs the native
+// preamble ops over the primary's captured `qkv` so the preamble term is
+// measured on identical inputs too.
+//
+// TEST-ONLY. Every observer below is the provider-seam wrapper this file already
+// uses for the residual row (CaptureResidualNorm, :228-237): read the live kernel
+// with vt::GetOp, register a priority-100 replacement, forward to the saved
+// pointer. Nothing under src/ or include/ changes and no attention arithmetic is
+// touched. Everything is gated on VT_ATTN_DUMP; when that is unset no observer is
+// registered at all and vt::GetOp dispatch is byte-identical to production.
+//
+// EAGER ONLY. The capture does device->host copies, which are illegal inside a
+// graph capture, and vt::Backend carries no "is capturing" query (gap G5:
+// include/vt/backend.h:244-262, include/vt/device.h:131-135). The workload that
+// matters never captures: RocmPlatform::support_static_graph_mode() is false
+// (src/vllm/platforms/rocm.cpp:91, include/vllm/platforms/interface.h:344), so
+// the production registry path does not enter the graph driver.
+//
+// THE THREE OBSERVERS AND WHY EACH IS ENOUGH.
+//  * kPagedAttention — its arguments ARE the post-RoPE boundary: `query` (post-
+//    RoPE Q), `k_cache`/`v_cache` (what the kernel reads), `block_table`,
+//    `seq_lens`, `query_start_loc` and `out` (include/vt/ops.h:5424-5426,
+//    src/vt/ops.cpp:5038-5130).
+//  * kRopeFromCache — on ROCm the recipe `kAttnQkNormRope` has no fast
+//    realisation (src/vt/rocm/rocm_ops.hip registers kAttnQkNormRopeGate and not
+//    kAttnQkNormRope), so vt::FusedChain falls through to its Tier-0 composite
+//    (src/vt/ops.cpp:1449-1455) and the preamble is exactly
+//    RmsNorm(q) + RmsNorm(k) + RopeFromCache. This observer therefore sees the
+//    post-norm PRE-RoPE q2/k2 on entry, the post-RoPE q3/k3 on return, and the
+//    cos|sin table that was actually read — all three without a product-file
+//    hook, because the FusedChain composite reaches the op through GetOp.
+//  * kRmsNorm — records every call in order so the pair immediately preceding
+//    the captured RopeFromCache call is identified by position in that call
+//    sequence rather than by shape (the layer input norms have the same shape).
+//
+// THE OPERATOR COMMAND. One binary, one process, one run; both cases below skip
+// with exit 77 when their environment is absent, so an ordinary test run is
+// unchanged. Run it under the host's recorded GPU mutex, with
+// `VT_ATTN_DUMP=1` and these six values in the environment:
+//
+//   VT_ROCM_MOE_FIXTURE        = /home/vikash/.cache/rdna3-moe-impl/preserved/fixture
+//   VT_ATTN_PARITY_PRIMARY     = /home/vikash/.cache/rdna3-moe-attention-operator/results
+//   VT_ATTN_PARITY_PREAMBLE    = /home/vikash/.cache/residual-norm-impl/oracle-probe-v3/observed
+//   VT_ATTN_PARITY_OUT         = a scratch directory for the dumped native bytes
+//   HIP_VISIBLE_DEVICES        = 0
+//
+//   flock /home/vikash/gpu.lock -c '<the five values above> build-attn-hip/tests/test_rocm_moe_bf16 --test-case="ROCm paged attention replays*"'
+//
+// The CPU-only half needs no device and only VT_ATTN_PARITY_PRIMARY:
+//
+//   VT_ATTN_PARITY_PRIMARY=<results> build-attn-hip/tests/test_rocm_moe_bf16 --test-case="Primary attention capture decodes*"
+//
+// MEASURED at 691b7af30 + this instrument (gfx1100, bf16, 66 tokens, hq 1,
+// hkv 1, dh 128, L33/C2/R0 layer 0 step 0; all 1322 assertions pass), over the
+// primary capture above and the primary preamble capture:
+//
+//   row                                                        differing / 8448
+//   A0 native run output vs primary output (the recorded 2902)          2902
+//   B  native run post-RoPE Q vs primary Q                              1569
+//   B  native run post-RoPE K vs primary K                              1542
+//   C0 replay self-consistency (native Q/K/V at the primary's
+//      geometry vs the native run's own output)                             0
+//   C  native ROCm kernel on the PRIMARY's own Q/K/V vs its output      2918
+//   D  native preamble on the primary's qkv (RmsNorm + RopeFromCache)   1569 Q / 1542 K
+//   D' the same through RopeNeox instead of the cos|sin cache           1776 Q / 1719 K
+//   E  native cos|sin table vs primary cos_sin at the same positions        0
+//   F  primary qkv q/k slices vs the native run's pre-norm q/k              0
+//
+// VERDICT: BOTH, kernel-dominant. The kernel term alone is 2918 of 8448 words on
+// identical inputs (row C, with row C0 proving the replay reproduces the native
+// run exactly at the primary's geometry), which is the whole recorded 2902. The
+// preamble term is 1569 Q and 1542 K. Rows E and F exclude the cos|sin source
+// and the qkv projection, so the preamble term is the pre-RoPE BF16 norm store.
+// Row C's shape: rows 0 and 33 (query position 0, a one-key softmax) are exact,
+// no differing word lies in a row whose maximum probability is >= 0.999, all
+// 2918 lie in rows below 0.9, and 2132 of them are one bf16 code unit apart.
+//
+// GAP G5 (recorded, not repaired): a device->host read is illegal inside a graph
+// capture and vt::Backend carries no "is capturing" query
+// (include/vt/backend.h:244-262; vt::Queue is include/vt/device.h:131-135), so
+// this instrument cannot decline on its own during a capture. It is declared
+// EAGER-ONLY instead: RocmPlatform::support_static_graph_mode() is false, so the
+// workload measured here is never captured. A graphed variant needs
+// `virtual bool IsCapturing() const` on vt::Backend, overridden in RocmBackend
+// beside BeginCapture, and an issue of its own.
+// ---------------------------------------------------------------------------
+namespace {
+
+// One env var, read once into a function-local static — the tree's convention
+// (dense_attn_block.h:65, :93, :154). Unset => no observer is installed, so the
+// default path pays nothing and dispatches exactly as it does today.
+bool AttnDumpEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_ATTN_DUMP");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+// --- host file helpers ------------------------------------------------------
+std::vector<uint8_t> ReadBytes(const std::filesystem::path& path) {
+  REQUIRE_MESSAGE(std::filesystem::exists(path), "missing capture file ", path.string());
+  const auto size = static_cast<size_t>(std::filesystem::file_size(path));
+  std::vector<uint8_t> bytes(size);
+  std::ifstream in(path, std::ios::binary);
+  if (size > 0)
+    in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
+  REQUIRE(static_cast<bool>(in));
+  return bytes;
+}
+
+template <typename T>
+std::vector<T> ReadTyped(const std::filesystem::path& path) {
+  const std::vector<uint8_t> bytes = ReadBytes(path);
+  REQUIRE(bytes.size() % sizeof(T) == 0);
+  std::vector<T> values(bytes.size() / sizeof(T));
+  if (!bytes.empty()) std::memcpy(values.data(), bytes.data(), bytes.size());
+  return values;
+}
+
+std::vector<uint16_t> ReadBf16(const std::filesystem::path& path) {
+  return ReadTyped<uint16_t>(path);
+}
+
+void WriteWords(const std::filesystem::path& path, const std::vector<uint16_t>& words) {
+  if (words.empty()) return;
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream(path, std::ios::binary)
+      .write(reinterpret_cast<const char*>(words.data()),
+             static_cast<std::streamsize>(words.size() * sizeof(uint16_t)));
+}
+
+// --- device read helpers ----------------------------------------------------
+std::vector<uint8_t> ReadDevice(vt::Queue& q, const vt::Tensor& tensor) {
+  std::vector<uint8_t> host(tensor.Bytes());
+  auto& backend = vt::GetBackend(q.device);
+  if (!host.empty()) backend.Copy(q, host.data(), tensor.data, host.size());
+  backend.Synchronize(q);
+  return host;
+}
+
+std::vector<uint16_t> ReadDeviceBf16(vt::Queue& q, const vt::Tensor& tensor) {
+  REQUIRE(tensor.dtype == vt::DType::kBF16);
+  const std::vector<uint8_t> bytes = ReadDevice(q, tensor);
+  std::vector<uint16_t> words(bytes.size() / sizeof(uint16_t));
+  if (!bytes.empty()) std::memcpy(words.data(), bytes.data(), bytes.size());
+  return words;
+}
+
+template <typename T>
+std::vector<T> ReadDeviceTyped(vt::Queue& q, const vt::Tensor& tensor) {
+  const std::vector<uint8_t> bytes = ReadDevice(q, tensor);
+  REQUIRE(bytes.size() % sizeof(T) == 0);
+  std::vector<T> values(bytes.size() / sizeof(T));
+  if (!bytes.empty()) std::memcpy(values.data(), bytes.data(), bytes.size());
+  return values;
+}
+
+// The (num_blocks, block_size, hkv, dh) unbind slice is STRIDED: the block
+// stride is 2*block_size*hkv*dh because the flash cache interleaves K and V per
+// block (dense_attn_block.h:356-373). One linear Copy would read the wrong
+// bytes, so read the slice one block at a time.
+std::vector<uint16_t> ReadCacheSlice(vt::Queue& q, const vt::Tensor& cache) {
+  REQUIRE(cache.rank == 4);
+  REQUIRE(cache.dtype == vt::DType::kBF16);
+  REQUIRE(cache.stride[3] == 1);
+  const int64_t blocks = cache.shape[0], bs = cache.shape[1];
+  const int64_t h = cache.shape[2], d = cache.shape[3];
+  std::vector<uint16_t> host(static_cast<size_t>(blocks * bs * h * d));
+  auto& backend = vt::GetBackend(q.device);
+  for (int64_t b = 0; b < blocks; ++b) {
+    backend.Copy(q, host.data() + static_cast<size_t>(b * bs * h * d),
+                 static_cast<const char*>(cache.data) +
+                     static_cast<size_t>(b * cache.stride[0]) * sizeof(uint16_t),
+                 static_cast<size_t>(bs * h * d) * sizeof(uint16_t));
+  }
+  backend.Synchronize(q);
+  return host;
+}
+
+// The K/V row the kernel reads for request r, key position j:
+//   cache[block_table[r, j / block_size], j % block_size, 0, :]
+std::vector<uint16_t> GatherKv(const std::vector<uint16_t>& slice, int64_t block_size,
+                               int64_t hkv, int64_t dh,
+                               const std::vector<int32_t>& block_table,
+                               int64_t block_table_cols, int64_t request, int64_t keys) {
+  const size_t row = static_cast<size_t>(hkv * dh);
+  std::vector<uint16_t> out(static_cast<size_t>(keys) * row);
+  for (int64_t j = 0; j < keys; ++j) {
+    const int64_t block =
+        block_table[static_cast<size_t>(request * block_table_cols + j / block_size)];
+    const size_t src = static_cast<size_t>((block * block_size + j % block_size)) * row;
+    REQUIRE(src + row <= slice.size());
+    std::memcpy(out.data() + static_cast<size_t>(j) * row, slice.data() + src,
+                row * sizeof(uint16_t));
+  }
+  return out;
+}
+
+// --- capture records --------------------------------------------------------
+struct PagedAttentionCapture {
+  int64_t calls = 0;
+  int64_t tokens = 0, hq = 0, dh = 0, hkv = 0, block_size = 0, blocks = 0;
+  int64_t block_table_cols = 0;
+  float scale = 0.0f;
+  bool causal = true;
+  bool have = false;
+  std::vector<uint16_t> query, out, k_cache, v_cache;
+  std::vector<int32_t> block_table, seq_lens, query_start_loc;
+};
+
+struct RopeCapture {
+  bool have = false;
+  int64_t tokens = 0, heads = 0, dh = 0, rot = 0, rms_calls_before = 0;
+  std::vector<uint16_t> q_pre, k_pre, q_post, k_post, cos_sin;
+  std::vector<int32_t> index;
+};
+
+struct RmsNormCall {
+  int64_t shape0 = 0, shape1 = 0;
+  float eps = 0.0f;
+  std::vector<uint16_t> in, out, weight;
+};
+
+PagedAttentionCapture g_attn;
+RopeCapture g_rope;
+int64_t g_rope_neox_calls = 0;
+std::vector<RmsNormCall> g_rms_calls;
+bool g_record = false;
+
+vt::PagedAttentionFn g_native_paged_attention = nullptr;
+vt::RmsNormFn g_native_rms_norm = nullptr;
+vt::RopeFromCacheFn g_native_rope_from_cache = nullptr;
+vt::RopeFn g_native_rope_neox = nullptr;
+
+void CapturePagedAttention(vt::Queue& q, vt::Tensor& out, const vt::Tensor& query,
+                           const vt::Tensor& k_cache, const vt::Tensor& v_cache,
+                           const vt::Tensor& block_table, const vt::Tensor& seq_lens,
+                           const vt::Tensor& query_start_loc,
+                           const vt::PagedAttentionArgs& args) {
+  const bool record = g_record && g_attn.calls == 0;
+  if (record) {
+    g_attn.tokens = query.shape[0];
+    g_attn.hq = query.shape[1];
+    g_attn.dh = query.shape[2];
+    g_attn.hkv = k_cache.shape[2];
+    g_attn.block_size = k_cache.shape[1];
+    g_attn.blocks = k_cache.shape[0];
+    g_attn.block_table_cols = block_table.shape[1];
+    g_attn.scale = args.scale;
+    g_attn.causal = args.causal;
+    g_attn.query = ReadDeviceBf16(q, query);
+    g_attn.k_cache = ReadCacheSlice(q, k_cache);
+    g_attn.v_cache = ReadCacheSlice(q, v_cache);
+    g_attn.block_table = ReadDeviceTyped<int32_t>(q, block_table);
+    g_attn.seq_lens = ReadDeviceTyped<int32_t>(q, seq_lens);
+    g_attn.query_start_loc = ReadDeviceTyped<int32_t>(q, query_start_loc);
+  }
+  g_native_paged_attention(q, out, query, k_cache, v_cache, block_table, seq_lens,
+                           query_start_loc, args);
+  if (record) {
+    g_attn.out = ReadDeviceBf16(q, out);
+    g_attn.have = true;
+  }
+  g_attn.calls += 1;
+}
+
+void CaptureRmsNorm(vt::Queue& q, vt::Tensor& out, const vt::Tensor& x,
+                    const vt::Tensor& weight, const vt::RmsNormArgs& args,
+                    vt::Tensor* residual) {
+  const bool record = g_record && !g_rope.have && g_rms_calls.size() < 32 &&
+                      x.Numel() <= 65536 && x.dtype == vt::DType::kBF16 &&
+                      out.dtype == vt::DType::kBF16;
+  RmsNormCall call;
+  if (record) {
+    call.shape0 = x.shape[0];
+    call.shape1 = x.rank >= 2 ? x.shape[1] : 0;
+    call.eps = args.eps;
+    call.in = ReadDeviceBf16(q, x);
+    call.weight = ReadDeviceBf16(q, weight);
+  }
+  g_native_rms_norm(q, out, x, weight, args, residual);
+  if (record) {
+    call.out = ReadDeviceBf16(q, out);
+    g_rms_calls.push_back(std::move(call));
+  }
+}
+
+// The preamble's RoPE call is preceded by RmsNorm(q) then RmsNorm(k) from the
+// SAME composite (include/vt/recipes.h kAttnQkNormRope), so the two RmsNorm
+// calls immediately before it are the pair, identified by position in the call
+// sequence rather than by shape.
+void CaptureRopeFromCache(vt::Queue& q, vt::Tensor& q_states, vt::Tensor* k_states,
+                          const vt::Tensor& positions, const vt::Tensor& cos_sin_cache,
+                          const vt::RopeArgs& args) {
+  const bool record = g_record && !g_rope.have;
+  if (record) {
+    g_rope.tokens = q_states.shape[0];
+    g_rope.heads = q_states.shape[1];
+    g_rope.dh = q_states.shape[2];
+    g_rope.rot = args.rotary_dim;
+    g_rope.rms_calls_before = static_cast<int64_t>(g_rms_calls.size());
+    g_rope.q_pre = ReadDeviceBf16(q, q_states);
+    if (k_states != nullptr) g_rope.k_pre = ReadDeviceBf16(q, *k_states);
+    g_rope.cos_sin = ReadDeviceBf16(q, cos_sin_cache);
+    g_rope.index = ReadDeviceTyped<int32_t>(q, positions);
+  }
+  g_native_rope_from_cache(q, q_states, k_states, positions, cos_sin_cache, args);
+  if (record) {
+    g_rope.q_post = ReadDeviceBf16(q, q_states);
+    if (k_states != nullptr) g_rope.k_post = ReadDeviceBf16(q, *k_states);
+    g_rope.have = true;
+  }
+}
+
+void CaptureRopeNeox(vt::Queue& q, vt::Tensor& q_states, vt::Tensor& k_states,
+                     const vt::Tensor& positions, const vt::RopeArgs& args) {
+  g_rope_neox_calls += 1;
+  g_native_rope_neox(q, q_states, k_states, positions, args);
+}
+
+// Function-local static: the provider table is process-global and registering
+// the same name twice is refused, so this runs exactly once. GetOp is read here
+// and NOWHERE else, so on a re-entry the saved pointer is the live kernel and
+// never this wrapper.
+void InstallAttnObservers() {
+  static const bool installed = [] {
+    g_native_paged_attention = reinterpret_cast<vt::PagedAttentionFn>(
+        vt::GetOp(vt::OpId::kPagedAttention, vt::DeviceType::kROCM));
+    vt::RegisterOpProvider(vt::OpId::kPagedAttention, vt::DeviceType::kROCM,
+                           {"test-attention-boundary-paged-attention", 100, nullptr,
+                            reinterpret_cast<void*>(static_cast<vt::PagedAttentionFn>(
+                                &CapturePagedAttention))});
+    g_native_rms_norm = reinterpret_cast<vt::RmsNormFn>(
+        vt::GetOp(vt::OpId::kRmsNorm, vt::DeviceType::kROCM));
+    vt::RegisterOpProvider(vt::OpId::kRmsNorm, vt::DeviceType::kROCM,
+                           {"test-attention-boundary-rmsnorm", 100, nullptr,
+                            reinterpret_cast<void*>(
+                                static_cast<vt::RmsNormFn>(&CaptureRmsNorm))});
+    g_native_rope_from_cache = reinterpret_cast<vt::RopeFromCacheFn>(
+        vt::GetOp(vt::OpId::kRopeFromCache, vt::DeviceType::kROCM));
+    vt::RegisterOpProvider(vt::OpId::kRopeFromCache, vt::DeviceType::kROCM,
+                           {"test-attention-boundary-rope-from-cache", 100, nullptr,
+                            reinterpret_cast<void*>(static_cast<vt::RopeFromCacheFn>(
+                                &CaptureRopeFromCache))});
+    g_native_rope_neox =
+        reinterpret_cast<vt::RopeFn>(vt::GetOp(vt::OpId::kRopeNeox, vt::DeviceType::kROCM));
+    vt::RegisterOpProvider(vt::OpId::kRopeNeox, vt::DeviceType::kROCM,
+                           {"test-attention-boundary-rope-neox", 100, nullptr,
+                            reinterpret_cast<void*>(
+                                static_cast<vt::RopeFn>(&CaptureRopeNeox))});
+    return true;
+  }();
+  (void)installed;
+}
+
+// --- the primary's captured attention boundary ------------------------------
+struct PrimaryBoundary {
+  int64_t tokens = 0, hq = 0, hkv = 0, dh = 0, num_reqs = 0;
+  int64_t block_size = 0, block_table_cols = 0;
+  float scale = 0.0f;
+  std::vector<uint16_t> query, key, value, output;
+  std::vector<int32_t> query_start_loc, seq_lens, block_table;
+  std::vector<int64_t> slot_mapping;
+};
+
+PrimaryBoundary LoadPrimaryBoundary(const std::filesystem::path& dir, const std::string& label,
+                                    int index) {
+  const std::string stem = label + "-attention-" + std::to_string(index);
+  nlohmann::json record;
+  std::ifstream(dir / (stem + ".json")) >> record;
+  REQUIRE(!record.is_null());
+  PrimaryBoundary b;
+  b.scale = record.at("scale").get<float>();
+  b.hq = record.at("num_heads").get<int64_t>();
+  b.hkv = record.at("num_kv_heads").get<int64_t>();
+  b.dh = record.at("head_size").get<int64_t>();
+  b.tokens = record.at("num_actual_tokens").get<int64_t>();
+  b.block_size = record.at("kv_cache").at("shape").at(2).get<int64_t>();
+  b.block_table_cols = record.at("tensors").at("block_table").at("shape").at(1).get<int64_t>();
+  b.num_reqs = static_cast<int64_t>(record.at("seq_lens").size());
+  b.query = ReadBf16(dir / (stem + "-query.bin"));
+  b.key = ReadBf16(dir / (stem + "-key.bin"));
+  b.value = ReadBf16(dir / (stem + "-value.bin"));
+  b.output = ReadBf16(dir / (stem + "-output.bin"));
+  b.query_start_loc = ReadTyped<int32_t>(dir / (stem + "-query_start_loc.bin"));
+  b.seq_lens = ReadTyped<int32_t>(dir / (stem + "-seq_lens.bin"));
+  b.block_table = ReadTyped<int32_t>(dir / (stem + "-block_table.bin"));
+  b.slot_mapping = ReadTyped<int64_t>(dir / (stem + "-slot_mapping.bin"));
+  const size_t expected = static_cast<size_t>(b.tokens * b.hq * b.dh);
+  REQUIRE(b.query.size() == expected);
+  REQUIRE(b.key.size() == expected);
+  REQUIRE(b.value.size() == expected);
+  REQUIRE(b.output.size() == expected);
+  return b;
+}
+
+// --- diffs ------------------------------------------------------------------
+struct WordDiff {
+  int64_t words = 0, different = 0;
+  std::vector<int64_t> row_different;
+  int64_t distance[5] = {0, 0, 0, 0, 0};
+  std::vector<int64_t> first;
+};
+
+// bf16 shares f32's ordering, so reading the 16 bits as a signed integer is
+// monotone within one sign and the difference is a code-unit (ULP) distance.
+int64_t Bf16CodeDistance(uint16_t a, uint16_t b) {
+  return std::llabs(static_cast<long long>(static_cast<int16_t>(a)) -
+                    static_cast<long long>(static_cast<int16_t>(b)));
+}
+
+WordDiff DiffWords(const std::vector<uint16_t>& actual, const std::vector<uint16_t>& expected,
+                   int64_t row) {
+  REQUIRE(actual.size() == expected.size());
+  WordDiff d;
+  d.words = static_cast<int64_t>(actual.size());
+  if (row > 0) d.row_different.assign(static_cast<size_t>(d.words / row), 0);
+  for (size_t i = 0; i < actual.size(); ++i) {
+    if (actual[i] == expected[i]) continue;
+    d.different += 1;
+    const int64_t distance = Bf16CodeDistance(actual[i], expected[i]);
+    d.distance[distance >= 4 ? 4 : distance] += 1;
+    if (row > 0) d.row_different[i / static_cast<size_t>(row)] += 1;
+    if (d.first.size() < 8) d.first.push_back(static_cast<int64_t>(i));
+  }
+  return d;
+}
+
+// Host-side f32 classification of each query row: for query token t the maximum
+// softmax probability over the keys it can see. A difference confined to rows
+// whose maximum is ~1 (a trivial softmax) points at exp/reduction order; a
+// difference spread over rows with a flat distribution points at the
+// probability dtype.
+std::vector<double> MaxProbPerRow(const PrimaryBoundary& b) {
+  std::vector<double> result(static_cast<size_t>(b.tokens), 0.0);
+  for (int64_t r = 0; r < b.num_reqs; ++r) {
+    const int64_t begin = b.query_start_loc[static_cast<size_t>(r)];
+    const int64_t end = b.query_start_loc[static_cast<size_t>(r + 1)];
+    const int64_t seq = b.seq_lens[static_cast<size_t>(r)];
+    for (int64_t t = begin; t < end; ++t) {
+      const int64_t position = seq - (end - begin) + (t - begin);
+      std::vector<double> scores(static_cast<size_t>(position + 1), 0.0);
+      for (int64_t j = 0; j <= position; ++j) {
+        double dot = 0.0;
+        for (int64_t d = 0; d < b.dh; ++d)
+          dot += static_cast<double>(vt::BF16ToF32(b.query[static_cast<size_t>(t * b.dh + d)])) *
+                 static_cast<double>(vt::BF16ToF32(b.key[static_cast<size_t>(j * b.dh + d)]));
+        scores[static_cast<size_t>(j)] = static_cast<double>(b.scale) * dot;
+      }
+      const double max = *std::max_element(scores.begin(), scores.end());
+      double sum = 0.0;
+      for (double s : scores) sum += std::exp(s - max);
+      result[static_cast<size_t>(t)] = 1.0 / sum;
+    }
+  }
+  return result;
+}
+
+void PrintDiff(const std::string& tag, const WordDiff& d) {
+  std::cout << "[attn-parity] " << tag << ": " << d.different << " / " << d.words
+            << " differing bf16 words; bf16 code-unit distance 1:" << d.distance[1]
+            << " 2:" << d.distance[2] << " 3:" << d.distance[3] << " >=4:" << d.distance[4]
+            << std::endl;
+}
+
+// WHERE the words differ, in the two axes that localize the cause.
+void PrintDiffShape(const PrimaryBoundary& b, const WordDiff& d,
+                    const std::vector<double>& max_prob) {
+  std::cout << "[attn-parity]   per-row differing words (" << d.row_different.size()
+            << " rows):";
+  for (size_t t = 0; t < d.row_different.size(); ++t)
+    std::cout << " " << d.row_different[t];
+  std::cout << std::endl;
+  const double edges[3] = {0.999, 0.99, 0.9};
+  int64_t words[4] = {0, 0, 0, 0}, rows[4] = {0, 0, 0, 0}, total[4] = {0, 0, 0, 0};
+  for (size_t t = 0; t < max_prob.size(); ++t) {
+    const int bucket = max_prob[t] >= edges[0]   ? 0
+                       : max_prob[t] >= edges[1] ? 1
+                       : max_prob[t] >= edges[2] ? 2
+                                                 : 3;
+    total[bucket] += 1;
+    if (t < d.row_different.size() && d.row_different[t] > 0) rows[bucket] += 1;
+    if (t < d.row_different.size()) words[bucket] += d.row_different[t];
+  }
+  const char* names[4] = {"maxprob>=0.999", "0.99<=maxprob<0.999", "0.9<=maxprob<0.99",
+                          "maxprob<0.9"};
+  for (int i = 0; i < 4; ++i)
+    std::cout << "[attn-parity]   " << names[i] << ": " << words[i] << " differing words over "
+              << rows[i] << " of " << total[i] << " rows" << std::endl;
+  if (!d.row_different.empty())
+    std::cout << "[attn-parity]   row 0 (position 0, softmax trivial): "
+              << d.row_different[0] << " differing words; first differing flat indices:";
+  for (int64_t index : d.first) std::cout << " " << index;
+  std::cout << std::endl;
+  std::cout << "[attn-parity]   requests: " << b.num_reqs;
+  for (int64_t r = 0; r < b.num_reqs; ++r) {
+    int64_t count = 0;
+    for (int64_t t = b.query_start_loc[static_cast<size_t>(r)];
+         t < b.query_start_loc[static_cast<size_t>(r + 1)]; ++t)
+      if (t < static_cast<int64_t>(d.row_different.size()))
+        count += d.row_different[static_cast<size_t>(t)];
+    std::cout << " request " << r << "=" << count;
+  }
+  std::cout << std::endl;
+}
+
+// The primary's captured Q/K preamble boundary, beside the attention capture.
+struct PrimaryPreamble {
+  int64_t tokens = 0, qkv_width = 0, dh = 0, rot = 0;
+  std::vector<uint16_t> qkv, q_gamma, k_gamma, cos_sin, q_left, q_right, k_left, k_right;
+  std::vector<int64_t> positions;
+};
+
+PrimaryPreamble LoadPrimaryPreamble(const std::filesystem::path& dir, const std::string& label,
+                                    int index) {
+  const std::string stem = label + "-residual-preamble-" + std::to_string(index);
+  nlohmann::json record;
+  std::ifstream(dir / (stem + ".json")) >> record;
+  REQUIRE(!record.is_null());
+  PrimaryPreamble p;
+  p.tokens = record.at("inputs").at("qkv").at("shape").at(0).get<int64_t>();
+  p.qkv_width = record.at("inputs").at("qkv").at("shape").at(1).get<int64_t>();
+  p.dh = record.at("inputs").at("q_gamma").at("shape").at(0).get<int64_t>();
+  p.rot = record.at("inputs").at("cos_sin").at("shape").at(1).get<int64_t>();
+  p.qkv = ReadBf16(dir / (stem + "-input-qkv.bin"));
+  p.q_gamma = ReadBf16(dir / (stem + "-input-q_gamma.bin"));
+  p.k_gamma = ReadBf16(dir / (stem + "-input-k_gamma.bin"));
+  p.cos_sin = ReadBf16(dir / (stem + "-input-cos_sin.bin"));
+  p.positions = ReadTyped<int64_t>(dir / (stem + "-input-positions.bin"));
+  p.q_left = ReadBf16(dir / (stem + "-output-q_left.bin"));
+  p.q_right = ReadBf16(dir / (stem + "-output-q_right.bin"));
+  p.k_left = ReadBf16(dir / (stem + "-output-k_left.bin"));
+  p.k_right = ReadBf16(dir / (stem + "-output-k_right.bin"));
+  REQUIRE(p.qkv.size() == static_cast<size_t>(p.tokens * p.qkv_width));
+  REQUIRE(p.cos_sin.size() ==
+          static_cast<size_t>(record.at("inputs").at("cos_sin").at("shape").at(0).get<int64_t>() *
+                              p.rot));
+  REQUIRE(p.positions.size() == static_cast<size_t>(p.tokens));
+  return p;
+}
+
+// q_left|q_right (each [T,1,Dh/2], stride [Dh,Dh,1]) reassembled into the
+// [T,1,Dh] query the attention capture holds.
+std::vector<uint16_t> JoinRopeHalves(const PrimaryPreamble& p, const std::vector<uint16_t>& left,
+                                     const std::vector<uint16_t>& right) {
+  const int64_t half = p.dh / 2;
+  std::vector<uint16_t> joined(static_cast<size_t>(p.tokens * p.dh), 0);
+  for (int64_t t = 0; t < p.tokens; ++t) {
+    for (int64_t d = 0; d < half; ++d) {
+      joined[static_cast<size_t>(t * p.dh + d)] = left[static_cast<size_t>(t * half + d)];
+      joined[static_cast<size_t>(t * p.dh + half + d)] = right[static_cast<size_t>(t * half + d)];
+    }
+  }
+  return joined;
+}
+
+// One head-contiguous row of the flash cache, at the address the capture's own
+// slot_mapping names: block = slot / block_size, offset = slot % block_size.
+void ScatterCacheSlot(std::vector<uint16_t>& cache, int64_t blocks, int64_t block_size,
+                      int64_t hkv, int64_t dh, int which, int64_t slot, const uint16_t* row) {
+  const int64_t block = slot / block_size;
+  const int64_t offset = slot % block_size;
+  REQUIRE(block >= 0);
+  REQUIRE(block < blocks);
+  const size_t base = static_cast<size_t>((block * 2 + which) * block_size * hkv * dh +
+                                          offset * hkv * dh);
+  REQUIRE(base + static_cast<size_t>(hkv * dh) <= cache.size());
+  std::memcpy(cache.data() + base, row, static_cast<size_t>(hkv * dh) * sizeof(uint16_t));
+}
+
+}  // namespace
+
+// The replay's cache geometry, checked on the CPU against the recorded capture
+// before anything reaches a device. The replay is only meaningful if
+// slot_mapping, block_table and block_size agree with each other, and this case
+// is what makes that a gate rather than an assumption. It needs no GPU: it is
+// the red-first half of the instrument and it runs wherever the artifact is.
+TEST_CASE("Primary attention capture decodes to the cache geometry the replay uses") {
+  const char* results = std::getenv("VT_ATTN_PARITY_PRIMARY");
+  if (results == nullptr) {
+    MESSAGE("Set VT_ATTN_PARITY_PRIMARY to the primary attention-capture directory");
+    std::exit(77);
+  }
+  const std::filesystem::path dir(results);
+  const std::string label = std::getenv("VT_ATTN_PARITY_LABEL") != nullptr
+                                ? std::getenv("VT_ATTN_PARITY_LABEL")
+                                : "L33-C2-R0";
+  const PrimaryBoundary primary = LoadPrimaryBoundary(dir, label, 0);
+  CHECK(primary.tokens == 66);
+  CHECK(primary.hq == 1);
+  CHECK(primary.hkv == 1);
+  CHECK(primary.dh == 128);
+  CHECK(primary.block_size == 16);
+  CHECK(primary.num_reqs == 2);
+  CHECK(primary.query_start_loc == std::vector<int32_t>({0, 33, 66}));
+  CHECK(primary.seq_lens == std::vector<int32_t>({33, 33}));
+  CHECK(primary.block_table.size() ==
+        static_cast<size_t>(primary.num_reqs * primary.block_table_cols));
+  CHECK(std::vector<int32_t>(primary.block_table.begin(), primary.block_table.begin() + 3) ==
+        std::vector<int32_t>({7, 8, 9}));
+  CHECK(std::vector<int32_t>(primary.block_table.begin() + primary.block_table_cols,
+                             primary.block_table.begin() + primary.block_table_cols + 3) ==
+        std::vector<int32_t>({10, 11, 12}));
+  // Every token of every request addresses its own block table entry at its own
+  // offset. A capture whose slot_mapping disagreed with its block_table would
+  // make the replay write K/V somewhere the kernel never reads.
+  int64_t addressed = 0, blocks_needed = 0;
+  for (int64_t r = 0; r < primary.num_reqs; ++r) {
+    const int64_t keys = primary.seq_lens[static_cast<size_t>(r)];
+    for (int64_t j = 0; j < keys; ++j) {
+      const int64_t token = primary.query_start_loc[static_cast<size_t>(r)] + j;
+      const int64_t slot = primary.slot_mapping[static_cast<size_t>(token)];
+      CAPTURE(r);
+      CAPTURE(j);
+      CHECK(slot / primary.block_size ==
+            primary.block_table[static_cast<size_t>(r * primary.block_table_cols +
+                                                    j / primary.block_size)]);
+      CHECK(slot % primary.block_size == j % primary.block_size);
+      blocks_needed =
+          std::max<int64_t>(blocks_needed,
+                            primary.block_table[static_cast<size_t>(r * primary.block_table_cols +
+                                                                   j / primary.block_size)] +
+                                1);
+      addressed += 1;
+    }
+  }
+  CHECK(addressed == primary.tokens);
+  CHECK(blocks_needed == 13);
+  // The zero-cached-prefix record is what licenses deriving the KV cache from
+  // `key`/`value` plus `slot_mapping` instead of capturing it.
+  nlohmann::json record;
+  std::ifstream(dir / (label + "-attention-0.json")) >> record;
+  CHECK(record.at("zero_cached_prefix").get<bool>());
+  CHECK(record.at("kv_cache").at("raw_omitted").is_string());
+  std::cout << "[attn-parity] capture geometry: " << addressed << " tokens, " << blocks_needed
+            << " cache blocks, block_size " << primary.block_size << std::endl;
+}
+
+TEST_CASE("ROCm paged attention replays the primary's captured attention boundary") {
+  const char* fixture = std::getenv("VT_ROCM_MOE_FIXTURE");
+  if (fixture == nullptr) {
+    MESSAGE("Set VT_ROCM_MOE_FIXTURE to the exported production checkpoint");
+    std::exit(77);
+  }
+  const char* results_env = std::getenv("VT_ATTN_PARITY_PRIMARY");
+  if (results_env == nullptr) {
+    MESSAGE("Set VT_ATTN_PARITY_PRIMARY to the primary attention-capture directory");
+    std::exit(77);
+  }
+  if (!AttnDumpEnabled()) {
+    MESSAGE("Set VT_ATTN_DUMP=1 to run the attention-boundary instrument");
+    std::exit(77);
+  }
+  const std::filesystem::path results(results_env);
+  const char* preamble_env = std::getenv("VT_ATTN_PARITY_PREAMBLE");
+  const std::filesystem::path out_dir =
+      std::getenv("VT_ATTN_PARITY_OUT") != nullptr ? std::filesystem::path(std::getenv("VT_ATTN_PARITY_OUT"))
+                                                   : std::filesystem::path();
+  const std::string label = std::getenv("VT_ATTN_PARITY_LABEL") != nullptr
+                                ? std::getenv("VT_ATTN_PARITY_LABEL")
+                                : "L33-C2-R0";
+
+  InstallAttnObservers();
+  const PrimaryBoundary primary = LoadPrimaryBoundary(results, label, 0);
+  nlohmann::json report;
+  report["label"] = label;
+  report["layer"] = 0;
+  report["primary_dir"] = results.string();
+
+  auto& backend = vt::GetBackend(vt::DeviceType::kROCM);
+  QueueGuard queue(backend);
+  auto& q = queue.queue;
+
+  // ---- (i) the native boundary, from the unchanged production path --------
+  g_record = true;
+  Generate(fixture, 33, 2, 1);
+  g_record = false;
+  REQUIRE(g_attn.have);
+  REQUIRE(g_rope.have);
+  REQUIRE(g_attn.tokens == primary.tokens);
+  CHECK(g_attn.hq == primary.hq);
+  CHECK(g_attn.hkv == primary.hkv);
+  CHECK(g_attn.dh == primary.dh);
+  CHECK(g_attn.block_table_cols >=
+        (primary.seq_lens[0] + g_attn.block_size - 1) / g_attn.block_size);
+  CHECK(g_attn.causal);
+  CHECK(std::fabs(g_attn.scale - primary.scale) < 1e-9f);
+  // The metadata the replay reuses must be model-independent, or the replay
+  // would compare two different batches.
+  CHECK(g_attn.query_start_loc == primary.query_start_loc);
+  CHECK(g_attn.seq_lens == primary.seq_lens);
+  CHECK(g_attn.calls == 2);  // one PagedAttention per full-attention layer
+  std::cout << "[attn-parity] native dispatch: " << g_attn.tokens << " tokens, hq "
+            << g_attn.hq << ", hkv " << g_attn.hkv << ", dh " << g_attn.dh
+            << ", block_size " << g_attn.block_size << ", blocks " << g_attn.blocks
+            << ", scale " << g_attn.scale << std::endl;
+  std::cout << "[attn-parity] native preamble call: rmsnorm calls before rope "
+            << g_rope.rms_calls_before << " of " << g_rms_calls.size() << "; rope_neox calls "
+            << g_rope_neox_calls << "; rot " << g_rope.rot << std::endl;
+  REQUIRE(g_rope.rms_calls_before >= 2);
+
+  const std::vector<double> max_prob = MaxProbPerRow(primary);
+
+  // Row 0: the recorded comparison, reproduced at this boundary.
+  const WordDiff run_out = DiffWords(g_attn.out, primary.output, primary.dh);
+  PrintDiff("A0 native run output vs primary output", run_out);
+
+  // Row B: the preamble term on the two runs' own inputs.
+  const WordDiff run_q = DiffWords(g_attn.query, primary.query, primary.dh);
+  const WordDiff run_k = DiffWords(g_rope.k_post, primary.key, primary.dh);
+  PrintDiff("B  native run Q vs primary Q", run_q);
+  PrintDiff("B  native run K (post-RoPE) vs primary K", run_k);
+
+  // Row F: the qkv boundary, so a preamble difference cannot be blamed on the
+  // projection upstream of it.
+  const RmsNormCall& q_norm_call = g_rms_calls[static_cast<size_t>(g_rope.rms_calls_before - 2)];
+  const RmsNormCall& k_norm_call = g_rms_calls[static_cast<size_t>(g_rope.rms_calls_before - 1)];
+  CHECK(q_norm_call.shape1 == primary.dh);
+  CHECK(k_norm_call.shape1 == primary.dh);
+  // The composite norms in place, so the call's output and the RoPE call's input
+  // are the same bytes; a difference here would mean the capture is not the
+  // boundary it claims to be.
+  const WordDiff normed_vs_pre_rope = DiffWords(q_norm_call.out, g_rope.q_pre, primary.dh);
+  CHECK(normed_vs_pre_rope.different == 0);
+
+  // The native cache rows the kernel reads must be the post-RoPE K the preamble
+  // produced, or the capture is not the boundary it claims to be.
+  std::vector<uint16_t> cache_k;
+  for (int64_t r = 0; r < primary.num_reqs; ++r) {
+    const int64_t keys = primary.seq_lens[static_cast<size_t>(r)];
+    const std::vector<uint16_t> rows =
+        GatherKv(g_attn.k_cache, g_attn.block_size, g_attn.hkv, g_attn.dh, g_attn.block_table,
+                 g_attn.block_table_cols, r, keys);
+    cache_k.insert(cache_k.end(), rows.begin(), rows.end());
+  }
+  const WordDiff cache_identity = DiffWords(cache_k, g_rope.k_post, primary.dh);
+  std::cout << "[attn-parity] native cache K rows vs post-RoPE k3: " << cache_identity.different
+            << " / " << cache_identity.words << " differing" << std::endl;
+
+  // ---- (ii) the native kernel on the PRIMARY's captured Q/K/V -------------
+  const int64_t bs = primary.block_size;
+  const int64_t hkv = primary.hkv, dh = primary.dh;
+  int64_t blocks = 0;
+  for (int64_t r = 0; r < primary.num_reqs; ++r)
+    for (int64_t c = 0; c < (primary.seq_lens[static_cast<size_t>(r)] + bs - 1) / bs; ++c)
+      blocks = std::max<int64_t>(
+          blocks, primary.block_table[static_cast<size_t>(r * primary.block_table_cols + c)] + 1);
+  const size_t tile_words = static_cast<size_t>(bs * hkv * dh);
+  const size_t slice_words = static_cast<size_t>(blocks) * tile_words;
+  std::vector<uint16_t> cache(2 * slice_words, 0);
+  int64_t scattered = 0;
+  auto scatter = [&](int which, const std::vector<uint16_t>& rows) {
+    for (int64_t r = 0; r < primary.num_reqs; ++r) {
+      for (int64_t j = 0; j < primary.seq_lens[static_cast<size_t>(r)]; ++j) {
+        const int64_t token = primary.query_start_loc[static_cast<size_t>(r)] + j;
+        ScatterCacheSlot(cache, blocks, bs, hkv, dh, which,
+                         primary.slot_mapping[static_cast<size_t>(token)],
+                         rows.data() + static_cast<size_t>(token * hkv * dh));
+        if (which == 0) scattered += 1;
+      }
+    }
+  };
+
+  Buffer cache_buffer(backend, cache.size() * sizeof(uint16_t));
+  Buffer query_buffer(backend, primary.query.size() * sizeof(uint16_t));
+  Buffer out_buffer(backend, primary.query.size() * sizeof(uint16_t));
+  Buffer qsl_buffer(backend, primary.query_start_loc.size() * sizeof(int32_t));
+  Buffer seq_buffer(backend, primary.seq_lens.size() * sizeof(int32_t));
+  Buffer table_buffer(backend, primary.block_table.size() * sizeof(int32_t));
+  backend.Copy(q, qsl_buffer.data, primary.query_start_loc.data(),
+               primary.query_start_loc.size() * sizeof(int32_t));
+  backend.Copy(q, seq_buffer.data, primary.seq_lens.data(),
+               primary.seq_lens.size() * sizeof(int32_t));
+  backend.Copy(q, table_buffer.data, primary.block_table.data(),
+               primary.block_table.size() * sizeof(int32_t));
+  backend.Synchronize(q);
+
+  auto kv_slice = [&](int which) {
+    // The two dim-1 slices of the (blocks, 2, block_size, hkv, dh) flash cache:
+    // K starts at the buffer base, V one block-slice further in, and both carry
+    // the block stride 2*block_size*hkv*dh (dense_attn_block.h:356-373).
+    vt::Tensor t;
+    t.data = static_cast<char*>(cache_buffer.data) +
+             static_cast<size_t>(which) * tile_words * sizeof(uint16_t);
+    t.dtype = vt::DType::kBF16;
+    t.device = q.device;
+    t.rank = 4;
+    t.shape[0] = blocks;
+    t.shape[1] = bs;
+    t.shape[2] = hkv;
+    t.shape[3] = dh;
+    t.stride[0] = 2 * bs * hkv * dh;
+    t.stride[1] = hkv * dh;
+    t.stride[2] = dh;
+    t.stride[3] = 1;
+    return t;
+  };
+  vt::Tensor replay_query =
+      Tensor(query_buffer.data, vt::DType::kBF16, q.device, {primary.tokens, primary.hq, primary.dh});
+  vt::Tensor replay_out =
+      Tensor(out_buffer.data, vt::DType::kBF16, q.device, {primary.tokens, primary.hq, primary.dh});
+  vt::Tensor replay_qsl = Tensor(qsl_buffer.data, vt::DType::kI32, q.device, {primary.num_reqs + 1});
+  vt::Tensor replay_seq = Tensor(seq_buffer.data, vt::DType::kI32, q.device, {primary.num_reqs});
+  vt::Tensor replay_table = Tensor(table_buffer.data, vt::DType::kI32, q.device,
+                                   {primary.num_reqs, primary.block_table_cols});
+  vt::PagedAttentionArgs replay_args;
+  replay_args.scale = primary.scale;
+  replay_args.causal = true;
+  replay_args.query_start_loc_host = primary.query_start_loc.data();
+  replay_args.max_seq_len = *std::max_element(primary.seq_lens.begin(), primary.seq_lens.end());
+
+  auto run_replay = [&](const std::vector<uint16_t>& k_rows,
+                        const std::vector<uint16_t>& v_rows,
+                        const std::vector<uint16_t>& query_rows) {
+    std::fill(cache.begin(), cache.end(), static_cast<uint16_t>(0));
+    scatter(0, k_rows);
+    scatter(1, v_rows);
+    backend.Copy(q, cache_buffer.data, cache.data(), cache.size() * sizeof(uint16_t));
+    backend.Copy(q, query_buffer.data, query_rows.data(),
+                 query_rows.size() * sizeof(uint16_t));
+    backend.Synchronize(q);
+    vt::PagedAttention(q, replay_out, replay_query, kv_slice(0), kv_slice(1), replay_table,
+                       replay_seq, replay_qsl, replay_args);
+    backend.Synchronize(q);
+    return ReadDeviceBf16(q, replay_out);
+  };
+
+  // Self-consistency first. The kernel addresses the cache by logical
+  // (request, key position), so the native run's own Q/K/V through the same
+  // kernel at block_size 16 must reproduce the native run's own output at
+  // block_size 64. A difference here means the replay's cache construction is
+  // wrong, and row C below would mean nothing.
+  std::vector<uint16_t> native_v;
+  for (int64_t r = 0; r < primary.num_reqs; ++r) {
+    const int64_t keys = primary.seq_lens[static_cast<size_t>(r)];
+    const std::vector<uint16_t> rows =
+        GatherKv(g_attn.v_cache, g_attn.block_size, g_attn.hkv, g_attn.dh, g_attn.block_table,
+                 g_attn.block_table_cols, r, keys);
+    native_v.insert(native_v.end(), rows.begin(), rows.end());
+  }
+  const std::vector<uint16_t> replay_self = run_replay(g_rope.k_post, native_v, g_attn.query);
+  const WordDiff replay_self_diff = DiffWords(replay_self, g_attn.out, primary.dh);
+  CHECK(replay_self_diff.different == 0);
+  PrintDiff("C0 replay self-consistency: native Q/K/V at the primary's geometry vs native run out",
+            replay_self_diff);
+
+  const std::vector<uint16_t> replay = run_replay(primary.key, primary.value, primary.query);
+  const WordDiff replay_diff = DiffWords(replay, primary.output, primary.dh);
+  CHECK(scattered == 2 * primary.tokens);
+  std::cout << "[attn-parity] replay: " << blocks << " cache blocks of " << bs
+            << " at the primary's geometry, " << scattered << " K/V rows written by direct copy"
+            << std::endl;
+  PrintDiff("C  native PagedAttention on PRIMARY Q/K/V vs primary output", replay_diff);
+  PrintDiffShape(primary, replay_diff, max_prob);
+
+  // ---- (iii) the native preamble on the PRIMARY's captured qkv ------------
+  WordDiff preamble_q, preamble_k, neox_q, neox_k, table_diff, qkv_q, qkv_k;
+  bool have_preamble = false;
+  if (preamble_env != nullptr) {
+    const PrimaryPreamble preamble = LoadPrimaryPreamble(preamble_env, label, 0);
+    REQUIRE(preamble.tokens == primary.tokens);
+    REQUIRE(preamble.dh == primary.dh);
+    REQUIRE(preamble.rot == primary.dh);
+    // The two captures must describe the same rows, or the lane compares
+    // different tokens.
+    const WordDiff join_q =
+        DiffWords(JoinRopeHalves(preamble, preamble.q_left, preamble.q_right), primary.query,
+                  primary.dh);
+    const WordDiff join_k =
+        DiffWords(JoinRopeHalves(preamble, preamble.k_left, preamble.k_right), primary.key,
+                  primary.dh);
+    CHECK(join_q.different == 0);
+    CHECK(join_k.different == 0);
+
+    const vllm::HfConfig config =
+        vllm::LoadHfConfig((std::filesystem::path(fixture) / "config.json").string());
+    CHECK(config.rope_parameters.rope_type != "llama3");
+    vt::RopeArgs rope;  // dense_attn::MakeRopeArgs (dense_attn_block.h:108-123), default rope type
+    rope.base = static_cast<float>(config.rope_theta);
+    rope.rotary_dim = static_cast<int>(config.rotary_dim);
+    CHECK(rope.base == 10000000.0f);
+    CHECK(rope.rotary_dim == static_cast<int>(primary.dh));
+    const float eps = static_cast<float>(config.rms_norm_eps);
+
+    const size_t rows = static_cast<size_t>(preamble.tokens * preamble.dh);
+    std::vector<uint16_t> q2(rows), k2(rows);
+    for (int64_t t = 0; t < preamble.tokens; ++t) {
+      for (int64_t d = 0; d < preamble.dh; ++d) {
+        q2[static_cast<size_t>(t * preamble.dh + d)] =
+            preamble.qkv[static_cast<size_t>(t * preamble.qkv_width + d)];
+        k2[static_cast<size_t>(t * preamble.dh + d)] =
+            preamble.qkv[static_cast<size_t>(t * preamble.qkv_width + preamble.dh + d)];
+      }
+    }
+    // Row F: the two runs' qkv projection outputs, so a preamble difference
+    // cannot be blamed on the GEMM upstream of it. The residual row already
+    // found this boundary exact; this confirms it on this capture pair.
+    qkv_q = DiffWords(q2, q_norm_call.in, preamble.dh);
+    qkv_k = DiffWords(k2, k_norm_call.in, preamble.dh);
+    PrintDiff("F  primary qkv q slice vs native run pre-norm q", qkv_q);
+    PrintDiff("F  primary qkv k slice vs native run pre-norm k", qkv_k);
+    std::vector<int32_t> positions(static_cast<size_t>(preamble.tokens));
+    std::vector<int32_t> row_index(static_cast<size_t>(preamble.tokens));
+    for (int64_t t = 0; t < preamble.tokens; ++t) {
+      positions[static_cast<size_t>(t)] = static_cast<int32_t>(preamble.positions[static_cast<size_t>(t)]);
+      row_index[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+    }
+    Buffer q2_buffer(backend, q2.size() * sizeof(uint16_t));
+    Buffer k2_buffer(backend, k2.size() * sizeof(uint16_t));
+    Buffer qg_buffer(backend, preamble.q_gamma.size() * sizeof(uint16_t));
+    Buffer kg_buffer(backend, preamble.k_gamma.size() * sizeof(uint16_t));
+    Buffer pos_buffer(backend, positions.size() * sizeof(int32_t));
+    Buffer idx_buffer(backend, row_index.size() * sizeof(int32_t));
+    Buffer cs32_buffer(backend, rows * sizeof(float));
+    Buffer cs16_buffer(backend, rows * sizeof(uint16_t));
+    backend.Copy(q, q2_buffer.data, q2.data(), q2.size() * sizeof(uint16_t));
+    backend.Copy(q, k2_buffer.data, k2.data(), k2.size() * sizeof(uint16_t));
+    backend.Copy(q, qg_buffer.data, preamble.q_gamma.data(),
+                 preamble.q_gamma.size() * sizeof(uint16_t));
+    backend.Copy(q, kg_buffer.data, preamble.k_gamma.data(),
+                 preamble.k_gamma.size() * sizeof(uint16_t));
+    backend.Copy(q, pos_buffer.data, positions.data(), positions.size() * sizeof(int32_t));
+    backend.Copy(q, idx_buffer.data, row_index.data(), row_index.size() * sizeof(int32_t));
+    backend.Synchronize(q);
+
+    vt::Tensor t_q2 = Tensor(q2_buffer.data, vt::DType::kBF16, q.device,
+                             {preamble.tokens, preamble.dh});
+    vt::Tensor t_k2 = Tensor(k2_buffer.data, vt::DType::kBF16, q.device,
+                             {preamble.tokens, preamble.dh});
+    vt::Tensor t_qg = Tensor(qg_buffer.data, vt::DType::kBF16, q.device, {preamble.dh});
+    vt::Tensor t_kg = Tensor(kg_buffer.data, vt::DType::kBF16, q.device, {preamble.dh});
+    vt::Tensor t_pos = Tensor(pos_buffer.data, vt::DType::kI32, q.device, {preamble.tokens});
+    vt::Tensor t_idx = Tensor(idx_buffer.data, vt::DType::kI32, q.device, {preamble.tokens});
+    vt::Tensor t_cs32 = Tensor(cs32_buffer.data, vt::DType::kF32, q.device,
+                               {preamble.tokens, preamble.rot});
+    vt::Tensor t_cs16 = Tensor(cs16_buffer.data, vt::DType::kBF16, q.device,
+                               {preamble.tokens, preamble.rot});
+    vt::RopeCosSinCache(q, t_cs32, t_pos, rope);
+    vt::CastBf16(q, t_cs16, t_cs32);
+    const std::vector<uint16_t> native_table = ReadDeviceBf16(q, t_cs16);
+    // The native per-step table row t already encodes positions[t]; the primary's
+    // cache is indexed by the real position.
+    std::vector<uint16_t> expected_table(static_cast<size_t>(preamble.tokens * preamble.rot));
+    for (int64_t t = 0; t < preamble.tokens; ++t)
+      for (int64_t d = 0; d < preamble.rot; ++d)
+        expected_table[static_cast<size_t>(t * preamble.rot + d)] =
+            preamble.cos_sin[static_cast<size_t>(preamble.positions[static_cast<size_t>(t)] *
+                                                     preamble.rot + d)];
+    table_diff = DiffWords(native_table, expected_table, preamble.rot);
+    PrintDiff("E  native cos|sin table vs primary cos_sin at positions", table_diff);
+
+    vt::RmsNorm(q, t_q2, t_q2, t_qg, vt::RmsNormArgs{eps, false});
+    vt::RmsNorm(q, t_k2, t_k2, t_kg, vt::RmsNormArgs{eps, false});
+    backend.Synchronize(q);
+    const std::vector<uint16_t> normed_q = ReadDeviceBf16(q, t_q2);
+    const std::vector<uint16_t> normed_k = ReadDeviceBf16(q, t_k2);
+    REQUIRE(normed_q.size() == rows);
+
+    Buffer q3_buffer(backend, rows * sizeof(uint16_t));
+    Buffer k3_buffer(backend, rows * sizeof(uint16_t));
+    backend.Copy(q, q3_buffer.data, normed_q.data(), rows * sizeof(uint16_t));
+    backend.Copy(q, k3_buffer.data, normed_k.data(), rows * sizeof(uint16_t));
+    backend.Synchronize(q);
+    vt::Tensor t_q3 = Tensor(q3_buffer.data, vt::DType::kBF16, q.device,
+                             {preamble.tokens, 1, preamble.dh});
+    vt::Tensor t_k3 = Tensor(k3_buffer.data, vt::DType::kBF16, q.device,
+                             {preamble.tokens, 1, preamble.dh});
+    vt::RopeFromCache(q, t_q3, &t_k3, t_idx, t_cs16, rope);
+    backend.Synchronize(q);
+    preamble_q = DiffWords(ReadDeviceBf16(q, t_q3), primary.query, primary.dh);
+    preamble_k = DiffWords(ReadDeviceBf16(q, t_k3), primary.key, primary.dh);
+    PrintDiff("D  native preamble (RmsNorm+RopeFromCache) on primary qkv vs primary Q", preamble_q);
+    PrintDiff("D  native preamble (RmsNorm+RopeFromCache) on primary qkv vs primary K", preamble_k);
+
+    // The same normed q/k through the non-cached native RoPE, to separate the
+    // norm store from the cos|sin source.
+    Buffer q4_buffer(backend, rows * sizeof(uint16_t));
+    Buffer k4_buffer(backend, rows * sizeof(uint16_t));
+    backend.Copy(q, q4_buffer.data, normed_q.data(), rows * sizeof(uint16_t));
+    backend.Copy(q, k4_buffer.data, normed_k.data(), rows * sizeof(uint16_t));
+    backend.Synchronize(q);
+    vt::Tensor t_q4 = Tensor(q4_buffer.data, vt::DType::kBF16, q.device,
+                             {preamble.tokens, 1, preamble.dh});
+    vt::Tensor t_k4 = Tensor(k4_buffer.data, vt::DType::kBF16, q.device,
+                             {preamble.tokens, 1, preamble.dh});
+    vt::RopeNeox(q, t_q4, t_k4, t_pos, rope);
+    backend.Synchronize(q);
+    neox_q = DiffWords(ReadDeviceBf16(q, t_q4), primary.query, primary.dh);
+    neox_k = DiffWords(ReadDeviceBf16(q, t_k4), primary.key, primary.dh);
+    PrintDiff("D' native preamble (RmsNorm+RopeNeox) on primary qkv vs primary Q", neox_q);
+    PrintDiff("D' native preamble (RmsNorm+RopeNeox) on primary qkv vs primary K", neox_k);
+    have_preamble = true;
+
+    if (!out_dir.empty()) {
+      WriteWords(out_dir / (label + "-native-preamble-rope-from-cache-q.bin"),
+                 ReadDeviceBf16(q, t_q3));
+      WriteWords(out_dir / (label + "-native-preamble-rope-neox-q.bin"), ReadDeviceBf16(q, t_q4));
+      WriteWords(out_dir / (label + "-native-cos-sin-table.bin"), native_table);
+    }
+  } else {
+    std::cout << "[attn-parity] preamble lanes SKIPPED: VT_ATTN_PARITY_PREAMBLE unset"
+              << std::endl;
+  }
+
+  // ---- the verdict --------------------------------------------------------
+  // #3115's two hypotheses: the Q/K preamble, the kernel arithmetic, or both.
+  std::string verdict;
+  if (replay_diff.different == 0) {
+    verdict = "PREAMBLE-ONLY";
+  } else if (run_q.different == 0 && run_k.different == 0) {
+    verdict = "KERNEL-ONLY";
+  } else {
+    verdict = "BOTH";
+  }
+  std::cout << "[attn-parity] VERDICT " << verdict << ": native-on-primary-inputs "
+            << replay_diff.different << "/" << replay_diff.words << "; preamble (native run Q/K) "
+            << run_q.different << "/" << run_q.words << " and " << run_k.different << "/"
+            << run_k.words << std::endl;
+  if (replay_diff.different == 0)
+    std::cout << "[attn-parity] repair site: dense_attn_block.h:637-653 (do not touch the kernel)"
+              << std::endl;
+  else
+    std::cout << "[attn-parity] repair site: rocm_paged_attn.hip:527-531 (probability dtype), "
+                 ":196-198 (FastExp), :512 (warp reduction order)"
+              << std::endl;
+
+  report["native_dispatch"] = {{"tokens", g_attn.tokens},
+                               {"hq", g_attn.hq},
+                               {"hkv", g_attn.hkv},
+                               {"dh", g_attn.dh},
+                               {"block_size", g_attn.block_size},
+                               {"blocks", g_attn.blocks},
+                               {"scale", g_attn.scale}};
+  report["A0_native_run_output_vs_primary_output"] = run_out.different;
+  report["B_native_run_q_vs_primary_q"] = run_q.different;
+  report["B_native_run_k_vs_primary_k"] = run_k.different;
+  report["C_native_kernel_on_primary_inputs_vs_primary_output"] = replay_diff.different;
+  report["C_words"] = replay_diff.words;
+  report["C_per_row"] = replay_diff.row_different;
+  report["C_distance_1"] = replay_diff.distance[1];
+  report["C_distance_2"] = replay_diff.distance[2];
+  report["C_distance_3"] = replay_diff.distance[3];
+  report["C_distance_ge4"] = replay_diff.distance[4];
+  report["C0_replay_self_consistency"] = replay_self_diff.different;
+  report["cache_k_identity_different"] = cache_identity.different;
+  if (have_preamble) {
+    report["D_preamble_rope_cache_q"] = preamble_q.different;
+    report["D_preamble_rope_cache_k"] = preamble_k.different;
+    report["D_preamble_rope_neox_q"] = neox_q.different;
+    report["D_preamble_rope_neox_k"] = neox_k.different;
+    report["E_cos_sin_table"] = table_diff.different;
+    report["E_cos_sin_words"] = table_diff.words;
+    report["F_qkv_q"] = qkv_q.different;
+    report["F_qkv_k"] = qkv_k.different;
+  }
+  report["verdict"] = verdict;
+  if (!out_dir.empty()) {
+    std::filesystem::create_directories(out_dir);
+    std::ofstream(out_dir / (label + "-attn-parity-report.json")) << report.dump(2) << '\n';
+    WriteWords(out_dir / (label + "-native-attention-0-query.bin"), g_attn.query);
+    WriteWords(out_dir / (label + "-native-attention-0-output.bin"), g_attn.out);
+    WriteWords(out_dir / (label + "-native-attention-0-k-cache.bin"), g_attn.k_cache);
+    WriteWords(out_dir / (label + "-native-attention-0-v-cache.bin"), g_attn.v_cache);
+    WriteWords(out_dir / (label + "-native-attention-0-k3.bin"), g_rope.k_post);
+    WriteWords(out_dir / (label + "-replay-output.bin"), replay);
+  }
 }

@@ -192,6 +192,7 @@ SUITES=(
   test_agent_issue_index
   test_check_symbol_anchors
   test_check_oracle_denominator_flags
+  test_rocm_quant_gather_compare
   test_rocm_strix_ourarm_staged
   # The TOKENGATE job's build stage (#2895). `--no-build-isolation` makes pip
   # skip the pin's [build-system] requires, so the harness has to install them

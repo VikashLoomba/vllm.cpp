@@ -329,6 +329,9 @@ TEST_CASE("ROCm BF16 MoE enters native providers through the production registry
           CAPTURE(repeat);
           compared = true;
           const auto native = run["tokens"].get<std::vector<std::vector<int32_t>>>();
+          // The compared request count is the captured record's concurrency, not
+          // whatever the native run happened to return.
+          REQUIRE(native.size() == static_cast<size_t>(concurrency));
           for (size_t request = 0; request < native.size(); ++request) {
             CAPTURE(request);
             // Every captured configuration of this workload forms the reference

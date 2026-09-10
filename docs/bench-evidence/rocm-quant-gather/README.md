@@ -86,8 +86,10 @@ All 32 were downloaded with the developer's authority and sha256-verified at
 289,655,872 bytes. Their exported tensors (160 cases over 16 primary codecs)
 pass the native-versus-plugin comparison: 320 outputs, 140 byte-exact, and every
 remaining element inside the unchanged upstream tolerance.
-The raw receipt is `gather-3113-repair/fixture-download-receipt.json`; the
-comparison is `original-fixture-coverage/compare/report.json`.
+The raw receipt is `gather-3113-repair/fixture-download-receipt.json` under
+`/home/vikash/.cache/`; the comparison is
+`original-fixture-coverage/compare/report.json` under
+`/home/vikash/.cache/rdna3-gather-oracle-impl/`.
 
 Eight nonidentical comparisons are confined to Q6_K and IQ3_S, across two widths and output dtypes.
 Q6_K's primary decoder rounds intermediate products to F16; the local decoder uses F32 products.

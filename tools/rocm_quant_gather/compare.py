@@ -34,7 +34,8 @@ def bf16_from_f32(data: bytes) -> bytes:
     return bytes(result)
 
 
-def compare(manifest: Path, native: Path, primary: Path, secondary: Path, output: Path) -> None:
+def compare(manifest: Path, native: Path, primary: Path, secondary: Path, output: Path,
+            scope: str = "synthetic operation parity; original fixture and model gates remain separate") -> None:
     cases = json.loads(manifest.read_text())["cases"]
     native_report = json.loads((native / "report.json").read_text())
     needs_primary = any(case["type"] not in (15, 39, 66) for case in cases)
@@ -91,7 +92,7 @@ def compare(manifest: Path, native: Path, primary: Path, secondary: Path, output
     passed = all(result["pass"] for result in results)
     output.write_text(json.dumps({"manifest": seal(manifest), "cases": results,
                                  "outputs": len(results), "all_pass": passed,
-                                 "scope": "synthetic operation parity; original fixture and model gates remain separate"},
+                                 "scope": scope},
                                 indent=2) + "\n")
     if not passed:
         raise SystemExit("one or more native outputs differ from the pinned oracle")
@@ -105,8 +106,11 @@ def main() -> None:
     parser.add_argument("primary", type=Path)
     parser.add_argument("secondary", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--scope", default="synthetic operation parity; original fixture and "
+                        "model gates remain separate",
+                        help="Report scope line describing the inputs this run compared.")
     args = parser.parse_args()
-    compare(args.manifest, args.native, args.primary, args.secondary, args.output)
+    compare(args.manifest, args.native, args.primary, args.secondary, args.output, args.scope)
 
 
 if __name__ == "__main__":

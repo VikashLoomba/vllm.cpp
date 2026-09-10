@@ -645,8 +645,22 @@ struct RmsNormCall {
   std::vector<uint16_t> in, out, weight;
 };
 
+// The fused qk-norm-plus-RoPE preamble op (`vt::OpId::kAttnQkNormRope`). Before
+// the #3115 repair ROCm registers no fast realization for the recipe, so the
+// production preamble is the Tier-0 composite and this observer never fires.
+// After it, the fused op IS the preamble, and the kRopeFromCache/kRmsNorm
+// observers above stop firing on the production path. The runner reads whichever
+// realization executed, so one case measures one boundary before and after.
+struct PreambleCapture {
+  bool have = false;
+  int64_t tokens = 0, hq = 0, hkv = 0, dh = 0, rot = 0;
+  float eps = 0.0f;
+  std::vector<uint16_t> q_in, k_in, q_post, k_post;
+};
+
 PagedAttentionCapture g_attn;
 RopeCapture g_rope;
+PreambleCapture g_preamble;
 int64_t g_rope_neox_calls = 0;
 std::vector<RmsNormCall> g_rms_calls;
 bool g_record = false;
@@ -655,6 +669,7 @@ vt::PagedAttentionFn g_native_paged_attention = nullptr;
 vt::RmsNormFn g_native_rms_norm = nullptr;
 vt::RopeFromCacheFn g_native_rope_from_cache = nullptr;
 vt::RopeFn g_native_rope_neox = nullptr;
+vt::AttnQkNormRopeFn g_native_attn_qk_norm_rope = nullptr;
 
 void CapturePagedAttention(vt::Queue& q, vt::Tensor& out, const vt::Tensor& query,
                            const vt::Tensor& k_cache, const vt::Tensor& v_cache,
@@ -742,6 +757,37 @@ void CaptureRopeNeox(vt::Queue& q, vt::Tensor& q_states, vt::Tensor& k_states,
   g_native_rope_neox(q, q_states, k_states, positions, args);
 }
 
+// The fused preamble norms and rotates q3/k3 IN PLACE (include/vt/ops.h:2285),
+// so the entry bytes ARE the qkv projection's own slice and the return bytes ARE
+// the post-RoPE boundary the attention kernel consumes.
+void CaptureAttnQkNormRope(vt::Queue& q, vt::Tensor& q3, vt::Tensor& k3,
+                           const vt::Tensor& q_norm, const vt::Tensor& k_norm,
+                           const vt::Tensor& cos_sin, const vt::Tensor& positions,
+                           const vt::RmsNormArgs& norm_args, const vt::RopeArgs& rope_args) {
+  const bool record = g_record && !g_preamble.have;
+  if (record) {
+    g_preamble.tokens = q3.shape[0];
+    g_preamble.hq = q3.shape[1];
+    g_preamble.dh = q3.shape[2];
+    g_preamble.hkv = k3.shape[1];
+    g_preamble.rot = rope_args.rotary_dim;
+    g_preamble.eps = norm_args.eps;
+    g_preamble.q_in = ReadDeviceBf16(q, q3);
+    g_preamble.k_in = ReadDeviceBf16(q, k3);
+    (void)q_norm;
+    (void)k_norm;
+    (void)cos_sin;
+    (void)positions;
+  }
+  g_native_attn_qk_norm_rope(q, q3, k3, q_norm, k_norm, cos_sin, positions, norm_args,
+                            rope_args);
+  if (record) {
+    g_preamble.q_post = ReadDeviceBf16(q, q3);
+    g_preamble.k_post = ReadDeviceBf16(q, k3);
+    g_preamble.have = true;
+  }
+}
+
 // Function-local static: the provider table is process-global and registering
 // the same name twice is refused, so this runs exactly once. GetOp is read here
 // and NOWHERE else, so on a re-entry the saved pointer is the live kernel and
@@ -772,6 +818,19 @@ void InstallAttnObservers() {
                            {"test-attention-boundary-rope-neox", 100, nullptr,
                             reinterpret_cast<void*>(
                                 static_cast<vt::RopeFn>(&CaptureRopeNeox))});
+    // Registered only when the backend HAS the fused op. Before the #3115 repair
+    // ROCm registers none, GetOp would return null, and the wrapper would
+    // forward into a null pointer; the composite observers above are the
+    // preamble source on that tree.
+    if (vt::OpRegistered(vt::OpId::kAttnQkNormRope, vt::DeviceType::kROCM)) {
+      g_native_attn_qk_norm_rope = reinterpret_cast<vt::AttnQkNormRopeFn>(
+          vt::GetOp(vt::OpId::kAttnQkNormRope, vt::DeviceType::kROCM));
+      vt::RegisterOpProvider(
+          vt::OpId::kAttnQkNormRope, vt::DeviceType::kROCM,
+          {"test-attention-boundary-attn-qk-norm-rope", 100, nullptr,
+           reinterpret_cast<void*>(
+               static_cast<vt::AttnQkNormRopeFn>(&CaptureAttnQkNormRope))});
+    }
     return true;
   }();
   (void)installed;
@@ -1100,7 +1159,38 @@ TEST_CASE("ROCm paged attention replays the primary's captured attention boundar
   Generate(fixture, 33, 2, 1);
   g_record = false;
   REQUIRE(g_attn.have);
-  REQUIRE(g_rope.have);
+  // The preamble boundary comes from whichever realization executed: the fused
+  // op when the backend registers one, the Tier-0 composite otherwise. Both
+  // describe the same three tensors, so the rows below read the same thing on
+  // either tree.
+  if (!g_preamble.have) REQUIRE(g_rope.have);
+  const bool preamble_fused = g_preamble.have;
+  // The RAW qkv slice the preamble starts from, and the post-RoPE K it ends at.
+  // Both realizations norm in place: the fused op reads q3/k3 on entry, and the
+  // composite's RmsNorm records its input before it writes. The check in the
+  // composite arm pins that its normed output is the RoPE call's input, so the
+  // capture is the boundary it claims to be.
+  std::vector<uint16_t> raw_q, raw_k;
+  if (preamble_fused) {
+    raw_q = g_preamble.q_in;
+    raw_k = g_preamble.k_in;
+  } else {
+    REQUIRE(g_rope.rms_calls_before >= 2);
+    const RmsNormCall& q_norm_call =
+        g_rms_calls[static_cast<size_t>(g_rope.rms_calls_before - 2)];
+    const RmsNormCall& k_norm_call =
+        g_rms_calls[static_cast<size_t>(g_rope.rms_calls_before - 1)];
+    CHECK(q_norm_call.shape1 == primary.dh);
+    CHECK(k_norm_call.shape1 == primary.dh);
+    const WordDiff normed_vs_pre_rope = DiffWords(q_norm_call.out, g_rope.q_pre, primary.dh);
+    CHECK(normed_vs_pre_rope.different == 0);
+    raw_q = q_norm_call.in;
+    raw_k = k_norm_call.in;
+  }
+  const std::vector<uint16_t>& post_rope_k = preamble_fused ? g_preamble.k_post : g_rope.k_post;
+  REQUIRE(raw_q.size() == g_attn.query.size());
+  REQUIRE(raw_k.size() == g_attn.query.size());
+  REQUIRE(post_rope_k.size() == g_attn.query.size());
   REQUIRE(g_attn.tokens == primary.tokens);
   CHECK(g_attn.hq == primary.hq);
   CHECK(g_attn.hkv == primary.hkv);
@@ -1118,10 +1208,10 @@ TEST_CASE("ROCm paged attention replays the primary's captured attention boundar
             << g_attn.hq << ", hkv " << g_attn.hkv << ", dh " << g_attn.dh
             << ", block_size " << g_attn.block_size << ", blocks " << g_attn.blocks
             << ", scale " << g_attn.scale << std::endl;
-  std::cout << "[attn-parity] native preamble call: rmsnorm calls before rope "
-            << g_rope.rms_calls_before << " of " << g_rms_calls.size() << "; rope_neox calls "
-            << g_rope_neox_calls << "; rot " << g_rope.rot << std::endl;
-  REQUIRE(g_rope.rms_calls_before >= 2);
+  std::cout << "[attn-parity] native preamble: fused op " << (preamble_fused ? "yes" : "no")
+            << "; rmsnorm calls before rope " << g_rope.rms_calls_before << " of "
+            << g_rms_calls.size() << "; rope_neox calls " << g_rope_neox_calls << "; rot "
+            << (preamble_fused ? g_preamble.rot : g_rope.rot) << std::endl;
 
   const std::vector<double> max_prob = MaxProbPerRow(primary);
 
@@ -1131,21 +1221,11 @@ TEST_CASE("ROCm paged attention replays the primary's captured attention boundar
 
   // Row B: the preamble term on the two runs' own inputs.
   const WordDiff run_q = DiffWords(g_attn.query, primary.query, primary.dh);
-  const WordDiff run_k = DiffWords(g_rope.k_post, primary.key, primary.dh);
+  const WordDiff run_k = DiffWords(post_rope_k, primary.key, primary.dh);
   PrintDiff("B  native run Q vs primary Q", run_q);
   PrintDiff("B  native run K (post-RoPE) vs primary K", run_k);
 
-  // Row F: the qkv boundary, so a preamble difference cannot be blamed on the
-  // projection upstream of it.
-  const RmsNormCall& q_norm_call = g_rms_calls[static_cast<size_t>(g_rope.rms_calls_before - 2)];
-  const RmsNormCall& k_norm_call = g_rms_calls[static_cast<size_t>(g_rope.rms_calls_before - 1)];
-  CHECK(q_norm_call.shape1 == primary.dh);
-  CHECK(k_norm_call.shape1 == primary.dh);
-  // The composite norms in place, so the call's output and the RoPE call's input
-  // are the same bytes; a difference here would mean the capture is not the
-  // boundary it claims to be.
-  const WordDiff normed_vs_pre_rope = DiffWords(q_norm_call.out, g_rope.q_pre, primary.dh);
-  CHECK(normed_vs_pre_rope.different == 0);
+  // Row F is compared against the raw slice in the preamble block below.
 
   // The native cache rows the kernel reads must be the post-RoPE K the preamble
   // produced, or the capture is not the boundary it claims to be.
@@ -1157,7 +1237,7 @@ TEST_CASE("ROCm paged attention replays the primary's captured attention boundar
                  g_attn.block_table_cols, r, keys);
     cache_k.insert(cache_k.end(), rows.begin(), rows.end());
   }
-  const WordDiff cache_identity = DiffWords(cache_k, g_rope.k_post, primary.dh);
+  const WordDiff cache_identity = DiffWords(cache_k, post_rope_k, primary.dh);
   std::cout << "[attn-parity] native cache K rows vs post-RoPE k3: " << cache_identity.different
             << " / " << cache_identity.words << " differing" << std::endl;
 
@@ -1262,7 +1342,7 @@ TEST_CASE("ROCm paged attention replays the primary's captured attention boundar
                  g_attn.block_table_cols, r, keys);
     native_v.insert(native_v.end(), rows.begin(), rows.end());
   }
-  const std::vector<uint16_t> replay_self = run_replay(g_rope.k_post, native_v, g_attn.query);
+  const std::vector<uint16_t> replay_self = run_replay(post_rope_k, native_v, g_attn.query);
   const WordDiff replay_self_diff = DiffWords(replay_self, g_attn.out, primary.dh);
   CHECK(replay_self_diff.different == 0);
   PrintDiff("C0 replay self-consistency: native Q/K/V at the primary's geometry vs native run out",
@@ -1279,7 +1359,9 @@ TEST_CASE("ROCm paged attention replays the primary's captured attention boundar
 
   // ---- (iii) the native preamble on the PRIMARY's captured qkv ------------
   WordDiff preamble_q, preamble_k, neox_q, neox_k, table_diff, qkv_q, qkv_k;
+  WordDiff production_q, production_k;
   bool have_preamble = false;
+  bool have_production = false;
   if (preamble_env != nullptr) {
     const PrimaryPreamble preamble = LoadPrimaryPreamble(preamble_env, label, 0);
     REQUIRE(preamble.tokens == primary.tokens);
@@ -1319,8 +1401,8 @@ TEST_CASE("ROCm paged attention replays the primary's captured attention boundar
     // Row F: the two runs' qkv projection outputs, so a preamble difference
     // cannot be blamed on the GEMM upstream of it. The residual row already
     // found this boundary exact; this confirms it on this capture pair.
-    qkv_q = DiffWords(q2, q_norm_call.in, preamble.dh);
-    qkv_k = DiffWords(k2, k_norm_call.in, preamble.dh);
+    qkv_q = DiffWords(q2, raw_q, preamble.dh);
+    qkv_k = DiffWords(k2, raw_k, preamble.dh);
     PrintDiff("F  primary qkv q slice vs native run pre-norm q", qkv_q);
     PrintDiff("F  primary qkv k slice vs native run pre-norm k", qkv_k);
     std::vector<int32_t> positions(static_cast<size_t>(preamble.tokens));
@@ -1415,6 +1497,40 @@ TEST_CASE("ROCm paged attention replays the primary's captured attention boundar
     PrintDiff("D' native preamble (RmsNorm+RopeNeox) on primary qkv vs primary K", neox_k);
     have_preamble = true;
 
+    // D2: the PRODUCTION preamble on the primary's own qkv. D above measures the
+    // Tier-0 composite, which keeps the pre-RoPE BF16 store on every backend that
+    // registers no fused op; D2 measures the path this repair changes. The
+    // binding is the fused branch's own BF16 binding (dense_attn_block.h:594-613):
+    // bf16 norm weights, the bf16 per-step cos|sin table, the identity row index.
+    if (vt::OpRegistered(vt::OpId::kAttnQkNormRope, vt::DeviceType::kROCM)) {
+      auto fused_preamble_op = reinterpret_cast<vt::AttnQkNormRopeFn>(
+          vt::GetOp(vt::OpId::kAttnQkNormRope, vt::DeviceType::kROCM));
+      REQUIRE(fused_preamble_op != nullptr);
+      Buffer q5_buffer(backend, rows * sizeof(uint16_t));
+      Buffer k5_buffer(backend, rows * sizeof(uint16_t));
+      backend.Copy(q, q5_buffer.data, q2.data(), rows * sizeof(uint16_t));
+      backend.Copy(q, k5_buffer.data, k2.data(), rows * sizeof(uint16_t));
+      backend.Synchronize(q);
+      vt::Tensor t_q5 = Tensor(q5_buffer.data, vt::DType::kBF16, q.device,
+                               {preamble.tokens, 1, preamble.dh});
+      vt::Tensor t_k5 = Tensor(k5_buffer.data, vt::DType::kBF16, q.device,
+                               {preamble.tokens, 1, preamble.dh});
+      fused_preamble_op(q, t_q5, t_k5, t_qg, t_kg, t_cs16, t_idx,
+                        vt::RmsNormArgs{eps, false}, rope);
+      backend.Synchronize(q);
+      production_q = DiffWords(ReadDeviceBf16(q, t_q5), primary.query, primary.dh);
+      production_k = DiffWords(ReadDeviceBf16(q, t_k5), primary.key, primary.dh);
+      PrintDiff("D2 production preamble (fused qk-norm-rope) on primary qkv vs primary Q",
+                production_q);
+      PrintDiff("D2 production preamble (fused qk-norm-rope) on primary qkv vs primary K",
+                production_k);
+      have_production = true;
+      if (!out_dir.empty()) {
+        WriteWords(out_dir / (label + "-native-production-preamble-q.bin"),
+                   ReadDeviceBf16(q, t_q5));
+      }
+    }
+
     if (!out_dir.empty()) {
       WriteWords(out_dir / (label + "-native-preamble-rope-from-cache-q.bin"),
                  ReadDeviceBf16(q, t_q3));
@@ -1424,6 +1540,30 @@ TEST_CASE("ROCm paged attention replays the primary's captured attention boundar
   } else {
     std::cout << "[attn-parity] preamble lanes SKIPPED: VT_ATTN_PARITY_PREAMBLE unset"
               << std::endl;
+  }
+
+  // ---- focused cases for the #3115 repair ---------------------------------
+  // KERNEL. Under the primary's arithmetic (the softmax probability narrowed to
+  // the value dtype before the value accumulate, prefix_prefill.py:471) the
+  // native kernel on the primary's OWN Q/K/V must reproduce the primary's
+  // output byte-for-byte. Red at 2918 of 8448 before that repair.
+  std::cout << "[attn-parity][focused-kernel] C " << replay_diff.different << " / "
+            << replay_diff.words << " differing words (want 0)" << std::endl;
+  CHECK(replay_diff.different == 0);
+
+  // PREAMBLE. Under the primary's boundary (f32 carrier through RoPE, narrowed
+  // once at the store) the native run and the primary must agree on Q and K up
+  // to the CPU model's own 1-word residue against the primary's capture. Red at
+  // 1569 Q / 1542 K before that repair.
+  std::cout << "[attn-parity][focused-preamble] B " << run_q.different << " Q / "
+            << run_k.different << " K differing words (want <= 1)" << std::endl;
+  CHECK(run_q.different <= 1);
+  CHECK(run_k.different <= 1);
+  if (have_production) {
+    std::cout << "[attn-parity][focused-preamble-op] D2 " << production_q.different << " Q / "
+              << production_k.different << " K differing words (want <= 1)" << std::endl;
+    CHECK(production_q.different <= 1);
+    CHECK(production_k.different <= 1);
   }
 
   // ---- the verdict --------------------------------------------------------
@@ -1467,6 +1607,7 @@ TEST_CASE("ROCm paged attention replays the primary's captured attention boundar
   report["C_distance_ge4"] = replay_diff.distance[4];
   report["C0_replay_self_consistency"] = replay_self_diff.different;
   report["cache_k_identity_different"] = cache_identity.different;
+  report["preamble_fused"] = preamble_fused;
   if (have_preamble) {
     report["D_preamble_rope_cache_q"] = preamble_q.different;
     report["D_preamble_rope_cache_k"] = preamble_k.different;
@@ -1477,6 +1618,11 @@ TEST_CASE("ROCm paged attention replays the primary's captured attention boundar
     report["F_qkv_q"] = qkv_q.different;
     report["F_qkv_k"] = qkv_k.different;
   }
+  report["D2_production_preamble_measured"] = have_production;
+  if (have_production) {
+    report["D2_production_preamble_q"] = production_q.different;
+    report["D2_production_preamble_k"] = production_k.different;
+  }
   report["verdict"] = verdict;
   if (!out_dir.empty()) {
     std::filesystem::create_directories(out_dir);
@@ -1485,7 +1631,7 @@ TEST_CASE("ROCm paged attention replays the primary's captured attention boundar
     WriteWords(out_dir / (label + "-native-attention-0-output.bin"), g_attn.out);
     WriteWords(out_dir / (label + "-native-attention-0-k-cache.bin"), g_attn.k_cache);
     WriteWords(out_dir / (label + "-native-attention-0-v-cache.bin"), g_attn.v_cache);
-    WriteWords(out_dir / (label + "-native-attention-0-k3.bin"), g_rope.k_post);
+    WriteWords(out_dir / (label + "-native-attention-0-k3.bin"), post_rope_k);
     WriteWords(out_dir / (label + "-replay-output.bin"), replay);
   }
 }

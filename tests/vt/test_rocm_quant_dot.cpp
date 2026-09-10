@@ -25,11 +25,13 @@
 #include <vector>
 
 #include "vt/backend.h"
+#include "vt/cpu/cpu_quant_blocks.h"
 #include "vt/device.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/quant.h"
 #include "vt/rocm/rocm_mmvq_policy.h"
+#include "vt/rocm/rocm_norm_quant_bridge.h"
 #include "vt/tensor.h"
 
 // Compile the exact scratch policy used by the HIP provider with host fakes.
@@ -50,6 +52,9 @@ using vt::Tensor;
 namespace vt::rocm {
 void Q8KResetRouteDispatchCountsForTest();
 uint64_t Q8KRouteDispatchCountForTest(bool grouped, bool candidate);
+void Q8KQuantizeForTest(Queue& q, void* scratch, const void* act, DType dtype,
+                        int64_t row_stride, int64_t rows, int64_t nsb,
+                        bool candidate);
 }  // namespace vt::rocm
 #endif
 
@@ -255,6 +260,36 @@ using vt::rocm::MmvqRouteCounts;
 void ResetMmvq() { vt::rocm::MmvqResetRouteCountsForTesting(); }
 MmvqRouteCounts MmvqCounts() { return vt::rocm::MmvqRouteCountsForTesting(); }
 }  // namespace vt_rocm_test_api
+
+std::vector<uint8_t> EncodeNormValues(DType dtype,
+                                      const std::vector<float>& values) {
+  const size_t element_bytes = dtype == DType::kF32 ? sizeof(float)
+                                                     : sizeof(uint16_t);
+  std::vector<uint8_t> encoded(values.size() * element_bytes);
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (dtype == DType::kF32) {
+      std::memcpy(encoded.data() + i * element_bytes, &values[i],
+                  sizeof(float));
+    } else {
+      const uint16_t value =
+          dtype == DType::kBF16 ? vt::F32ToBF16(values[i])
+                                : vt::F32ToF16(values[i]);
+      std::memcpy(encoded.data() + i * element_bytes, &value, sizeof(value));
+    }
+  }
+  return encoded;
+}
+
+float DecodeNormValue(DType dtype, const uint8_t* encoded, size_t index) {
+  if (dtype == DType::kF32) {
+    float value = 0.0F;
+    std::memcpy(&value, encoded + index * sizeof(float), sizeof(value));
+    return value;
+  }
+  uint16_t value = 0;
+  std::memcpy(&value, encoded + index * sizeof(value), sizeof(value));
+  return vt::BF16ToF32(value);
+}
 #endif
 
 }  // namespace
@@ -381,6 +416,353 @@ TEST_CASE("ROCm MMVQ production route observes M and fold gates") {
     CHECK(counts.fused == 0);
   }
 
+  gpu.DestroyQueue(queue);
+}
+
+TEST_CASE("ROCm fused norm quant matches standalone bytes and CPU Q8_K") {
+  if (!HasRocm()) return;
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue queue = gpu.CreateQueue();
+  constexpr int64_t rows = 3;
+  constexpr int64_t k = 2 * 256;
+  constexpr int64_t nsb = k / 256;
+  const size_t scratch_bytes =
+      static_cast<size_t>(rows * nsb) * sizeof(vt::cpu::BlockQ8_K);
+
+  std::vector<float> input(static_cast<size_t>(rows * k));
+  GenerateData(0.75F, static_cast<size_t>(k), input.data());
+  input[static_cast<size_t>(k)] = 3.5F;
+  input[static_cast<size_t>(k + 17)] = -3.5F;
+  std::fill(input.begin() + 2 * k, input.end(), 0.0F);
+  std::vector<float> gamma(static_cast<size_t>(k), 1.0F);
+  const std::vector<uint8_t> encoded_input =
+      EncodeNormValues(DType::kBF16, input);
+  const std::vector<uint8_t> encoded_gamma =
+      EncodeNormValues(DType::kBF16, gamma);
+
+  void* device_input = gpu.Alloc(encoded_input.size());
+  void* device_gamma = gpu.Alloc(encoded_gamma.size());
+  gpu.Copy(queue, device_input, encoded_input.data(), encoded_input.size());
+  gpu.Copy(queue, device_gamma, encoded_gamma.data(), encoded_gamma.size());
+
+  ScopedEnv enabled("VT_NORM_QUANT_FUSED", "1");
+  ScopedEnv mmvq("VT_GEMV_MMVQ", nullptr);
+  for (DType output_dtype : {DType::kBF16, DType::kF32}) {
+    CAPTURE(static_cast<int>(output_dtype));
+    const size_t output_bytes = static_cast<size_t>(rows * k) *
+                                (output_dtype == DType::kF32 ? 4 : 2);
+    void* device_output = gpu.Alloc(output_bytes);
+    void* device_reference = gpu.Alloc(scratch_bytes);
+    Tensor input_tensor = DevTensor(device_input, DType::kBF16, {rows, k});
+    Tensor gamma_tensor = DevTensor(device_gamma, DType::kBF16, {k});
+    Tensor output_tensor =
+        DevTensor(device_output, output_dtype, {rows, k});
+
+    vt::rocm::NormQuantResetForTesting();
+    vt::RmsNorm(queue, output_tensor, input_tensor, gamma_tensor,
+                vt::RmsNormArgs{1e-6F, false});
+    const void* fused_scratch =
+        vt::rocm::NormQuantLastScratchForTesting();
+    REQUIRE(fused_scratch != nullptr);
+    vt::rocm::Q8KQuantizeForTest(queue, device_reference, device_output,
+                                 output_dtype, k, rows, nsb, false);
+
+    std::vector<uint8_t> fused(scratch_bytes);
+    std::vector<uint8_t> standalone(scratch_bytes);
+    std::vector<uint8_t> normalized(output_bytes);
+    gpu.Copy(queue, fused.data(), fused_scratch, fused.size());
+    gpu.Copy(queue, standalone.data(), device_reference, standalone.size());
+    gpu.Copy(queue, normalized.data(), device_output, normalized.size());
+    gpu.Synchronize(queue);
+    CHECK(fused == standalone);
+
+    const auto quantize_cpu = vt::cpu::BlockFromFloat(DType::kQ8_K);
+    REQUIRE(quantize_cpu != nullptr);
+    for (int64_t row = 0; row < rows; ++row) {
+      std::vector<float> widened(static_cast<size_t>(k));
+      for (int64_t column = 0; column < k; ++column) {
+        widened[static_cast<size_t>(column)] = DecodeNormValue(
+            output_dtype, normalized.data(),
+            static_cast<size_t>(row * k + column));
+      }
+      std::vector<uint8_t> expected(
+          static_cast<size_t>(nsb) * sizeof(vt::cpu::BlockQ8_K));
+      quantize_cpu(widened.data(), expected.data(), k);
+      CHECK(std::memcmp(fused.data() + static_cast<size_t>(row * nsb) *
+                                         sizeof(vt::cpu::BlockQ8_K),
+                        expected.data(), expected.size()) == 0);
+    }
+    const auto counts = vt::rocm::NormQuantCountsForTesting();
+    CHECK(counts.producers == 1);
+    CHECK(counts.consumers_reused == 0);
+    CHECK(counts.consumers_standalone == 0);
+    gpu.Free(device_reference);
+    gpu.Free(device_output);
+  }
+
+  gpu.Free(device_input);
+  gpu.Free(device_gamma);
+  gpu.DestroyQueue(queue);
+}
+
+TEST_CASE("ROCm fused norm quant is opt-in one-shot and rejects mismatches") {
+  if (!HasRocm()) return;
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue producer_queue = gpu.CreateQueue();
+  Queue other_queue = gpu.CreateQueue();
+  constexpr int64_t rows = 2;
+  constexpr int64_t k = 2 * 256;
+  constexpr int64_t n = 7;
+  const WeightCase& mismatch_weights_case = kCases[7];
+  std::vector<float> input(static_cast<size_t>(rows * k));
+  GenerateData(1.25F, input.size(), input.data());
+  std::vector<float> gamma(static_cast<size_t>(k), 1.0F);
+  const std::vector<uint8_t> encoded_input =
+      EncodeNormValues(DType::kBF16, input);
+  const std::vector<uint8_t> encoded_gamma =
+      EncodeNormValues(DType::kBF16, gamma);
+  const std::vector<uint8_t> mismatch_weights =
+      RandomBlocks(mismatch_weights_case, n * (k / 256), 0x2791U);
+  void* device_input = gpu.Alloc(encoded_input.size());
+  void* device_gamma = gpu.Alloc(encoded_gamma.size());
+  void* device_norm = gpu.Alloc(encoded_input.size() + sizeof(uint16_t));
+  void* device_weights = gpu.Alloc(mismatch_weights.size());
+  void* device_output = gpu.Alloc(static_cast<size_t>(rows * n) * sizeof(float));
+  gpu.Copy(producer_queue, device_input, encoded_input.data(),
+           encoded_input.size());
+  gpu.Copy(producer_queue, device_gamma, encoded_gamma.data(),
+           encoded_gamma.size());
+  gpu.Copy(producer_queue, device_weights, mismatch_weights.data(),
+           mismatch_weights.size());
+  Tensor input_tensor = DevTensor(device_input, DType::kBF16, {rows, k});
+  Tensor gamma_tensor = DevTensor(device_gamma, DType::kBF16, {k});
+  Tensor norm_tensor = DevTensor(device_norm, DType::kBF16, {rows, k});
+  Tensor weights_tensor =
+      DevTensor(device_weights, DType::kQ4_K, {n, k});
+  Tensor output_tensor =
+      DevTensor(device_output, DType::kF32, {rows, n});
+  ScopedEnv mmvq("VT_GEMV_MMVQ", nullptr);
+
+  {
+    ScopedEnv disabled("VT_NORM_QUANT_FUSED", nullptr);
+    vt::rocm::NormQuantResetForTesting();
+    vt::RmsNorm(producer_queue, norm_tensor, input_tensor, gamma_tensor,
+                vt::RmsNormArgs{1e-6F, false});
+    vt::MatmulBTQuant(producer_queue, output_tensor, norm_tensor,
+                      weights_tensor);
+    const auto counts = vt::rocm::NormQuantCountsForTesting();
+    CHECK(counts.producers == 0);
+    CHECK(counts.consumers_reused == 0);
+    CHECK(counts.consumers_standalone == 1);
+  }
+  {
+    ScopedEnv disabled("VT_NORM_QUANT_FUSED", "0");
+    vt::rocm::NormQuantResetForTesting();
+    vt::RmsNorm(producer_queue, norm_tensor, input_tensor, gamma_tensor,
+                vt::RmsNormArgs{1e-6F, false});
+    CHECK(vt::rocm::NormQuantCountsForTesting().producers == 0);
+  }
+
+  ScopedEnv enabled("VT_NORM_QUANT_FUSED", "1");
+  auto produce = [&] {
+    vt::RmsNorm(producer_queue, norm_tensor, input_tensor, gamma_tensor,
+                vt::RmsNormArgs{1e-6F, false});
+  };
+
+  for (size_t case_index : {size_t{7}, size_t{8}, size_t{9}}) {
+    const WeightCase& weights_case = kCases[case_index];
+    const std::string weights_name(weights_case.name);
+    CAPTURE(weights_name);
+    const std::vector<uint8_t> weights = RandomBlocks(
+        weights_case, n * (k / 256), 0x2791U + case_index);
+    void* format_weights = gpu.Alloc(weights.size());
+    gpu.Copy(producer_queue, format_weights, weights.data(), weights.size());
+    Tensor format_weights_tensor =
+        DevTensor(format_weights, weights_case.dtype, {n, k});
+
+    produce();
+    vt::rocm::NormQuantResetForTesting();
+    vt::MatmulBTQuant(producer_queue, output_tensor, norm_tensor,
+                      format_weights_tensor);
+    std::vector<uint8_t> standalone(static_cast<size_t>(rows * n) *
+                                    sizeof(float));
+    gpu.Copy(producer_queue, standalone.data(), device_output,
+             standalone.size());
+    gpu.Synchronize(producer_queue);
+
+    vt::rocm::NormQuantResetForTesting();
+    produce();
+    vt::MatmulBTQuant(producer_queue, output_tensor, norm_tensor,
+                      format_weights_tensor);
+    std::vector<uint8_t> reused(standalone.size());
+    gpu.Copy(producer_queue, reused.data(), device_output, reused.size());
+    gpu.Synchronize(producer_queue);
+    CHECK(reused == standalone);
+    const auto format_counts = vt::rocm::NormQuantCountsForTesting();
+    CHECK(format_counts.producers == 1);
+    CHECK(format_counts.consumers_reused == 1);
+    CHECK(format_counts.consumers_standalone == 0);
+    gpu.Free(format_weights);
+  }
+
+  vt::rocm::NormQuantResetForTesting();
+  produce();
+  vt::MatmulBTQuant(producer_queue, output_tensor, norm_tensor, weights_tensor);
+  vt::MatmulBTQuant(producer_queue, output_tensor, norm_tensor, weights_tensor);
+  auto counts = vt::rocm::NormQuantCountsForTesting();
+  CHECK(counts.producers == 1);
+  CHECK(counts.consumers_reused == 1);
+  CHECK(counts.consumers_standalone == 1);
+
+  vt::rocm::NormQuantResetForTesting();
+  Tensor one_row_input = DevTensor(device_input, DType::kBF16, {1, k});
+  Tensor one_row_norm = DevTensor(device_norm, DType::kBF16, {1, k});
+  Tensor one_row_output = DevTensor(device_output, DType::kF32, {1, n});
+  vt::RmsNorm(producer_queue, one_row_norm, one_row_input, gamma_tensor,
+              vt::RmsNormArgs{1e-6F, false});
+  {
+    ScopedEnv fused_mmvq("VT_GEMV_MMVQ", "1");
+    vt_rocm_test_api::ResetMmvq();
+    vt::MatmulBTQuant(producer_queue, one_row_output, one_row_norm,
+                      weights_tensor);
+    CHECK(vt_rocm_test_api::MmvqCounts().fused == 1);
+  }
+  vt::MatmulBTQuant(producer_queue, one_row_output, one_row_norm,
+                    weights_tensor);
+  counts = vt::rocm::NormQuantCountsForTesting();
+  CHECK(counts.consumers_reused == 0);
+  CHECK(counts.consumers_standalone == 1);
+
+  vt::rocm::NormQuantResetForTesting();
+  produce();
+  gpu.Synchronize(producer_queue);
+  vt::MatmulBTQuant(other_queue, output_tensor, norm_tensor, weights_tensor);
+  gpu.Synchronize(other_queue);
+  vt::MatmulBTQuant(producer_queue, output_tensor, norm_tensor, weights_tensor);
+  counts = vt::rocm::NormQuantCountsForTesting();
+  CHECK(counts.consumers_reused == 0);
+  CHECK(counts.consumers_standalone == 2);
+
+  vt::rocm::NormQuantResetForTesting();
+  produce();
+  vt::MatmulBTQuant(producer_queue, one_row_output, one_row_norm,
+                    weights_tensor);
+  vt::MatmulBTQuant(producer_queue, output_tensor, norm_tensor, weights_tensor);
+  counts = vt::rocm::NormQuantCountsForTesting();
+  CHECK(counts.consumers_reused == 0);
+  CHECK(counts.consumers_standalone == 2);
+
+  vt::rocm::NormQuantResetForTesting();
+  produce();
+  Tensor wrong_stride = norm_tensor;
+  wrong_stride.stride[0] = k + 1;
+  vt::MatmulBTQuant(producer_queue, output_tensor, wrong_stride,
+                    weights_tensor);
+  vt::MatmulBTQuant(producer_queue, output_tensor, norm_tensor, weights_tensor);
+  counts = vt::rocm::NormQuantCountsForTesting();
+  CHECK(counts.consumers_reused == 0);
+  CHECK(counts.consumers_standalone == 2);
+
+  vt::rocm::NormQuantResetForTesting();
+  produce();
+  Tensor wrong_dtype = norm_tensor;
+  wrong_dtype.dtype = DType::kF16;
+  vt::MatmulBTQuant(producer_queue, output_tensor, wrong_dtype,
+                    weights_tensor);
+  vt::MatmulBTQuant(producer_queue, output_tensor, norm_tensor, weights_tensor);
+  counts = vt::rocm::NormQuantCountsForTesting();
+  CHECK(counts.consumers_reused == 0);
+  CHECK(counts.consumers_standalone == 2);
+
+  gpu.Synchronize(producer_queue);
+  gpu.Synchronize(other_queue);
+  gpu.Free(device_input);
+  gpu.Free(device_gamma);
+  gpu.Free(device_norm);
+  gpu.Free(device_weights);
+  gpu.Free(device_output);
+  gpu.DestroyQueue(other_queue);
+  gpu.DestroyQueue(producer_queue);
+}
+
+TEST_CASE("ROCm fused norm quant scratch supports warm graph capture") {
+  if (!HasRocm()) return;
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  REQUIRE(gpu.SupportsGraphCapture());
+  Queue queue = gpu.CreateQueue();
+  constexpr int64_t k = 2 * 256;
+  constexpr int64_t n = 7;
+  std::vector<float> input(static_cast<size_t>(k));
+  GenerateData(2.0F, input.size(), input.data());
+  std::vector<float> gamma(static_cast<size_t>(k), 1.0F);
+  const std::vector<uint8_t> encoded_input =
+      EncodeNormValues(DType::kBF16, input);
+  const std::vector<uint8_t> encoded_gamma =
+      EncodeNormValues(DType::kBF16, gamma);
+  void* device_input = gpu.Alloc(encoded_input.size());
+  void* device_gamma = gpu.Alloc(encoded_gamma.size());
+  void* device_norm = gpu.Alloc(encoded_input.size());
+  void* device_output = gpu.Alloc(static_cast<size_t>(n) * sizeof(float));
+  gpu.Copy(queue, device_input, encoded_input.data(), encoded_input.size());
+  gpu.Copy(queue, device_gamma, encoded_gamma.data(), encoded_gamma.size());
+  gpu.Synchronize(queue);
+  Tensor input_tensor = DevTensor(device_input, DType::kBF16, {1, k});
+  Tensor gamma_tensor = DevTensor(device_gamma, DType::kBF16, {k});
+  Tensor norm_tensor = DevTensor(device_norm, DType::kBF16, {1, k});
+  Tensor output_tensor = DevTensor(device_output, DType::kF32, {1, n});
+  ScopedEnv enabled("VT_NORM_QUANT_FUSED", "1");
+  ScopedEnv mmvq("VT_GEMV_MMVQ", nullptr);
+
+  gpu.BeginCapture(queue);
+  CHECK_THROWS_WITH_AS(
+      vt::RmsNorm(queue, norm_tensor, input_tensor, gamma_tensor,
+                  vt::RmsNormArgs{1e-6F, false}),
+      doctest::Contains("pre-warm"), std::runtime_error);
+  void* empty_graph = gpu.EndCaptureGraph(queue);
+  gpu.DestroyGraph(empty_graph);
+
+  vt::RmsNorm(queue, norm_tensor, input_tensor, gamma_tensor,
+              vt::RmsNormArgs{1e-6F, false});
+  for (size_t case_index : {size_t{7}, size_t{8}, size_t{9}}) {
+    const WeightCase& weights_case = kCases[case_index];
+    const std::string weights_name(weights_case.name);
+    CAPTURE(weights_name);
+    const std::vector<uint8_t> weights = RandomBlocks(
+        weights_case, n * (k / 256), 0xCA2791U + case_index);
+    void* device_weights = gpu.Alloc(weights.size());
+    gpu.Copy(queue, device_weights, weights.data(), weights.size());
+    Tensor weights_tensor =
+        DevTensor(device_weights, weights_case.dtype, {n, k});
+
+    vt::rocm::NormQuantResetForTesting();
+    vt::MatmulBTQuant(queue, output_tensor, norm_tensor, weights_tensor);
+    std::vector<uint8_t> standalone(static_cast<size_t>(n) * sizeof(float));
+    gpu.Copy(queue, standalone.data(), device_output, standalone.size());
+    gpu.Synchronize(queue);
+
+    vt::rocm::NormQuantResetForTesting();
+    gpu.BeginCapture(queue);
+    vt::RmsNorm(queue, norm_tensor, input_tensor, gamma_tensor,
+                vt::RmsNormArgs{1e-6F, false});
+    vt::MatmulBTQuant(queue, output_tensor, norm_tensor, weights_tensor);
+    void* graph = gpu.EndCaptureGraph(queue);
+    const auto counts = vt::rocm::NormQuantCountsForTesting();
+    CHECK(counts.producers == 1);
+    CHECK(counts.consumers_reused == 1);
+    CHECK(counts.consumers_standalone == 0);
+    gpu.ReplayGraph(queue, graph);
+    std::vector<uint8_t> captured(standalone.size());
+    gpu.Copy(queue, captured.data(), device_output, captured.size());
+    gpu.Synchronize(queue);
+    CHECK(captured == standalone);
+    gpu.DestroyGraph(graph);
+    gpu.Free(device_weights);
+  }
+
+  gpu.Free(device_input);
+  gpu.Free(device_gamma);
+  gpu.Free(device_norm);
+  gpu.Free(device_output);
   gpu.DestroyQueue(queue);
 }
 #endif

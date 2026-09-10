@@ -3,10 +3,18 @@
 The two fixture reports preserve actual successful Q4_0 captures. The temporary
 matrix uses their metadata with synthetic model bytes and repeated test tokens.
 It is a validator test, not an oracle measurement or a model parity result.
+
+The last class covers `compare.py` instead. It runs the whole tool over one
+synthesized single-case matrix so the report's `scope` line is measured through
+the command line and through the module API, including the default that issue
+#3126 is about.
 """
 
+from contextlib import redirect_stdout
 from copy import deepcopy
+import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import struct
@@ -24,6 +32,9 @@ try:
     spec = importlib.util.spec_from_file_location("gather_compare", TOOLS / "compare_models.py")
     comparator = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(comparator)
+    tool_spec = importlib.util.spec_from_file_location("gather_compare_tool", TOOLS / "compare.py")
+    tool = importlib.util.module_from_spec(tool_spec)
+    tool_spec.loader.exec_module(tool)
 finally:
     sys.path.pop(0)
 
@@ -269,6 +280,106 @@ class CompareModelsTest(unittest.TestCase):
             ("shrunk_storage", shrunk_storage), ("grown_shape", grown_shape),
             ("inactive_allocator", inactive_allocator), ("wrong_layout", wrong_layout),
             ("changed_during_generation", changed_during_generation)])
+
+
+class CompareReportScopeTest(unittest.TestCase):
+    """Measure the comparison report's scope line over one synthesized case.
+
+    `compare.py` reads a manifest, a native report, and a primary report, so the
+    smallest end-to-end input is one primary codec case carrying both output
+    dtypes. Zeros on both sides keep the comparison itself trivial: this class
+    asks what the report says its scope is, not what the run compared.
+    """
+
+    # Issue #3126 is about this label, so the literal is pinned here rather than
+    # imported from the tool under test.
+    DEFAULT_SCOPE = ("synthetic operation parity; original fixture and "
+                     "model gates remain separate")
+    NAME = "Q4_0-256"
+    WIDTH = 256
+    ROWS = 128
+    TOKENS = 4
+
+    @staticmethod
+    def seal(path):
+        data = Path(path).read_bytes()
+        return {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="gather-scope-")
+        self.base = Path(self.directory.name)
+        row_bytes = self.WIDTH // 32 * 18  # Q4_0 stores 18 bytes per 32 values.
+        self.packed_bytes = self.ROWS * row_bytes
+        packed = self.base / (self.NAME + ".packed")
+        packed.write_bytes(bytes(self.packed_bytes))
+        ids = self.base / (self.NAME + ".ids")
+        ids.write_bytes(struct.pack("<4i", 0, 127, 64, 0))
+        self.manifest = self.base / "manifest.json"
+        self.manifest.write_text(json.dumps(
+            {"version": 1, "source": "synthetic-scope-case", "cases": [
+                {"name": self.NAME, "type": 2, "rows": self.ROWS, "width": self.WIDTH,
+                 "packed": packed.name, "ids": ids.name}]}) + "\n")
+        self.native = self.base / "native"
+        self.primary = self.base / "primary"
+        self.secondary = self.base / "secondary"
+        for directory in (self.native, self.primary, self.secondary):
+            directory.mkdir()
+        elements = self.TOKENS * self.WIDTH
+        native_cases, primary_cases = [], []
+        for dtype, size in (("f32", elements * 4), ("bf16", elements * 2)):
+            native_result = self.native / f"{self.NAME}-{dtype}.bin"
+            native_result.write_bytes(bytes(size))
+            native_cases.append({"name": self.NAME, "type": 2, "dtype": dtype,
+                                 "table_bytes": self.packed_bytes, "id_dtype": "i32",
+                                 "id_bytes": self.TOKENS * 4, "output_bytes": size,
+                                 "scratch_bytes": 16, "selected_packed_bytes": 0,
+                                 "selections": 1, "provider": "synthetic-scope-case",
+                                 "result": native_result.name})
+            primary_result = self.primary / f"{self.NAME}-{dtype}.bin"
+            primary_result.write_bytes(bytes(size))
+            primary_cases.append({"name": self.NAME, "type": 2, "dtype": dtype,
+                                  "packed": self.seal(packed), "ids": self.seal(ids),
+                                  "table_bytes": self.packed_bytes,
+                                  "selected_packed_bytes": row_bytes,
+                                  "result": primary_result.name,
+                                  "seal": self.seal(primary_result)})
+        (self.native / "report.json").write_text(
+            json.dumps({"version": 1, "cases": native_cases}) + "\n")
+        (self.primary / "report.json").write_text(
+            json.dumps({"version": 1, "cases": primary_cases}) + "\n")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def run_cli(self, output, *extra):
+        argv = ["compare.py", str(self.manifest), str(self.native), str(self.primary),
+                str(self.secondary), str(output), *extra]
+        original = sys.argv
+        sys.argv = argv
+        try:
+            with redirect_stdout(io.StringIO()) as printed:
+                tool.main()
+        finally:
+            sys.argv = original
+        return json.loads(Path(output).read_text()), printed.getvalue()
+
+    def test_cli_default_scope_is_the_previous_literal(self):
+        report, printed = self.run_cli(self.base / "default-report.json")
+        self.assertTrue(report["all_pass"])
+        self.assertEqual(report["scope"], self.DEFAULT_SCOPE)
+        self.assertEqual(printed.strip(), "PASS: 2 outputs, 2 byte-exact")
+
+    def test_cli_scope_value_is_carried_into_the_report(self):
+        label = "original 32-fixture coverage; model and synthetic gates remain separate"
+        report, _ = self.run_cli(self.base / "explicit-report.json", "--scope", label)
+        self.assertTrue(report["all_pass"])
+        self.assertEqual(report["scope"], label)
+
+    def test_api_default_scope_is_the_previous_literal(self):
+        output = self.base / "api-report.json"
+        with redirect_stdout(io.StringIO()):
+            tool.compare(self.manifest, self.native, self.primary, self.secondary, output)
+        self.assertEqual(json.loads(output.read_text())["scope"], self.DEFAULT_SCOPE)
 
 
 if __name__ == "__main__":

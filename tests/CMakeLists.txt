@@ -3179,6 +3179,12 @@ vllm_cpp_add_test(test_ops_moe_grouped_bf16 vt/test_ops_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_rocm_moe_grouped_bf16 vt/test_rocm_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_rocm_moe_upstream vt/test_rocm_moe_upstream.cpp)
 vllm_cpp_add_test(test_moe_bf16_native_contract vt/test_moe_bf16_native_contract.cpp)
+# BACKEND-ROCM-BF16-MOE (#3094): the row's CPU gate on the production token
+# gate's reference-set predicate. The predicate is pure host code in
+# tests/support/rocm_moe_reference_set.h, so this case needs no device and no
+# oracle file, while tests/vllm/models/test_rocm_moe_bf16.cpp applies the same
+# predicate to the captured records.
+vllm_cpp_add_test(test_rocm_moe_reference_set support/test_rocm_moe_reference_set.cpp)
 if(VLLM_CPP_HIP)
   foreach(moe_test IN ITEMS test_rocm_moe_grouped_bf16 test_rocm_moe_upstream
                             test_moe_bf16_native_contract)

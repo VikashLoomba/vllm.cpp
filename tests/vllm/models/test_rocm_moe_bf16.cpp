@@ -5,11 +5,13 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <set>
 #include <string>
 #include <vector>
 #include "rocm_moe_fixture.h"
+#include "support/rocm_moe_reference_set.h"
 #include "support/residual_norm_fixture.h"
 #include "support/residual_norm_test.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
@@ -319,13 +321,46 @@ TEST_CASE("ROCm BF16 MoE enters native providers through the production registry
         CHECK(run["tokens"] == reference);
         bool compared = false;
         for (const auto& expected : oracle.at("runs")) {
-          if (expected["length"] == length && expected["concurrency"] == concurrency &&
-              expected["repeat"] == repeat) {
-            CAPTURE(length);
-            CAPTURE(concurrency);
-            CAPTURE(repeat);
-            CHECK(run["tokens"] == expected["tokens"]);
-            compared = true;
+          if (expected["length"] != length || expected["concurrency"] != concurrency ||
+              expected["repeat"] != repeat)
+            continue;
+          CAPTURE(length);
+          CAPTURE(concurrency);
+          CAPTURE(repeat);
+          compared = true;
+          const auto native = run["tokens"].get<std::vector<std::vector<int32_t>>>();
+          for (size_t request = 0; request < native.size(); ++request) {
+            CAPTURE(request);
+            // Every captured configuration of this workload forms the reference
+            // set for this request. Request 1 exists only in the records at
+            // concurrency 2, so a record without it contributes nothing.
+            const auto reference_set = rocm_moe_reference_set::Collect(
+                oracle.at("runs"), length, repeat, request);
+            REQUIRE(!reference_set.empty());
+            const auto comparison = rocm_moe_reference_set::Compare(
+                reference_set, native[request], concurrency);
+            const int matched = comparison.pass() ? comparison.matched : -1;
+            // The gate reports the reference set, the matched configuration, the
+            // same-configuration outcome, and the reference's own disagreement
+            // positions. The same-configuration outcome is a report and not an
+            // assertion: the pinned primary disagrees with itself at length 33.
+            std::cout << "[production tokens] length " << length << " concurrency "
+                      << concurrency << " repeat " << repeat << " request " << request
+                      << ": reference set "
+                      << rocm_moe_reference_set::Describe(reference_set)
+                      << "; matched configuration "
+                      << (matched < 0
+                              ? std::string("none")
+                              : std::to_string(reference_set[static_cast<size_t>(matched)]
+                                                   .concurrency))
+                      << "; same-configuration match "
+                      << (comparison.same_configuration_match ? "true" : "false")
+                      << "; reference disagreement positions "
+                      << rocm_moe_reference_set::Describe(comparison.disagreements)
+                      << std::endl;
+            // Whole-sequence membership. A per-position mix of two reference
+            // sequences matches no member and fails here.
+            CHECK(comparison.pass());
           }
         }
         REQUIRE(compared);

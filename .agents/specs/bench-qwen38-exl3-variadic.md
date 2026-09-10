@@ -327,3 +327,11 @@ pool would have made the concurrency ladder measure its own configuration.
   ([#2620](https://github.com/mudler/vllm.cpp/issues/2620)).
 - A second boot for each rung. Rounds 1 and 2 restart both servers, so this row
   has two boots per cell, which the predecessor did not.
+- **[#3124](https://github.com/mudler/vllm.cpp/issues/3124): the EXL3
+  reconstruct+cuBLAS GEMM path for M > 144.** Root cause of the prefill-rate
+  gap (298 vs 585 tok/s on XL prompts). ExLlamaV3 dispatches to a
+  dequantize-weights-to-fp16 + cuBLAS path when M exceeds 144; vllm.cpp always
+  uses the EXL3 cooperative kernel. The data matches: bands below the
+  threshold (S, M=111) are within 10%, bands above (L=931, XL=2811) diverge
+  to 0.67x and 0.51x. This row records the gap; the fix is a separate code
+  change under its own issue.

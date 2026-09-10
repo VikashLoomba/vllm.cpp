@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Issue | [#2970](https://github.com/mudler/vllm.cpp/issues/2970) |
+| Issue | [#2970](https://github.com/mudler/vllm.cpp/issues/2970) (closed, c1–c8), [#3122](https://github.com/mudler/vllm.cpp/issues/3122) (c16/c32 expansion and prefill-rate gap) |
 | Owning row | `BENCH-QWEN38-EXL3-VARIADIC` |
 | Published page | [`docs/benchmarks/qwen38-27b-exl3-variadic-gb10.md`](../../docs/benchmarks/qwen38-27b-exl3-variadic-gb10.md) |
 | Methodology | [`docs/benchmarks/variadic-load-methodology.md`](../../docs/benchmarks/variadic-load-methodology.md) |
@@ -12,7 +12,7 @@
 | Upstream anchor | vLLM `5559679229bc961848b121ccdeaa8fa5d79bec98`, `vllm/benchmarks/serve.py` |
 | Host | `dgx:gpu0`, GB10 `sm_121a`, inside an `rc` lease |
 | Predecessor | [`bench-qwen38-exl3-headtohead.md`](bench-qwen38-exl3-headtohead.md) |
-| Status | `DONE` |
+| Status | `ACTIVE` |
 
 ## 1. Scope
 
@@ -21,6 +21,8 @@
 | A reusable, parameterised harness for a variadic serving load | A one-shot script for this checkpoint |
 | A mixed prompt-length distribution built by a committed script from pinned corpora | A distribution asserted in prose |
 | A concurrency sweep with interleaved arms and repeated rounds | A single sample at any rung |
+| Rungs `C = 1, 4, 8, 16, 32` — the first three already published, the new two appended by resume | Rungs stopped at `C = 8` |
+| Closing the prefill-rate gap if it persists at higher concurrency | Accepting a prefill rate half the comparator's without investigation |
 | p50, p90, p95, p99 and max for TTFT, ITL, TPOT and end-to-end latency | Means as the headline |
 | An explicit warmup discard, with both views published | A discard rule applied silently |
 | Tokens per streamed chunk, measured on both engines | A TTFT comparison that ignores chunking |
@@ -88,13 +90,17 @@ histogram is the one the servers counted.
 
 ### 3.3 The sweep, and how drift is separated from the rung
 
-Rungs `C = 1, 4, 8`. Two rounds. Within a round each arm serves all three rungs
+Rungs `C = 1, 4, 8, 16, 32`. The first three rungs are already published
+closed (#2970) and are not re-run. Two rounds. Within a round each arm serves all rungs
 from one server boot, and the round order is:
 
 ```text
-round 1:  THEIRS c=1, c=4, c=8   then  OURS c=1, c=4, c=8
-round 2:  OURS   c=8, c=4, c=1   then  THEIRS c=8, c=4, c=1
+round 1:  THEIRS c=1, c=4, c=8, c=16, c=32   then  OURS c=1, c=4, c=8, c=16, c=32
+round 2:  OURS   c=32, c=16, c=8, c=4, c=1  then  THEIRS c=32, c=16, c=8, c=4, c=1
 ```
+
+The c=1, c=4, c=8 legs already have two rounds published and the resume logic
+skips them. Only c=16 and c=32 are newly run.
 
 Round 2 reverses both the arm order and the rung order. A monotone drift over
 the session therefore biases each rung in opposite directions in the two rounds,
@@ -246,11 +252,19 @@ per-leg summaries, and `results.txt`. Per-request records stay on the share.
 
 ## Now
 
-`DONE`. The run completed all twelve legs between 5 and 10 September 2026 on
-`dgx:gpu0`; the three `THEIRS` round-2 legs that were lost when the box dropped
-2h33m into the first session were recovered by resume job `59372f89`. Results
-are published on
-[`qwen38-27b-exl3-variadic-gb10`](../../docs/benchmarks/qwen38-27b-exl3-variadic-gb10.md).
+`ACTIVE`. The c=1,4,8 sweep is published and closed (#2970). The row reopened
+(#3122) to append rungs c=16 and c=32 and to investigate the prefill-rate gap
+that the c=1,4,8 data exposed: our XL-band prefill plateaus at ~298 tok/s while
+the comparator reaches 585 tok/s.
+
+The c16/c32 legs run with `MAX_NUM_SEQS=32` and a re-pinned `--num-blocks` to
+hold the larger KV pool (32 sequences of ~3.6k tokens plus recurrent state)
+without the draft speculative context growth (#2993, ~160 MiB per concurrent
+request, ~5128 MiB at c=32) eating into the auto-fit. The harness resume logic
+skips the twelve already-recorded c=1,4,8 legs.
+
+If the c16/c32 data confirms the prefill gap persists or widens, investigate
+the root cause in the prefill path and improve the engine, then re-measure.
 
 ## Outcome
 

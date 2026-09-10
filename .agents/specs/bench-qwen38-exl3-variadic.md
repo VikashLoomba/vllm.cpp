@@ -12,7 +12,7 @@
 | Upstream anchor | vLLM `5559679229bc961848b121ccdeaa8fa5d79bec98`, `vllm/benchmarks/serve.py` |
 | Host | `dgx:gpu0`, GB10 `sm_121a`, inside an `rc` lease |
 | Predecessor | [`bench-qwen38-exl3-headtohead.md`](bench-qwen38-exl3-headtohead.md) |
-| Status | `ACTIVE` |
+| Status | `DONE` |
 
 ## 1. Scope
 
@@ -246,9 +246,10 @@ per-leg summaries, and `results.txt`. Per-request records stay on the share.
 
 ## Now
 
-`DONE`, with three legs owed. The run completed nine of twelve legs on
-5-6 September 2026 before `dgx:gpu0` was lost 2h33m in; the resume is `rc` job
-`493d6c72-1ff0-4362-bde4-1a1887edaf9a`, queued. Results are published on
+`DONE`. The run completed all twelve legs between 5 and 10 September 2026 on
+`dgx:gpu0`; the three `THEIRS` round-2 legs that were lost when the box dropped
+2h33m into the first session were recovered by resume job `59372f89`. Results
+are published on
 [`qwen38-27b-exl3-variadic-gb10`](../../docs/benchmarks/qwen38-27b-exl3-variadic-gb10.md).
 
 ## Outcome
@@ -256,7 +257,9 @@ per-leg summaries, and `results.txt`. Per-request records stay on the share.
 **What was measured.** `rc` job `7b5084ab-f214-4d8d-b1fe-1eca86efb1e8`, tree
 `3351ec54f`, binary md5 `23be01c338457038fe8354b01d92c7aa`. `G-BYTES` and
 `G-RESOLVED` both passed; every leg reported `publishable = yes` under `G-USAGE`;
-every cell of ours carries two rounds agreeing to 0.4% or better.
+every cell of both engines carries two rounds; ours agrees to 0.4% or better,
+theirs to 4.2% at the widest (c = 8, where the second round served into heavier
+queueing).
 
 **The paged draft route ran at its shipped default**, which the smoke probe
 cleared on the first attempt at the top rung. Every previously published number
@@ -265,7 +268,7 @@ default configuration and no number here is comparable to one on the predecessor
 page.
 
 **Three results.** Their aggregate throughput does not move with concurrency
-(33.10, 33.33, 33.52 output tok/s at c = 1, 4, 8) and ours does (35.81, 53.17,
+(33.12, 33.05, 32.85 output tok/s at c = 1, 4, 8) and ours does (35.81, 53.17,
 53.93), which is their `gen_lock` measured rather than argued. We prefill long
 prompts about half as fast as they do, and the gap widens with prompt length —
 298 against 585 tok/s implied on the `XL` band — which the predecessor's
@@ -303,11 +306,8 @@ pool would have made the concurrency ladder measure its own configuration.
   `max_model_len`, so an operator raising either exceeds the fraction they set.
   This row does not fix it; it pinned `--num-blocks` explicitly so the ladder
   would not measure it as noise. The issue carries a `-` row and is owned here.
-- **`THEIRS` round 2 at every rung**, lost with the box 2h33m into the run.
-  Their column is one sample per rung. Resume: `rc` job
-  `493d6c72-1ff0-4362-bde4-1a1887edaf9a`.
 - A third round, if any cell's two rounds disagree by more than 10%. None does:
-  the widest is 0.4%.
+  the widest is 4.2%.
 - A matched-configuration leg. Each engine still runs its own published recipe,
   and this engine still refuses an NVFP4 KV cache by name
   ([#2620](https://github.com/mudler/vllm.cpp/issues/2620)).

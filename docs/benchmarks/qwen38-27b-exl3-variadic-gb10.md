@@ -12,19 +12,16 @@ ratios, because the two pages measure different loads.
 
 ## Disposition
 
-**Measured, and incomplete.** On 5 and 6 September 2026 one client drove both
-engines on one GB10 board over a mixed prompt-length corpus at concurrency 1, 4
-and 8. Nine of the twelve planned legs completed before the box was lost
-mid-run. Every one of ours has two rounds and a spread. Theirs has one round per
-rung and **no spread at all**, which is stated on every table that carries one of
-their numbers. The three missing legs are their second round; the resume is
-queued and they are [owed](#owed).
+**Measured.** Between 5 and 10 September 2026 one client drove both engines on
+one GB10 board over a mixed prompt-length corpus at concurrency 1, 4 and 8.
+Every cell has two rounds, in different boots, and the spread is published
+beside every value.
 
 Three results, warm only, warmup discarded:
 
 - **Their aggregate throughput does not move with concurrency and ours does.**
-  33.10, 33.33, 33.52 output tok/s at c = 1, 4 and 8 against our 35.81, 53.17,
-  53.93. Eight times the offered load buys them 1.3% and buys us 50.6%.
+  33.12, 33.05, 32.85 output tok/s at c = 1, 4 and 8 against our 35.81, 53.17,
+  53.93. Eight times the offered load buys them nothing and buys us 50.6%.
 - **We prefill long prompts about half as fast as they do**, and the gap widens
   with prompt length. This is the finding the predecessor's 93-to-457-token
   workload could not produce.
@@ -39,7 +36,7 @@ faulted eagerly until `42b309508` closed
 measurement of the default configuration, so **no number here is directly
 comparable to a number on that page** — a different code path served it.
 
-## Three things that are true of every number here
+## Two things that are true of every number here
 
 **No correctness gate covers this run, and none can.** Both engines sample at
 `T = 0.6`, so the two token streams are not expected to match and a token-exact
@@ -51,12 +48,6 @@ Their own docstring at line 18 says "requests are serialized (batch-1 draft);
 concurrent callers queue." Above concurrency 1 their figures measure queueing and
 ours measure batching, and the flat throughput row above is that lock. A ratio at
 c = 8 is a serving result and not a kernel result.
-
-**Their side is one sample per rung.** Ours is two, in different rounds and on
-different server boots, and the spread is published beside every value. Theirs is
-one leg, because the box was lost before their second round. This repository has
-one unchanged binary reading 36.82 and 78.86 tok/s in the same session at c = 8,
-so a single leg is indicative and not gated.
 
 ## Subject
 
@@ -188,19 +179,19 @@ rendered the corpus to the same counts.
 
 | band | n | min | p50 | p90 | max | mean |
 |---|---|---|---|---|---|---|
-| `S` short question | 381 | 78 | 109 | 139 | 160 | 111 |
-| `M` code completion | 480 | 93 | 170 | 276 | 457 | 185 |
-| `L` prose summary | 183 | 739 | 930 | 1127 | 1139 | 933 |
-| `XL` long code review | 108 | 2288 | 2962 | 3127 | 3153 | 2811 |
+| `S` short question | 508 | 78 | 109 | 139 | 160 | 111 |
+| `M` code completion | 640 | 93 | 170 | 276 | 457 | 185 |
+| `L` prose summary | 244 | 739 | 930 | 1127 | 1139 | 933 |
+| `XL` long code review | 144 | 2288 | 2962 | 3127 | 3153 | 2811 |
 
 | prompt tokens | share of requests |
 |---|---|
-| 0-127 | 25% |
-| 128-255 | 24% |
-| 256-511 | 5% |
-| 512-1023 | 9% |
-| 1024-2047 | 2% |
-| 2048-4095 | 7% |
+| 0-127 | 35% |
+| 128-255 | 34% |
+| 256-511 | 6% |
+| 512-1023 | 13% |
+| 1024-2047 | 3% |
+| 2048-4095 | 9% |
 
 The corpus itself measures 26 to 3,233 tokens with the target's own tokenizer
 (`benchmarks/variadic/corpus_tokens.py`, seed 0, sha256
@@ -214,44 +205,45 @@ Warm only. Aggregate output tokens divided by the measured wall clock.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/variadic-concurrency-dark.svg">
-  <img alt="Aggregate output throughput against concurrency. vllm.cpp rises from 35.8 tok/s at one concurrent request to 53.9 at eight. exllamav3 stays flat at 33.1 to 33.5." src="assets/variadic-concurrency-light.svg" width="640">
+  <img alt="Aggregate output throughput against concurrency. vllm.cpp rises from 35.8 tok/s at one concurrent request to 53.9 at eight. exllamav3 stays flat at 33.1." src="assets/variadic-concurrency-light.svg" width="640">
 </picture>
 
 
-| c | ours, round 1 / round 2 | spread | theirs | ours / theirs |
-|---|---|---|---|---|
-| 1 | 35.85 / 35.77 | 0.2% | 33.10 | **1.082x** |
-| 4 | 53.18 / 53.16 | 0.0% | 33.33 | **1.595x** |
-| 8 | 53.83 / 54.03 | 0.4% | 33.52 | **1.609x** |
+| c | ours, round 1 / round 2 | spread | theirs, round 1 / round 2 | spread | ours / theirs |
+|---|---|---|---|---|---|
+| 1 | 35.85 / 35.77 | 0.2% | 33.10 / 33.14 | 0.1% | **1.081x** |
+| 4 | 53.18 / 53.16 | 0.0% | 33.33 / 32.77 | 1.7% | **1.609x** |
+| 8 | 53.83 / 54.03 | 0.4% | 33.52 / 32.17 | 4.2% | **1.642x** |
 
-Ours moves 50.6% from c = 1 to c = 8. Theirs moves 1.3%. That is the
+Ours moves 50.6% from c = 1 to c = 8. Theirs moves nothing. That is the
 `gen_lock` above, measured: their engine serves one request at a time whatever
 the client offers it, so its aggregate rate is its single-stream rate and the
 extra requests wait.
 
-Our own two rounds agree to 0.4% or better at every rung, on different server
-boots, which is the tightest agreement this repository has recorded at c = 8.
-Their column has one leg per rung and no spread.
+Both engines' two rounds agree on different server boots. Ours agrees to 0.4%
+or better at every rung, the tightest agreement this repository has recorded at
+c = 8. Theirs agrees to 0.1% at c = 1 but widens to 4.2% at c = 8, where the
+second round served into heavier queueing.
 
 ## Percentiles
 
-Warm only, pooled over the rounds a cell has. Ours pools 256 requests per cell
-and theirs 128. Percentiles interpolate linearly between order statistics, as
-`numpy.percentile` and `vllm/benchmarks/serve.py:739` do.
+Warm only, pooled over both rounds. Each cell pools 256 requests. Percentiles
+interpolate linearly between order statistics, as `numpy.percentile` and
+`vllm/benchmarks/serve.py:739` do.
 
 ### Time to first token, ms
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/variadic-ttft-p95-dark.svg">
-  <img alt="p95 time to first token against concurrency. exllamav3 rises from 4641 ms at one concurrent request to 45418 ms at eight, while vllm.cpp goes from 9472 ms to 10838 ms." src="assets/variadic-ttft-p95-light.svg" width="640">
+  <img alt="p95 time to first token against concurrency. exllamav3 rises from 4639 ms at one concurrent request to 47362 ms at eight, while vllm.cpp goes from 9799 ms to 11180 ms." src="assets/variadic-ttft-p95-light.svg" width="640">
 </picture>
 
 
 | c | ours p50 | ours p95 | ours p99 | theirs p50 | theirs p95 | theirs p99 |
 |---|---|---|---|---|---|---|
-| 1 | 802.2 | 9798.6 | 10530.2 | **738.6** | **4641.4** | **5449.9** |
-| 4 | **1226.6** | **10434.1** | **13325.7** | 16583.0 | 21807.4 | 26089.1 |
-| 8 | **1921.7** | **11179.7** | **13711.9** | 36498.1 | 45418.1 | 48067.2 |
+| 1 | 802.2 | 9798.6 | 10530.2 | **736.8** | **4638.6** | **5476.3** |
+| 4 | **1226.6** | **10434.1** | **13325.7** | 16711.0 | 22786.9 | 26147.6 |
+| 8 | **1921.7** | **11179.7** | **13711.9** | 37438.0 | 47361.5 | 49125.7 |
 
 At concurrency 1 their engine wins every percentile, and its tail wins by more
 than its median: 1.09x at p50 and 2.11x at p95. At every higher rung their
@@ -261,9 +253,9 @@ figures are queue time and ours are not.
 
 | c | ours p50 | ours p95 | theirs p50 | theirs p95 |
 |---|---|---|---|---|
-| 1 | **16.1** | **24.3** | 21.3 | 32.2 |
-| 4 | 50.6 | 113.5 | **22.2** | **33.1** |
-| 8 | 123.2 | 205.3 | **22.0** | **32.0** |
+| 1 | **16.1** | **24.3** | 21.3 | 32.0 |
+| 4 | 50.6 | 113.5 | **22.3** | **33.3** |
+| 8 | 123.2 | 205.3 | **22.3** | **31.9** |
 
 This table is the other half of the throughput table and should be read with it.
 Their per-stream rate is flat because every request runs alone. Ours degrades
@@ -274,9 +266,9 @@ that trade; the harness does not pick one for them.
 
 | c | ours p50 | theirs p50 | theirs / ours |
 |---|---|---|---|
-| 1 | 3944.3 | 4655.2 | 1.18x |
-| 4 | 11696.2 | 20465.9 | 1.75x |
-| 8 | 25732.3 | 40480.2 | 1.57x |
+| 1 | 3944.3 | 4738.2 | 1.20x |
+| 4 | 11696.2 | 20739.8 | 1.77x |
+| 8 | 25732.3 | 41194.2 | 1.60x |
 
 ## Where the time to first token goes: prefill, by band, at concurrency 1
 
@@ -308,7 +300,7 @@ trace on one long prompt, not a further ratio.
 | arm | tokens per streamed chunk | chars per token | first chunk tokens (est) | corrections refused |
 |---|---|---|---|---|
 | ours | 4.87 | 3.60 | 0.58 | 0 of 256 |
-| theirs | 1.09 | 3.58 | 1.02 | 0 of 128 |
+| theirs | 1.09 | 3.58 | 1.02 | 0 of 256 |
 
 The predecessor inferred that our first streamed chunk carries a whole accepted
 speculative block, and that this inflates our time to first token at the median.
@@ -333,8 +325,11 @@ is real on other configurations, not because it did anything here.
 | ours | 8 | 1 | 7,252.7 | 1935.1 | 3797.2 | 3997.9 |
 | ours | 8 | 2 | 20,684.2 | 1921.7 | 3910.4 | 4894.5 |
 | theirs | 1 | 1 | 7,839.8 | 738.6 | 1359.7 | 1422.7 |
+| theirs | 1 | 2 | 7,873.7 | 734.9 | 1350.8 | 1414.4 |
 | theirs | 4 | 1 | 973.1 | 16,583.0 | 16,681.3 | 16,415.7 |
+| theirs | 4 | 2 | 11,089.3 | 17,059.2 | 16,972.2 | 16,716.6 |
 | theirs | 8 | 1 | 25,726.4 | 36,498.1 | 36,600.6 | 35,387.9 |
+| theirs | 8 | 2 | 31,463.0 | 38,249.8 | 38,348.5 | 38,061.5 |
 
 **The cold start is per process, not per leg**, and the table shows it. Our first
 leg on a fresh server paid 27,106 ms; the round-2 c = 1 leg, which ran third on
@@ -353,9 +348,9 @@ cold-start measurement and should not be read as one.
 | ours | 1 | 0.796 | 0.539 |
 | ours | 4 | 0.798, 0.799 | 0.547, 0.549 |
 | ours | 8 | 0.798, 0.798 | 0.547, 0.546 |
-| theirs | 1 | 0.778 | not exported |
-| theirs | 4 | 0.774 | not exported |
-| theirs | 8 | 0.775 | not exported |
+| theirs | 1 | 0.778, 0.778 | not exported |
+| theirs | 4 | 0.774, 0.774 | not exported |
+| theirs | 8 | 0.775, 0.776 | not exported |
 
 Ours comes from `GET /metrics`, which serves vLLM's four speculative-decoding
 families since `58a7162ba` closed
@@ -387,11 +382,6 @@ comparison was built for and is not one configuration.
 
 ## Owed
 
-- **`THEIRS` round 2 at c = 1, 4 and 8.** The box was lost 2h33m into the run,
-  after nine of twelve legs. Their column is therefore one sample per rung with
-  no spread, and this page says so on every table that carries one. The resume is
-  `rc` job `493d6c72-1ff0-4362-bde4-1a1887edaf9a`, queued; the job skips the nine
-  recorded legs and runs only the three missing ones.
 - **A prefill trace on one long prompt.** The band table shows their rate climbing
   with prompt length while ours plateaus near 300 tok/s. No mechanism is claimed
   and the next step is a matched trace, not another ratio.

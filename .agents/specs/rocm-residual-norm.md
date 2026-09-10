@@ -309,7 +309,8 @@ The first attention-output comparison contains 2902 differing BF16 words.
 The generated `c4r2zan` preamble keeps normalized Q/K values in FP32 until after RoPE and reads a BF16 cos/sin cache.
 The native `dense_attn::AttnBlock` stores BF16 Q/K norms before `RopeNeox` with FP32 cos/sin.
 Capture actual Q/K immediately before attention, V, cos/sin, KV data and metadata, and the attention output on both sides.
-Existing captures omit those exact attention inputs and cannot isolate preamble error from attention-kernel arithmetic.
+The preserved capture `/home/vikash/.cache/rdna3-moe-attention-operator/results/L33-C2-R0-attention-0.json` and its ten binary siblings hold exactly those inputs and the output, and a validated CPU transcription of `prefix_prefill._fwd_kernel` separated the two hypotheses on them before any native byte of that boundary existed (#3115).
+The native capture-and-replay instrument in `tests/vllm/models/test_rocm_moe_bf16.cpp` then measured both terms on the device: 2918 of 8448 words from the attention kernel on identical Q/K/V, and 1569 Q plus 1542 K words from the preamble, with the cos/sin table and the qkv projection byte-exact on both sides.
 The pinned normal decoder prefill enters `prefix_prefill.py` through `chunked_prefill_paged_decode.py`.
 Its probability-to-value product narrows probabilities to the V dtype.
 The native D128/QG1 dispatch retains FP32 probabilities even during prefill.

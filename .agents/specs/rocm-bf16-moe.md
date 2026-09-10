@@ -455,9 +455,10 @@ positions from different reference sequences, never drops a workload, and never
 relaxes a stable position.
 
 Fidelity is a separate criterion, and no gate in this change measures it. It
-accepts a native-versus-reference logit difference of at most one BF16 unit in
-the last place, `1.953125e-3` (`2^-9`), per logit. That value is recomputed from
-the retained BF16 head-logit diagnostic captures in
+accepts a native-versus-reference logit difference of at most `1.953125e-3`
+(`2^-9`) per logit, which is one BF16 unit in the last place at the logit
+magnitude where that maximum was measured. That value is recomputed from the
+retained BF16 head-logit diagnostic captures in
 `/home/vikash/.cache/rdna3-moe-impl/preserved/oracle-diagnostic-1/`, comparing
 request 0 of the concurrency-1 and concurrency-2 captures of one workload at
 every step where the generated context still agrees, that is
@@ -465,7 +466,8 @@ every step where the generated context still agrees, that is
 `L33-C{1,2}-R0-head-{0,1,2,3,4,5}-logits.bin` (BF16, vocabulary 128; request 0 is
 row 0 of the concurrency-2 capture). The largest absolute per-logit difference is
 exactly `1.953125e-3`, attained at length 33 steps 3, 4, and 5, which is one BF16
-ulp at those logits' magnitude, and the greedy argmax is unchanged at every compared step. The oracle's
+ulp at those logits' magnitude, and the greedy argmax is unchanged at every
+compared step. The oracle's
 own logprob deltas in `oracle-selection-6/production.json`, which reach `2.028e-3`
 between its concurrency-1 and concurrency-2 records at positions where their token
 sequences agree, are log-probabilities over the vocabulary and are not this logit

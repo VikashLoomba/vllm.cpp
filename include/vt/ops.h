@@ -3696,6 +3696,15 @@ void AttnQkNormRopeGate(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out
                         const Tensor& k_norm, const Tensor& cos_sin,
                         const RmsNormArgs& norm_args, const RopeArgs& rope_args);
 
+// Gate-free fused attention preamble (the kAttnQkNormRope recipe): per-head
+// standard RMSNorm(q) + RMSNorm(k) + partial RoPE-from-cache, with q3/k3 normed
+// and rotated IN PLACE. A backend that registers no kernel for it is a refusal;
+// the recipe's Tier-0 composite is reached through vt::FusedChain, which is the
+// only caller that falls back.
+void AttnQkNormRope(Queue& q, Tensor& q3, Tensor& k3, const Tensor& q_norm,
+                    const Tensor& k_norm, const Tensor& cos_sin, const Tensor& positions,
+                    const RmsNormArgs& norm_args, const RopeArgs& rope_args);
+
 // --- GDN (Gated DeltaNet) ops. Formula reference: .agents/specs/gdn-semantics.md.
 // All GDN state tensors are caller-allocated f32 and updated IN PLACE
 // (upstream computes states in f32 and rounds to the cache dtype on store —

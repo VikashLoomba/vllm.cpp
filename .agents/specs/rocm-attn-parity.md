@@ -101,18 +101,68 @@ at the primary's cache geometry, so row C measures the kernel and not the
 transplant. E and F exclude the cos/sin source and the projection, so the
 preamble term is exactly the pre-RoPE BF16 store.
 
-## Design 1 — the value-dtype probability
+## Design 1 — the value-dtype probability, at the primary's reference max
 
-Mirror `p.to(v.dtype)` and nothing else:
+### The literal one-line mirror is FALSIFIED
+
+The first implementation of this design narrowed `pw` at the accumulate, exactly
+as `prefix_prefill.py:471` narrows `p`. Measured on gfx1100 at the same workload,
+row C moved **2918 -> 3011 of 8448 words**: the literal mirror makes parity worse.
+
+It was falsified on CPU first, and the CPU model is exact for this workload. The
+preserved transcription in `/home/vikash/.cache/attn-parity-plan/` is a faithful
+model of the native kernel: its warp-online variant reproduces the device's
+2918 exactly. Parameterized (`/home/vikash/.cache/moe-attn-parity/check_variants.py`,
+`diag.py`), it gives:
+
+| form | words / 8448 |
+|---|---|
+| tile max, narrow | **0** |
+| tile max, no narrow | 2917 |
+| warp-online, no narrow (the device's 2918) | 2918 |
+| warp-online, narrow (the literal mirror) | 3011 |
+| sequential-online, narrow | 2058 |
+
+The second column is the reason. Narrowing is only the primary's boundary when
+the exponent's reference max is the same one the primary used. `p` is narrowed
+at the scale of `qk - m_ij`: the primary's `m_ij` is
+`maximum(m_i, tl.max(qk, axis=1))` (`prefix_prefill.py:442`) — a **running max
+advanced once per 64-key tile** — while the native kernel advances a running max
+**once per key, per warp** (`rocm_paged_attn.hip:525-533`). A bf16 rounding is
+relative, so narrowing `exp(qk - m_warp_running)` and then rescaling by
+`exp(m_warp - gm)` at the combine is not the same rounding as narrowing
+`exp(qk - m_ij)`. For a row whose keys fit one tile the two scales coincide, which
+is why the tile-max model is exact at 0 — and why this workload's rows, at 33
+keys, are the case where getting the scale right is worth the whole 2918.
+
+Keeping the literal mirror would ship a change that measurably worsens the row's
+metric, so it is reverted, not committed.
+
+### The repaired design
+
+Mirror the primary's rule together with the reference max it is taken against:
 
 * the value accumulate multiplies a probability narrowed to the **value dtype**;
+* that probability is `exp(s - m_ij)` where `m_ij` is the running max advanced
+  **once per contiguous 64-key tile**, exactly the primary's
+  `maximum(m_i, tl.max(qk, axis=1))` over `BLOCK_N = 64` (`prefix_prefill.py:442`,
+  the launcher's tile for a power-of-two physical block size);
 * `corr` (the primary's `alpha`) stays f32 — `prefix_prefill.py:449`, `:258`;
-* the running sum keeps the f32 probability — `prefix_prefill.py:445` against
-  `:471`, and `chunked_prefill_paged_decode.py:251` against `:265`;
-* the warp-combine rescale stays f32, because the primary's `acc = acc * alpha`
-  is f32 at `:449`/`:258` and has no narrowed analogue.
+* the running sum keeps the un-narrowed f32 probability — `prefix_prefill.py:445`
+  against `:471`, `chunked_prefill_paged_decode.py:251` against `:265`;
+* the warp-combine rescale stays f32, because the primary's `acc = acc * alpha` is
+  f32 at `:449`/`:258` and has no narrowed analogue.
 
-One device helper expresses the narrowing for both value dtypes the file uses
+Concretely, the key walk in `PagedAttnDecodeOptBf16T` becomes two-phase per tile:
+each of the eight warps computes its eight keys' scores for the tile, the tile
+max is reduced across the CTA (one `__syncthreads` per 64 keys, where today the
+loop has none), then every warp applies the shared `m_ij`, the shared
+`alpha = FastExp(m_prev - m_ij)`, and accumulates `ProbInValueDtype<bf16>(p) *
+v_reg` with the f32 `p` in `lsum`. The key-to-warp map stays the
+tile-and-warp-strided one the kernel already uses, so all eight warps stay busy
+on a 33-key row and the loop keeps its shape.
+
+One helper expresses the narrowing for both value dtypes the file uses
 (`src/vt/rocm/rocm_paged_attn.hip` uses only `float` and `__hip_bfloat16`; there
 is no f16 KV path in the file):
 
@@ -130,27 +180,40 @@ __device__ inline float ProbInValueDtype(float p) {
 Narrowing to f32 is the identity, so a site templated on the value dtype is
 correct for both arms and no dispatch is added.
 
+**Cost, stated because it is real.** The tile max needs the tile's scores before
+the exponent, so the loop needs one `__syncthreads` per 64 keys and eight score
+registers per warp. That is the primary's own structure and the price of the
+mirror; this change makes no performance claim and the decode arm's throughput
+must be re-measured before it is accepted as free.
+
 ### Sibling sites in `src/vt/rocm/rocm_paged_attn.hip`
+
+Every site below needs both halves of the repaired design: the value-dtype
+probability **and** the reference max it is narrowed against. This change
+implements the pair at the measured site only; the rest are owed, because each is
+a separate kernel rewrite of the same shape and none of them is measured on this
+workload. The literal one-line narrowing was measured at the measured site and
+made parity worse, so it is not applied anywhere.
 
 | site | kernel | value dtype | disposition |
 |---|---|---|---|
-| `:299` | `PagedAttnOnline` | `TKV` | **changed** — the generic fallback; the primary's rule is uniform |
 | `:527` | `PagedAttnDecodeOptBf16T` | bf16 | **changed** — the measured site; d=128 at `:2242`, d=256 at `:2249`, d=512 at `:2256` |
-| `:668` | `PagedAttnDecodeGqaBf16` | bf16 | **changed** — the QG-fused decode sibling (`:2213`, `:2220`, `:2227`) |
-| `:812` | `PagedAttnDecodeGqaF32Q` | `TKV` | **changed** — the f32-query / bf16-KV arm |
-| `:1138` | `PagedAttnPrefillFlashTile` | bf16 | **changed** — scalar online-V branch of the flash tile |
-| `:1608` | `PagedAttnPrefillSharedK` | `TKV` | **changed** — the scoreless shared-K prefill |
+| `:299` | `PagedAttnOnline` | `TKV` | **owed** — the generic fallback, and the primary's arm for neither measured dtype |
+| `:668` | `PagedAttnDecodeGqaBf16` | bf16 | **owed** — the QG-fused decode sibling (`:2213`, `:2220`, `:2227`); needs the same two-phase tile |
+| `:812` | `PagedAttnDecodeGqaF32Q` | `TKV` | **owed** — the f32-query / bf16-KV arm |
+| `:1138` | `PagedAttnPrefillFlashTile` | bf16 | **owed** — scalar online-V branch of the flash tile |
+| `:1608` | `PagedAttnPrefillSharedK` | `TKV` | **owed** — the scoreless shared-K prefill |
 | `:1367` | `PagedAttnPrefillWmmaWave` | bf16 | **owed** — body compiles only under `VT_ROCWMMA_OK` (`:8-10`, gfx1200/1201), so on gfx1100 neither the edit nor its result can be compiled or run here |
 | `:1944` | `PagedAttnPrefillSharedKWmma` | bf16 | **owed** — same guard, and the host admits it only through `PrefillSharedKWmmaHostOk()` on gfx1200/1201 (`:2077-2080`) |
 
-The two owed sites are also both reachable only from default-OFF lab toggles
-(`VT_ATTN_PREFILL_FLASH`, `VT_ATTN_PREFILL_SHAREDK_WMMA`). They are recorded
-under `## Owed`, not silently skipped.
+The last two are also both reachable only from default-OFF lab toggles
+(`VT_ATTN_PREFILL_FLASH`, `VT_ATTN_PREFILL_SHAREDK_WMMA`). Every owed site is
+recorded under `## Owed`, not silently skipped.
 
-**Not a site.** `FastExp` (`:196-198`) and the warp-strided key order (`:512`)
-are native traits with no primary analogue in the executing arm — the primary's
-key reduction is a `tl.dot` over a whole tile. They are left alone; if they hold
-residual words after this repair they are attributed, not rewritten.
+**Not a site.** `FastExp` (`:196-198`) is left alone: the CPU model shows
+`fast_exp` and `np.exp` both reach 0 in the tile form, so it is not on this
+path's critical term. The reciprocal epilogue (`:563`) is a 2^-24-scale
+difference against the primary's division and is likewise not the term.
 
 ## Design 2 — the FP32 Q/K carrier through RoPE
 
@@ -236,7 +299,8 @@ recorded under `## Owed`.
 (`tests/vllm/models/test_rocm_moe_bf16.cpp`, case "ROCm paged attention replays
 the primary's captured attention boundary"):
 
-* kernel: `CHECK(replay_diff.different == 0)` — red at 2918 before Design 1;
+* kernel: `CHECK(replay_diff.different == 0)` — red at 2918 before Design 1,
+  and still red at 3011 under the falsified literal mirror;
 * preamble: `CHECK(run_q.different <= 1 && run_k.different <= 1)` — red at
   1569/1542 before Design 2;
 * preamble on the primary's own qkv through the production op, which must reach
@@ -271,6 +335,9 @@ case under `flock /home/vikash/gpu.lock` with `HIP_VISIBLE_DEVICES=0`,
 
 ## Owed
 
+* The five unmeasured attention kernels named in `## Sibling sites` keep both
+  the f32 probability and the per-key running max; each needs the same two-phase
+  tile before it mirrors the primary.
 * The two rocWMMA attention kernels (`rocm_paged_attn.hip:1367`, `:1944`) keep
   the f32 probability until a gfx1200/1201 host can compile and run them.
 * The Tier-0 `kAttnQkNormRope` composite keeps the pre-RoPE BF16 store. It is the
@@ -283,9 +350,9 @@ case under `flock /home/vikash/gpu.lock` with `HIP_VISIBLE_DEVICES=0`,
 
 ## Stop conditions
 
-* If row C does not reach 0, the residual is attributed to one of the three named
-  remaining traits before any further product edit, or the repair returns with
-  the residual reported as an open gap.
+* If row C does not reach 0, the residual is attributed against the parameterized
+  CPU model before any further product edit, or the repair returns with the
+  residual reported as an open gap.
 * If the production gate's recorded tokens move, the golden is reported as moved
   with the failing positions; it is never silently re-derived.
 * If the primary's boundary cannot be reproduced without changing an op contract

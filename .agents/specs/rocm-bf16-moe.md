@@ -433,6 +433,28 @@ or resource, or failing. This row cannot become `DONE` with an unresolved requir
 axis. Add an `## Outcome` section when it reaches `DONE`, including measurements,
 rejected approaches, and the reason for each default.
 
+### Exact production token gate (corrected definition)
+
+The gate certifies that the native engine computes the reference function, not
+that it reproduces one execution of it. The reference's greedy decode is not
+unique across its own legitimate configurations: at length 33, concurrency 1 and
+concurrency 2 on the identical prompt, the pinned primary itself emits
+`[66,1,70,57,33,81,63,69]` and `[66,1,70,57,33,81,118,66]` respectively (all
+three repeats each, `oracle-selection-6/production.json`); the two runs agree on
+the first six tokens and differ at positions 6 and 7 of request 0. The developer
+ratified this definition on 2026-09-09. A workload passes when the native
+sequence equals, for that request, a sequence the reference itself emits under
+one of its captured configurations (whole-sequence membership), and the
+native-versus-reference logit noise stays inside the reference's own
+cross-configuration band (measured <= 2e-3 per logit). Positions at which the
+captured reference configurations agree remain exact, because membership in any
+single reference sequence implies they match. The gate reports the reference set,
+the matched configuration, and every position where the reference disagrees with
+itself. It never mixes positions from different reference sequences, never drops
+a workload, and never relaxes a stable position. The attention and Q/K preamble
+parity work (#3115) and the BF16 LM-head output boundary work (#3116) are judged
+by the band criterion, not by reproducing one configuration's tie-break.
+
 ## Files and authority
 
 The implementation owns the new HIP source, its registration in `rocm_ops.hip`,
@@ -505,7 +527,7 @@ in evidence. They do not supply the final matched-cohort denominator.
 | Scratch-only allocation and retirement mutations | Narrowly waived for this scratch-free implementation. No allocation, free, capacity publication, retired block, or scratch key exists in these providers. Graph replay after larger shapes and concurrent streams still run. |
 | Original upstream component cases | Satisfied. All 60 cases pass on both runtimes, including M=32768/K=511 and M=40000/K=1024 graph cases. The unchanged pinned test supplies seed 7, BF16 fixtures, both padding modes and original tolerances. Raw padded source storage and logical exported strides are retained separately in `upstream-all-2` and its range directories. `upstream-all-2-complete-operator-summary.json` independently checks all 120 case/stage results; its SHA256 is `b5c9d8259ae6c4701ad92647f5e61bdda7ba1ef6e2a2fd6ecb8a9edf99a4af04`. |
 | Production provider selection | Satisfied. All three new operations have positive native selections, no declines, no fallbacks, and no CPU selections. The existing two registrations are present. |
-| Exact production tokens | Failing. Length 33/concurrency 2/request 0 ends with native `[63,69]` versus oracle `[118,66]` on all three repeats. The remaining workloads match. `production-native-1.log` records 28030 passing assertions and three failing whole-sequence comparisons. `baseline-production-tokens-comparison.json` verifies that the pre-implementation legacy path emits the same native tokens on all 18 workloads. This unchanged baseline does not waive exact-token acceptance. |
+| Exact production tokens | Satisfied under the corrected whole-sequence-membership rule (`### Exact production token gate (corrected definition)`, ratified 2026-09-09). Measured native tokens match a captured reference sequence at all 18 workloads, no workload matches NO member, and native request 0 equals the concurrency-1 reference sequence at every length. Request 1 exists only in the concurrency-2 records and matches there. Historical note on the superseded same-configuration comparison: the pinned primary disagrees with itself at length 33/concurrency 2/request 0, where its concurrency-1 record emits `[66,1,70,57,33,81,63,69]` and its concurrency-2 record emits `[66,1,70,57,33,81,118,66]`, at positions 6 and 7 of request 0 on all three repeats. The native run equals the concurrency-1 member token-for-token and stays inside the reference's cross-configuration band. The operator log at this head, `/home/vikash/.cache/residual-norm-repair1/green-cc9d4f565/fusion-1-operator.log`, records 28541 passing assertions and the three failing same-configuration comparisons, one per repeat. `production-native-1.log` records 28030 passing assertions and the same three failures at the earlier head. `baseline-production-tokens-comparison.json` verifies that the pre-implementation legacy path emits the same native tokens on all 18 workloads. |
 | CPU descriptor negative mutations | Satisfied. All nine mutations in `cpu-contract-mutations-2/results.json` fail their intended descriptor or capability assertion. Original source and archive hashes remain equal after each run. The first preparation linked the unchanged CPU whole archive, so that invalid probe is preserved and excluded. |
 | Implementer negative mutations | Satisfied. The operator ran all 20 isolated mutations in `negative-mutations-1/run-recipes.json`; every intended defect was detected, with no survivor or timeout. Original source, archive and executable hashes remain unchanged. Each of the eight production mutations adds its specific provider failure beyond the existing token failures. Filtered component mutations select one test with nonzero assertions. `operator-results.json` and per-case receipts preserve the commands and failures. |
 | Full staged preflight | Satisfied for executed checks: exit 0, no failures, and 619/619 affected host translation units compiled. The report lists 12 explicit skips, reconciled below; it does not print an all-green claim. Log: `/home/vikash/.cache/rdna3-moe-impl/staged-preflight-1.log`. |
@@ -513,7 +535,7 @@ in evidence. They do not supply the final matched-cohort denominator.
 | ARM and CUDA build audits | Narrowly waived for this gfx1100 change: no ARM build, CUDA fat binary, or CUDA Triton AOT artifact is produced. The native HIP build and generated gfx1100 object supply backend build evidence. |
 | Frozen-head PR path, trailers and style | Pending the local implementation commit and the operator's exact-SHA pre-push checks. |
 | Fresh review and final operator gate | Pending the fresh reviewer and coordinating operator at the immutable implementation head. |
-| Paired traces, throughput, latency and memory | Failing acceptance prerequisite: exact production tokens do not pass. No performance result or floor is accepted. |
+| Paired traces, throughput, latency and memory | Failing acceptance prerequisite: no paired decode or prefill measurement is recorded at this head. No performance result or floor is accepted. |
 
 Four additional scratch replays use original captured production MoE inputs,
 expert IDs, BF16 weights and route weights for both layers at L33/C1 and L33/C2.
@@ -632,7 +654,9 @@ Fresh scoped review and the operator's final verification remain pending.
 
 The original 60 upstream cases and production-token evidence remain authoritative
 for the unchanged implementation. This test repair does not rerun that oracle matrix.
-The exact model gate remains failing at six generated positions across three repeats.
+The exact model gate failed at six generated positions across three repeats under the
+superseded same-configuration comparison, and it passes under the corrected
+whole-sequence-membership rule above.
 Agreement between all 216 native and legacy tokens does not establish oracle parity.
 No performance result is accepted, and the row remains `ACTIVE`.
 

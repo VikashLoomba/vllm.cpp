@@ -82,7 +82,12 @@ The primary gate preserves `atol=0.01`, `rtol=0.04`, widths 256/1024, and both a
 The local ABI flattens the upstream two-by-two IDs; the primary harness restores that shape.
 IQ1_M and F16 output exceed the shared local contracts and remain explicit exclusions.
 The generated 128-row corpus does not replace the 32 original upstream GGUF fixtures.
-Their 289,655,872-byte download awaits the developer's authority under issue #3093.
+All 32 were downloaded with the developer's authority and sha256-verified at
+289,655,872 bytes. Their exported tensors (160 cases over 16 primary codecs)
+pass the native-versus-plugin comparison: 320 outputs, 140 byte-exact, and every
+remaining element inside the unchanged upstream tolerance.
+The raw receipt is `gather-3113-repair/fixture-download-receipt.json`; the
+comparison is `original-fixture-coverage/compare/report.json`.
 
 Eight nonidentical comparisons are confined to Q6_K and IQ3_S, across two widths and output dtypes.
 Q6_K's primary decoder rounds intermediate products to F16; the local decoder uses F32 products.

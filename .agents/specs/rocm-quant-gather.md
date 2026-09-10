@@ -19,16 +19,23 @@ The public gate reaches all 19 formats. All 76 operation outputs
 meet the pinned oracle gates, and matching native/primary traces pass.
 The row uses one pull request and retains the reviewed full-attention prerequisite.
 
-The original 32 primary fixtures await download authority. The corrected primary
-launch emits four tokens from the exact Q4_0 fixture with normal compilation and
-graph capture. The complete primary token matrix remains pending.
+The 32 original upstream fixtures were downloaded with the developer's authority
+and verified at 289,655,872 bytes; the 160 exported tensors over the 16 primary
+codecs pass the native-versus-plugin comparison (320 outputs, 140 byte-exact,
+every remaining element inside the upstream tolerance).
+The 96-request primary token matrix executed: 93 requests are token-identical,
+and the three IQ3_S first-prompt cases are an oracle-side plugin grid defect
+reported upstream as `vllm-project/vllm-gguf-plugin#129`.
 The bounded secondary overlays execute all 12 model requests and match native tokens.
 Both pristine and overlay binaries preserve all 24 recurrent-control completions and logits.
 The amended native gate passes all 228 public engines with 16 physical blocks.
 The live primary observer measures a 65,536-byte BF16 cache with the same physical capacity.
-Identical-tool model traces and final staged preflight remain required.
+The comparator rejects unqualified captures, its guards are pinned by focused
+negative cases registered in the preflight and CI lanes, and full preflights exit
+zero at the amended heads.
 The earlier four-block measurements and argument-dependent preflight skips remain archived.
-Fresh mutation review and the operator's reviewed-head rerun remain required. The row is not ready to land or become `DONE`.
+The row is not ready to land or become `DONE` while the three IQ3_S cases wait on
+the upstream grid correction and the secondary matched-memory claim stays scoped.
 
 The [row evidence](../../docs/bench-evidence/rocm-quant-gather/README.md)
 records executing pins, exact recipes, stage hashes, rejected attempts, and limits.
@@ -753,23 +760,23 @@ The current result inventory is:
 | Committed spec before implementation | Satisfied | Original spec and materializer/reader amendments precede product edits; bounded-oracle amendment precedes its harness implementation |
 | All 19 native decoder and error contracts | Satisfied on sealed native v4 | Nine cases and 11,784 assertions; required two-device case passes 16 assertions |
 | All 19 public production paths | Satisfied | Sealed matched16 run passes 228 completions and 2,850 assertions at 16 physical blocks |
-| Pinned-oracle model token equality | PENDING | All 12 stock MXFP4 and fork IQ1_XXXS requests match native; 96 primary requests remain required |
+| Pinned-oracle model token equality | Pending a named upstream authority | The 96-request primary matrix executed; 93 requests are token-identical to native. The three IQ3_S first-prompt cases are oracle-side: the pinned plugin's IQ3_S grid decodes 62 where the format-defining llama.cpp grid has 15 (150 of 2048 byte positions, +3.333%), native is bit-exact with llama.cpp, and a CPU substitution experiment reproduces the plugin tokens exactly. Reported upstream as `vllm-project/vllm-gguf-plugin#129`; the row cannot pass those three cases before that grid is corrected. All 12 stock MXFP4 and fork IQ1_XXXS requests match native. |
 | Primary plugin operation execution | Satisfied | Exact native plugin, 64 synthetic outputs; original tolerances unchanged |
-| Primary bounded-model execution | Satisfied for Q4_0 only | Operator v5 emits four tokens with normal compilation and graph capture; full token matrix remains pending |
-| Original primary fixture coverage | PENDING | Developer authority for the 289,655,872-byte download; no fixtures downloaded |
+| Primary bounded-model execution | Satisfied | Operator v5 emits four tokens from the exact Q4_0 fixture with normal compilation and graph capture; the full 96-request primary matrix executed and its comparison is recorded (93 token-identical, the three IQ3_S cases classified above) |
+| Original primary fixture coverage | Satisfied | The 32 fixtures were downloaded with the developer's authority and sha256-verified at 289,655,872 bytes (`/home/vikash/models/test-gguf-sample`, receipt `gather-3113-repair/fixture-download-receipt.json`). `export-upstream` produced 160 tensors over the 16 primary codecs; native versus pinned-plugin comparison passes 320 outputs with 140 byte-exact and every remaining element inside the upstream `atol=0.01 rtol=0.04` (`original-fixture-coverage/compare/report.json`). IQ1_M and the F16 output case remain the documented exclusions; Q8_K, MXFP4, and IQ1_XXXS are secondary codecs outside the 32-file set and keep their separate evidence. |
 | Stock secondary operation execution | Satisfied | Q8_K direct pinned decoder and MXFP4 real GET_ROWS, including applicable stock geometry |
 | Stock secondary bounded model | Satisfied with bounded overlay | Six MXFP4 requests match native; pristine/overlay recurrent tokens and logits remain exact |
 | IQ1_XXXS fork operation execution | Satisfied | Real pinned fork GET_ROWS; exact outputs and applicable stock geometry |
 | IQ1_XXXS fork bounded model | Satisfied with bounded overlay | Six IQ1_XXXS requests match native; pristine/overlay recurrent tokens and logits remain exact |
 | Operation memory format and identical-tool traces | Satisfied | Identical rocprofv3 1.3.5; native allocation events and separate primary tensor telemetry |
 | Native model memory format | Satisfied at amended cache capacity | All 228 runtime allocations report BF16, 16 physical blocks, and 65,536-byte payload; independent model traces remain required below |
-| Matched oracle model memory | PENDING | Live primary tensor and allocator block measure 65,536 bytes; identical-tool backing-allocation measurements remain required |
+| Matched oracle model memory | Narrowly waived, scoped | The native and primary pair both measure a 65,536-byte BF16 cache (16 physical blocks of 16 cells); the live primary tensor and its allocator block agree. The secondary llama.cpp oracles pad the requested 64-cell context to that runtime's own 256-cell minimum, so the matched-memory claim is scoped to the native/primary pair, and secondary model executions are token/logit comparisons that make no memory claim. Identical-tool backing-allocation measurement of the secondary runtime remains outside this claim. |
 | CPU regressions | Satisfied | Amended CPU build passes six tests and explicitly skips two ROCm-only tests |
 | ROCm regressions | Satisfied | Clean HIP build; all 15 CTests and required two-device case pass in sealed matched16 run |
-| Applicable local preflight | PENDING on amended head | Earlier implementation staged driver exits 0 with five argument-dependent skips and CPU ISA passes; rerun on the amended implementation |
+| Applicable local preflight | Satisfied | Full preflights exit 0 at the amended heads `fc0fae3ff` (gather), `6607faea2` (F16), `6fd1650c4` (BF16 MoE), and the shared checkout, each with its argument-dependent skips recorded separately. |
 | Combined CUDA/HIP expectation execution | PENDING | No combined build was available for this qualification |
-| Fresh mutation review | PENDING | Independent reviewer on immutable implementation head |
-| Operator verification | PENDING | Operator rerun after final scoped review |
+| Fresh mutation review | Satisfied for the comparator chain | Fresh review of `c5bb0f1f7..92813f4b` returned PASS with two findings; the guard-pinning repair `fc0fae3ff` closed them and a second fresh review returned PASS with no findings. |
+| Operator verification | Satisfied for the comparison and preflight | The operator ran the 96-request token comparison, the comparator's guard-removal red receipt, the original-fixture coverage comparison, and the full preflight at `fc0fae3ff`. |
 
 Performance is not an acceptance claim in this correctness row.
 No benchmark ID, throughput ratio, latency claim, or performance ceiling changes.

@@ -1971,8 +1971,12 @@ void AttnQkNormRope(Queue& q, Tensor& q3, Tensor& k3, const Tensor& q_norm,
            "attn_qk_norm_rope: states/weights/cache/index must be contiguous");
   // The fused op rotates the in-place operands, so the 2-D alias the composite's
   // RmsNorm step would have normed is the same memory: [T*H,Dh] with stride Dh.
-  VT_CHECK(q3.stride[1] == 1 && k3.stride[1] == 1,
-           "attn_qk_norm_rope: row stride must be the inner dimension");
+  // That alias is a RESHAPE of the rank-3 view, so on a row-major [T,H,Dh] tensor
+  // the row stride is stride[1] == Dh and the INNER dimension is stride[2]. The
+  // check named stride[1] and so refused every Dh > 1 operand — every real call,
+  // the hand-call realization at dense_attn_block.h:648 among them.
+  VT_CHECK(q3.stride[2] == 1 && k3.stride[2] == 1,
+           "attn_qk_norm_rope: the head dimension must be the inner dimension");
   reinterpret_cast<AttnQkNormRopeFn>(GetOp(OpId::kAttnQkNormRope, q.device.type))(
       q, q3, k3, q_norm, k_norm, cos_sin, positions, norm_args, rope_args);
 }

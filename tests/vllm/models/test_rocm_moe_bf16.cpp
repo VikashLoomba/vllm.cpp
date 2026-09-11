@@ -3,20 +3,24 @@
 #include <doctest/doctest.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 #include "rocm_moe_fixture.h"
 #include "support/rocm_moe_reference_set.h"
 #include "support/residual_norm_fixture.h"
 #include "support/residual_norm_test.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/dense_attn_block.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/transformers_utils/hf_config.h"
@@ -26,6 +30,15 @@
 
 namespace {
 using namespace rocm_moe_fixture;
+
+// The production fixture this file's first two cases replay. Declared up here
+// because the case decorators below are evaluated in file order; see the
+// "env-gated cases" block for why those cases skip instead of exiting.
+bool FixtureAbsent() {
+  const char* e = std::getenv("VT_ROCM_MOE_FIXTURE");
+  return e == nullptr || e[0] == '\0';
+}
+
 vt::MoeRouterTopKFn native_router = nullptr;
 vt::RmsNormFn native_norm = nullptr;
 vt::ResidualRmsNormFn native_expression = nullptr;
@@ -223,10 +236,12 @@ nlohmann::json Generate(const std::filesystem::path& fixture, int length, int co
 }
 }  // namespace
 
-TEST_CASE("ROCm residual row zero matches the compiled primary through production forward") {
+TEST_CASE("ROCm residual row zero matches the compiled primary through production forward" *
+          doctest::skip(FixtureAbsent())) {
   using namespace residual_norm_fixture;
+  REQUIRE_MESSAGE(!FixtureAbsent(),
+                  "VT_ROCM_MOE_FIXTURE must name the exported production checkpoint");
   const char* directory = std::getenv("VT_ROCM_MOE_FIXTURE");
-  REQUIRE(directory != nullptr);
   native_norm = reinterpret_cast<vt::RmsNormFn>(
       vt::GetOp(vt::OpId::kRmsNorm, vt::DeviceType::kROCM));
   vt::RegisterOpProvider(vt::OpId::kRmsNorm, vt::DeviceType::kROCM,
@@ -285,12 +300,11 @@ TEST_CASE("ROCm residual row zero matches the compiled primary through productio
   CHECK(observed_expressions[2].base == observed_expressions[1].residual);
 }
 
-TEST_CASE("ROCm BF16 MoE enters native providers through the production registry") {
+TEST_CASE("ROCm BF16 MoE enters native providers through the production registry" *
+          doctest::skip(FixtureAbsent())) {
+  REQUIRE_MESSAGE(!FixtureAbsent(),
+                  "VT_ROCM_MOE_FIXTURE must name the exported production checkpoint");
   const char* directory = std::getenv("VT_ROCM_MOE_FIXTURE");
-  if (directory == nullptr) {
-    MESSAGE("Set VT_ROCM_MOE_FIXTURE to the exported production checkpoint");
-    std::exit(77);
-  }
   const std::filesystem::path fixture(directory);
   if (std::getenv("VT_ROCM_MOE_EXPORT_ONLY") != nullptr) {
     Export(fixture);
@@ -444,14 +458,22 @@ TEST_CASE("ROCm BF16 MoE enters native providers through the production registry
 //    RoPE Q), `k_cache`/`v_cache` (what the kernel reads), `block_table`,
 //    `seq_lens`, `query_start_loc` and `out` (include/vt/ops.h:5424-5426,
 //    src/vt/ops.cpp:5038-5130).
-//  * kRopeFromCache — on ROCm the recipe `kAttnQkNormRope` has no fast
-//    realisation (src/vt/rocm/rocm_ops.hip registers kAttnQkNormRopeGate and not
-//    kAttnQkNormRope), so vt::FusedChain falls through to its Tier-0 composite
-//    (src/vt/ops.cpp:1449-1455) and the preamble is exactly
-//    RmsNorm(q) + RmsNorm(k) + RopeFromCache. This observer therefore sees the
-//    post-norm PRE-RoPE q2/k2 on entry, the post-RoPE q3/k3 on return, and the
-//    cos|sin table that was actually read — all three without a product-file
-//    hook, because the FusedChain composite reaches the op through GetOp.
+//  * kRopeFromCache — reached only where the recipe's Tier-0 composite runs
+//    (a backend with no fast realisation) or by the standalone fallback. On ROCm
+//    the fast realisation IS registered at this head
+//    (src/vt/rocm/rocm_ops.hip:331), so with the default VT_FUSED_CHAIN_ADOPT=1
+//    the preamble is the fused op and this observer does not fire; with
+//    VT_FUSED_CHAIN_ADOPT=0 the bf16 branch calls vt::AttnQkNormRope, which
+//    dispatches to that same registered op (dense_attn_block.h:645-649), so it
+//    does not fire there either. Where it does fire it sees the post-norm
+//    PRE-RoPE q2/k2 on entry, the post-RoPE q3/k3 on return, and the cos|sin
+//    table that was actually read — all three without a product-file hook,
+//    because the composite reaches the op through GetOp.
+//  * kAttnQkNormRope — the recipe's fast realisation, which is the production
+//    preamble on this backend for BOTH settings of the adoption switch: ADOPT=1
+//    through vt::FusedChain and ADOPT=0 through the hand-call. The runner reads
+//    whichever realization executed, so one case measures the boundary under
+//    either lever.
 //  * kRmsNorm — records every call in order so the pair immediately preceding
 //    the captured RopeFromCache call is identified by position in that call
 //    sequence rather than by shape (the layer input norms have the same shape).
@@ -1051,6 +1073,313 @@ void ScatterCacheSlot(std::vector<uint16_t>& cache, int64_t blocks, int64_t bloc
   std::memcpy(cache.data() + base, row, static_cast<size_t>(hkv * dh) * sizeof(uint16_t));
 }
 
+// --- the arm's key walk, on synthesized data --------------------------------
+//
+// The reference max the probability is narrowed against is not a free parameter:
+// the primary takes it per contiguous key tile, and the tile is chosen by the arm
+// that executes for that row (## Design 1, .agents/specs/rocm-attn-parity.md).
+// The recorded capture cannot witness the choice: its 33-token rows are all
+// prefix_prefill with an EMPTY context, so `max(keys 0..31) == max(keys 0..32)`
+// and a 32-key tile reproduces the same 8448 bytes. These cases synthesize the
+// data that makes the width load-bearing, and compare the device against a host
+// transcription of the primary's own key walk for the arm (`PrimaryTiles` +
+// `HostArmOutput`) and against the same transcription under neighbouring widths.
+//
+// Data design. q = e0 and every K row is either 0 or `kArmHighKey` in element 0,
+// so every score is exactly 0 or s = kArmHighKey * scale (bf16-exact operands, a
+// single nonzero product, so the dot is order-independent). Every V row is a
+// single bf16-exact integer in its own lane, so each output lane is fed by one
+// key and the narrowed-probability accumulations are sums of bf16-exact values.
+// A key that lies in a tile with a high key is narrowed at exp(-s); the same key
+// alone in a tile is narrowed at 1. The two differ by a relative 2^-9, which is
+// what moves the output word -- and it only exists when the tile is right.
+constexpr float kArmHighKey = 5.65625f;  // bf16-exact; s = 0.4999466
+constexpr int64_t kArmDh = 128;
+
+// The kernel's FastExp (src/vt/rocm/rocm_paged_attn.hip:196-198) on the host.
+// Only exp2(0) = 1 and exp2(-inf) = 0 are load-bearing here.
+float ArmFastExp(float x) { return std::exp2(x * 1.4426950408889634f); }
+
+std::vector<uint16_t> ArmWords(const std::vector<float>& values) {
+  std::vector<uint16_t> words(values.size());
+  for (size_t i = 0; i < values.size(); ++i) words[i] = vt::F32ToBF16(values[i]);
+  return words;
+}
+
+// The primary's key walk for ONE query row, as absolute [begin, end) key tiles.
+// chunked selects prefix_prefill; the widths are its pinned constants:
+// TRITON_BLOCK_SIZE = 32 for the cached context (:1007, :1014) and BLOCK_N = 64
+// for the current chunk when the physical block size is a power of two, 32
+// otherwise (:955-966). The decode arm tiles by min(block_size, 128)
+// (chunked_prefill_paged_decode.py:444-445), also 32 for a non-power-of-two
+// physical block size.
+std::vector<std::pair<int64_t, int64_t>> PrimaryTiles(bool chunked, int64_t context,
+                                                      int64_t jmax, int64_t block_size) {
+  const bool pow2 = block_size > 0 && (block_size & (block_size - 1)) == 0;
+  std::vector<std::pair<int64_t, int64_t>> tiles;
+  if (chunked) {
+    for (int64_t base = 0; base < context; base += 32)
+      tiles.emplace_back(base, std::min(base + 32, context));
+  }
+  const int64_t width = chunked ? (pow2 ? 64 : 32)
+                                : (pow2 ? std::min<int64_t>(block_size, 128) : 32);
+  for (int64_t base = chunked ? context : 0; base <= jmax; base += width)
+    tiles.emplace_back(base, std::min(base + width, jmax + 1));
+  return tiles;
+}
+
+// A uniform-width tiling from key 0, the geometry this kernel used before the
+// repair. Used as the falsifying counterfactual: a case whose device bytes match
+// the primary arm's tiles and NOT these is a case the width is load-bearing for.
+std::vector<std::pair<int64_t, int64_t>> UniformTiles(int64_t jmax, int64_t width) {
+  std::vector<std::pair<int64_t, int64_t>> tiles;
+  for (int64_t base = 0; base <= jmax; base += width)
+    tiles.emplace_back(base, std::min(base + width, jmax + 1));
+  return tiles;
+}
+
+// The primary's softmax over one query row, transcribed from
+// prefix_prefill.py:442-478 (context loop :379-414, chunk loop :426-478) and
+// chunked_prefill_paged_decode.py:244-268. `key_score[j]` is the f32 q.k for key
+// j, `values[j*dh + d]` the f32 V row, `tiles` the arm's key walk.
+std::vector<float> HostArmOutput(const std::vector<float>& key_score,
+                                 const std::vector<float>& values,
+                                 const std::vector<std::pair<int64_t, int64_t>>& tiles,
+                                 float scale, int64_t dh) {
+  const float ninf = -std::numeric_limits<float>::infinity();
+  float m = ninf, l = 0.0f;
+  std::vector<float> acc(static_cast<size_t>(dh), 0.0f);
+  for (const auto& tile : tiles) {
+    float tile_max = ninf;
+    for (int64_t j = tile.first; j < tile.second; ++j)
+      tile_max = std::max(tile_max, key_score[static_cast<size_t>(j)] * scale);
+    const float m_new = std::max(m, tile_max);
+    const float alpha = ArmFastExp(m - m_new);
+    for (float& a : acc) a *= alpha;
+    l *= alpha;
+    m = m_new;
+    for (int64_t j = tile.first; j < tile.second; ++j) {
+      const float p = ArmFastExp(key_score[static_cast<size_t>(j)] * scale - m_new);
+      const float pw = vt::BF16ToF32(vt::F32ToBF16(p));  // p.to(v.dtype)
+      for (int64_t d = 0; d < dh; ++d)
+        acc[static_cast<size_t>(d)] += pw * values[static_cast<size_t>(j * dh + d)];
+      l += p;
+    }
+  }
+  const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+  for (float& a : acc) a *= inv;
+  return acc;
+}
+
+// One synthesized workload: `num_reqs` requests of `query_len` query tokens each
+// over a cache that already holds `seq_len - query_len` keys, with exactly one
+// high-scoring key at `high_key`. Every request has the same shape, so the arm
+// is the same for every row of the batch.
+struct SyntheticArm {
+  int64_t num_reqs = 0, query_len = 0, seq_len = 0, block_size = 0, high_key = 0;
+  int64_t dh = kArmDh, hq = 1, hkv = 1, blocks = 0, block_table_cols = 0, total_q = 0;
+  float scale = 0.0f;
+  std::vector<int32_t> query_start_loc, seq_lens, block_table;
+  std::vector<uint16_t> query, k_cache, v_cache;
+  std::vector<float> key_score, values;  // host f32 copies for the model
+};
+
+SyntheticArm BuildSyntheticArm(int64_t num_reqs, int64_t query_len, int64_t seq_len,
+                               int64_t block_size, int64_t high_key) {
+  SyntheticArm a;
+  a.num_reqs = num_reqs;
+  a.query_len = query_len;
+  a.seq_len = seq_len;
+  a.block_size = block_size;
+  a.high_key = high_key;
+  a.scale = 1.0f / std::sqrt(static_cast<float>(kArmDh));
+  a.total_q = num_reqs * query_len;
+  a.block_table_cols = (seq_len + block_size - 1) / block_size;
+  a.blocks = num_reqs * a.block_table_cols;
+  const size_t row = static_cast<size_t>(a.dh);
+  a.query.assign(static_cast<size_t>(a.total_q) * row, 0);
+  a.k_cache.assign(static_cast<size_t>(a.blocks * block_size) * row, 0);
+  a.v_cache.assign(static_cast<size_t>(a.blocks * block_size) * row, 0);
+  a.key_score.assign(static_cast<size_t>(seq_len), 0.0f);
+  a.values.assign(static_cast<size_t>(seq_len) * row, 0.0f);
+  a.query_start_loc.assign(static_cast<size_t>(num_reqs) + 1, 0);
+  for (int64_t j = 0; j < seq_len; ++j) {
+    a.key_score[static_cast<size_t>(j)] = j == high_key ? kArmHighKey : 0.0f;
+    // Key j's value row is a single bf16-exact integer in lane j, so each output
+    // lane is fed by exactly one key and the narrowing is what the lane shows.
+    a.values[static_cast<size_t>(j * a.dh + (j % a.dh))] = static_cast<float>(64 + j % 8);
+  }
+  for (int64_t r = 0; r < num_reqs; ++r) {
+    a.query_start_loc[static_cast<size_t>(r + 1)] = static_cast<int32_t>((r + 1) * query_len);
+    a.seq_lens.push_back(static_cast<int32_t>(seq_len));
+    for (int64_t c = 0; c < a.block_table_cols; ++c)
+      a.block_table.push_back(static_cast<int32_t>(r * a.block_table_cols + c));
+    for (int64_t j = 0; j < seq_len; ++j) {
+      const int64_t slot = static_cast<int64_t>(
+                               a.block_table[static_cast<size_t>(r * a.block_table_cols +
+                                                                 j / block_size)]) *
+                               block_size +
+                           j % block_size;
+      const size_t base = static_cast<size_t>(slot) * row;
+      a.k_cache[base] = vt::F32ToBF16(a.key_score[static_cast<size_t>(j)]);
+      a.v_cache[base + static_cast<size_t>(j % a.dh)] =
+          vt::F32ToBF16(a.values[static_cast<size_t>(j * a.dh + j % a.dh)]);
+    }
+    for (int64_t i = 0; i < query_len; ++i) {
+      const size_t t = static_cast<size_t>(r * query_len + i);
+      a.query[t * row] = vt::F32ToBF16(1.0f);  // q = e0, so q.k_j = key_score[j]
+    }
+  }
+  return a;
+}
+
+// One device forward of the workload through the shared op layer, returning the
+// [total_q, hq, dh] BF16 output.
+std::vector<uint16_t> RunSyntheticArm(vt::Backend& backend, vt::Queue& q,
+                                      const SyntheticArm& a) {
+  Buffer qb(backend, a.query.size() * sizeof(uint16_t));
+  Buffer kb(backend, a.k_cache.size() * sizeof(uint16_t));
+  Buffer vb(backend, a.v_cache.size() * sizeof(uint16_t));
+  Buffer ob(backend, a.query.size() * sizeof(uint16_t));
+  Buffer tbb(backend, a.block_table.size() * sizeof(int32_t));
+  Buffer slb(backend, a.seq_lens.size() * sizeof(int32_t));
+  Buffer qlb(backend, a.query_start_loc.size() * sizeof(int32_t));
+  backend.Copy(q, qb.data, a.query.data(), a.query.size() * sizeof(uint16_t));
+  backend.Copy(q, kb.data, a.k_cache.data(), a.k_cache.size() * sizeof(uint16_t));
+  backend.Copy(q, vb.data, a.v_cache.data(), a.v_cache.size() * sizeof(uint16_t));
+  backend.Copy(q, tbb.data, a.block_table.data(), a.block_table.size() * sizeof(int32_t));
+  backend.Copy(q, slb.data, a.seq_lens.data(), a.seq_lens.size() * sizeof(int32_t));
+  backend.Copy(q, qlb.data, a.query_start_loc.data(),
+               a.query_start_loc.size() * sizeof(int32_t));
+  backend.Synchronize(q);
+  vt::Tensor tq = Tensor(qb.data, vt::DType::kBF16, q.device, {a.total_q, a.hq, a.dh});
+  vt::Tensor tk = Tensor(kb.data, vt::DType::kBF16, q.device, {a.blocks, a.block_size, a.hkv, a.dh});
+  vt::Tensor tv = Tensor(vb.data, vt::DType::kBF16, q.device, {a.blocks, a.block_size, a.hkv, a.dh});
+  vt::Tensor to = Tensor(ob.data, vt::DType::kBF16, q.device, {a.total_q, a.hq, a.dh});
+  vt::Tensor tt = Tensor(tbb.data, vt::DType::kI32, q.device, {a.num_reqs, a.block_table_cols});
+  vt::Tensor ts = Tensor(slb.data, vt::DType::kI32, q.device, {a.num_reqs});
+  vt::Tensor tl = Tensor(qlb.data, vt::DType::kI32, q.device, {a.num_reqs + 1});
+  vt::PagedAttentionArgs args;
+  args.scale = a.scale;
+  args.causal = true;
+  args.query_start_loc_host = a.query_start_loc.data();
+  args.max_seq_len = a.seq_len;
+  vt::PagedAttention(q, to, tq, tk, tv, tt, ts, tl, args);
+  backend.Synchronize(q);
+  return ReadDeviceBf16(q, to);
+}
+
+// The model's output for the whole batch, one arm geometry for every row.
+std::vector<uint16_t> ArmModelWords(const SyntheticArm& a, bool chunked, int64_t tile_override) {
+  std::vector<uint16_t> words;
+  for (int64_t r = 0; r < a.num_reqs; ++r) {
+    const int64_t context = a.seq_len - a.query_len;
+    for (int64_t i = 0; i < a.query_len; ++i) {
+      const int64_t jmax = context + i;  // causal: the row sits at position jmax
+      const std::vector<std::pair<int64_t, int64_t>> tiles =
+          tile_override > 0 ? UniformTiles(jmax, tile_override)
+                            : PrimaryTiles(chunked, context, jmax, a.block_size);
+      const std::vector<float> out =
+          HostArmOutput(a.key_score, a.values, tiles, a.scale, a.dh);
+      const std::vector<uint16_t> row_words = ArmWords(out);
+      words.insert(words.end(), row_words.begin(), row_words.end());
+    }
+  }
+  return words;
+}
+
+void PrintArmDiff(const char* what, const WordDiff& d, int64_t rows) {
+  std::cout << "[arm-geometry] " << what << ": " << d.different << " / " << d.words
+            << " differing words over " << rows << " rows" << std::endl;
+}
+
+// The noise floor is the host/device accumulation-order difference on the f32
+// running sum; the signal is the narrowed-probability scale the tile decides.
+// They are three orders of magnitude apart on this data, so the thresholds are
+// not tuned to the measurement.
+constexpr int64_t kArmNoiseWords = 8;
+constexpr int64_t kArmSignalWords = 32;
+
+// ─── env-gated cases: per-case skip, process-level 77 ────────────────────────
+//
+// Four cases in this file need an environment the default run does not have: the
+// two production cases need `VT_ROCM_MOE_FIXTURE`, the CPU half of the instrument
+// needs `VT_ATTN_PARITY_PRIMARY`, and the device half needs all of that plus
+// `VT_ATTN_DUMP=1`. They used to call `std::exit(77)` on the absent variable, and
+// doctest runs the cases in file order, so the first absent variable ended the
+// PROCESS: the summary was never printed and every later case was silently not
+// run (the fresh review's fourth finding).
+//
+// The cases are now decorated `doctest::skip(...)`, so doctest reports them
+// skipped in its own summary and the remaining cases still run, and the process
+// still exits 77 -- CTest reports Skipped, the convention `tests/CMakeLists.txt`
+// registers -- but ONLY when nothing failed, so a reddened case keeps doctest's
+// own non-zero status instead of being folded into the skip. `--no-skip` forces
+// a gated case anyway; the in-case guard then FAILS rather than reading an absent
+// variable as a path.
+bool AttnCaptureAbsent() {
+  const char* e = std::getenv("VT_ATTN_PARITY_PRIMARY");
+  return e == nullptr || e[0] == '\0';
+}
+bool AttnInstrumentAbsent() {
+  return FixtureAbsent() || AttnCaptureAbsent() || !AttnDumpEnabled();
+}
+
+bool g_env_cases_skipped = false;
+bool g_run_failed = false;
+
+// A listener, not a reporter: listeners are always active whatever `-r=` selects,
+// so neither the skip note nor the failure guard can be switched off from the
+// command line (the sibling head test registers the same shape).
+struct GatedCaseListener : public doctest::IReporter {
+  explicit GatedCaseListener(const doctest::ContextOptions&) {}
+  void test_run_start() override {}
+  void report_query(const doctest::QueryData&) override {}
+  void test_run_end(const doctest::TestRunStats& stats) override {
+    g_run_failed = stats.numTestCasesFailed != 0 || stats.numAssertsFailed != 0;
+  }
+  void test_case_start(const doctest::TestCaseData&) override {}
+  void test_case_reenter(const doctest::TestCaseData&) override {}
+  void test_case_end(const doctest::CurrentTestCaseStats&) override {}
+  void test_case_exception(const doctest::TestCaseException&) override {}
+  void subcase_start(const doctest::SubcaseSignature&) override {}
+  void subcase_end() override {}
+  void log_assert(const doctest::AssertData&) override {}
+  void log_message(const doctest::MessageData&) override {}
+  // Also fires for a case a filter excluded; only the decorator sets `m_skip`,
+  // and only that means "the environment for this case is not here".
+  void test_case_skipped(const doctest::TestCaseData& tc) override {
+    if (!tc.m_skip) return;
+    g_env_cases_skipped = true;
+    std::cout << "[rocm-moe-bf16] SKIPPED: " << tc.m_name
+              << " (its environment is not set; see the case's own message)" << std::endl;
+  }
+};
+DOCTEST_REGISTER_LISTENER("vt-rocm-moe-env-gated", 1, GatedCaseListener);
+
+// Registered during static initialization, so it runs after doctest's main has
+// printed its summary and returned. `std::_Exit` rather than `std::exit`: this IS
+// an exit handler, and re-entering the exit sequence is undefined.
+void ExitSkippedWhenAGatedCaseDidNotRun() {
+  if (!g_env_cases_skipped || g_run_failed) return;
+  std::cout.flush();
+  std::fflush(nullptr);
+  std::fprintf(stderr,
+               "\n*** SKIPPED (exit 77): at least one env-gated case did not run. The cases that "
+               "did run are reported in the summary above and their result stands; this status "
+               "says only that the gated ones did not. ***\n\n");
+  std::fflush(stderr);
+  std::_Exit(77);
+}
+
+struct RegisterExitSkippedWhenAGatedCaseDidNotRun {
+  RegisterExitSkippedWhenAGatedCaseDidNotRun() {
+    std::atexit(&ExitSkippedWhenAGatedCaseDidNotRun);
+  }
+};
+[[maybe_unused]] const RegisterExitSkippedWhenAGatedCaseDidNotRun
+    g_exit_skipped_when_a_gated_case_did_not_run;
+
 }  // namespace
 
 // The replay's cache geometry, checked on the CPU against the recorded capture
@@ -1058,12 +1387,11 @@ void ScatterCacheSlot(std::vector<uint16_t>& cache, int64_t blocks, int64_t bloc
 // slot_mapping, block_table and block_size agree with each other, and this case
 // is what makes that a gate rather than an assumption. It needs no GPU: it is
 // the red-first half of the instrument and it runs wherever the artifact is.
-TEST_CASE("Primary attention capture decodes to the cache geometry the replay uses") {
+TEST_CASE("Primary attention capture decodes to the cache geometry the replay uses" *
+          doctest::skip(AttnCaptureAbsent())) {
+  REQUIRE_MESSAGE(!AttnCaptureAbsent(),
+                  "VT_ATTN_PARITY_PRIMARY must name the primary attention-capture directory");
   const char* results = std::getenv("VT_ATTN_PARITY_PRIMARY");
-  if (results == nullptr) {
-    MESSAGE("Set VT_ATTN_PARITY_PRIMARY to the primary attention-capture directory");
-    std::exit(77);
-  }
   const std::filesystem::path dir(results);
   const std::string label = std::getenv("VT_ATTN_PARITY_LABEL") != nullptr
                                 ? std::getenv("VT_ATTN_PARITY_LABEL")
@@ -1119,21 +1447,14 @@ TEST_CASE("Primary attention capture decodes to the cache geometry the replay us
             << " cache blocks, block_size " << primary.block_size << std::endl;
 }
 
-TEST_CASE("ROCm paged attention replays the primary's captured attention boundary") {
+TEST_CASE("ROCm paged attention replays the primary's captured attention boundary" *
+          doctest::skip(AttnInstrumentAbsent())) {
+  REQUIRE_MESSAGE(
+      !AttnInstrumentAbsent(),
+      "the attention-boundary instrument needs VT_ROCM_MOE_FIXTURE, "
+      "VT_ATTN_PARITY_PRIMARY and VT_ATTN_DUMP=1");
   const char* fixture = std::getenv("VT_ROCM_MOE_FIXTURE");
-  if (fixture == nullptr) {
-    MESSAGE("Set VT_ROCM_MOE_FIXTURE to the exported production checkpoint");
-    std::exit(77);
-  }
   const char* results_env = std::getenv("VT_ATTN_PARITY_PRIMARY");
-  if (results_env == nullptr) {
-    MESSAGE("Set VT_ATTN_PARITY_PRIMARY to the primary attention-capture directory");
-    std::exit(77);
-  }
-  if (!AttnDumpEnabled()) {
-    MESSAGE("Set VT_ATTN_DUMP=1 to run the attention-boundary instrument");
-    std::exit(77);
-  }
   const std::filesystem::path results(results_env);
   const char* preamble_env = std::getenv("VT_ATTN_PARITY_PREAMBLE");
   const std::filesystem::path out_dir =
@@ -1360,8 +1681,11 @@ TEST_CASE("ROCm paged attention replays the primary's captured attention boundar
   // ---- (iii) the native preamble on the PRIMARY's captured qkv ------------
   WordDiff preamble_q, preamble_k, neox_q, neox_k, table_diff, qkv_q, qkv_k;
   WordDiff production_q, production_k;
+  WordDiff handcall_q, handcall_k;
+  int64_t hand_fused_identity = -1;
   bool have_preamble = false;
   bool have_production = false;
+  bool have_handcall = false;
   if (preamble_env != nullptr) {
     const PrimaryPreamble preamble = LoadPrimaryPreamble(preamble_env, label, 0);
     REQUIRE(preamble.tokens == primary.tokens);
@@ -1529,6 +1853,41 @@ TEST_CASE("ROCm paged attention replays the primary's captured attention boundar
         WriteWords(out_dir / (label + "-native-production-preamble-q.bin"),
                    ReadDeviceBf16(q, t_q5));
       }
+
+      // D3: the HAND-CALL realization on the same primary qkv, through the
+      // op-layer entry the ADOPT=0 branch calls (dense_attn_block.h:645-649).
+      // Before the stride repair this threw
+      // "attn_qk_norm_rope: row stride must be the inner dimension" for every
+      // Dh > 1, which made the documented same-binary A/B lever unusable; the two
+      // realizations must also agree byte-for-byte, which is the recipe's
+      // composite contract and what makes the lever an A/B rather than two arms.
+      Buffer q6_buffer(backend, rows * sizeof(uint16_t));
+      Buffer k6_buffer(backend, rows * sizeof(uint16_t));
+      backend.Copy(q, q6_buffer.data, q2.data(), rows * sizeof(uint16_t));
+      backend.Copy(q, k6_buffer.data, k2.data(), rows * sizeof(uint16_t));
+      backend.Synchronize(q);
+      vt::Tensor t_q6 = Tensor(q6_buffer.data, vt::DType::kBF16, q.device,
+                               {preamble.tokens, 1, preamble.dh});
+      vt::Tensor t_k6 = Tensor(k6_buffer.data, vt::DType::kBF16, q.device,
+                               {preamble.tokens, 1, preamble.dh});
+      vt::AttnQkNormRope(q, t_q6, t_k6, t_qg, t_kg, t_cs16, t_idx,
+                         vt::RmsNormArgs{eps, false}, rope);
+      backend.Synchronize(q);
+      const std::vector<uint16_t> hand_q = ReadDeviceBf16(q, t_q6);
+      const std::vector<uint16_t> hand_k = ReadDeviceBf16(q, t_k6);
+      handcall_q = DiffWords(hand_q, primary.query, primary.dh);
+      handcall_k = DiffWords(hand_k, primary.key, primary.dh);
+      PrintDiff("D3 hand-call preamble (vt::AttnQkNormRope) on primary qkv vs primary Q",
+                handcall_q);
+      PrintDiff("D3 hand-call preamble (vt::AttnQkNormRope) on primary qkv vs primary K",
+                handcall_k);
+      const WordDiff hand_vs_fused_q = DiffWords(hand_q, ReadDeviceBf16(q, t_q5), primary.dh);
+      const WordDiff hand_vs_fused_k = DiffWords(hand_k, ReadDeviceBf16(q, t_k5), primary.dh);
+      PrintDiff("D3 hand-call vs D2 fused-op, same primary qkv, Q", hand_vs_fused_q);
+      PrintDiff("D3 hand-call vs D2 fused-op, same primary qkv, K", hand_vs_fused_k);
+      hand_fused_identity = hand_vs_fused_q.different + hand_vs_fused_k.different;
+      CHECK(hand_fused_identity == 0);
+      have_handcall = true;
     }
 
     if (!out_dir.empty()) {
@@ -1565,6 +1924,29 @@ TEST_CASE("ROCm paged attention replays the primary's captured attention boundar
     CHECK(production_q.different <= 1);
     CHECK(production_k.different <= 1);
   }
+  if (have_handcall) {
+    std::cout << "[attn-parity][focused-handcall] D3 " << handcall_q.different << " Q / "
+              << handcall_k.different << " K differing words (want <= 1); hand-call vs fused op "
+              << hand_fused_identity << " differing words (want 0)" << std::endl;
+    CHECK(handcall_q.different <= 1);
+    CHECK(handcall_k.different <= 1);
+    CHECK(hand_fused_identity == 0);
+  }
+  // BOTH SETTINGS OF THE ADOPTION SWITCH MUST REACH THE REGISTERED OP. On ROCm the
+  // bf16 production preamble is the fused realization either way:
+  // VT_FUSED_CHAIN_ADOPT=1 enters it through vt::FusedChain's fast_op dispatch,
+  // =0 through the hand-call at dense_attn_block.h:645-649, which is the same
+  // vt::AttnQkNormRope entry. `preamble_fused` records that the OP ran, not which
+  // branch called it, so the branch is pinned by the second check: the Tier-0
+  // composite must NOT have run, or the =0 run would be measuring the standalone
+  // RmsNorm+RopeFromCache sequence instead of the hand-call this finding names.
+  // The device A/B -- same binary, same workload, one variable -- is the other half.
+  const bool adopt = vllm::dense_attn::FusedChainAdoptEnabled();
+  std::cout << "[attn-parity][focused-adopt] VT_FUSED_CHAIN_ADOPT=" << (adopt ? 1 : 0)
+            << "; registered fused op ran: " << (preamble_fused ? "yes" : "no")
+            << "; composite fallback ran: " << (g_rope.have ? "yes" : "no") << std::endl;
+  CHECK(preamble_fused);
+  CHECK_FALSE(g_rope.have);
 
   // ---- the verdict --------------------------------------------------------
   // #3115's two hypotheses: the Q/K preamble, the kernel arithmetic, or both.
@@ -1623,6 +2005,13 @@ TEST_CASE("ROCm paged attention replays the primary's captured attention boundar
     report["D2_production_preamble_q"] = production_q.different;
     report["D2_production_preamble_k"] = production_k.different;
   }
+  report["D3_handcall_preamble_measured"] = have_handcall;
+  report["fused_chain_adopt"] = vllm::dense_attn::FusedChainAdoptEnabled();
+  if (have_handcall) {
+    report["D3_handcall_preamble_q"] = handcall_q.different;
+    report["D3_handcall_preamble_k"] = handcall_k.different;
+    report["D3_handcall_vs_fused_differing_words"] = hand_fused_identity;
+  }
   report["verdict"] = verdict;
   if (!out_dir.empty()) {
     std::filesystem::create_directories(out_dir);
@@ -1634,4 +2023,190 @@ TEST_CASE("ROCm paged attention replays the primary's captured attention boundar
     WriteWords(out_dir / (label + "-native-attention-0-k3.bin"), post_rope_k);
     WriteWords(out_dir / (label + "-replay-output.bin"), replay);
   }
+}
+
+// ---------------------------------------------------------------------------
+// The key-walk geometry the primary selects, one case per arm.
+//
+// The recorded capture measures ONE arm: prefix_prefill over a request with no
+// cached prefix, where BLOCK_N = 64 and the 33 keys fit one tile. The same native
+// kernel also serves pure decode (the Triton decode arm tiles by
+// min(block_size, 128)) and a chunked prefill (a 32-key context tile walk before
+// the 64-key chunk walk), and it served both of those with the prefill tile
+// before this repair. These cases synthesize the data that separates the arms
+// and compare the device against the primary's own key walk for the arm.
+// ---------------------------------------------------------------------------
+namespace {
+
+void CheckArmGeometry(const char* label, const SyntheticArm& arm, bool chunked,
+                      const std::vector<int64_t>& wrong_widths) {
+  auto& backend = vt::GetBackend(vt::DeviceType::kROCM);
+  QueueGuard queue(backend);
+  auto& q = queue.queue;
+  const std::vector<uint16_t> device = RunSyntheticArm(backend, q, arm);
+  const WordDiff correct = DiffWords(device, ArmModelWords(arm, chunked, 0), arm.dh);
+  std::cout << "[arm-geometry] " << label << ": " << arm.num_reqs << " requests, query_len "
+            << arm.query_len << ", seq_len " << arm.seq_len << ", context "
+            << (arm.seq_len - arm.query_len) << ", block_size " << arm.block_size << ", high key "
+            << arm.high_key << ", " << arm.total_q << " query rows" << std::endl;
+  PrintArmDiff("device vs the primary arm's own tiles", correct, arm.total_q);
+  CHECK_MESSAGE(correct.different <= kArmNoiseWords,
+                label << ": the device must follow the primary arm's key walk ("
+                      << correct.different << " differing words, noise floor " << kArmNoiseWords
+                      << ")");
+  for (int64_t width : wrong_widths) {
+    const WordDiff d = DiffWords(device, ArmModelWords(arm, chunked, width), arm.dh);
+    PrintArmDiff("device vs a uniform tiling of that width", d, arm.total_q);
+    CHECK_MESSAGE(d.different >= kArmSignalWords,
+                  label << ": a uniform " << width
+                        << "-key tiling must not reproduce the device (" << d.different
+                        << " differing words, signal floor " << kArmSignalWords << ")");
+  }
+}
+
+}  // namespace
+
+// THE PREFILL ARM: max_query_len > 1, no cached prefix -> prefix_prefill with
+// BLOCK_N = 64 (prefix_prefill.py:955-966). 65 query tokens so that 33 rows per
+// request have a key range that reaches past key 32, and the high key sits AT 32:
+// one key beyond the 32-boundary, so a 32-key tile and a 64-key tile take their
+// reference max over different key sets and narrow the other 32 keys against
+// different scales.
+TEST_CASE("ROCm paged attention uses the primary's 64-key prefill tile") {
+  REQUIRE(vt::TryGetBackend(vt::DeviceType::kROCM) != nullptr);
+  CheckArmGeometry("prefill, empty context", BuildSyntheticArm(4, 65, 65, 16, 32), true, {32, 16});
+}
+
+// THE CHUNKED-CONTEXT ARM: max_query_len > 1 with a cached prefix -> prefix_prefill
+// walks the context in TRITON_BLOCK_SIZE = 32 key tiles from key 0 and then the
+// chunk in BLOCK_N = 64 tiles anchored at the chunk start (:1007, :1014, :379-414,
+// :426-478). 37 cached keys and 3 query tokens; the high key is at 33, inside the
+// second context tile, so a 64-key context tile would put it in the same tile as
+// keys 0..31 and narrow those at the high scale instead of at 1.
+TEST_CASE("ROCm paged attention uses the primary's 32-key context tile") {
+  REQUIRE(vt::TryGetBackend(vt::DeviceType::kROCM) != nullptr);
+  CheckArmGeometry("chunked prefill, 37-key context", BuildSyntheticArm(4, 3, 40, 16, 33), true,
+                   {64});
+}
+
+// THE PURE-DECODE ARM: max_query_len == 1 -> the Triton decode kernel tiles the
+// key range by TRITON_BLOCK_SIZE = min(block_size, 128) = 16 for this cache
+// (chunked_prefill_paged_decode.py:444-445, :147-149, :244). A 16-wide tile puts
+// key 17 in its own tile; a 32- or 64-wide one puts it with keys 0..15, whose
+// probability is then narrowed at the high scale.
+TEST_CASE("ROCm paged attention uses the primary's decode tile") {
+  REQUIRE(vt::TryGetBackend(vt::DeviceType::kROCM) != nullptr);
+  CheckArmGeometry("pure decode, block_size 16", BuildSyntheticArm(8, 1, 40, 16, 17), false,
+                   {32, 64});
+}
+
+// ---------------------------------------------------------------------------
+// The hand-call realization of the qk-norm-RoPE preamble, on synthesized data.
+//
+// The production bf16 preamble has two realizations that must agree: the recipe's
+// fast op through vt::FusedChain (VT_FUSED_CHAIN_ADOPT=1) and the hand-call
+// vt::AttnQkNormRope the fallback branch reaches under VT_FUSED_CHAIN_ADOPT=0
+// (dense_attn_block.h:645-649). Before the op-layer stride repair the second one
+// threw for every Dh > 1, so the documented same-binary A/B lever could not run
+// at all on this workload; this case runs both in one process, on identical
+// inputs, and requires byte identity.
+// ---------------------------------------------------------------------------
+TEST_CASE("ROCm bf16 qk-norm-rope: the hand-call realization matches the fused recipe") {
+  REQUIRE(vt::TryGetBackend(vt::DeviceType::kROCM) != nullptr);
+  REQUIRE_MESSAGE(vt::OpRegistered(vt::OpId::kAttnQkNormRope, vt::DeviceType::kROCM),
+                  "this case measures the Recipe-vs-hand-call pair on a backend that registers "
+                  "the recipe's fast realization");
+  auto& backend = vt::GetBackend(vt::DeviceType::kROCM);
+  QueueGuard queue(backend);
+  auto& q = queue.queue;
+  const int64_t tokens = 8, dh = 128, rot = 128;
+  const size_t rows = static_cast<size_t>(tokens * dh);
+  std::vector<uint16_t> q_words(rows), k_words(rows);
+  std::vector<uint16_t> q_gamma(static_cast<size_t>(dh)), k_gamma(static_cast<size_t>(dh));
+  for (size_t i = 0; i < rows; ++i) {
+    q_words[i] = static_cast<uint16_t>(0x3C00 + ((i * 37 + 11) % 1024));   // [1, 8)
+    k_words[i] = static_cast<uint16_t>(0x3C00 + ((i * 53 + 29) % 1024));
+  }
+  // Distinct q/k weights, so a realization that swapped them could not agree.
+  for (size_t i = 0; i < q_gamma.size(); ++i) {
+    q_gamma[i] = static_cast<uint16_t>(0x3F00 + (i % 64));         // [0.5, 1)
+    k_gamma[i] = static_cast<uint16_t>(0x3E80 + ((i * 3) % 96));   // [0.25, 0.625)
+  }
+  std::vector<int32_t> positions(static_cast<size_t>(tokens));
+  for (int64_t t = 0; t < tokens; ++t) positions[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+  Buffer qb(backend, rows * sizeof(uint16_t)), kb(backend, rows * sizeof(uint16_t));
+  Buffer qc(backend, rows * sizeof(uint16_t)), kc(backend, rows * sizeof(uint16_t));
+  Buffer qgb(backend, q_gamma.size() * sizeof(uint16_t));
+  Buffer kgb(backend, k_gamma.size() * sizeof(uint16_t));
+  Buffer pb(backend, positions.size() * sizeof(int32_t));
+  Buffer cs32(backend, rows * sizeof(float)), cs16(backend, rows * sizeof(uint16_t));
+  backend.Copy(q, qb.data, q_words.data(), rows * sizeof(uint16_t));
+  backend.Copy(q, qc.data, q_words.data(), rows * sizeof(uint16_t));
+  backend.Copy(q, kb.data, k_words.data(), rows * sizeof(uint16_t));
+  backend.Copy(q, kc.data, k_words.data(), rows * sizeof(uint16_t));
+  backend.Copy(q, qgb.data, q_gamma.data(), q_gamma.size() * sizeof(uint16_t));
+  backend.Copy(q, kgb.data, k_gamma.data(), k_gamma.size() * sizeof(uint16_t));
+  backend.Copy(q, pb.data, positions.data(), positions.size() * sizeof(int32_t));
+  backend.Synchronize(q);
+
+  vt::RopeArgs rope;
+  rope.base = 1000000.0f;
+  rope.rotary_dim = static_cast<int>(rot);
+  const vt::RmsNormArgs norm{1e-6f, false};
+  vt::Tensor t_cs32 = Tensor(cs32.data, vt::DType::kF32, q.device, {tokens, rot});
+  vt::Tensor t_cs16 = Tensor(cs16.data, vt::DType::kBF16, q.device, {tokens, rot});
+  vt::Tensor t_pos = Tensor(pb.data, vt::DType::kI32, q.device, {tokens});
+  vt::RopeCosSinCache(q, t_cs32, t_pos, rope);
+  vt::CastBf16(q, t_cs16, t_cs32);
+  backend.Synchronize(q);
+
+  // Arm 1 (VT_FUSED_CHAIN_ADOPT=1): the recipe's fast realization, with exactly the
+  // binding the model builds (dense_attn_block.h:594-613): the 2-D norm view and
+  // the 3-D rope view alias one buffer, bf16 weights, the bf16 cache, identity rows.
+  vt::Tensor f_q2 = Tensor(qb.data, vt::DType::kBF16, q.device, {tokens, dh});
+  vt::Tensor f_k2 = Tensor(kb.data, vt::DType::kBF16, q.device, {tokens, dh});
+  vt::Tensor f_q3 = Tensor(qb.data, vt::DType::kBF16, q.device, {tokens, 1, dh});
+  vt::Tensor f_k3 = Tensor(kb.data, vt::DType::kBF16, q.device, {tokens, 1, dh});
+  vt::Tensor t_qg = Tensor(qgb.data, vt::DType::kBF16, q.device, {dh});
+  vt::Tensor t_kg = Tensor(kgb.data, vt::DType::kBF16, q.device, {dh});
+  vt::FusedBinding binding;
+  binding.op[0] = &f_q2;
+  binding.op[1] = &t_qg;
+  binding.op[2] = &f_k2;
+  binding.op[3] = &t_kg;
+  binding.op[4] = &f_q3;
+  binding.op[5] = &f_k3;
+  binding.op[6] = &t_cs16;
+  binding.op[7] = &t_pos;
+  binding.n = 8;
+  vt::FusedParams params;
+  params.eps = norm.eps;
+  params.rope = rope;
+  vt::FusedChain(q, vt::kAttnQkNormRope, binding, params);
+  backend.Synchronize(q);
+
+  // Arm 2 (VT_FUSED_CHAIN_ADOPT=0): the hand-call through the op layer, the same
+  // entry the model's fallback branch reaches.
+  vt::Tensor h_q3 = Tensor(qc.data, vt::DType::kBF16, q.device, {tokens, 1, dh});
+  vt::Tensor h_k3 = Tensor(kc.data, vt::DType::kBF16, q.device, {tokens, 1, dh});
+  vt::AttnQkNormRope(q, h_q3, h_k3, t_qg, t_kg, t_cs16, t_pos, norm, rope);
+  backend.Synchronize(q);
+
+  const std::vector<uint16_t> fused_q = ReadDeviceBf16(q, f_q3);
+  const std::vector<uint16_t> fused_k = ReadDeviceBf16(q, f_k3);
+  const WordDiff dq = DiffWords(ReadDeviceBf16(q, h_q3), fused_q, dh);
+  const WordDiff dk = DiffWords(ReadDeviceBf16(q, h_k3), fused_k, dh);
+  PrintDiff("hand-call vs fused recipe, Q", dq);
+  PrintDiff("hand-call vs fused recipe, K", dk);
+  const bool any_rotation = [&] {
+    for (int64_t t = 0; t < tokens; ++t)
+      for (int64_t d = 0; d < dh; ++d)
+        if (fused_q[static_cast<size_t>(t * dh + d)] != q_words[static_cast<size_t>(t * dh + d)])
+          return true;
+    return false;
+  }();
+  CHECK(any_rotation);  // a no-op preamble would make the identity vacuous
+  CHECK(dq.different == 0);
+  CHECK(dk.different == 0);
 }

@@ -535,68 +535,115 @@ __global__ void PagedAttnDecodeOptBf16T(__hip_bfloat16* out, const __hip_bfloat1
   // A bf16 rounding is relative, so that mirror only holds when the probability
   // is taken against the same reference max the primary used, and the primary's
   // is `m_ij = tl.maximum(m_i, tl.max(qk, axis=1))` at :442 -- a running max
-  // advanced once per contiguous BLOCK_N=64 key tile, not once per key. This
-  // kernel therefore walks the key range in tiles of kTileKeys, reduces each
-  // tile's max across the CTA, and only then exponentiates, narrows and
-  // accumulates. Narrowing against a per-warp per-key running max instead was
-  // measured on gfx1100 and moved row C the wrong way (2918 -> 3011 of 8448
-  // words); the tiled reference max is what reproduces the primary.
+  // advanced once per contiguous key tile, not once per key. This kernel
+  // therefore walks the key range in tiles, reduces each tile's max across the
+  // CTA, and only then exponentiates, narrows and accumulates. Narrowing against
+  // a per-warp per-key running max instead was measured on gfx1100 and moved row C
+  // the wrong way (2918 -> 3011 of 8448 words); the tiled reference max is what
+  // reproduces the primary.
+  //
+  // WHICH TILE, and where the walk starts, are the primary's own choice for the
+  // arm this row executes, so they are read off the pinned source rather than
+  // fixed. `chunked_prefill_paged_decode.py:317` dispatches the CALL on the
+  // batch's max query length, and the decode kernel it launches returns
+  // immediately for a row with query_len > 1 (`filter_by_query_len=True`,
+  // :93-97, :503), so the arm is per ROW:
+  //
+  //  * query_len > 1 -> `prefix_prefill._fwd_kernel` (prefix_prefill.py). It
+  //    walks the cached context in TRITON_BLOCK_SIZE = 32 key tiles anchored at
+  //    key 0, masking lanes at or past `cur_batch_ctx_len` (:1007, :1014,
+  //    :267-295, :379-414), and then the current chunk in BLOCK_N-key tiles
+  //    anchored at the chunk start (:426-478). BLOCK_N is 64 when the physical
+  //    block size is a power of two and 32 otherwise (:955-966).
+  //  * query_len == 1 -> the Triton decode kernel, which tiles the whole key
+  //    range from key 0 by TRITON_BLOCK_SIZE = min(block_size, 128), or 32 for a
+  //    non-power-of-two physical block size (chunked_prefill_paged_decode.py:
+  //    444-445, :147-149, :244).
+  //
+  // Tiles are anchored where the primary anchors them, and a key outside the
+  // causal or sliding-window bound is skipped rather than dropped from the grid:
+  // the primary masks such a lane to -inf (prefix_prefill.py:291) or -10000
+  // (chunked_prefill_paged_decode.py:236), neither of which can raise a tile max,
+  // and `exp(x - m)` underflows to 0 for either. Anchoring the grid at `jmin`
+  // instead would move every tile boundary on a sliding-window model and change
+  // which keys share a reference max; whole tiles below `jmin` are skipped so the
+  // walk still costs O(window) rather than O(sequence).
   extern __shared__ float smem_dec[];
   float* tile_sh = smem_dec;  // kDecWarps partial maxima; o_sh reuses it below
-  constexpr int kTileKeys = 64;
-  constexpr int kPerWarp = (kTileKeys + kDecWarps - 1) / kDecWarps;
-  for (int64_t base = jmin; base <= jmax; base += kTileKeys) {
-    const int64_t tile_end = base + kTileKeys;
-    float s_reg[kPerWarp];
-    float warp_max = -INFINITY;
+  const bool chunked_arm = query_len > 1;
+  const bool pow2_block = block_size > 0 && (block_size & (block_size - 1)) == 0;
+  constexpr int64_t kContextTile = 32;  // prefix_prefill TRITON_BLOCK_SIZE
+  const int64_t chunk_tile = chunked_arm ? (pow2_block ? 64 : 32)
+                                         : (pow2_block ? (block_size < 128 ? block_size : 128) : 32);
+  // One runtime width, at most 128 (min(block_size,128) on the decode arm), so the
+  // per-warp score registers are sized for the widest tile any arm can ask for.
+  constexpr int kMaxTileKeys = 128;
+  constexpr int kPerWarp = (kMaxTileKeys + kDecWarps - 1) / kDecWarps;
+  // Phase 0 is the cached context (chunked arm only) and phase 1 is the chunk, or
+  // the whole key range on the decode arm, which the primary always walks from 0.
+  const int64_t chunk_begin = chunked_arm ? context : 0;
+  for (int phase = (chunked_arm && context > 0) ? 0 : 1; phase < 2; ++phase) {
+    const int64_t tile = phase == 0 ? kContextTile : chunk_tile;
+    const int64_t begin = phase == 0 ? 0 : chunk_begin;
+    const int64_t end = phase == 0 ? context - 1 : jmax;
+    for (int64_t base = begin; base <= end; base += tile) {
+      if (base + tile <= jmin) continue;  // the whole tile is out of the window
+      const int64_t tile_end = base + tile;
+      const int per_warp = static_cast<int>((tile + kDecWarps - 1) / kDecWarps);
+      float s_reg[kPerWarp];
+      float warp_max = -INFINITY;
 #pragma unroll
-    for (int k = 0; k < kPerWarp; ++k) {
-      const int64_t j = base + warp + static_cast<int64_t>(k) * kDecWarps;
-      float s = -INFINITY;
-      if (j < tile_end && j <= jmax) {
+      for (int k = 0; k < kPerWarp; ++k) {
+        float s = -INFINITY;
+        if (k < per_warp) {
+          const int64_t j = base + warp + static_cast<int64_t>(k) * kDecWarps;
+          if (j < tile_end && j <= end && j >= jmin) {
+            const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
+            const int64_t off = j % block_size;
+            float k_reg[kEpl];
+            LoadRowEplBf16<kEpl>(k_cache, blk * kc_blk + off * kc_pg + g * kc_hd, lane, k_reg);
+            float dot = 0.f;
+#pragma unroll
+            for (int i = 0; i < kEpl; ++i) dot += q_reg[i] * k_reg[i];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) dot += __shfl_down(dot, o);
+            s = Softcap(__shfl(dot, 0) * scale, softcap);
+          }
+        }
+        s_reg[k] = s;
+        warp_max = fmaxf(warp_max, s);
+      }
+
+      if (lane == 0) tile_sh[warp] = warp_max;
+      __syncthreads();
+      float tile_max = -INFINITY;
+#pragma unroll
+      for (int w = 0; w < kDecWarps; ++w) tile_max = fmaxf(tile_max, tile_sh[w]);
+      // Every warp has read the tile maximum before the next tile overwrites it.
+      __syncthreads();
+
+      const float m_new = fmaxf(m, tile_max);
+      const float corr = FastExp(m - m_new);
+#pragma unroll
+      for (int i = 0; i < kEpl; ++i) o_reg[i] *= corr;
+      lsum *= corr;
+      m = m_new;
+
+#pragma unroll
+      for (int k = 0; k < kPerWarp; ++k) {
+        if (k >= per_warp) continue;
+        const int64_t j = base + warp + static_cast<int64_t>(k) * kDecWarps;
+        if (!(j < tile_end && j <= end && j >= jmin)) continue;
+        const float pw = FastExp(s_reg[k] - m_new);
+        const float pwv = ProbInValueDtype<__hip_bfloat16>(pw);
         const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
         const int64_t off = j % block_size;
-        float k_reg[kEpl];
-        LoadRowEplBf16<kEpl>(k_cache, blk * kc_blk + off * kc_pg + g * kc_hd, lane, k_reg);
-        float dot = 0.f;
+        float v_reg[kEpl];
+        LoadRowEplBf16<kEpl>(v_cache, blk * vc_blk + off * vc_pg + g * vc_hd, lane, v_reg);
 #pragma unroll
-        for (int i = 0; i < kEpl; ++i) dot += q_reg[i] * k_reg[i];
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) dot += __shfl_down(dot, o);
-        s = Softcap(__shfl(dot, 0) * scale, softcap);
+        for (int i = 0; i < kEpl; ++i) o_reg[i] += pwv * v_reg[i];
+        lsum += pw;
       }
-      s_reg[k] = s;
-      warp_max = fmaxf(warp_max, s);
-    }
-
-    if (lane == 0) tile_sh[warp] = warp_max;
-    __syncthreads();
-    float tile_max = -INFINITY;
-#pragma unroll
-    for (int w = 0; w < kDecWarps; ++w) tile_max = fmaxf(tile_max, tile_sh[w]);
-    // Every warp has read the tile maximum before the next tile overwrites it.
-    __syncthreads();
-
-    const float m_new = fmaxf(m, tile_max);
-    const float corr = FastExp(m - m_new);
-#pragma unroll
-    for (int i = 0; i < kEpl; ++i) o_reg[i] *= corr;
-    lsum *= corr;
-    m = m_new;
-
-#pragma unroll
-    for (int k = 0; k < kPerWarp; ++k) {
-      const int64_t j = base + warp + static_cast<int64_t>(k) * kDecWarps;
-      if (!(j < tile_end && j <= jmax)) continue;
-      const float pw = FastExp(s_reg[k] - m_new);
-      const float pwv = ProbInValueDtype<__hip_bfloat16>(pw);
-      const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
-      const int64_t off = j % block_size;
-      float v_reg[kEpl];
-      LoadRowEplBf16<kEpl>(v_cache, blk * vc_blk + off * vc_pg + g * vc_hd, lane, v_reg);
-#pragma unroll
-      for (int i = 0; i < kEpl; ++i) o_reg[i] += pwv * v_reg[i];
-      lsum += pw;
     }
   }
 

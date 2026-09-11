@@ -24,7 +24,9 @@ differed at six generated positions across three repeated length-33,
 concurrency-2 runs.
 The first proved residual-normalization difference belongs to
 [#3103](https://github.com/mudler/vllm.cpp/issues/3103), under `BACKEND-ROCM-RESIDUAL-NORM`.
-Attention and head-output differences also require resolution before acceptance.
+Attention differences (#3115) also require resolution before acceptance; the
+head-output boundary is implemented and gated under
+[the child spec](rocm-lmhead-bf16.md).
 
 All 60 original upstream component cases pass on both runtimes.
 Initial fresh review found three missing test witnesses at `94b8bb0ec`.
@@ -472,8 +474,8 @@ own logprob deltas in `oracle-selection-6/production.json`, which reach `2.028e-
 between its concurrency-1 and concurrency-2 records at positions where their token
 sequences agree, are log-probabilities over the vocabulary and are not this logit
 band. The attention and Q/K preamble parity work (#3115) and the BF16 LM-head
-output boundary work (#3116) are judged by this fidelity criterion, not by
-reproducing one configuration's tie-break.
+output boundary work (#3116, [the child spec](rocm-lmhead-bf16.md)) are judged by
+this fidelity criterion, not by reproducing one configuration's tie-break.
 
 ## Files and authority
 

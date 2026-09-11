@@ -12,7 +12,10 @@ The implementation pull request closes #3116 when its required gates pass and it
 
 State: `SPIKE`. The boundary measurement is complete on `gfx1100` and the specification precedes the implementation.
 The measurement supports landing the boundary as a fidelity mirror and does **not** support claiming a token repair.
-The complete 18-workload production token gate, the fresh mutation review, and the frozen-head preflight remain required.
+The operator's 18-workload production token gate passes at `8e43d18bd` under the corrected whole-sequence-membership rule
+(28598 of 28598 assertions, receipt `/home/vikash/.cache/moe-head-bf16/operator-gate.log`), and the frozen-head preflight
+there exits 0 (receipt `/home/vikash/.cache/moe-head-bf16/preflight-final.log`). The fresh review's two LOW findings and
+two bookkeeping corrections are repaired on this branch; a fresh scoped review of the repair is the next gate.
 
 ## Problem and scope
 
@@ -28,12 +31,20 @@ Scope is the head-output dtype boundary only:
 1. The head projection writes BF16, mirroring the primary's head output dtype.
 2. The shared `vt::CastF32` widens that BF16 result into the F32 buffer the forward returns today.
 
-Out of scope, and unchanged by this work:
+Out of scope:
 
 - Decode attention and Q/K preamble parity (#3115). Hidden-state parity at about one BF16 ulp remains required, and
   this change alone cannot move the native answer onto the primary's concurrency-2 token.
-- The tied-embedding arm's arithmetic, the router, grouped MoE, quantization arms, the upstream pin, CI, and checkers.
+- The router, grouped MoE, quantization arms, the upstream pin, CI, and checkers.
 - Any change to the sampler, the logits views, or the captured-graph logits slot.
+
+Changed by this work, and unreplayed: the tied-embedding arm's arithmetic. `lm_head::Project` sends BOTH arms through the
+same BF16 store and the same `vt::CastF32` (`include/vllm/model_executor/models/lm_head_projection.h:64-69`), so the tied
+arm's `vt::MatmulBT` now narrows to BF16 where it stored F32 directly before this change. No captured artifact exercises
+that arm — the fixture this spec replays records `"tie_word_embeddings": false`
+(`/home/vikash/.cache/rdna3-moe-impl/preserved/fixture/config.json`), and the measurement above is the untied `vt::Matmul`
+orientation only. The tied arm is therefore changed here, unreplayed, and unreachable from this measurement; its own
+artifact replay is owed in `## Owed`.
 
 ## Upstream anchor
 
@@ -178,11 +189,14 @@ would leave those views and host copies invalid" (`.agents/specs/rocm-residual-n
   - `the production head projection mirrors the primary` — calls `vllm::lm_head::Project` with the primary's exact
     hidden and weight bytes on every available device and requires the returned F32 logits to equal the primary's
     widened BF16 words element for element, to keep the F32 `[rows, vocab]` shape, and to select the primary's
-    argmax. It exits 77 (CTest: Skipped) without `VT_MOE_HEAD_FIXTURE`.
+    argmax. It skips itself (reported skipped by doctest) without `VT_MOE_HEAD_FIXTURE`, and the binary exits 77
+    (CTest: Skipped) on that run.
   - `the production forward returns BF16 logits` — the call-site case, and the one a reverted call site must
     redden. It drives `Qwen3MoeModel::Forward` with a degenerate but legal zero-decoder-layer config (embed ->
     final RMSNorm -> lm_head) and synthetic BF16 weights, so it needs no checkpoint, no capture and no fixture
-    directory, and it requires every logit the sampler would receive to be a BF16 word widened to F32.
+    directory, and it requires every logit the sampler would receive to be a BF16 word widened to F32. It carries no
+    skip decorator, so it runs and is reported in the fixture-absent run too, where the two replay cases skip; a
+    failure in it keeps doctest's non-zero exit instead of being folded into the run's 77.
 - Red before implementation: with the production projection storing F32 (the pre-change behavior, extracted
   verbatim), the projection case reports 256/256 differing logits per device at `max_abs = 9.72956e-04`, and the
   forward case reports 128/128 logits that are not BF16-representable.
@@ -200,6 +214,7 @@ would leave those views and host copies invalid" (`.agents/specs/rocm-residual-n
 | Gate | Requirement |
 |---|---|
 | Focused green | `build-head-hip/tests/test_qwen3_moe_lm_head_bf16` exits 0 with the fixture set, on CPU and ROCm. |
+| Focused, fixture absent | The same binary reports the two replay cases skipped, runs the fixture-free call-site case on CPU and ROCm, and exits 77 (CTest: Skipped); a failing case exits non-zero rather than being folded into that 77. |
 | Red and mutation | The pre-change form reddens the production case; the reviewer reproduces it and restores byte-for-byte. |
 | Preflight | `scripts/agent-preflight.sh --staged` at the implementation head, log under `/home/vikash/.cache/moe-head-bf16/`. |
 | Production token gate | Operator only: the 18-workload membership gate in `tests/vllm/models/test_rocm_moe_bf16.cpp` at the frozen head, with the recorded concurrency-1/-2 reference set. |
@@ -212,6 +227,14 @@ would leave those views and host copies invalid" (`.agents/specs/rocm-residual-n
 - Native step-6 narrowing log: `/home/vikash/.cache/moe-head-bf16/native-step6-narrowing.txt`.
 - Build log: `/home/vikash/.cache/moe-head-bf16/build-lib.log`, `build-measure.log`.
 - Preflight log: `/home/vikash/.cache/moe-head-bf16/preflight.log`.
+- Fixture-absent run of the repaired suite: `/home/vikash/.cache/moe-head-bf16/implt-no-fixture.log` — exit 77,
+  `1 passed | 0 failed | 2 skipped` with 10 assertions, both replay cases reported skipped and the call-site case
+  reported per device. With the fixture: `implt-with-fixture.log` — exit 0, 3 cases, 126/126 assertions.
+- Repair mutations (scratch seam revert, restored byte-for-byte at sha256
+  `26682c309b39264e4ecf349023652affad27d07818ff0a25a675c2cee15cab3c`): `implt-mut1-no-fixture.log` exits 1 with 2
+  failing assertions when the failure guard is present, `implt-mut2-no-fixture.log` reports a masked 77 when it is
+  disabled, and `implt-mut3-no-fixture.log` exits 1 through the in-case `REQUIRE_MESSAGE` guard when the skip decorator
+  is removed. CTest reports Skipped without the fixture and Passed with it: `implt-ctest.log`.
 
 ## Stop conditions
 

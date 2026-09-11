@@ -1325,6 +1325,16 @@ bool AttnInstrumentAbsent() {
   return FixtureAbsent() || AttnCaptureAbsent() || !AttnDumpEnabled();
 }
 
+// The four backend-requiring cases near the end of this file measure the ROCm
+// arm on data the file builds itself, so they need the ROCm backend registered
+// but no captured oracle and no environment variable. On the CPU-only lane
+// (VLLM_CPP_HIP=OFF) nothing registers that backend, and a bare REQUIRE would
+// FATAL there instead of reporting the CTest Skipped the rest of this file's
+// ROCm-only cases report.
+bool RocmBackendAbsent() {
+  return vt::TryGetBackend(vt::DeviceType::kROCM) == nullptr;
+}
+
 bool g_env_cases_skipped = false;
 bool g_run_failed = false;
 
@@ -2072,8 +2082,11 @@ void CheckArmGeometry(const char* label, const SyntheticArm& arm, bool chunked,
 // one key beyond the 32-boundary, so a 32-key tile and a 64-key tile take their
 // reference max over different key sets and narrow the other 32 keys against
 // different scales.
-TEST_CASE("ROCm paged attention uses the primary's 64-key prefill tile") {
-  REQUIRE(vt::TryGetBackend(vt::DeviceType::kROCM) != nullptr);
+TEST_CASE("ROCm paged attention uses the primary's 64-key prefill tile" *
+          doctest::skip(RocmBackendAbsent())) {
+  REQUIRE_MESSAGE(!RocmBackendAbsent(),
+                  "this case measures the ROCm arm's key tiling and needs the ROCm backend "
+                  "registered");
   CheckArmGeometry("prefill, empty context", BuildSyntheticArm(4, 65, 65, 16, 32), true, {32, 16});
 }
 
@@ -2083,8 +2096,11 @@ TEST_CASE("ROCm paged attention uses the primary's 64-key prefill tile") {
 // :369). 37 cached keys and 3 query tokens; the high key is at 33, inside the
 // second context tile, so a 64-key context tile would put it in the same tile as
 // keys 0..31 and narrow those at the high scale instead of at 1.
-TEST_CASE("ROCm paged attention uses the primary's 32-key context tile") {
-  REQUIRE(vt::TryGetBackend(vt::DeviceType::kROCM) != nullptr);
+TEST_CASE("ROCm paged attention uses the primary's 32-key context tile" *
+          doctest::skip(RocmBackendAbsent())) {
+  REQUIRE_MESSAGE(!RocmBackendAbsent(),
+                  "this case measures the ROCm arm's key tiling and needs the ROCm backend "
+                  "registered");
   CheckArmGeometry("chunked prefill, 37-key context", BuildSyntheticArm(4, 3, 40, 16, 33), true,
                    {64});
 }
@@ -2094,8 +2110,11 @@ TEST_CASE("ROCm paged attention uses the primary's 32-key context tile") {
 // (chunked_prefill_paged_decode.py:444-445, :147-149, :244). A 16-wide tile puts
 // key 17 in its own tile; a 32- or 64-wide one puts it with keys 0..15, whose
 // probability is then narrowed at the high scale.
-TEST_CASE("ROCm paged attention uses the primary's decode tile") {
-  REQUIRE(vt::TryGetBackend(vt::DeviceType::kROCM) != nullptr);
+TEST_CASE("ROCm paged attention uses the primary's decode tile" *
+          doctest::skip(RocmBackendAbsent())) {
+  REQUIRE_MESSAGE(!RocmBackendAbsent(),
+                  "this case measures the ROCm arm's key tiling and needs the ROCm backend "
+                  "registered");
   CheckArmGeometry("pure decode, block_size 16", BuildSyntheticArm(8, 1, 40, 16, 17), false,
                    {32, 64});
 }
@@ -2111,8 +2130,11 @@ TEST_CASE("ROCm paged attention uses the primary's decode tile") {
 // at all on this workload; this case runs both in one process, on identical
 // inputs, and requires byte identity.
 // ---------------------------------------------------------------------------
-TEST_CASE("ROCm bf16 qk-norm-rope: the hand-call realization matches the fused recipe") {
-  REQUIRE(vt::TryGetBackend(vt::DeviceType::kROCM) != nullptr);
+TEST_CASE("ROCm bf16 qk-norm-rope: the hand-call realization matches the fused recipe" *
+          doctest::skip(RocmBackendAbsent())) {
+  REQUIRE_MESSAGE(!RocmBackendAbsent(),
+                  "this case measures the ROCm arm's qk-norm-RoPE hand-call realization and "
+                  "needs the ROCm backend registered");
   REQUIRE_MESSAGE(vt::OpRegistered(vt::OpId::kAttnQkNormRope, vt::DeviceType::kROCM),
                   "this case measures the Recipe-vs-hand-call pair on a backend that registers "
                   "the recipe's fast realization");

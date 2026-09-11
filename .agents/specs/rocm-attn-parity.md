@@ -201,13 +201,13 @@ Anchors and widths are read from the launcher, not chosen: `prefix_prefill.py:95
 (`BLOCK_M`/`BLOCK_N`), `:965` (`TRITON_BLOCK_SIZE = 32`, bound as the kernel's
 `BLOCK_SIZE` at `:1007`), `:231-343` (the context loop from key 0: its running max
 at `:312`, the narrowed probability at `:338`, the value dot at `:340`, and lanes
-at or past `cur_batch_ctx_len` masked at `:291`) and `:369` (the chunk loop from
-the chunk start);
+at or past `cur_batch_ctx_len` masked at `:288-290`) and `:369` (the chunk loop
+from the chunk start);
 `chunked_prefill_paged_decode.py:444-445` (`TRITON_BLOCK_SIZE = min(block_size, 128)`,
 or 32 when the physical block size is not a power of two), `:147-149` (`start_n = j *
 BLOCK_SIZE`) and `:244`. A key outside the causal or sliding-window bound is
 skipped rather than dropped from the grid: the primary masks such a lane to `-inf`
-(`prefix_prefill.py:291`) or `-10000` (`chunked_prefill_paged_decode.py:236`),
+(`prefix_prefill.py:288-290`) or `-10000` (`chunked_prefill_paged_decode.py:236`),
 neither of which can raise a tile max, and `exp(x - m)` underflows to 0 for either.
 Tiles wholly below the window's left bound are skipped so a windowed model keeps its
 `O(window)` walk.

@@ -1108,7 +1108,7 @@ std::vector<uint16_t> ArmWords(const std::vector<float>& values) {
 
 // The primary's key walk for ONE query row, as absolute [begin, end) key tiles.
 // chunked selects prefix_prefill; the widths are its pinned constants:
-// TRITON_BLOCK_SIZE = 32 for the cached context (:1007, :1014) and BLOCK_N = 64
+// TRITON_BLOCK_SIZE = 32 for the cached context (:965, :1007) and BLOCK_N = 64
 // for the current chunk when the physical block size is a power of two, 32
 // otherwise (:955-966). The decode arm tiles by min(block_size, 128)
 // (chunked_prefill_paged_decode.py:444-445), also 32 for a non-power-of-two
@@ -1139,7 +1139,7 @@ std::vector<std::pair<int64_t, int64_t>> UniformTiles(int64_t jmax, int64_t widt
 }
 
 // The primary's softmax over one query row, transcribed from
-// prefix_prefill.py:442-478 (context loop :379-414, chunk loop :426-478) and
+// prefix_prefill.py:442-478 (context loop :231-343, chunk loop :369) and
 // chunked_prefill_paged_decode.py:244-268. `key_score[j]` is the f32 q.k for key
 // j, `values[j*dh + d]` the f32 V row, `tiles` the arm's key walk.
 std::vector<float> HostArmOutput(const std::vector<float>& key_score,
@@ -2079,8 +2079,8 @@ TEST_CASE("ROCm paged attention uses the primary's 64-key prefill tile") {
 
 // THE CHUNKED-CONTEXT ARM: max_query_len > 1 with a cached prefix -> prefix_prefill
 // walks the context in TRITON_BLOCK_SIZE = 32 key tiles from key 0 and then the
-// chunk in BLOCK_N = 64 tiles anchored at the chunk start (:1007, :1014, :379-414,
-// :426-478). 37 cached keys and 3 query tokens; the high key is at 33, inside the
+// chunk in BLOCK_N = 64 tiles anchored at the chunk start (:965, :1007, :231-343,
+// :369). 37 cached keys and 3 query tokens; the high key is at 33, inside the
 // second context tile, so a 64-key context tile would put it in the same tile as
 // keys 0..31 and narrow those at the high scale instead of at 1.
 TEST_CASE("ROCm paged attention uses the primary's 32-key context tile") {

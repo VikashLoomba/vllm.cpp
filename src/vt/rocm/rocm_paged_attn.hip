@@ -562,7 +562,7 @@ __global__ void PagedAttnDecodeOptBf16T(__hip_bfloat16* out, const __hip_bfloat1
   //
   // Tiles are anchored where the primary anchors them, and a key outside the
   // causal or sliding-window bound is skipped rather than dropped from the grid:
-  // the primary masks such a lane to -inf (prefix_prefill.py:291) or -10000
+  // the primary masks such a lane to -inf (prefix_prefill.py:288-290) or -10000
   // (chunked_prefill_paged_decode.py:236), neither of which can raise a tile max,
   // and `exp(x - m)` underflows to 0 for either. Anchoring the grid at `jmin`
   // instead would move every tile boundary on a sliding-window model and change

@@ -1883,8 +1883,11 @@ target_include_directories(test_act_dump PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # BACKEND-ROCM-BF16-MOE (#3116): the LM-head output boundary, replayed over the
 # primary's own captured head input. The fixture is a directory of raw captures,
-# so the case exits 77 (Skipped) without `VT_MOE_HEAD_FIXTURE` rather than
-# reporting a green gate that never ran.
+# so the two replay cases skip themselves (`doctest::skip`, reported skipped in
+# doctest's own summary) and the binary still exits 77 (Skipped) without
+# `VT_MOE_HEAD_FIXTURE` rather than reporting a green gate that never ran. The
+# fixture-free call-site case in the same binary runs either way, and a failure
+# in it keeps its own non-zero exit instead of being folded into the skip.
 vllm_cpp_add_test(test_qwen3_moe_lm_head_bf16
   vllm/model_executor/test_qwen3_moe_lm_head_bf16.cpp)
 

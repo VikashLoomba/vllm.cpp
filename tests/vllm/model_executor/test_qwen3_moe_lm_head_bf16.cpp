@@ -31,14 +31,19 @@
 // that is the orientation the forward's `vt::Matmul` consumes; the artifact
 // stores the torch Linear [vocab, H] order.
 //
-// `VT_MOE_HEAD_FIXTURE` names the directory holding the artifact. Without it the
-// file exits 77 (CTest: Skipped) rather than reporting a green gate that never
-// ran, which is the convention `tests/CMakeLists.txt` documents.
+// `VT_MOE_HEAD_FIXTURE` names the directory holding the artifact. The two cases
+// that replay it are decorated `doctest::skip(...)` when the variable is unset,
+// so doctest reports them skipped while the fixture-free call-site case below
+// still runs and still gates. The process then exits 77 (CTest: Skipped) rather
+// than reporting a green gate that never ran, which is the convention
+// `tests/CMakeLists.txt` documents -- and it does so ONLY when nothing failed,
+// so a reddened case keeps doctest's own non-zero status.
 #include <doctest/doctest.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -406,16 +411,92 @@ void Report(const std::string& device, int64_t row, const HeadArtifact& art,
   CHECK(max_ac > 0.0);
 }
 
+// ─── The fixture-absent run: per-case skip, process-level 77 ────────────────
+//
+// The two replay cases need `VT_MOE_HEAD_FIXTURE`; the production call-site case
+// at the bottom needs no directory at all. Before this repair both replay cases
+// called `std::exit(77)`, and because doctest runs the cases in file order that
+// stopped the binary at the FIRST one whenever the fixture was absent: the
+// fixture-free case never ran, and the whole binary read as Skipped although a
+// gate inside it could have run (the fresh review's finding 1).
+//
+// The replay cases are now decorated `doctest::skip(HeadFixtureAbsent())`, so
+// doctest itself reports them as skipped in its summary while the call-site case
+// still runs and still gates. A fixture-absent run still exits 77 -- CTest
+// reports Skipped and a shell chain stops, the convention `tests/CMakeLists.txt`
+// documents -- but ONLY when nothing failed, so a reddened call-site case keeps
+// doctest's own non-zero exit instead of being hidden behind the skip.
+bool HeadFixtureAbsent() {
+  const char* directory = std::getenv("VT_MOE_HEAD_FIXTURE");
+  return directory == nullptr || directory[0] == '\0';
+}
+
+bool g_replay_cases_skipped = false;
+bool g_run_failed = false;
+
+// A listener, not a reporter: listeners are always active whatever `-r=`
+// selects, so neither the skip note nor the failure guard can be switched off
+// from the command line (`tests/vt/test_ops_attention_cross.cpp:662` has the
+// same shape).
+struct ReplaySkipListener : public doctest::IReporter {
+  explicit ReplaySkipListener(const doctest::ContextOptions&) {}
+  void test_run_start() override {}
+  void report_query(const doctest::QueryData&) override {}
+  void test_run_end(const doctest::TestRunStats& stats) override {
+    g_run_failed = stats.numTestCasesFailed != 0 || stats.numAssertsFailed != 0;
+  }
+  void test_case_start(const doctest::TestCaseData&) override {}
+  void test_case_reenter(const doctest::TestCaseData&) override {}
+  void test_case_end(const doctest::CurrentTestCaseStats&) override {}
+  void test_case_exception(const doctest::TestCaseException&) override {}
+  void subcase_start(const doctest::SubcaseSignature&) override {}
+  void subcase_end() override {}
+  void log_assert(const doctest::AssertData&) override {}
+  void log_message(const doctest::MessageData&) override {}
+  // This also fires for a case a filter excluded; only the decorator sets
+  // `m_skip`, and only that means "the fixture is not here".
+  void test_case_skipped(const doctest::TestCaseData& tc) override {
+    if (!tc.m_skip) return;
+    g_replay_cases_skipped = true;
+    std::cout << "[lm-head boundary] SKIPPED: " << tc.m_name
+              << " (set VT_MOE_HEAD_FIXTURE to run it)" << std::endl;
+  }
+};
+DOCTEST_REGISTER_LISTENER("vt-moe-head-replay-skip", 1, ReplaySkipListener);
+
+// Registered during static initialization, so it runs after doctest's main has
+// printed its summary and returned. `std::_Exit` rather than `std::exit`: this
+// IS an exit handler, and re-entering the exit sequence is undefined.
+void ExitSkippedWhenTheReplayDidNotRun() {
+  if (!g_replay_cases_skipped || g_run_failed) return;
+  std::cout.flush();
+  std::fflush(nullptr);
+  std::fprintf(stderr,
+               "\n*** SKIPPED (exit 77): the artifact-replay cases did not run because "
+               "VT_MOE_HEAD_FIXTURE is unset. The fixture-free production case above DID "
+               "run and its result stands; this status says only that the replay gate did "
+               "not. ***\n\n");
+  std::fflush(stderr);
+  std::_Exit(77);
+}
+
+struct RegisterExitSkippedWhenTheReplayDidNotRun {
+  RegisterExitSkippedWhenTheReplayDidNotRun() { std::atexit(&ExitSkippedWhenTheReplayDidNotRun); }
+};
+[[maybe_unused]] const RegisterExitSkippedWhenTheReplayDidNotRun
+    g_exit_skipped_when_the_replay_did_not_run;
+
 }  // namespace
 
-TEST_CASE("qwen3 MoE LM-head BF16 boundary: primary artifact replay") {
-  const char* directory = std::getenv("VT_MOE_HEAD_FIXTURE");
-  if (directory == nullptr) {
-    MESSAGE("Set VT_MOE_HEAD_FIXTURE to the directory holding "
-            "L33-C2-R0-head-6.{json,hidden.bin,weight.bin,logits.bin}");
-    std::exit(77);
-  }
-  const HeadArtifact art = LoadArtifact(directory, "L33-C2-R0", 6);
+TEST_CASE("qwen3 MoE LM-head BF16 boundary: primary artifact replay" *
+          doctest::skip(HeadFixtureAbsent())) {
+  // The decorator above covers the normal run; `--no-skip` forces the case
+  // anyway, and then the absent fixture must FAIL rather than reach
+  // `LoadArtifact` as a null path.
+  REQUIRE_MESSAGE(!HeadFixtureAbsent(),
+                  "VT_MOE_HEAD_FIXTURE must name the directory holding "
+                  "L33-C2-R0-head-6.{json,hidden.bin,weight.bin,logits.bin}");
+  const HeadArtifact art = LoadArtifact(std::getenv("VT_MOE_HEAD_FIXTURE"), "L33-C2-R0", 6);
   for (const Device device : Devices()) {
     CAPTURE(DeviceName(device));
     QueueHandle queue(device);
@@ -429,14 +510,13 @@ TEST_CASE("qwen3 MoE LM-head BF16 boundary: primary artifact replay") {
 // projection the forward calls, over the primary's own captured head input, and
 // requires the logits it returns to be the primary's BF16 words widened to F32 —
 // not merely close to them.
-TEST_CASE("qwen3 MoE LM-head BF16 boundary: the production projection mirrors the primary") {
-  const char* directory = std::getenv("VT_MOE_HEAD_FIXTURE");
-  if (directory == nullptr) {
-    MESSAGE("Set VT_MOE_HEAD_FIXTURE to the directory holding "
-            "L33-C2-R0-head-6.{json,hidden.bin,weight.bin,logits.bin}");
-    std::exit(77);
-  }
-  const HeadArtifact art = LoadArtifact(directory, "L33-C2-R0", 6);
+TEST_CASE("qwen3 MoE LM-head BF16 boundary: the production projection mirrors the primary" *
+          doctest::skip(HeadFixtureAbsent())) {
+  // Same decorator, same `--no-skip` guard as the replay case above.
+  REQUIRE_MESSAGE(!HeadFixtureAbsent(),
+                  "VT_MOE_HEAD_FIXTURE must name the directory holding "
+                  "L33-C2-R0-head-6.{json,hidden.bin,weight.bin,logits.bin}");
+  const HeadArtifact art = LoadArtifact(std::getenv("VT_MOE_HEAD_FIXTURE"), "L33-C2-R0", 6);
   const std::vector<float> primary = Widen(art.logits_bf16);
   for (const Device device : Devices()) {
     CAPTURE(DeviceName(device));
@@ -527,6 +607,10 @@ vllm::OwnedTensor SyntheticBf16(const std::vector<int64_t>& shape, uint64_t seed
 // word widened to F32, i.e. its low 16 mantissa bits are zero. Nothing else in
 // this path is allowed to round the logits, so the property is the boundary's
 // fingerprint rather than a coincidence of the fixture.
+//
+// THIS CASE IS UNDECORATED AND UNCONDITIONAL: it carries no `doctest::skip`, so
+// it runs and is reported in the fixture-absent run too, where the two cases
+// above skip. That is what makes it the gate a reverted call site has to redden.
 TEST_CASE("qwen3 MoE LM-head BF16 boundary: the production forward returns BF16 logits") {
   constexpr int64_t kH = 128;
   constexpr int64_t kV = 128;

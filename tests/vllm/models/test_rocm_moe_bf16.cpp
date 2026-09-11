@@ -1357,12 +1357,16 @@ struct GatedCaseListener : public doctest::IReporter {
   void log_assert(const doctest::AssertData&) override {}
   void log_message(const doctest::MessageData&) override {}
   // Also fires for a case a filter excluded; only the decorator sets `m_skip`,
-  // and only that means "the environment for this case is not here".
+  // and only that means a prerequisite this case needs is absent -- an unset
+  // environment variable for the captured-oracle cases, a registered backend for
+  // the synthesized-data ones. `TestCaseData` carries no reason, so the note
+  // below has to stay true for either.
   void test_case_skipped(const doctest::TestCaseData& tc) override {
     if (!tc.m_skip) return;
     g_env_cases_skipped = true;
     std::cout << "[rocm-moe-bf16] SKIPPED: " << tc.m_name
-              << " (its environment is not set; see the case's own message)" << std::endl;
+              << " (a prerequisite this case needs is absent; see the case's own message)"
+              << std::endl;
   }
 };
 DOCTEST_REGISTER_LISTENER("vt-rocm-moe-env-gated", 1, GatedCaseListener);

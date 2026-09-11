@@ -198,9 +198,11 @@ the arm is decided per **row**:
 | any, non-power-of-two physical block size | both of the above | 32 | 32 |
 
 Anchors and widths are read from the launcher, not chosen: `prefix_prefill.py:955-966`
-(`BLOCK_M`/`BLOCK_N`), `:1007` (`TRITON_BLOCK_SIZE = 32` for the context walk),
-`:379-414` (the context loop from key 0, lanes at or past `cur_batch_ctx_len`
-masked at `:291`) and `:426-478` (the chunk loop from the chunk start);
+(`BLOCK_M`/`BLOCK_N`), `:965` (`TRITON_BLOCK_SIZE = 32`, bound as the kernel's
+`BLOCK_SIZE` at `:1007`), `:231-343` (the context loop from key 0: its running max
+at `:312`, the narrowed probability at `:338`, the value dot at `:340`, and lanes
+at or past `cur_batch_ctx_len` masked at `:291`) and `:369` (the chunk loop from
+the chunk start);
 `chunked_prefill_paged_decode.py:444-445` (`TRITON_BLOCK_SIZE = min(block_size, 128)`,
 or 32 when the physical block size is not a power of two), `:147-149` (`start_n = j *
 BLOCK_SIZE`) and `:244`. A key outside the causal or sliding-window bound is

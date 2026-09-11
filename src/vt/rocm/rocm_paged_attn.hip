@@ -551,10 +551,10 @@ __global__ void PagedAttnDecodeOptBf16T(__hip_bfloat16* out, const __hip_bfloat1
   //
   //  * query_len > 1 -> `prefix_prefill._fwd_kernel` (prefix_prefill.py). It
   //    walks the cached context in TRITON_BLOCK_SIZE = 32 key tiles anchored at
-  //    key 0, masking lanes at or past `cur_batch_ctx_len` (:1007, :1014,
-  //    :267-295, :379-414), and then the current chunk in BLOCK_N-key tiles
-  //    anchored at the chunk start (:426-478). BLOCK_N is 64 when the physical
-  //    block size is a power of two and 32 otherwise (:955-966).
+  //    key 0 (:965, :1007) inside the context loop (:231-343), masking lanes at
+  //    or past `cur_batch_ctx_len` (:267-295), and then the current chunk in
+  //    BLOCK_N-key tiles anchored at the chunk start (:369). BLOCK_N is 64 when
+  //    the physical block size is a power of two and 32 otherwise (:955-966).
   //  * query_len == 1 -> the Triton decode kernel, which tiles the whole key
   //    range from key 0 by TRITON_BLOCK_SIZE = min(block_size, 128), or 32 for a
   //    non-power-of-two physical block size (chunked_prefill_paged_decode.py:

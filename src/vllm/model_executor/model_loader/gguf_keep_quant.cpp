@@ -215,8 +215,8 @@ bool DeviceQuantGatherSupported(vt::DeviceType dev) {
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {
   vt::DType dt = vt::DType::kF32;
   if (!vt::BlockDTypeFromGgmlTypeId(ggml_type, &dt)) return false;
-  // Q8_K is the K-quants' ACTIVATION encoding; it never appears as a file
-  // weight type and has no vec_dot, so it is not keep-quant capable.
+  // Q8_K is the K-quants' ACTIVATION encoding and has no weight-side vec_dot, so
+  // it is not keep-quant capable, although a file CAN carry it (reader case 15).
   if (!vt::cpu::HasQuantDotKernel(dt)) return false;
   if (out != nullptr) *out = dt;
   return true;

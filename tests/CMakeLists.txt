@@ -1233,6 +1233,22 @@ target_include_directories(test_glm5_next_bridge PRIVATE
 # because at any geometry small enough to run in a test the default gives ONE
 # chunk and the loop would never be entered twice.
 vllm_cpp_add_test(test_glm5_next_forward vllm/models/test_glm5_next_forward.cpp)
+vllm_cpp_add_test(test_glm5_next_placement vllm/models/test_glm5_next_placement.cpp)
+target_include_directories(test_glm5_next_placement PRIVATE ${CMAKE_SOURCE_DIR}/src)
+set_tests_properties(test_glm5_next_placement PROPERTIES
+  ENVIRONMENT "VT_GLM5_NEXT_DEVICE_EXPERTS=1")
+add_test(NAME test_glm5_next_placement_default
+  COMMAND ${CMAKE_COMMAND} -E env --unset=VT_GLM5_NEXT_DEVICE_EXPERTS
+  $<TARGET_FILE:test_glm5_next_placement>
+  "--test-case=glm5_next placement: loaded CPU experts never upload to ROCm")
+add_test(NAME test_glm5_next_placement_off COMMAND test_glm5_next_placement
+  "--test-case=glm5_next placement: loaded CPU experts never upload to ROCm")
+set_tests_properties(test_glm5_next_placement_off PROPERTIES
+  ENVIRONMENT "VT_GLM5_NEXT_DEVICE_EXPERTS=0")
+add_test(NAME test_glm5_next_placement_nonexact COMMAND test_glm5_next_placement
+  "--test-case=glm5_next placement: loaded CPU experts never upload to ROCm")
+set_tests_properties(test_glm5_next_placement_nonexact PROPERTIES
+  ENVIRONMENT "VT_GLM5_NEXT_DEVICE_EXPERTS=11")
 target_include_directories(test_glm5_next_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(test_glm5_next_forward PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
@@ -2651,6 +2667,14 @@ vllm_cpp_add_test(test_rocm_f16_contract vt/test_rocm_f16_contract.cpp)
 # the SYNCHRONISATION is gated on a CPU-only runner with no accelerator.
 vllm_cpp_add_test(test_grow_only_stream_scratch vt/test_grow_only_stream_scratch.cpp)
 target_include_directories(test_grow_only_stream_scratch PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# The fused ROCm norm-quant token is pure host bookkeeping. Keep its identity,
+# one-shot, and concurrency contract gated when no AMD compiler is installed.
+vllm_cpp_add_test(test_rocm_norm_quant_bridge vt/test_rocm_norm_quant_bridge.cpp)
+target_include_directories(test_rocm_norm_quant_bridge PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# The ROCm quant-dot device cases skip without HIP. Its scratch policy is
+# compiled with host fakes so capture ownership remains gated in CPU-only CI.
+vllm_cpp_add_test(test_rocm_quant_dot vt/test_rocm_quant_dot.cpp)
+target_include_directories(test_rocm_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # #785 P1 host package (fixture/oracle/trace classifier). CPU-only.
 vllm_cpp_add_test(test_ops_paged_attn_sharedk_wmma_p1
   vt/test_ops_paged_attn_sharedk_wmma_p1.cpp)
@@ -2915,6 +2939,19 @@ target_include_directories(test_cuda_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # header and the vt/cpu quant headers.
 vllm_cpp_add_test(test_cuda_embedding_quant vt/test_cuda_embedding_quant.cpp)
 target_include_directories(test_cuda_embedding_quant PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# BACKEND-ROCM-QUANT-GATHER: the production gate starts at the public loader.
+vllm_cpp_add_test(test_capi_rocm_embedding_quant capi/test_rocm_embedding_quant.cpp)
+vllm_cpp_add_test(test_rocm_embedding_quant vt/test_rocm_embedding_quant.cpp)
+target_include_directories(test_rocm_embedding_quant PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(VLLM_CPP_HIP)
+  set_source_files_properties(vt/test_rocm_embedding_quant.cpp PROPERTIES LANGUAGE HIP)
+  if(VLLM_CPP_HIP_ARCHITECTURES)
+    set_property(TARGET test_rocm_embedding_quant PROPERTY HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
+  endif()
+endif()
+add_executable(rocm_quant_gather_capture ../tools/rocm_quant_gather/capture.cpp)
+target_link_libraries(rocm_quant_gather_capture PRIVATE vllm)
+target_include_directories(rocm_quant_gather_capture PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
 # CPU-ELEM-GEMM: the specialized + SIMD elementwise (bf16/f16/f32) GEMM. The
 # gate is BYTE-IDENTITY against an independent scalar reference across every
 # dtype combination, both weight orientations, ragged K/N, row-strided

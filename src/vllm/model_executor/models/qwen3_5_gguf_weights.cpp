@@ -84,11 +84,15 @@ inline void PrefaultBorrowedSpan(const uint8_t* src, size_t bytes) {
 OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
                                int64_t k, int64_t row_offset,
                                const GgufFile* mmap_src, bool repack,
-                               bool cuda_align, bool prefault) {
+                               bool cuda_align, bool prefault, GgufTensorRole role) {
   vt::DType dt = vt::DType::kF32;
-  VT_CHECK(KeepQuantDType(tensor.ggml_type, &dt),
+  const bool gather = role == GgufTensorRole::kEmbeddingTable;
+  VT_CHECK(gather ? KeepQuantGatherDType(tensor.ggml_type, &dt)
+                  : KeepQuantDType(tensor.ggml_type, &dt),
            "qwen3_5 gguf: keep-quant on a non-keep-quant encoding for " +
                tensor.name);
+  VT_CHECK(!gather || (!repack && !cuda_align),
+             "qwen3_5 gguf: embedding blocks cannot use a matrix repack");
   VT_CHECK(n > 0 && k > 0 && row_offset >= 0,
            "qwen3_5 gguf: bad keep-quant slice for " + tensor.name);
   // Throws when k is not a whole number of blocks (ggml_row_size contract).
@@ -812,7 +816,8 @@ void LoadEmbedAndHead(const GgufFile& g, const GgufLoadPolicy& pol,
     // it does on the f16 arm — this tensor is a table, not a [N,K] GEMM weight.
     *embed = OwnGgufQuantBlocks(et, et.shape[0], et.shape[1], /*row_offset=*/0,
                                 MmapSrc(g, pol), /*repack=*/false,
-                                /*cuda_align=*/false);
+                                /*cuda_align=*/false, /*prefault=*/true,
+                                GgufTensorRole::kEmbeddingTable);
     embed->nk = false;
   } else if (embed_r == GgufResidency::kKeepF16) {
     VT_CHECK(et.shape.size() == 2, "qwen3_5 gguf: token_embd must be 2-D");

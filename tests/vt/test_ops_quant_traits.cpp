@@ -417,7 +417,9 @@ TEST_CASE("quant traits mirror type_traits_cpu (ggml-cpu.c:211-406)") {
 TEST_CASE("BlockToFloat matches the GGUF loader's dequant byte-for-byte") {
   for (const BlockCase& c : kBlockCases) {
     CAPTURE(c.name);
-    if (c.dtype == vt::DType::kQ8_K) continue;  // not a file type
+    // Q8_K has no arm in the loader's expansion path: `DequantGgufRowToF32`
+    // refuses it there, while the decode-only embedding gather takes it packed.
+    if (c.dtype == vt::DType::kQ8_K) continue;
     constexpr int64_t kBlocks = 5;
     const std::vector<uint8_t> bytes = RandomBlocks(c, kBlocks, 1234U);
     const int64_t numel = kBlocks * c.block_elems;
@@ -487,8 +489,8 @@ TEST_CASE("MatmulBTQuant generic-composite fallback == dequant-then-matmul") {
     for (float& v : a) v = dist(rng);
 
     // The reference decodes the SAME bytes through the traits `to_float`.
-    // (Q8_K never appears in a GGUF file, so the loader's DequantGgufRowToF32
-    // correctly refuses it — see the GgmlTraits cross-check above.)
+    // (The loader's DequantGgufRowToF32 has no Q8_K arm and refuses it there,
+    // while the reader carries its file geometry — see the cross-check above.)
     std::vector<float> w(static_cast<size_t>(n * k));
     vt::cpu::BlockToFloat(c.dtype)(wq.data(), w.data(), n * k);
     const std::vector<float> expected = ReferenceMatmul(a, w, m, k, n);

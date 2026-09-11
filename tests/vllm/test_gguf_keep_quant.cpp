@@ -66,9 +66,10 @@ namespace {
 // ggml type ids (ggml/include/ggml.h:390-432).
 constexpr uint32_t kF32 = 0, kF16 = 1, kQ4_0 = 2, kQ5_0 = 6, kQ8_0 = 8,
                    kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kQ6_K = 14,
-                   kQ8_K = 15, kIQ2_XS = 17, kIQ4_NL = 20, kIQ2_S = 22,
+                   kQ8_K = 15, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18,
+                   kIQ1_S = 19, kIQ4_NL = 20, kIQ3_S = 21, kIQ2_S = 22,
                    kIQ4_XS = 23, kBF16 = 30, kMXFP4 = 39, kQ1_0 = 41,
-                   kIQ3_S = 21;
+                   kIQ1_XXXS = 66;
 
 // Every executable weight encoding, with a K that is a whole number of blocks.
 struct Encoding {
@@ -242,8 +243,8 @@ TEST_CASE("keep-quant expert split is lossless per expert") {
 TEST_CASE("keep-quant routing respects the RUNNING DEVICE's format set (review #523)") {
   // Registering kMatmulBTQuant flips keep-quant loader-wide via the boolean
   // GgufQuantComputeAvailable(), but a device's kernel set can be narrower
-  // than the CPU admission list. On ROCm exactly {Q8_0, Q4_K, Q5_K, Q6_K} are
-  // implemented; with no CPU fallback tier on a discrete card, an unsupported
+  // than the CPU admission list. The provider-specific case below pins ROCm's
+  // complete set; with no CPU fallback tier on a discrete card, an unsupported
   // format that flipped to keep-quant would throw at FORWARD time with the
   // model fully resident. The loader must keep the pre-existing expand_bf16
   // residency for those formats instead.
@@ -268,11 +269,53 @@ TEST_CASE("keep-quant routing respects the RUNNING DEVICE's format set (review #
   CHECK(route(kQ4_K) == GgufResidency::kKeepQuant);
   CHECK(route(kQ5_K) == GgufResidency::kKeepQuant);
   CHECK(route(kQ6_K) == GgufResidency::kKeepQuant);
-  CHECK(route(kQ2_K) == GgufResidency::kExpandBf16);  // owed, not silently kept
+  CHECK(route(kQ2_K) == GgufResidency::kKeepQuant);
   // keep-f16 must be OFF on ROCm: MatmulBTKernelRocm accepts bf16/f32 only.
   // Asked of a ROCm-resolved policy, not of this process's own.
   const GgufLoadPolicy pol = GgufLoadPolicy::FromEnv(vt::DeviceType::kROCM);
   CHECK(!pol.keep_f16);
+}
+
+TEST_CASE("ROCm loader admits every format implemented by the quant-dot provider") {
+  struct ProviderEncoding {
+    uint32_t ggml_type;
+    const char* name;
+  };
+  const ProviderEncoding implemented[] = {
+      {kIQ2_XXS, "IQ2_XXS"}, {kIQ3_XXS, "IQ3_XXS"},
+      {kQ2_K, "Q2_K"},       {kQ3_K, "Q3_K"},
+      {kIQ2_S, "IQ2_S"},     {kIQ1_S, "IQ1_S"},
+      {kIQ1_XXXS, "IQ1_XXXS"},
+  };
+  GgufLoadPolicy rocm = KeepQuantOn();
+  rocm.device = vt::DeviceType::kROCM;
+  for (const ProviderEncoding& encoding : implemented) {
+    CAPTURE(encoding.name);
+    vllm::GgufTensorInfo tensor;
+    tensor.name = "blk.0.attn_q.weight";
+    tensor.ggml_type = encoding.ggml_type;
+    tensor.shape = {8, 256};
+    CHECK(rocm.Route(tensor, GgufTensorRole::kMatmulWeight) ==
+          GgufResidency::kKeepQuant);
+
+    tensor.name = "blk.0.ffn_gate_exps.weight";
+    tensor.shape = {2, 8, 256};
+    CHECK(rocm.Route(tensor, GgufTensorRole::kStackedExpertWeight) ==
+          GgufResidency::kKeepQuant);
+  }
+
+  // These formats have no arm in rocm_quant_dot.hip. Keep them on the named
+  // expansion path instead of handing a discrete queue an unsupported block.
+  for (uint32_t ggml_type :
+       {kQ4_0, kIQ2_XS, kIQ4_XS, kMXFP4}) {
+    CAPTURE(ggml_type);
+    vllm::GgufTensorInfo tensor;
+    tensor.name = "blk.0.attn_q.weight";
+    tensor.ggml_type = ggml_type;
+    tensor.shape = {8, 256};
+    CHECK(rocm.Route(tensor, GgufTensorRole::kMatmulWeight) ==
+          GgufResidency::kExpandBf16);
+  }
 }
 
 TEST_CASE("keep-quant routing on TENSTORRENT admits exactly the registered decodes (KEEPQUANT W3)") {
@@ -551,10 +594,12 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // IQ3_S (21) joins with QUANT-IQ3S (#2510), and it is the one entry here that
   // is GATHER-capable and GEMM-incapable, so it is what keeps the two terms
   // below from being the same predicate written twice.
-  const uint32_t all_types[] = {kF32,   kF16,    kBF16,   kQ4_0,   kQ5_0,
-                                kQ8_0,  kQ3_K,   kQ4_K,   kQ5_K,   kQ6_K,
-                                kQ8_K,  kIQ2_XS, kIQ4_NL, kIQ2_S,  kIQ4_XS,
-                                kMXFP4, kIQ3_S};
+  const uint32_t all_types[] = {
+      kF32,      kF16,      kBF16,    kQ4_0,     kQ5_0,    kQ8_0,
+      kQ2_K,     kQ3_K,     kQ4_K,    kQ5_K,     kQ6_K,    kQ8_K,
+      kIQ2_XXS,  kIQ2_XS,   kIQ3_XXS, kIQ1_S,    kIQ4_NL,  kIQ3_S,
+      kIQ2_S,    kIQ4_XS,   kMXFP4,   kIQ1_XXXS,
+  };
 
   // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: ONE device, named here, and both the
   // route and the expectation read it. It used to be
@@ -590,20 +635,24 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
         // IQ2_S (256-elem, Q8_K-act) and MXFP4 (32-elem, Q8_0-act) are keep-quant
         // capable as of the UD-IQ2_M vehicle, so they route like the others.
         // The DEVICE axis (review #523): the running device's kernel set can be
-        // narrower than the loader's CPU-derived list — ROCm implements exactly
-        // {Q8_0, Q4_K, Q5_K, Q6_K}; the rest keep expand_bf16 there.
+        // narrower than the loader's CPU-derived list. This row gives ROCm the
+        // seven Q8_K-activation formats in addition to its four prior formats.
         // QUANT-GGUF-IQ-VECDOT (#2247) put IQ2_XS and IQ4_XS in this list.
         // They were gather-only between #2245 and #2247 — decoder, no vec_dot —
         // and the `vec_dot` rows are what moved them onto the GEMM arm.
         const bool cpu_capable =
             type == kQ4_0 || type == kQ5_0 || type == kQ8_0 || type == kQ3_K ||
-            type == kQ4_K || type == kQ5_K || type == kQ6_K || type == kIQ2_S ||
-            type == kMXFP4 || type == kIQ4_NL || type == kIQ2_XS ||
-            type == kIQ4_XS;
+            type == kQ2_K || type == kQ4_K || type == kQ5_K ||
+            type == kQ6_K || type == kIQ2_XXS || type == kIQ2_XS ||
+            type == kIQ3_XXS || type == kIQ1_S || type == kIQ4_NL ||
+            type == kIQ2_S || type == kIQ4_XS ||
+            type == kMXFP4 || type == kIQ1_XXXS;
         const bool rocm = kRouteDev == vt::DeviceType::kROCM;
         const bool device_capable =
-            !rocm || type == kQ8_0 || type == kQ4_K || type == kQ5_K ||
-            type == kQ6_K;
+            !rocm || type == kQ8_0 || type == kQ2_K || type == kQ3_K ||
+            type == kQ4_K || type == kQ5_K || type == kQ6_K ||
+            type == kIQ2_XXS || type == kIQ3_XXS || type == kIQ2_S ||
+            type == kIQ1_S || type == kIQ1_XXXS;
         const bool block_capable = cpu_capable && device_capable;
         const int64_t blk = (type == kQ4_0 || type == kQ5_0 || type == kQ8_0 ||
                              type == kMXFP4 || type == kIQ4_NL)
@@ -691,11 +740,10 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   }
   // Both outcomes are actually exercised (a table that never keeps anything
   // would pass every assertion above vacuously). The kept count is
-  // device-dependent (review #523): 12 block-capable encodings x 2 keep-capable
-  // GEMM roles where the device covers the CPU list; 4 x 2 on ROCm (ROCm's
-  // kernel set is {Q8_0, Q4_K, Q5_K, Q6_K}, and neither Q5_0 nor IQ4_NL nor
-  // either IQ*_XS is in it). The GATHER role adds 13 more (the 12, plus Q8_K,
-  // which has a decoder and no vec_dot) on any device that REGISTERS the block
+  // device-dependent (review #523): 17 block-capable encodings x 2 keep-capable
+  // GEMM roles where the device covers the CPU list; 11 x 2 on ROCm. The
+  // GATHER role adds 19 more (the 17, plus Q8_K and IQ3_S) on a device that
+  // REGISTERS the block
   // gather, and nothing on a device that does not. Written as named terms
   // rather than one number so a future change to any one of them says which one
   // moved. Both moves are now on record and they are mirror images:
@@ -720,11 +768,11 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // was, the same decode-only shape #2240 had. That asymmetry IS the row's
   // per-tier result: IQ3_S stays compressed in a gather table and expands to
   // bf16 in a GEMM, on every device.
-  const int gemm_kept = kRouteDev == vt::DeviceType::kROCM ? 8 : 24;
+  const int gemm_kept = kRouteDev == vt::DeviceType::kROCM ? 22 : 34;
   const int gather_kept =
-      vt::OpRegistered(vt::OpId::kEmbeddingQuant, kRouteDev) ? 14 : 0;
+      vt::OpRegistered(vt::OpId::kEmbeddingQuant, kRouteDev) ? 19 : 0;
   CHECK(kept == gemm_kept + gather_kept);
-  CHECK(expanded == 17 * 36 - (gemm_kept + gather_kept));
+  CHECK(expanded == 22 * 36 - (gemm_kept + gather_kept));
   }
 }
 
@@ -2617,10 +2665,9 @@ TEST_CASE("gguf residency: the policy carries its device, and Route uses it") {
 // for exactly one role, and the loader kept asking the engine.
 //
 // The file this exists for: GLM-5.3 `UD-IQ1_S` on `strix:gpu0`. Its routed
-// experts are IQ1_S/IQ3_XXS/IQ2_XXS/IQ4_XS/Q2_K/Q3_K,
-// `DeviceKeepQuantSupported` serves {Q8_0, Q4_K, Q5_K, Q6_K} on ROCm, and the
-// towers are never uploaded to any device — so every one of them expanded and
-// `LoadStackedExperts` refused a load whose experts the CPU can execute.
+// experts include IQ4_XS, which remains outside this row's ROCm provider and
+// is owned by #3029. A CPU placement can still keep that tower compressed,
+// while an unplaced ROCm tower must expand until #3029 lands.
 namespace {
 
 // A routed-expert tower as the file stores it: [E, N, K] with a K that is a
@@ -2628,7 +2675,7 @@ namespace {
 vllm::GgufTensorInfo IqTower(const std::string& name) {
   vllm::GgufTensorInfo t;
   t.name = name;
-  t.ggml_type = 19u;  // IQ1_S
+  t.ggml_type = kIQ4_XS;
   t.shape = {4, 2, 256};
   return t;
 }
@@ -2667,8 +2714,8 @@ TEST_CASE(
   const vllm::GgufTensorInfo t = IqTower("blk.3.ffn_gate_exps.weight");
 
   // NO PLAN INSTALLED — the inertness pin, and the state every load in this
-  // tree that configured no placement is in. IQ1_S has no ROCm `vec_dot`
-  // (#1940), so the tower expands, exactly as before this row.
+  // tree that configured no placement is in. IQ4_XS remains outside this row,
+  // so the tower expands until #3029 lands.
   CHECK(rocm.Route(t, vllm::GgufTensorRole::kStackedExpertWeight) ==
         vllm::GgufResidency::kExpandBf16);
 
@@ -2720,7 +2767,7 @@ TEST_CASE("#2516: only the STACKED-EXPERT role moves; the plan places nothing "
 
   vllm::GgufTensorInfo w;
   w.name = "blk.3.attn_q.weight";
-  w.ggml_type = 19u;  // IQ1_S: kept on the CPU, expanded on ROCm
+  w.ggml_type = kIQ4_XS;  // kept on the CPU, expanded on ROCm
   w.shape = {2, 256};
   CHECK(rocm.ComputeDeviceFor(w.name, vllm::GgufTensorRole::kMatmulWeight) ==
         vt::DeviceType::kROCM);

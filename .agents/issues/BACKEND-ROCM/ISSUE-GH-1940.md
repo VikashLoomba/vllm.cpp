@@ -1,5 +1,5 @@
 ID: ISSUE-GH-1940
-Title: ROCm ports zero I-quant formats, and porting a complex-vec_dot one would test whether #1910's nwarps split transfers
+Title: ROCm keep-quant still lacks Q4_0, Q5_0, IQ2_XS, IQ4_NL, IQ3_S, IQ4_XS, and MXFP4
 Row: BACKEND-ROCM
 State: OPEN
 Kind: UNKNOWN

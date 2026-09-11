@@ -1947,6 +1947,40 @@ void AttnQkNormRopeGate(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out
       q, q_out, k_out, gate_out, qgate, kf, q_norm, k_norm, cos_sin, norm_args, rope_args);
 }
 
+void AttnQkNormRope(Queue& q, Tensor& q3, Tensor& k3, const Tensor& q_norm,
+                    const Tensor& k_norm, const Tensor& cos_sin, const Tensor& positions,
+                    const RmsNormArgs& norm_args, const RopeArgs& rope_args) {
+  VT_CHECK(q3.rank == 3 && k3.rank == 3, "attn_qk_norm_rope: q3/k3 rank-3 [T,H,Dh]");
+  const int64_t t = q3.shape[0], dh = q3.shape[2];
+  VT_CHECK(k3.shape[0] == t && k3.shape[2] == dh, "attn_qk_norm_rope: k3 must be [T,Hkv,Dh]");
+  VT_CHECK(q3.dtype == k3.dtype, "attn_qk_norm_rope: q3/k3 dtype");
+  VT_CHECK(IsFloat(q3.dtype), "attn_qk_norm_rope: q3/k3 must be f32 or bf16");
+  VT_CHECK(q_norm.rank == 1 && q_norm.shape[0] == dh && k_norm.rank == 1 &&
+               k_norm.shape[0] == dh,
+           "attn_qk_norm_rope: q_norm/k_norm must be [Dh]");
+  VT_CHECK(positions.rank == 1 && positions.shape[0] == t,
+           "attn_qk_norm_rope: positions must be [T]");
+  VT_CHECK(rope_args.rotary_dim > 0 && rope_args.rotary_dim % 2 == 0 &&
+               rope_args.rotary_dim <= dh,
+           "attn_qk_norm_rope: rotary_dim must be even and <= Dh");
+  VT_CHECK(cos_sin.rank == 2 && cos_sin.shape[0] > 0 &&
+               cos_sin.shape[1] == rope_args.rotary_dim,
+           "attn_qk_norm_rope: cos_sin must be [rows, rotary_dim]");
+  VT_CHECK(q3.IsContiguous() && k3.IsContiguous() && q_norm.IsContiguous() &&
+               k_norm.IsContiguous() && cos_sin.IsContiguous() && positions.IsContiguous(),
+           "attn_qk_norm_rope: states/weights/cache/index must be contiguous");
+  // The fused op rotates the in-place operands, so the 2-D alias the composite's
+  // RmsNorm step would have normed is the same memory: [T*H,Dh] with stride Dh.
+  // That alias is a RESHAPE of the rank-3 view, so on a row-major [T,H,Dh] tensor
+  // the row stride is stride[1] == Dh and the INNER dimension is stride[2]. The
+  // check named stride[1] and so refused every Dh > 1 operand — every real call,
+  // the hand-call realization at dense_attn_block.h:648 among them.
+  VT_CHECK(q3.stride[2] == 1 && k3.stride[2] == 1,
+           "attn_qk_norm_rope: the head dimension must be the inner dimension");
+  reinterpret_cast<AttnQkNormRopeFn>(GetOp(OpId::kAttnQkNormRope, q.device.type))(
+      q, q3, k3, q_norm, k_norm, cos_sin, positions, norm_args, rope_args);
+}
+
 namespace {
 // Shared shape/dtype/device validation for the two conv ops. x/out [T,C],
 // weight [C,K], optional bias [C], conv_state [N,C,K-1] f32.

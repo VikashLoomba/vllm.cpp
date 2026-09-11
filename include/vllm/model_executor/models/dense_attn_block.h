@@ -634,22 +634,37 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
     // prefill AND decode.
     // Per-head q/k RMSNorm — Qwen3 only (SKIPPED when the model has no qk-norm,
     // e.g. Llama, which leaves w.q_norm/w.k_norm empty). RoPE runs either way.
-    if (has_qk_norm) {
-      Tensor wqn = attn_f32 ? ResidentWeightF32(d, w.q_norm, {Dh})
-                            : ResidentWeight(d, w.q_norm, {Dh});
-      Tensor wkn = attn_f32 ? ResidentWeightF32(d, w.k_norm, {Dh})
-                            : ResidentWeight(d, w.k_norm, {Dh});
-      vt::RmsNorm(d.q, q2, q2, wqn, vt::RmsNormArgs{eps, false});
-      vt::RmsNorm(d.q, k2, k2, wkn, vt::RmsNormArgs{eps, false});
-    }
-    if (RopeCacheEnabled() && rot > 0) {
-      Tensor k3v = k3;
-      vt::RopeFromCache(d.q, q3, &k3v, si.rope_row_idx.t(), si.cos_sin_bf16.t(),
-                        MakeRopeArgs(cfg));
+    // The hand-call takes the registered fused op when the device has one, so
+    // the ADOPT path (FusedChain -> the recipe's fast realisation) and this
+    // fallback agree on every backend, which is the recipe's byte-exact
+    // composite contract. Where no fast op is registered (CPU) both realizations
+    // stay the standalone three-op sequence below.
+    const bool fused_preamble_op =
+        has_qk_norm && rot > 0 && RopeCacheEnabled() && !attn_f32 &&
+        vt::OpRegistered(vt::OpId::kAttnQkNormRope, d.q.device.type);
+    if (fused_preamble_op) {
+      Tensor wqn = ResidentWeight(d, w.q_norm, {Dh});
+      Tensor wkn = ResidentWeight(d, w.k_norm, {Dh});
+      vt::AttnQkNormRope(d.q, q3, k3, wqn, wkn, si.cos_sin_bf16.t(), si.rope_row_idx.t(),
+                         vt::RmsNormArgs{eps, false}, MakeRopeArgs(cfg));
     } else {
-      // DEFAULT (byte-identical, deterministic): in-place bf16 NeoX RoPE with
-      // per-element fp64 cos/sin, mirroring vLLM's rotary_emb bf16 rounding.
-      vt::RopeNeox(d.q, q3, k3, si.positions.t(), MakeRopeArgs(cfg));
+      if (has_qk_norm) {
+        Tensor wqn = attn_f32 ? ResidentWeightF32(d, w.q_norm, {Dh})
+                              : ResidentWeight(d, w.q_norm, {Dh});
+        Tensor wkn = attn_f32 ? ResidentWeightF32(d, w.k_norm, {Dh})
+                              : ResidentWeight(d, w.k_norm, {Dh});
+        vt::RmsNorm(d.q, q2, q2, wqn, vt::RmsNormArgs{eps, false});
+        vt::RmsNorm(d.q, k2, k2, wkn, vt::RmsNormArgs{eps, false});
+      }
+      if (RopeCacheEnabled() && rot > 0) {
+        Tensor k3v = k3;
+        vt::RopeFromCache(d.q, q3, &k3v, si.rope_row_idx.t(), si.cos_sin_bf16.t(),
+                          MakeRopeArgs(cfg));
+      } else {
+        // DEFAULT (byte-identical, deterministic): in-place bf16 NeoX RoPE with
+        // per-element fp64 cos/sin, mirroring vLLM's rotary_emb bf16 rounding.
+        vt::RopeNeox(d.q, q3, k3, si.positions.t(), MakeRopeArgs(cfg));
+      }
     }
   }
 

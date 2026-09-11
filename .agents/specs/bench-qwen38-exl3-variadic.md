@@ -12,7 +12,7 @@
 | Upstream anchor | vLLM `5559679229bc961848b121ccdeaa8fa5d79bec98`, `vllm/benchmarks/serve.py` |
 | Host | `dgx:gpu0`, GB10 `sm_121a`, inside an `rc` lease |
 | Predecessor | [`bench-qwen38-exl3-headtohead.md`](bench-qwen38-exl3-headtohead.md) |
-| Status | `ACTIVE` |
+| Status | `DONE` |
 
 ## 1. Scope
 
@@ -252,19 +252,18 @@ per-leg summaries, and `results.txt`. Per-request records stay on the share.
 
 ## Now
 
-`ACTIVE`. The c=1,4,8 sweep is published and closed (#2970). The row reopened
+`DONE`. The c=1,4,8 sweep is published and closed (#2970). The row reopened
 (#3122) to append rungs c=16 and c=32 and to investigate the prefill-rate gap
-that the c=1,4,8 data exposed: our XL-band prefill plateaus at ~298 tok/s while
-the comparator reaches 585 tok/s.
+that the c=1,4,8 data exposed. Both are complete: the c16/c32 legs ran with two
+rounds per arm (20 legs total, all valid), and the prefill-rate gap is
+root-caused to the missing EXL3 reconstruct+cuBLAS path for M > 144 (#3124,
+listed under Owed as a separate code change).
 
-The c16/c32 legs run with `MAX_NUM_SEQS=32` and a re-pinned `--num-blocks` to
-hold the larger KV pool (32 sequences of ~3.6k tokens plus recurrent state)
-without the draft speculative context growth (#2993, ~160 MiB per concurrent
-request, ~5128 MiB at c=32) eating into the auto-fit. The harness resume logic
-skips the twelve already-recorded c=1,4,8 legs.
-
-If the c16/c32 data confirms the prefill gap persists or widens, investigate
-the root cause in the prefill path and improve the engine, then re-measure.
+The c16/c32 legs ran with `MAX_NUM_SEQS=32` and `--num-blocks 8192` to hold the
+larger KV pool (32 sequences of ~3.6k tokens plus recurrent state) without the
+draft speculative context growth (#2993, ~160 MiB per concurrent request,
+~5128 MiB at c=32) eating into the auto-fit. The harness resume logic skipped
+the twelve already-recorded c=1,4,8 legs.
 
 ## Outcome
 
@@ -309,6 +308,29 @@ corrected column that equals the raw one without explanation.
 adds 160.312 MiB per concurrent request that `gpu_memory_utilization` does not
 bound ([#2993](https://github.com/mudler/vllm.cpp/issues/2993)). An auto-fitted
 pool would have made the concurrency ladder measure its own configuration.
+
+**c=16 and c=32 (second sweep).** `rc` jobs `39e48a0e` (lost to a DGX crash
+after 53 min) and `a94c4f5c` (completed in 1h22m), tree `3351ec54f`, same
+binary. `G-BYTES` and `G-RESOLVED` passed; all eight new legs reported
+`publishable = yes`; round-to-round spread is 0.2–1.0% on our side and 2.4–2.6%
+on theirs.
+
+The throughput ratio holds at the new rungs: ours averages 53.5 vs 32.9 tok/s
+at c=16 (1.63x) and 50.6 vs 32.0 at c=32 (1.58x). TTFT widens in our favour:
+7.0 s vs 75.7 s at c=16 (10.8x faster) and 18.9 s vs 148.5 s at c=32 (7.8x
+faster), because their `gen_lock` serialises decode and the queue backs up
+under load. Our TPOT rises with concurrency (430 ms at c=16, 456 ms at c=32)
+while theirs stays flat at ~680 ms — the expected throughput-vs-latency
+tradeoff.
+
+The prefill-rate gap is root-caused, not closed. ExLlamaV3 dispatches to a
+reconstruct-to-fp16 + cuBLAS GEMM path when M > 144 (`AUTO_RECONSTRUCT_THRESHOLD`
+in `exllamav3/modules/quant/exl3.py:132-139`), and vllm.cpp lacks this path
+entirely — it always calls `vt::Exl3Gemm` via `Exl3MatmulD` with no M-threshold.
+The benchmark data matches: bands below the threshold are within 10%, bands
+above diverge to 0.67x (L) and 0.51x (XL). The gap is a c1 phenomenon; at
+higher concurrency TTFT is dominated by queue time and the gap is masked. The
+fix is tracked as #3124 under Owed.
 
 ## Owed
 

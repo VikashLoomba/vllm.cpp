@@ -430,7 +430,7 @@ The flag assertion and real wrong-stream mutation remain required; the backend d
 The added residual descriptor include moves `vt::Backend` to line 23.
 Repair only that citation in the `BACKEND-PLATFORM` matrix row, starting from the complete target file.
 The scoped proof requires every other matrix byte to remain unchanged.
-The [repair evidence](../../docs/bench-evidence/rocm-residual-norm/stream-fixture-repair/README.md)
+The [repair evidence](../../docs/bench-evidence/rocm-residual-norm/README.md)
 retains the operator red, record red/green, compiler recipe, upstream results, and unchanged-product proof.
 The repaired CPU component binary passes six tests and 8,985 assertions, including all 264 upstream cases.
 The hardware fixture, mutation, final preflight, fresh review, and operator rerun remain pending at this checkpoint.

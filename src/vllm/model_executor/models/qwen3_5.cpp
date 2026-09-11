@@ -1144,7 +1144,14 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
   // them -- it kept a private copy, so the fix never reached it. That is the
   // off-framework-model hazard the decode-framework-routing audit names.
   if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
-    return w.ViewOn(const_cast<uint8_t*>(w.bytes.data()), d.q.device, shape);
+    Tensor t = w.ViewOn(const_cast<uint8_t*>(w.bytes.data()), d.q.device, shape);
+    // This arm owns repacked/elem_kn_repacked and NOT q8_0_aligned, exactly as
+    // it did before ViewOn: MakeTensor dropped all three and this arm restored
+    // these two. The second resident helper below returns the view unchanged,
+    // which also matches main, where it returns MakeTensor with no markers.
+    t.repacked = w.repacked;
+    t.elem_kn_repacked = w.elem_kn_repacked;
+    return t;
   }
   // AUDIT GUARD (KERNEL-GEMM-CPU-TILED lever 2). Only the CPU MatmulBTKernel
   // honours elem_kn_repacked, and the staging path below uploads bytes verbatim

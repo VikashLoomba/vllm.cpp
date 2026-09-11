@@ -208,7 +208,13 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
              std::string("resident weight: EMPTY tensor has no host bytes to "
                          "alias (host-alias arm, dtype ") +
                  vt::Name(w.dtype) + ", rank " + std::to_string(w.rank) + ")");
-    return w.ViewOn(const_cast<uint8_t*>(w.bytes.data()), d.q.device, shape);
+    vt::Tensor t = w.ViewOn(const_cast<uint8_t*>(w.bytes.data()), d.q.device, shape);
+    // The CPU-alias arm owns these two markers and ONLY these two, exactly as it
+    // did before ViewOn existed. q8_0_aligned is deliberately absent: setting it
+    // on an aliased host buffer changes which kernel the CPU lane selects.
+    t.repacked = w.repacked;
+    t.elem_kn_repacked = w.elem_kn_repacked;
+    return t;
   }
   // AUDIT GUARD, mirroring `qwen3_5.cpp` (:1070-1072). Only the CPU
   // `MatmulBTKernel` honours `elem_kn_repacked`, and the staging path below

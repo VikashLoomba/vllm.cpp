@@ -535,9 +535,12 @@ vt::Tensor OwnedTensor::ViewOn(void* data, vt::Device device,
   t.data = data;
   t.dtype = dtype;
   t.device = device;
-  t.repacked = repacked;
-  t.q8_0_aligned = q8_0_aligned;
-  t.elem_kn_repacked = elem_kn_repacked;
+  // ViewOn carries ONLY weight_value_dtype. The LAYOUT markers (repacked,
+  // q8_0_aligned, elem_kn_repacked) are deliberately NOT inherited here: each
+  // ResidentWeight arm owns a different marker set, and copying them centrally
+  // silently changed the CPU-alias lane for every model that shares this helper.
+  // See expert_stream_seam.h, which documents that q8_0_aligned must not reach
+  // a resident view.
   t.weight_value_dtype = weight_value_dtype;
   t.rank = static_cast<int>(view_shape.size());
   int64_t stride = 1;

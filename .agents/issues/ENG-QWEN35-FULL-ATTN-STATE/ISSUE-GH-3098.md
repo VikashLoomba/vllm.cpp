@@ -1,14 +1,14 @@
 ID: ISSUE-GH-3098
 Title: fix(ENG-QWEN35-FULL-ATTN-STATE): validate state only for GDN consumers
 Row: ENG-QWEN35-FULL-ATTN-STATE
-State: OPEN
+State: CLOSED
 Kind: UNKNOWN
 GitHub: 3098
-Mirror: DIVERGED
+Mirror: SYNCED
 Availability: FULL
 Created: 2026-09-09
-Updated: 2026-09-09
-Closed: -
+Updated: 2026-09-11
+Closed: 2026-09-11
 
 ## Problem
 
@@ -48,26 +48,4 @@ The quoted text below is historical evidence only. It does not define issue auth
 
 ## Resolution
 
-The scoped implementation passes public completion through both default and
-callback sampling arms. The operator reproduced the independent red and reran
-all public and focused CPU gates. The implementer completed 30 mutation checks.
-
-Fresh review found missing negative coverage for the first query offset and
-internal offset ordering. The test repair covers both graph siblings.
-Each independent guard deletion now fails its corresponding new subcase.
-The unchanged control and four complete focused CPU suites pass.
-The specification records this repair's hashes, commands, and evidence.
-
-The exact GGUF attempt on pinned vLLM refuses the text-only engine configuration
-before generating a token. The owning [specification](../../specs/qwen35-full-attn-state.md)
-records the source hashes, commands, logs, and pending G4 obligation. Fresh
-review and the final operator gate remain pending. Keep this issue open until
-qualified work lands.
-
-The full-attention runner regression now requires successful execution and
-sampled-token feedback instead of the former GDN refusal. Its focused case
-passes 18 assertions and the complete CPU runner suite passes 41 cases and
-1914 assertions. Restoring unconditional dense GDN validation fails the new
-case at the original refusal. The scoped spec amendment precedes this test-only
-repair; runner allocation, group topology, fixtures, and product code stay
-unchanged. The specification records the exact red, green, and mutation evidence.
+Landed by #3101 on 2026-09-11. The forward path now keys state validation on the loaded layers' actual Gated DeltaNet consumers (HasGdnConsumers), so a Qwen3.5 model with only full-attention layers completes instead of refusing on unused recurrent state. The same predicate drives the refusal, validation, input preparation and graph padding at every decision site in both the MoE and dense drivers. gdn_state size and ValidateGdnStateCacheLayout stay unconditional for real recurrent models. Three CPU cases go red on revert, including the runner regression that now requires successful execution and sampled-token feedback.

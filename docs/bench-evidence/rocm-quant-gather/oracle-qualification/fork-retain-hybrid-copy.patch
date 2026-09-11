@@ -1,4 +1,0 @@
---- a/src/llama-graph.cpp
-+++ b/src/llama-graph.cpp
-@@ -3466,0 +3467 @@
-+    ggml_build_forward_expand(gf, inp_rs->s_copy);

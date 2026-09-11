@@ -11,7 +11,7 @@ They are superseded only for the matched model-memory comparison.
 ## Captures and provenance
 
 [`capture-manifest.json`](capture-manifest.json) seals each file in
-[`qualification-captures.tar.gz`](qualification-captures.tar.gz).
+[`qualification-captures.tar.gz`](../qualification-captures.tar.gz).
 Each execution directory retains exact argument arrays, environment, input hashes, operator receipts, and raw output.
 The root operator executed all GPU and secondary-oracle commands under the shared GPU mutex.
 The helper compiled with at most four jobs and ran the CPU-only regression build.
@@ -24,8 +24,9 @@ The harness selects the pinned text class and preserves the original rotary widt
 
 Stock llama.cpp stays at `10bf611e533d81f739128304991c5e133c6aebd8`.
 The IQ1 fork stays at `36fe8e1cc7f2b3b8c92fdda0ab07600141921786`.
-The [stock patch](stock-retain-hybrid-copy.patch) and [fork patch](fork-retain-hybrid-copy.patch)
+The [stock patch](stock-retain-hybrid-copy.md) and [fork patch](fork-retain-hybrid-copy.md)
 each retain `s_copy` as one graph leaf in `build_inp_mem_hybrid`.
+The raw `.patch` artifacts were re-homed to documents because `.patch` has no admitted evidence class.
 Complete pristine and overlay inventories prove that each patch changes only its intended source file.
 These overlays qualify this bounded synthetic model only; global oracle pins and issue #933 remain unchanged.
 

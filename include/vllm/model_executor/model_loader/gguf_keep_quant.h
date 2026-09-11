@@ -104,8 +104,9 @@ using GgufRoutingAudit =
 // writing its vt block dtype to `*out`. The rule is `HasQuantDotKernel`, not a
 // list: the encoding needs a keep-quant `vec_dot` and its activation encoding
 // needs a `from_float`. False for the unquantized types, for Q8_K
-// (activation-only, never a file weight type, and upstream gives it no `vec_dot`
-// row at all) and for every unported encoding. The list used to be spelled out
+// (the K-quants' activation encoding: a file type only the decode-only gather
+// arm takes, and one upstream gives no `vec_dot` row at all) and for every
+// unported encoding. The list used to be spelled out
 // here and went stale six encodings ago, so it deliberately is not any more.
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out);
 

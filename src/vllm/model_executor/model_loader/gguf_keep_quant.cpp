@@ -203,7 +203,7 @@ bool KeepQuantGatherDType(uint32_t ggml_type, vt::DType* out) {
 // CUDA backend (cuda_ops.cu, through cuda_quant_dequant.cuh) -- named in prose
 // rather than as the enumerator on purpose, because the leakage checker greps
 // the token in comments too, and rightly so: a prose mention is how the next
-// hand-kept device list starts. METAL, VULKAN, ROCM and
+// hand-kept device list starts. METAL, VULKAN and
 // TENSTORRENT register only `kEmbedding`, whose kernels each assert a float
 // table by name, so they answer false here and keep their pre-existing
 // expand-bf16 residency -- and their gather arms are owed.
@@ -221,8 +221,8 @@ bool DeviceQuantGatherSupported(vt::DeviceType dev) {
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {
   vt::DType dt = vt::DType::kF32;
   if (!vt::BlockDTypeFromGgmlTypeId(ggml_type, &dt)) return false;
-  // Q8_K is the K-quants' ACTIVATION encoding; it never appears as a file
-  // weight type and has no vec_dot, so it is not keep-quant capable.
+  // Q8_K is the K-quants' ACTIVATION encoding and has no weight-side vec_dot, so
+  // it is not keep-quant capable, although a file CAN carry it (reader case 15).
   if (!vt::cpu::HasQuantDotKernel(dt)) return false;
   if (out != nullptr) *out = dt;
   return true;

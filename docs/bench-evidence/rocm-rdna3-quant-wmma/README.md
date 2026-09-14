@@ -36,6 +36,7 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
 PYARCHIVE
 cd "$dest"
 sha256sum --check --strict SHA256SUMS
+printf 'Extracted evidence to: %s\n' "$PWD"
 )
 ```
 

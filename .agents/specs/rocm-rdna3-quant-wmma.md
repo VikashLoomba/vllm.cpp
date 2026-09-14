@@ -142,6 +142,35 @@ Retain the existing behavior on every excluded device and on decode.
 If a new kernel algorithm is required, report `NEEDS_DECISION` with evidence.
 Do not silently broaden the row or claim an unrun gate passed.
 
+## Evidence packaging
+
+`ISSUE-LOCAL-01M2GNY58NHBK3D4JQQ738M6GR` owns the developer-requested
+packaging correction of 14 September 2026. Keep this correction in the existing
+pull request. Preserve every implementation, test, and validation-harness byte.
+
+Archive all 236 evidence files from
+`d6e40c91f634a041c873c7a04516d55c4d05772a` with their original relative paths.
+Publish the archive and checksums as assets of a dedicated release on the
+developer's fork. Pin that release to the source revision. Verify anonymous
+download, the archive checksum, and every extracted file against the source tree
+before replacing the raw files in the diff.
+
+Keep one concise evidence report with the download link, source revision,
+SHA256, extraction instructions, correctness results, model results, review
+verdicts, and all material performance and gate qualifications. Update this
+specification and its issue references to that report. Detailed values, failed
+attempts, commands, and original manifests remain in the archive.
+
+The packaging gate checks archive completeness and bytes, repeatable archive
+creation, safe member paths, and detection of missing or altered files. It also
+checks retained links, canonical records, diff classification, commit style,
+and equality of product, test, and harness files with the reviewed head.
+A fresh reviewer verifies the immutable packaging commit and downloaded archive.
+The operator independently repeats the packaging gate. Reuse the recorded
+hardware results when their executing files remain byte-identical. Stop if
+publication or preservation cannot be verified. Do not weaken a checker or
+reclassify pending measurements as passing.
+
 ## Owed
 
 `ISSUE-LOCAL-01M2F4WCD6ZK5VH5S8TF83APD6` owns the remaining full-model

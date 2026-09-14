@@ -9,10 +9,13 @@ Commit this specification before implementation.
 
 ## Now
 
-`SPIKE`. Source inspection supports reusing the existing Q4_K and Q6_K
-kernels. Neither compilation nor execution on gfx1100 is proved yet.
-The next action is a failing gfx1100 dispatch test, followed by the smallest
-admission change and physical execution of those unchanged kernels.
+`SPIKE`. Implementation `c3fe98ba6c55ce71e75746e1b944a27640464e0f` passes
+G1-G3 on physical gfx1100. Both executing tile bodies remain unchanged.
+The 240 original primary fixture cases pass with their existing tolerances.
+The public gate matches every captured logit and completion token against its
+scalar control. G4 and fresh review remain with the coordinating operator.
+[Implementation receipts](../../docs/bench-evidence/rocm-rdna3-quant-wmma/README.md)
+record the commands, red-first results, full HIP gate, and mutations.
 
 ## Scope
 
@@ -144,4 +147,4 @@ owners. The parent RDNA4 row and its open cooperative-tile work remain separate.
 
 | ID | Upstream source | Local anchor | Tests and evidence | Spec | State | Owner | Issue |
 |---|---|---|---|---|---|---|---|
-| `KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA3` | Pinned llama.cpp RDNA3 integer WMMA; rocWMMA 2.2.1 gfx11 fragments | `KQuantGemmKWmmaQ4K`, `KQuantGemmKWmmaQ6K` | G1-G5 pending | [This spec](rocm-rdna3-quant-wmma.md) | `SPIKE` | RDNA3 helper; coordinating operator | `ISSUE-LOCAL-01M2F0PQWGSCXG0N4951NF9DPZ` |
+| `KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA3` | Pinned llama.cpp RDNA3 integer WMMA; rocWMMA 2.2.1 gfx11 fragments | `KQuantGemmKWmmaQ4K`, `KQuantGemmKWmmaQ6K` | [G1-G3 receipts](../../docs/bench-evidence/rocm-rdna3-quant-wmma/README.md), G4 and fresh review pending | [This spec](rocm-rdna3-quant-wmma.md) | `SPIKE` | RDNA3 helper; coordinating operator | `ISSUE-LOCAL-01M2F0PQWGSCXG0N4951NF9DPZ` |

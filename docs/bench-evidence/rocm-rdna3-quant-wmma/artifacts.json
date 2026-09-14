@@ -1,0 +1,65 @@
+{
+  "implementation_sha": "c3fe98ba6c55ce71e75746e1b944a27640464e0f",
+  "artifacts": {
+    "/home/vikash/vllm.cpp-rdna3-wmma-impl/src/vt/rocm/rocm_grouped_gemm.hip": {
+      "bytes": 92976,
+      "sha256": "22c2f031af3db6454d73d7cc6213861ed4af4907e1d53c82c2b621dc81deb367"
+    },
+    "/home/vikash/vllm.cpp-rdna3-wmma-impl/include/vt/rocm/rocm_quant_wmma_arch.h": {
+      "bytes": 1265,
+      "sha256": "b5e429843c9e8bb082e5b747bc03fe7ad8e50adc9edeab9b6c0c7ec9b7f80d10"
+    },
+    "/home/vikash/vllm.cpp-rdna3-wmma-impl/include/vt/rocm/rocm_arch.h": {
+      "bytes": 9746,
+      "sha256": "d36380d2f244209688c0e934b0fe3a74b9bb4537c19dc8adfbb2f05302ffa84a"
+    },
+    "/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/CMakeFiles/vllm.dir/src/vt/rocm/rocm_grouped_gemm.hip.o": {
+      "bytes": 418968,
+      "sha256": "55ec9348210144334dc3834c263e9476ac05e6d3320e82005db33581ea8f7054"
+    },
+    "/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/CMakeFiles/vllm.dir/src/vt/rocm/rocm_grouped_gemm.hip.o.0.hipv4-amdgcn-amd-amdhsa--gfx1100": {
+      "bytes": 304432,
+      "sha256": "57d4e41b61475719c7460cf1d3b368b91cc0128c8a74802907e14fa6c38bd55d"
+    },
+    "/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/test_backend_cross_device": {
+      "bytes": 52683648,
+      "sha256": "918268a8e67561d4a90c35aa3aa6790496e40bf6af474b046d9c3a0e1b37c935"
+    },
+    "/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/test_capi_rocm_quant_wmma": {
+      "bytes": 51344640,
+      "sha256": "c5cb1c6107a50a1f5bd0aec5fd72f5a6bd16d321e836e71e7fefdf9f8c831c85"
+    },
+    "/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/rocm_quant_wmma_capture": {
+      "bytes": 51282264,
+      "sha256": "ff0d1ff8e046ed76344993da61e4ea1f2a795fe36ffa0c3654cc397838eb51b5"
+    },
+    "/opt/rocm/include/rocwmma/rocwmma.hpp": {
+      "bytes": 18407,
+      "sha256": "9e677443ebd05b941a18f27f9b7ebe919d20fa8b9266de17fcd3923ee5bddb32"
+    },
+    "/opt/rocm/include/rocwmma/internal/wmma_impl.hpp": {
+      "bytes": 142214,
+      "sha256": "ae8d7771d037979371e6029b7e4b1627cdeb5a53d300ca65371bf1731aea8688"
+    },
+    "/opt/rocm/include/rocwmma/internal/config.hpp": {
+      "bytes": 8355,
+      "sha256": "9015b7f60ac362ba8e3cb31a7659846046961ba51a7dc0abc4a071709670c055"
+    },
+    "/tmp/wmma-impl-gfx1100-final.isa": {
+      "bytes": 3589305,
+      "sha256": "4338c05023b2ace0814bd5a7ea579afd2940fdcc6b59bf83480438eef6387688"
+    },
+    "/home/vikash/oracle/rdna3-wmma-latest/mmq-primary/manifest.json": {
+      "bytes": 260803,
+      "sha256": "37262843d79e4d38fbb84513cbf9323a307bf970b46099d39ae04fd0118dbf81"
+    },
+    "/home/vikash/oracle/rdna3-wmma-latest/mmq-native/report.json": {
+      "bytes": 32689,
+      "sha256": "ef12cb966bfec0f4224d73dcab609b9d9f509e14287c8d2ec8768c385d5eba11"
+    },
+    "/home/vikash/oracle/rdna3-wmma-latest/mmq-native/comparison.json": {
+      "bytes": 59993,
+      "sha256": "5588ba567595a156283bb426b29477f212b84923dec26b2226f4326d2dc50518"
+    }
+  }
+}

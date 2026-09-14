@@ -1,0 +1,14 @@
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+===============================================================================
+/home/vikash/vllm.cpp-rdna3-wmma-impl/tests/vt/test_rocm_arch.cpp:114:
+TEST CASE:  quantized WMMA admits only measured device names and HIP features
+
+/home/vikash/vllm.cpp-rdna3-wmma-impl/tests/vt/test_rocm_arch.cpp:129: ERROR: CHECK_FALSE( GcnArchNameHasQuantWmma(name) ) is NOT correct!
+  values: CHECK_FALSE( true )
+  logged: std::string(name) := gfx1101
+
+===============================================================================
+[doctest] test cases:  2 |  1 passed | 1 failed | 14 skipped
+[doctest] assertions: 44 | 43 passed | 1 failed |
+[doctest] Status: FAILURE!

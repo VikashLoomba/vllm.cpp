@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "plugin_pin": "d4c1f0d082fc7cd4350da56689109a01c1f29d6c",
+  "fixture_manifest": {
+    "bytes": 48002,
+    "sha256": "f83b5c3e5cdb988b623c1b7e565e325a9ed9ea8085ea132bc8e08e6978bc1bbb"
+  },
+  "torch": "2.12.0+git6bbd260",
+  "torch_git": "6bbd26020da1c6dc198625dfcdd968b1e4e6b1c5",
+  "hip": "7.2.53211",
+  "architecture": "gfx1100",
+  "ops_source": {
+    "bytes": 7597,
+    "sha256": "daac821e871ff73df30b1836c17a7ef9574f8be6e4bedd5f6456c442b69c90db"
+  },
+  "fixtures": {
+    "Quant_Q4_K_256.gguf": {
+      "bytes": 4018560,
+      "sha256": "c6256d86c59bc96db1eada611ec1fccb147eb3a738e3693cd2a68a497df77f53"
+    },
+    "Quant_Q4_K_1024.gguf": {
+      "bytes": 16073088,
+      "sha256": "00577c14c413f41d179dd11f5c92e0e3f1b9ed0c2ab410a0960f493db9d32c6b"
+    },
+    "Quant_Q6_K_256.gguf": {
+      "bytes": 5860224,
+      "sha256": "b2c8f71efa6a27204ae1c111eb1cecf4617cd3a07be5e7be80fb28e6cbe23839"
+    },
+    "Quant_Q6_K_1024.gguf": {
+      "bytes": 23439744,
+      "sha256": "e7d173382ec11eaa6ae981e8600dce38196203f193433df95ab83944fb4508cc"
+    }
+  },
+  "cases": 240,
+  "original_tensors": 20,
+  "native_extension_cases": 240,
+  "dimensions": {
+    "tokens": [
+      7,
+      83,
+      128,
+      2048
+    ],
+    "width": [
+      256,
+      1024
+    ],
+    "rows": [
+      768,
+      1024,
+      2048,
+      5120,
+      18944
+    ],
+    "dtype": [
+      "bf16",
+      "f16",
+      "f32"
+    ],
+    "seed": [
+      0
+    ],
+    "type": [
+      12,
+      14
+    ]
+  },
+  "input_output_artifacts": {
+    "primary": "/home/vikash/oracle/rdna3-wmma-latest/mmq-primary",
+    "native": "/home/vikash/oracle/rdna3-wmma-latest/mmq-native"
+  },
+  "native_comparison": "PASS against both original dense reference and primary outputs",
+  "f16_adaptation": "Native F32 output is narrowed to F16 after capture; native BF16 output remains BF16."
+}

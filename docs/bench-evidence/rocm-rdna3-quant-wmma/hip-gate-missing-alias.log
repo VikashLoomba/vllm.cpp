@@ -1,0 +1,106 @@
+Internal ctest changing into directory: /home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma
+Test project /home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma
+      Start 111: test_rocm_moe_bf16
+ 1/29 Test #111: test_rocm_moe_bf16 ..............................***Skipped   0.32 sec
+      Start 512: test_backend_cross_device
+ 2/29 Test #512: test_backend_cross_device .......................   Passed   17.37 sec
+      Start 513: test_backend_cross_device_vt_attn_decode_d128
+ 3/29 Test #513: test_backend_cross_device_vt_attn_decode_d128 ...   Passed    0.40 sec
+      Start 514: test_rocm_arch
+ 4/29 Test #514: test_rocm_arch ..................................   Passed    0.19 sec
+      Start 515: test_rocm_pinned_h2d
+ 5/29 Test #515: test_rocm_pinned_h2d ............................   Passed    0.18 sec
+      Start 516: test_rocm_f16_contract
+ 6/29 Test #516: test_rocm_f16_contract ..........................   Passed    0.19 sec
+      Start 518: test_rocm_norm_quant_bridge
+ 7/29 Test #518: test_rocm_norm_quant_bridge .....................   Passed    0.19 sec
+      Start 519: test_rocm_quant_dot
+ 8/29 Test #519: test_rocm_quant_dot .............................   Passed    4.09 sec
+      Start 524: test_rocm_backend
+ 9/29 Test #524: test_rocm_backend ...............................   Passed    0.74 sec
+      Start 525: test_rocm_attn_gate_split
+10/29 Test #525: test_rocm_attn_gate_split .......................   Passed    0.68 sec
+      Start 526: test_rocm_attn_gate_split_device_binding
+11/29 Test #526: test_rocm_attn_gate_split_device_binding ........***Skipped   0.19 sec
+      Start 527: test_rocm_attn_gate_split_large_index
+12/29 Test #527: test_rocm_attn_gate_split_large_index ...........   Passed    0.37 sec
+      Start 528: test_rocm_f16_weights
+13/29 Test #528: test_rocm_f16_weights ...........................   Passed    1.38 sec
+      Start 529: test_rocm_f16_graph_dedup
+14/29 Test #529: test_rocm_f16_graph_dedup .......................   Passed    0.70 sec
+      Start 530: test_rocm_f16_device
+15/29 Test #530: test_rocm_f16_device ............................***Skipped   0.18 sec
+      Start 531: test_rocm_f16_model
+16/29 Test #531: test_rocm_f16_model .............................***Skipped   0.18 sec
+      Start 532: test_rocm_fp8_kv_cache
+17/29 Test #532: test_rocm_fp8_kv_cache ..........................   Passed    0.43 sec
+      Start 533: test_ops_rocm_silu_rounding
+18/29 Test #533: test_ops_rocm_silu_rounding .....................   Passed    0.32 sec
+      Start 554: test_exl3_rocm
+19/29 Test #554: test_exl3_rocm ..................................   Passed    0.44 sec
+      Start 567: test_capi_rocm_embedding_quant
+20/29 Test #567: test_capi_rocm_embedding_quant ..................   Passed   10.85 sec
+      Start 568: test_capi_rocm_quant_wmma
+21/29 Test #568: test_capi_rocm_quant_wmma .......................   Passed    1.46 sec
+      Start 569: test_rocm_embedding_quant
+22/29 Test #569: test_rocm_embedding_quant .......................   Passed    9.75 sec
+      Start 616: test_rocm_moe_grouped_bf16
+23/29 Test #616: test_rocm_moe_grouped_bf16 ......................   Passed    0.83 sec
+      Start 617: test_rocm_moe_upstream
+24/29 Test #617: test_rocm_moe_upstream ..........................***Skipped   0.18 sec
+      Start 619: test_rocm_moe_reference_set
+25/29 Test #619: test_rocm_moe_reference_set .....................   Passed    0.19 sec
+      Start 678: test_rocm_sample_scratch
+26/29 Test #678: test_rocm_sample_scratch ........................   Passed    0.48 sec
+      Start 679: test_gemma4_rocm_fp8_seams
+27/29 Test #679: test_gemma4_rocm_fp8_seams ......................   Passed    0.19 sec
+      Start 754: test_rocm_qwen35_moe_kq_device
+Could not find executable /home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/test_qwen35_moe_kq_device
+Looked in the following places:
+/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/test_qwen35_moe_kq_device
+/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/test_qwen35_moe_kq_device
+/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/Release/test_qwen35_moe_kq_device
+/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/Release/test_qwen35_moe_kq_device
+/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/Debug/test_qwen35_moe_kq_device
+/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/Debug/test_qwen35_moe_kq_device
+/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/MinSizeRel/test_qwen35_moe_kq_device
+/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/MinSizeRel/test_qwen35_moe_kq_device
+/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/RelWithDebInfo/test_qwen35_moe_kq_device
+/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/RelWithDebInfo/test_qwen35_moe_kq_device
+/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/Deployment/test_qwen35_moe_kq_device
+/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/Deployment/test_qwen35_moe_kq_device
+/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/Development/test_qwen35_moe_kq_device
+/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/Development/test_qwen35_moe_kq_device
+home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/test_qwen35_moe_kq_device
+home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/test_qwen35_moe_kq_device
+home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/Release/test_qwen35_moe_kq_device
+home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/Release/test_qwen35_moe_kq_device
+home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/Debug/test_qwen35_moe_kq_device
+home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/Debug/test_qwen35_moe_kq_device
+home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/MinSizeRel/test_qwen35_moe_kq_device
+home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/MinSizeRel/test_qwen35_moe_kq_device
+home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/RelWithDebInfo/test_qwen35_moe_kq_device
+home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/RelWithDebInfo/test_qwen35_moe_kq_device
+home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/Deployment/test_qwen35_moe_kq_device
+home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/Deployment/test_qwen35_moe_kq_device
+home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/Development/test_qwen35_moe_kq_device
+home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/Development/test_qwen35_moe_kq_device
+Unable to find executable: /home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/tests/test_qwen35_moe_kq_device
+28/29 Test #754: test_rocm_qwen35_moe_kq_device ..................***Not Run   0.00 sec
+      Start 760: test_qwen4_exp_rocm_reductions
+29/29 Test #760: test_qwen4_exp_rocm_reductions ..................   Passed    1.94 sec
+
+97% tests passed, 1 tests failed out of 29
+
+Total Test time (real) =  54.44 sec
+
+The following tests did not run:
+	111 - test_rocm_moe_bf16 (Skipped)
+	526 - test_rocm_attn_gate_split_device_binding (Skipped)
+	530 - test_rocm_f16_device (Skipped)
+	531 - test_rocm_f16_model (Skipped)
+	617 - test_rocm_moe_upstream (Skipped)
+
+The following tests FAILED:
+	754 - test_rocm_qwen35_moe_kq_device (Not Run)
+Errors while running CTest

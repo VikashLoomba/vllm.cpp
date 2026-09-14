@@ -1,0 +1,20 @@
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+===============================================================================
+/home/vikash/vllm.cpp-rdna3-wmma-impl/tests/vt/test_rocm_arch.cpp:94:
+TEST CASE:  SharedK WMMA host gate is gfx1200/gfx1201 prefix, not substring
+
+/home/vikash/vllm.cpp-rdna3-wmma-impl/tests/vt/test_rocm_arch.cpp:102: ERROR: CHECK_FALSE( GcnArchNameIsGfx12PrefillWmma("gfx1100") ) is NOT correct!
+  values: CHECK_FALSE( true )
+
+===============================================================================
+/home/vikash/vllm.cpp-rdna3-wmma-impl/tests/vt/test_rocm_arch.cpp:114:
+TEST CASE:  quantized WMMA admits only measured device names and HIP features
+
+/home/vikash/vllm.cpp-rdna3-wmma-impl/tests/vt/test_rocm_arch.cpp:131: ERROR: CHECK_FALSE( vt::rocm::GcnArchNameIsGfx12PrefillWmma("gfx1100") ) is NOT correct!
+  values: CHECK_FALSE( true )
+
+===============================================================================
+[doctest] test cases:  2 |  0 passed | 2 failed | 14 skipped
+[doctest] assertions: 44 | 42 passed | 2 failed |
+[doctest] Status: FAILURE!

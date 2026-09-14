@@ -1,0 +1,74 @@
+[
+  {
+    "mutation": "admission",
+    "exit": 1,
+    "command": [
+      "flock",
+      "/home/vikash/gpu.lock",
+      "env",
+      "HIP_VISIBLE_DEVICES=0",
+      "ROCR_VISIBLE_DEVICES=0",
+      "timeout",
+      "120s",
+      "/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/mutation-copy/admission/test_capi_rocm_quant_wmma"
+    ],
+    "source_sha256": "6b0dc4e3f5f1dd7be2b7642823d9f2a96e33a9014680304489d9668fd4933c0d",
+    "original_restored": true,
+    "result_log": "/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/mutation-copy/admission/result.log",
+    "tracked_log": "production-mutations-admission.log"
+  },
+  {
+    "mutation": "q4-launch",
+    "exit": 1,
+    "command": [
+      "flock",
+      "/home/vikash/gpu.lock",
+      "env",
+      "HIP_VISIBLE_DEVICES=0",
+      "ROCR_VISIBLE_DEVICES=0",
+      "timeout",
+      "120s",
+      "/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/mutation-copy/q4-launch/test_capi_rocm_quant_wmma"
+    ],
+    "source_sha256": "e64d91ffb5435eea826275413163d55e03a89be6a42f45e7408ea490fcf5cfda",
+    "original_restored": true,
+    "result_log": "/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/mutation-copy/q4-launch/result.log",
+    "tracked_log": "production-mutations-q4-launch.log"
+  },
+  {
+    "mutation": "q6-launch",
+    "exit": 1,
+    "command": [
+      "flock",
+      "/home/vikash/gpu.lock",
+      "env",
+      "HIP_VISIBLE_DEVICES=0",
+      "ROCR_VISIBLE_DEVICES=0",
+      "timeout",
+      "120s",
+      "/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/mutation-copy/q6-launch/test_capi_rocm_quant_wmma"
+    ],
+    "source_sha256": "03c1e11120471a8bfb25d6a6c32bea2061e01fb2f7a19df2f67b2d0e1cc97495",
+    "original_restored": true,
+    "result_log": "/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/mutation-copy/q6-launch/result.log",
+    "tracked_log": "production-mutations-q6-launch.log"
+  },
+  {
+    "mutation": "scalar-control",
+    "exit": 1,
+    "command": [
+      "flock",
+      "/home/vikash/gpu.lock",
+      "env",
+      "HIP_VISIBLE_DEVICES=0",
+      "ROCR_VISIBLE_DEVICES=0",
+      "timeout",
+      "120s",
+      "/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/mutation-copy/scalar-control/test_capi_rocm_quant_wmma"
+    ],
+    "source_sha256": "01e584547cab09a7ee46e4791cf9fe056682f365be391b8f21389e500a922660",
+    "original_restored": true,
+    "result_log": "/home/vikash/vllm.cpp-rdna3-wmma-impl/build-rdna3-wmma/mutation-copy/scalar-control/result.log",
+    "tracked_log": "production-mutations-scalar-control.log"
+  }
+]

@@ -1,0 +1,38 @@
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+===============================================================================
+/home/vikash/vllm.cpp-rdna3-wmma-impl/tests/vt/test_rocm_arch.cpp:114:
+TEST CASE:  quantized WMMA admits only measured device names and HIP features
+
+/home/vikash/vllm.cpp-rdna3-wmma-impl/tests/vt/test_rocm_arch.cpp:129: ERROR: CHECK_FALSE( GcnArchNameHasQuantWmma(name) ) is NOT correct!
+  values: CHECK_FALSE( true )
+  logged: std::string(name) := gfx1100:
+
+/home/vikash/vllm.cpp-rdna3-wmma-impl/tests/vt/test_rocm_arch.cpp:129: ERROR: CHECK_FALSE( GcnArchNameHasQuantWmma(name) ) is NOT correct!
+  values: CHECK_FALSE( true )
+  logged: std::string(name) := gfx1100:xnack
+
+/home/vikash/vllm.cpp-rdna3-wmma-impl/tests/vt/test_rocm_arch.cpp:129: ERROR: CHECK_FALSE( GcnArchNameHasQuantWmma(name) ) is NOT correct!
+  values: CHECK_FALSE( true )
+  logged: std::string(name) := gfx1100:foo+
+
+/home/vikash/vllm.cpp-rdna3-wmma-impl/tests/vt/test_rocm_arch.cpp:129: ERROR: CHECK_FALSE( GcnArchNameHasQuantWmma(name) ) is NOT correct!
+  values: CHECK_FALSE( true )
+  logged: std::string(name) := gfx1100:xnack-:
+
+/home/vikash/vllm.cpp-rdna3-wmma-impl/tests/vt/test_rocm_arch.cpp:129: ERROR: CHECK_FALSE( GcnArchNameHasQuantWmma(name) ) is NOT correct!
+  values: CHECK_FALSE( true )
+  logged: std::string(name) := gfx1100::xnack-
+
+/home/vikash/vllm.cpp-rdna3-wmma-impl/tests/vt/test_rocm_arch.cpp:129: ERROR: CHECK_FALSE( GcnArchNameHasQuantWmma(name) ) is NOT correct!
+  values: CHECK_FALSE( true )
+  logged: std::string(name) := gfx1100:xnack-:xnack+
+
+/home/vikash/vllm.cpp-rdna3-wmma-impl/tests/vt/test_rocm_arch.cpp:129: ERROR: CHECK_FALSE( GcnArchNameHasQuantWmma(name) ) is NOT correct!
+  values: CHECK_FALSE( true )
+  logged: std::string(name) := gfx1200:sramecc+:sramecc+
+
+===============================================================================
+[doctest] test cases:  2 |  1 passed | 1 failed | 14 skipped
+[doctest] assertions: 44 | 37 passed | 7 failed |
+[doctest] Status: FAILURE!

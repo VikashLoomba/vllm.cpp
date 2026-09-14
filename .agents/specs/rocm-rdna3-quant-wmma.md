@@ -19,9 +19,8 @@ and generated token IDs. Native traces prove prefill-only WMMA dispatch.
 The observed prefill ratio is 1.2891 with WMMA enabled.
 Full-model floors remain failing, and accepted clock attribution remains pending
 under the dedicated issue in `## Owed`.
-[Implementation receipts](../../docs/bench-evidence/rocm-rdna3-quant-wmma/README.md)
-and [model receipts](../../docs/bench-evidence/rocm-rdna3-quant-wmma/model-summary.md)
-record commands, results, mutations, and measurement limits.
+[Evidence report and archive](../../docs/bench-evidence/rocm-rdna3-quant-wmma/README.md)
+retain commands, results, mutations, and measurement limits.
 
 ## Scope
 
@@ -171,13 +170,19 @@ hardware results when their executing files remain byte-identical. Stop if
 publication or preservation cannot be verified. Do not weaken a checker or
 reclassify pending measurements as passing.
 
+On 14 September 2026, the published archive preserves all 236 original files.
+The [retained report](../../docs/bench-evidence/rocm-rdna3-quant-wmma/README.md#retrieve-the-complete-evidence)
+pins the source revision, download, checksum, and extraction procedure.
+The operator verified anonymous download and every original byte before replacement.
+The original detailed reports and their qualifications remain unchanged in the archive.
+
 ## Owed
 
 `ISSUE-LOCAL-01M2F4WCD6ZK5VH5S8TF83APD6` owns the remaining full-model
 performance gaps on the retained gfx1100 workload. It includes every below-floor
 axis, matching oracle traces, comparable timing windows, and accepted clock
-attribution. The [model record](../../docs/bench-evidence/rocm-rdna3-quant-wmma/model-summary.md)
-retains all measured values, ratios, and limits. This debt is separate from
+attribution. The [evidence report and archive](../../docs/bench-evidence/rocm-rdna3-quant-wmma/README.md)
+retain all measured values, ratios, and limits. This debt is separate from
 architecture admission and from the deferred Qwen state characterization.
 
 Other formats, grouped expert tiles, and other RDNA3 devices keep their prior

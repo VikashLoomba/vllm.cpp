@@ -1,5 +1,0 @@
-AssertionError: Tensor-likes are not close!
-
-Mismatched elements: 1 / 5376 (0.0%)
-Greatest absolute difference: inf at index (0,) (up to 1 allowed)
-Greatest relative difference: inf at index (0,) (up to 0.1 allowed)

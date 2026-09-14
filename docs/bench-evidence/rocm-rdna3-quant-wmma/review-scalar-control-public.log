@@ -1,5 +1,0 @@
-["flock", "/home/vikash/gpu.lock", "env", "-u", "VT_ROCM_QUANT_WMMA", "HIP_VISIBLE_DEVICES=0", "ROCR_VISIBLE_DEVICES=0", "timeout", "180", "/home/vikash/vllm.cpp-rdna3-wmma-review-scratch/build-rdna3-wmma-review-scratch/tests/test_capi_rocm_quant_wmma"]
-engine: device placement: --fit resolved NO placement: the model has no routed-expert layers, so a placement has nothing to move
-vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
-PUBLIC WMMA FAILED: Q4_K public WMMA dispatch mismatch
-PUBLIC WMMA FAILED: scalar control failed

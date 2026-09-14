@@ -1,5 +1,0 @@
-["cmake", "--build", "/home/vikash/vllm.cpp-rdna3-wmma-review-scratch/build-rdna3-wmma-review-scratch", "-j", "4", "--target", "test_capi_rocm_quant_wmma", "test_backend_cross_device"]
-[1/4] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_grouped_gemm.hip.o
-[2/4] Linking HIP static library libvllm.a
-[3/4] Linking HIP executable tests/test_backend_cross_device
-[4/4] Linking HIP executable tests/test_capi_rocm_quant_wmma

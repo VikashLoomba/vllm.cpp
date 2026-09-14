@@ -1,283 +1,108 @@
-# gfx1100 quantized WMMA admission receipts
+# gfx1100 quantized WMMA evidence
 
 Row: `KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA3`.
-Issue: `ISSUE-LOCAL-01M2F0PQWGSCXG0N4951NF9DPZ`.
-Spec: [Reuse quantized WMMA prefill](../../../.agents/specs/rocm-rdna3-quant-wmma.md).
+[Specification](../../../.agents/specs/rocm-rdna3-quant-wmma.md).
+Architecture admission is `DONE`. Whole-model performance floors remain `FAILING`.
+This packaging change preserves the reviewed implementation, tests, and validation harness.
+
+## Retrieve the complete evidence
+
+[Release](https://github.com/VikashLoomba/vllm.cpp/releases/tag/rdna3-wmma-evidence-d6e40c91f634) ·
+[Download archive](https://github.com/VikashLoomba/vllm.cpp/releases/download/rdna3-wmma-evidence-d6e40c91f634/rdna3-wmma-evidence-d6e40c91f634.tar.gz).
+Source revision: `d6e40c91f634a041c873c7a04516d55c4d05772a`.
+The 511,480-byte archive preserves all 236 original files under this evidence path.
+It adds a root `SHA256SUMS` manifest. Archive SHA256:
+`996ed227235b9e85196055b9005e2adf7a1d8c86a61ef610249fcfd0be36eb0d`.
+
+Run these commands with Python 3.12 or later. Extraction uses a new private directory.
+
+```sh
+(
+set -eu
+archive=rdna3-wmma-evidence-d6e40c91f634.tar.gz
+curl -q --fail --location --output "$archive" \
+  "https://github.com/VikashLoomba/vllm.cpp/releases/download/rdna3-wmma-evidence-d6e40c91f634/$archive"
+printf '%s  %s\n' \
+  996ed227235b9e85196055b9005e2adf7a1d8c86a61ef610249fcfd0be36eb0d "$archive" | sha256sum --check --strict
+dest=$(mktemp -d)
+python3 - "$archive" "$dest" <<'PYARCHIVE'
+import pathlib, sys, tarfile
+with tarfile.open(sys.argv[1], "r:gz") as archive:
+    for member in archive.getmembers():
+        path = pathlib.PurePosixPath(member.name)
+        assert not path.is_absolute() and ".." not in path.parts
+        assert member.isfile() or member.isdir()
+    archive.extractall(sys.argv[2], filter="data")
+PYARCHIVE
+cd "$dest"
+sha256sum --check --strict SHA256SUMS
+)
+```
+
+Open `docs/bench-evidence/rocm-rdna3-quant-wmma/README.md` and `model-summary.md` inside the extraction for the full reports.
+Their original cross-links outside the evidence directory require the source checkout at the revision above.
+The archive retains commands, manifests, failed attempts, compiler identities, and receipt qualifications unchanged.
+Large raw matrices, model logits, and full profiler traces were already external at their sealed source paths.
+
+## Correctness, review, and scope
+
 Implementation: `c3fe98ba6c55ce71e75746e1b944a27640464e0f`.
-Spec ancestor: `a5b5c92f2604386fcf162d5e12a42988f412db3b`.
-Measured on 13 September 2026 on the local RX 7900 XTX, physical `gfx1100`.
-Every GPU invocation held `/home/vikash/gpu.lock` and selected device 0 with
-`HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0`.
+Measurements used physical RX 7900 XTX `gfx1100` on 13 September 2026.
+Every GPU invocation held `/home/vikash/gpu.lock` and selected device 0.
+Native tooling used HIP 7.15, Clang 23, and rocWMMA 2.2.1. The archive seals exact toolchain hashes.
 
-## Results
-
-| Gate | Result | Evidence |
+| Gate | Result | Archived receipts |
 |---|---|---|
-| G1 architecture policy | Satisfied. The CPU suite passes 16 cases and 109 assertions. The initial gfx12-only stub fails four assertions. | [Red](arch-red.log), [green](arch-green.log) |
-| G1 physical dispatch | Satisfied. Before admission, all four cases fail ten dispatch assertions. After admission, all 46 assertions pass. | [Red](hardware-red.log), [green](hardware-green.log) |
-| G2 unchanged tile bodies | Satisfied. The executing Q4_K and Q6_K bodies are byte-identical to the committed spec ancestor. | [Body hashes](tile-bodies.json) |
-| G2 signed-int8 instructions | Satisfied. The emitted gfx1100 object contains eight `v_wmma_i32_16x16x16_iu8` instructions across Q4_K and Q6_K, each with F32 and BF16 outputs. | [ISA excerpt](gfx1100-wmma-isa.txt), [artifact hashes](artifacts.json) |
-| G2 original upstream fixture gate | Satisfied. All 240 native tensor cases pass against the original dense reference and the primary plugin output. | [Summary](original-mmq-summary.json), [comparison](original-mmq-comparison.json), [log](native-comparison.log) |
-| G2 scalar control | Satisfied. A separate process with `VT_ROCM_QUANT_WMMA=0` passes all four physical cases and 46 assertions. | [Scalar log](hardware-scalar.log) |
-| G3 public production entry | Satisfied. Prompts of 16 and 37 tokens each enter two Q4_K calls and one Q6_K call. All 1024 logits and eight completion tokens match the scalar child process. | [Red](public-red.log), [green](public-green.log) |
-| G5 broad HIP gate | Satisfied with the five baseline resource skips listed below. All 29 registered tests have zero failures after a clean rebuild. | [HIP gate](hip-gate-green.log) |
-| G5 repository preflight | Executed with exit 0 and 12 unchanged skips. The skips remain unavailable checks, rather than passes. | [First](preflight-first.log), [staged](preflight-staged.log) |
-| G5 implementer mutations | Satisfied. Four CPU policy mutations and four public production mutations fail. The immutable original files retain their hashes. | [CPU mutations](cpu-mutations.json), [production mutations](production-mutations.json) |
-| G4 full-model correctness | Satisfied. All eight native prompt arrays match the primary. All 128 generated IDs in each of six native processes match both oracles. | [Model receipts](model-summary.md) |
-| G4 same-binary measurement | Executed. Prefill records 224.12 versus 173.86 tokens/s. Accepted clock attribution remains pending. | [Values and limits](model-summary.md#recorded-axes) |
-| G4 whole-model floor | Failing on the recorded below-floor axes. Comparable oracle traces and clock-window reproduction remain pending. | [Owned gaps](../../../.agents/issues/_owed/ISSUE-LOCAL-01M2F4WCD6ZK5VH5S8TF83APD6.md) |
-| G4 model path | Satisfied. Each of eight enabled prefill windows contains 152 WMMA calls. Disabled and decode windows contain zero. | [Trace summary](model-adapters-native-trace-pair-summary.json) |
-| G5 fresh review | Satisfied. Independent review of the immutable implementation passes with no findings. | [Review report](review-review-report.json) |
-| G5 operator HIP verification | Satisfied with the same five baseline resource skips. The independent build and all 29 registered tests exit 0. | [Operator receipt](operator-receipt.json) |
-| G5 operator repository preflight | Full run exits 1 on branch-role classification. The role check exits 0 after the branch rename. Seven skipped NumPy suites subsequently execute with exit 0. | [Original failure](operator-preflight-original-failure.log), [resolution](operator-role-after-rename.log), [supplement](operator-receipt.json) |
-| G5 operator original upstream fixture gate | Satisfied. The operator independently captures and compares all 240 original matrix cases. | [Capture](model-operator-mmq-report.json), [comparison](model-operator-mmq-comparison.json) |
+| G1 architecture policy | Four assertions fail before admission. Green: 16 cases, 109 assertions. Attention admission stays unchanged. | `arch-red.log`, `arch-green.log` |
+| G1-G2 physical tiles | Red: four cases fail ten dispatch assertions. Green and separate scalar control: 46 assertions each. | `hardware-red.log`, `hardware-green.log`, `hardware-scalar.log` |
+| G2 arithmetic and ISA | Both tile bodies remain byte-identical. Eight signed-int8 WMMA instructions span Q4_K/Q6_K and F32/BF16. | `tile-bodies.json`, `gfx1100-wmma-isa.txt` |
+| G2 original primary fixtures | All 240 cases pass against the dense reference and plugin outputs with original modes and tolerances. | `original-mmq-summary.json`, `original-mmq-comparison.json` |
+| G3 production reachability | Prompts of 16 and 37 tokens enter both formats. All 1024 logits and eight completion tokens match scalar. | `public-red.log`, `public-green.log` |
+| G5 fresh review | `PASS`, no findings. Mutated admission, launches, scalar override, and finite corruption fail their gates. Source hashes restore exactly. | `review-review-report.json`, `production-mutations.json` |
+| G5 operator verification | Independent architecture, public, and 240-case gates pass. HIP: 29 registered tests, zero failures, five baseline skips. | `operator-receipt.json`, `model-operator-mmq-comparison.json` |
 
-The existing physical fixtures preserve the partial four-wave block at
-`M=32, N=48, K=512`, both output dtypes, joint tails, and separate bottom and
-right tails. Their normalized mean squared error limit remains `5e-4`.
-The hardware test selects the physical device independently of production
-admission. Restoring gfx12-only admission cannot skip the gfx1100 test.
+Physical cases retain F32/BF16 outputs, joint and asymmetric tails, and the partial four-wave block `M=32,N=48,K=512`.
+Original fixtures retain `M=7,83,128,2048`, `K=256,1024`, seed zero, and F16/BF16/F32 inputs.
+The native harness narrows F32 to F16 for upstream F16 output comparisons. Native Q8_K activation and output contracts remain unchanged.
+Source chain: plugin `tests/test_kernels.py:145-196` → `ops.py:200` → `csrc/gguf/gguf_kernel.hip:221` → `mmq_hip.cuh:490,591`.
 
-The first broad invocation omitted `test_qwen35_moe_kq_device`, the executable
-behind the `test_rocm_qwen35_moe_kq_device` CTest alias. That invocation failed
-with one test not run. The [failed receipt](hip-gate-missing-alias.log) remains.
-Building the actual executable and rerunning the complete gate produced the
-passing receipt. No product change was needed.
+HIP skips require three model fixtures and two-visible-device coverage. Only device 0 was exposed.
+Historical full preflights preserve 12 skips. The operator's original role failure and its scoped branch-rename resolution remain recorded.
+Seven NumPy suites subsequently pass in isolation. Five adherence checkpoint subcases remain unavailable without `VT_LTX25_ADHERENCE_MODEL`.
+The archived final-records preflight retains its onboarding fixture failure and the passing isolated rerun of all 39 cases.
+The later source-head readiness run has zero failed checks and five argument-dependent skips, with exit 1 under readiness policy.
+PR classification passed separately. ARM, CPU, CUDA, and Triton argument-dependent checks concern unchanged architecture paths.
+These qualified results do not constitute an all-green readiness claim.
 
-The five baseline skips are `test_rocm_moe_bf16`, `test_rocm_moe_upstream`,
-and `test_rocm_f16_model`, which require model fixtures, plus
-`test_rocm_attn_gate_split_device_binding` and `test_rocm_f16_device`, which
-require two visible devices. This gate deliberately exposed only device 0.
+## Model identity and observed results
 
-## Build and execution recipe
+Checkpoint: `Qwen3.5-4B-Q4_K_M-unsloth-e87f1764.gguf`, 2,740,937,888 bytes.
+Source: `unsloth/Qwen3.5-4B-GGUF@e87f176479d0855a907a41277aca2f8ee7a09523`.
+SHA256: `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4`.
+Task snapshots: vLLM `39545e475d3627287ff69c25465dc0bd405f67e1`,
+llama.cpp `093a2f86c3e37c54fa3e1f9efb17b304f3433abd`,
+GGUF plugin `d4c1f0d082fc7cd4350da56689109a01c1f29d6c`.
+These developer-selected snapshots do not advance the repository parity pin.
 
-Worktree: `/home/vikash/vllm.cpp-rdna3-wmma-impl`.
-Build directory: `build-rdna3-wmma`. The default build type preserves test
-assertions. [Compiler details](compiler.txt) identify Clang 23 and its exact
-revision. The artifact manifest seals the rocWMMA 2.2.1 headers and binaries.
+Eight requests alternate 183/174 input tokens, totaling 1428 inputs and 128 generated IDs.
+Concurrency, temperature, and seed are 1, 0, and 0. Each request generates 16 tokens without chat templates or EOS-logit masks.
+All eight input arrays match the primary. All six native process outputs match both oracles exactly.
+Native `rocprofv3` captures contain 152 WMMA calls per prefill, 1216 total, and zero during decode or with WMMA disabled.
+Both traced completion arrays match the primary. Native traces do not establish cross-engine invocation parity.
 
-```sh
-cmake -S . -B build-rdna3-wmma -G Ninja \
-  -DVLLM_CPP_HIP=ON -DVLLM_CPP_HIP_ARCHITECTURES=gfx1100 \
-  -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++ -DROCM_PATH=/opt/rocm \
-  -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_VULKAN=OFF -DVLLM_CPP_METAL=OFF \
-  -DVLLM_CPP_MLX=OFF -DVLLM_CPP_TENSTORRENT=OFF \
-  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_HIP_COMPILER_LAUNCHER=ccache
-cmake --build build-rdna3-wmma --target test_rocm_arch \
-  test_backend_cross_device test_capi_rocm_quant_wmma rocm_quant_wmma_capture -j4
-build-rdna3-wmma/tests/test_rocm_arch
-flock /home/vikash/gpu.lock env HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
-  timeout 120s build-rdna3-wmma/tests/test_backend_cross_device \
-  '--test-case=*WMMA tile arm*,*M and N are not multiples*,*only one of M/N*'
-flock /home/vikash/gpu.lock env HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
-  VT_ROCM_QUANT_WMMA=0 timeout 120s build-rdna3-wmma/tests/test_backend_cross_device \
-  '--test-case=*WMMA tile arm*,*M and N are not multiples*,*only one of M/N*'
-flock /home/vikash/gpu.lock env HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
-  timeout 120s build-rdna3-wmma/tests/test_capi_rocm_quant_wmma
-```
+| Observed axis | WMMA enabled | WMMA disabled | Enabled/scalar |
+|---|---:|---:|---:|
+| Prefill input tokens per summed first-token latency | 224.12 tokens/s | 173.86 tokens/s | 1.2891 |
+| Median first-token latency | 386.51 ms | 617.09 ms | 0.6263 |
+| Mean per-stream decode rate | 53.33 tokens/s | 53.15 tokens/s | 1.0034 |
+| Sampled whole-device memory peak | 4.8638 GB | 4.8567 GB | 1.0015 |
 
-After the header change, the implementer clean-rebuilt every ROCm test target
-with `--clean-first` and `-j4`. The [target list](build-targets.json) includes
-the CTest alias's actual executable.
-
-```sh
-python3 - <<'PYBUILD'
-import json
-import subprocess
-from pathlib import Path
-targets = json.loads(Path("docs/bench-evidence/rocm-rdna3-quant-wmma/build-targets.json").read_text())
-subprocess.run(["cmake", "--build", "build-rdna3-wmma", "--clean-first",
-                "--target", *targets, "-j4"], check=True)
-PYBUILD
-flock /home/vikash/gpu.lock env HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
-  timeout 180s ctest --test-dir build-rdna3-wmma \
-  -R 'rocm|cross_device' --output-on-failure
-```
-
-## Primary oracle and memory format
-
-The developer selected task snapshots vLLM
-`39545e475d3627287ff69c25465dc0bd405f67e1` and GGUF plugin
-`d4c1f0d082fc7cd4350da56689109a01c1f29d6c`.
-The operator built and ran their isolated runtime. The manifest reports
-PyTorch `2.12.0+git6bbd260`, HIP `7.2.53211`, and physical `gfx1100`.
-These are the primary runtime's dependency versions. The native build uses
-the separate local HIP 7.15 and rocWMMA 2.2.1 toolchain.
-
-The port preserves plugin `tests/test_kernels.py::test_mmq`, lines 145 to 196,
-and `tests/utils.py::seed_everything`. Every original Q4_K and Q6_K tensor
-runs at `M=7,83,128,2048`, `K=256,1024`, with F16, BF16, and F32 input,
-and seed zero. The four source GGUF files retain the hashes in the
-[fixture summary](original-mmq-summary.json).
-
-| Output dtype | Original absolute tolerance | Original relative tolerance |
-|---|---|---|
-| F16 | 1 | 0.1 |
-| BF16 | 1.5 | 10000 |
-| F32 | 1.2 | 20 |
-
-All 240 cases select the compiled plugin extension. The executing source chain
-is `vllm_gguf_plugin/ops.py::ggml_mul_mat_a8`, line 200, to
-`vllm_gguf_plugin/csrc/gguf/gguf_kernel.hip::ggml_mul_mat_a8`, line 221.
-That function creates output with the input dtype and quantizes activations
-through `quantize_row_q8_1_cuda`. Its Q4_K and Q6_K branches call
-`ggml_mul_mat_q4_K_q8_1_cuda` and `ggml_mul_mat_q6_K_q8_1_cuda` in
-`vllm_gguf_plugin/csrc/gguf/mmq_hip.cuh`, lines 490 and 591.
-The corresponding device entry points are `mul_mat_q4_K` and `mul_mat_q6_K`.
-
-The native path retains its existing Q8_K activation format and F32 or BF16
-output contract. This row changes architecture admission only. The test adapter
-narrows native F32 output to F16 for the original upstream F16 comparison.
-BF16 emits directly from the native kernel. No model buffer dtype changes.
-The synthetic public model uses the normal BF16 model path.
-
-The adapter commands use the runtime and input locations supplied by this task.
-The runtime wrapper runs inside the caller's GPU mutex.
-
-```sh
-flock /home/vikash/gpu.lock timeout 300s \
-  /home/vikash/oracle/rdna3-wmma-latest/python-gpu-under-lock.sh \
-  /home/vikash/oracle/rdna3-wmma-latest/mmq-primary.py capture \
-  /home/vikash/oracle/rdna3-wmma-latest/mmq-original-fixture-manifest.json \
-  /home/vikash/models/test-gguf-sample \
-  /home/vikash/oracle/rdna3-wmma-latest/mmq-primary
-flock /home/vikash/gpu.lock env HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
-  timeout 300s build-rdna3-wmma/tests/rocm_quant_wmma_capture \
-  /home/vikash/oracle/rdna3-wmma-latest/mmq-primary/manifest.json \
-  /home/vikash/oracle/rdna3-wmma-latest/mmq-native
-flock /home/vikash/gpu.lock timeout 300s \
-  /home/vikash/oracle/rdna3-wmma-latest/python-gpu-under-lock.sh \
-  /home/vikash/oracle/rdna3-wmma-latest/mmq-primary.py compare \
-  /home/vikash/oracle/rdna3-wmma-latest/mmq-primary/manifest.json \
-  /home/vikash/oracle/rdna3-wmma-latest/mmq-native
-```
-
-The copied primary script equals
-`tools/rocm_quant_wmma/primary.py` at the implementation commit.
-The original fixture manifest comes from the existing
-`tools/rocm_quant_gather/primary.py::export_upstream` corpus exporter.
-The raw matrices remain in the recorded oracle directory, with manifest and
-output hashes sealed in this row's receipts.
-
-## Mutation method
-
-[CPU recipe](cpu-mutation-recipe.py) builds copied policy headers against the
-unchanged architecture test. Each mutation fails that suite.
-[Production recipe](production-mutation-recipe.py) compiles a copied grouped
-GEMM translation unit, substitutes its object into a copied static archive,
-and links the unchanged public test against that archive.
-The originals remain byte-identical throughout every mutation.
-
-| Mutation | Observed failure |
-|---|---|
-| Reject gfx1100 in the CPU predicate | gfx1100 admission assertions fail |
-| Admit unmeasured gfx1101 | exclusion assertion fails |
-| Accept malformed feature suffixes | malformed-name assertions fail |
-| Widen the attention predicate | attention exclusion assertions fail |
-| Restore gfx12-only runtime admission | public Q4_K dispatch assertion fails |
-| Delete only the Q4_K launch, retaining its counter | scalar completion token comparison fails |
-| Delete only the Q6_K launch, retaining its counter | completion fails because the unwritten output produces an invalid token |
-| Remove the scalar-control environment override | the scalar child's dispatch assertion fails |
-
-Removing a launch leaves its grid variable unused. The scratch copy retains
-the grid computation with a void cast. Removing Q4_K instantiation also leaves
-two internal helpers unused. Scratch compilation suppresses only
-`-Wunneeded-internal-declaration`. The production build retains `-Werror` and
-its ordinary warning flags. The initial scratch compile errors are harness
-failures, not mutation evidence. Each recorded mutation subsequently compiles,
-executes, and exits 1 for the stated runtime assertion.
-
-## Repository preflight
-
-The first full preflight, invoked before edits, completes with exit 0 and
-12 explicit skips. [Full receipt](preflight-first.log).
-Both full invocations use `GIT_CONFIG_GLOBAL=/dev/null` because the repository's
-onboarding test assumes Git's `master` default while the user's global setting
-selects `main`. No global configuration or checker changes are made.
-
-Seven skipped suites require NumPy, which this host Python cannot import.
-Five checks require arguments that `agent-preflight.sh` does not supply:
-`check-arm-isa-build.py`, `check-cpu-isa-build.py`, `check-cuda-fat-gencode.py`,
-`check-pr-size.py`, and `check-triton-aot-multiarch.py`.
-The relevant gfx1100 instruction path is separately inspected in this row.
-These skips do not constitute executed gate results.
-The full staged preflight completes with exit 0, no failed checks, and the
-same 12 explicit skips as the first run. It compiles all eight translation
-units in scope under the default host configuration.
-[Full staged receipt](preflight-staged.log). The record, symbol-anchor, and
-staged NOW checks also pass after the evidence and spec updates.
-
-## Independent review and operator verification
-
-The fresh reviewer executed the immutable implementation
-`c3fe98ba6c55ce71e75746e1b944a27640464e0f` and statically reviewed evidence commit
-`c176168cbbdcca700b6346ebb6a1914033b85eda`. The verdict is `PASS`, with no findings.
-The review's broad HIP run executes 24 tests and skips the same five baseline
-resource cases. Its full preflight exits 0 with the same 12 explicit skips.
-The reviewer independently captures all 240 original MMQ cases and reproduces
-the exact public logits and completion tokens.
-
-The reviewer mutates seven architecture policies, five MMQ guarantees, admission,
-both production launch sites, and the scalar override. Every intended defect
-fails its gate. The additional Q6_K mutation writes finite zeros while retaining
-the counter, and the public token comparison fails. Source hashes match the
-immutable implementation after restoration. The [review report](review-review-report.json)
-records commands, exits, scratch harness corrections, and remaining obligations.
-The [receipt manifest](review-receipt-manifest.json) seals the bounded log copies and records whitespace-only copy adaptations.
-Full ISA and raw matrices remain at their recorded source locations.
-
-The operator separately builds Release binaries in
-`/home/vikash/vllm.cpp-rdna3-wmma/build-rdna3-wmma-operator`.
-The architecture suite passes 16 cases and 109 assertions.
-The broad HIP gate exits 0 in 34.00 seconds, with 29 registered tests and the
-same five baseline resource skips. The [operator receipt](operator-receipt.json)
-seals build, binary, baseline, and candidate evidence. Its target recipe is a
-reconstruction from CMakeCache and CTest registration. The original complete
-build argument list was not retained.
-
-The operator's full preflight exits 1 on two invocations of the same role
-checker. Its `codex/rdna3-wmma-coordinator` branch made the checker treat pending
-task content as landed content. Renaming that branch to
-`row/KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA3-coordinator` makes the role check exit 0.
-The checker and product files remain unchanged. The full preflight was not
-rerun after the rename. Both the original failure and scoped resolution remain
-in the evidence.
-
-The operator subsequently runs all seven NumPy suites that the full preflight
-skips. The existing virtual environment initially causes two Qwen suite
-failures because its installed vLLM metadata conflicts with the fixture runtime.
-The isolated rerun exposes only existing NumPy and `numpy.libs` through
-`PYTHONPATH`, using `/usr/bin/python3`. The Qwen tools suite passes 17 cases,
-and the outputs suite passes 32 cases. All seven suites exit 0 without package,
-checker, or repository changes. The [initial results](operator-numpy-suites-summary.json)
-and [isolated reruns](operator-numpy-suites-numpy-only-summary.json) preserve
-both dispositions. The original preflight's skipped results remain unchanged.
-
-The prompt-adherence suite still skips five real-checkpoint subcases because
-`VT_LTX25_ADHERENCE_MODEL` is unset. The [operator receipt](operator-receipt.json)
-names each case. Four argument-dependent checks concern unchanged ARM, CPU,
-CUDA, and Triton build surfaces. They are outside this HIP admission change.
-The fifth, PR size, remains pending the final integrated diff.
-The [G4 model record](model-summary.md) contains completed correctness, native
-path traces, and measurements against both task-pinned oracles.
-Every below-floor axis remains open in the dedicated performance issue.
-The failed primary RPC attempt, later container teardown, and wrong native model
-argument retain separate receipts. None is relabeled as a successful process run.
-
-## Final records verification
-
-The [final records receipt](final-records-verification.json) records the complete
-preflight and the scoped checks after the lifecycle and evidence updates.
-The full preflight exits 1 on the unchanged onboarding fixture's branch-name
-assumption. The fixture expects `master`, while global Git configuration selects
-`main`. The committed spec ancestor records the same baseline failure.
-All 39 cases pass with `GIT_CONFIG_GLOBAL=/dev/null`.
-The original full run retains 12 skips, with their separate operator resolutions
-and remaining resource limits unchanged.
-
-Record, staged NOW, symbol-anchor, conflict, prompt-contract, and staged-role
-checks pass. The source diff against the reviewed implementation is empty for
-`include`, `src`, `tests`, and `tools`.
-The [path map](evidence-path-map.json) preserves the earlier nested receipt names.
-The flattened staged paths classify under the unchanged checker.
-The exact commit-range classification is checked before handoff.
+Native medians cover three complete processes per mode in `on1,off1,off2,on2,on3,off3` order, including first-use effects.
+Each oracle loads once and captures all four two-request legs. Primary compilation caches were warmed by its failed first attempt.
+Clocks vary dynamically. Monitor windows include initialization and teardown, so accepted clock attribution remains `PENDING`.
+Engine cache capacities differ. The primary reserves approximately 17 GiB, preventing equal-capacity memory conclusions.
+The llama.cpp client includes extra logit, memory, and finite-value instrumentation. Its decode-call-only timings are a separate scope.
+Memory values are sampled device-wide or process-tree peaks. Small decode or memory differences do not establish stable changes.
+Native/primary total whole-run throughput is 0.9443 and decode is 0.8880. Native/llama.cpp ratios are 0.2439 and 0.5743.
+The [open performance issue](../../../.agents/issues/_owed/ISSUE-LOCAL-01M2F4WCD6ZK5VH5S8TF83APD6.md) retains every below-floor axis, comparable timing windows, matching oracle traces, and accepted clock reproduction.
+The archived `model-summary.md` retains every value and ratio. Architecture admission claims no full-model parity or performance ceiling.

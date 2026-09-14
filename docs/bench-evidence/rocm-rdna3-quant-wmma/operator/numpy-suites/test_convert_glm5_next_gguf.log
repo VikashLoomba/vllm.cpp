@@ -1,0 +1,108 @@
+case: k-quant encoders are BYTE-IDENTICAL to llama.cpp b10451
+  ok   Q2_K matches the pinned reference byte-for-byte (504 bytes)
+  ok   Q6_K matches the pinned reference byte-for-byte (1260 bytes)
+  ok   Q8_0 matches the pinned reference byte-for-byte (1632 bytes)
+  ok   the golden names the pin it was captured at (b10451), not `master`
+
+case: the C++ name map equals the converter's, table for table
+  ok   Glm5NextCommonTensorMap: parsed 8 entries from the C++ TU
+  ok   Glm5NextCommonTensorMap: 8 entries identical to the converter's
+  ok   Glm5NextKdaTensorMap: parsed 15 entries from the C++ TU
+  ok   Glm5NextKdaTensorMap: 15 entries identical to the converter's
+  ok   Glm5NextDsaTensorMap: parsed 13 entries from the C++ TU
+  ok   Glm5NextDsaTensorMap: 13 entries identical to the converter's
+  ok   Glm5NextMlaKvBSplitTensorMap: parsed 2 entries from the C++ TU
+  ok   Glm5NextMlaKvBSplitTensorMap: 2 entries identical to the converter's
+  ok   Glm5NextDenseMlpTensorMap: parsed 3 entries from the C++ TU
+  ok   Glm5NextDenseMlpTensorMap: 3 entries identical to the converter's
+  ok   Glm5NextSparseMlpTensorMap: parsed 5 entries from the C++ TU
+  ok   Glm5NextSparseMlpTensorMap: 5 entries identical to the converter's
+  ok   Glm5NextVisionTensorMap: parsed 11 entries from the C++ TU
+  ok   Glm5NextVisionTensorMap: 11 entries identical to the converter's
+  ok   Glm5NextVisionBlockTensorMap: parsed 14 entries from the C++ TU
+  ok   Glm5NextVisionBlockTensorMap: 14 entries identical to the converter's
+  ok   Glm5NextStackedExpertTensorMap: 3 stacked expert tensors identical
+  ok   kGlm5NextGgufArch == ARCH == 'glm5next'
+case: the converter emits a well-formed glm5next GGUF
+  ok   q2_k conversion exits 0 (rc=0)
+
+  ok   GGUF version is 3
+  ok   general.architecture is `glm5next`
+  ok   block_count is 4
+  ok   general.file_type is the UINT32 `llama_ftype` MOSTLY_Q2_K = 10, not a string, and the arm name travels beside it
+case: the metadata carries the parameters the port hinges on
+  ok   `glm5next.kda.gate_lower_bound` is -5.0 -- the value that selects the sigmoid forget-gate branch over Kimi-Linear's softplus one
+  ok   `glm5next.kda.head_dim` is carried
+  ok   the fixture DISTINGUISHES the two conventions (kv_lora_rank 128 vs qk_nope_head_dim 64)
+  ok   `attention.key_length` is `kv_lora_rank + qk_rope_head_dim`, llama.cpp's meaning of the name (deepseek.py:345)
+  ok   `attention.value_length` is `kv_lora_rank` (deepseek.py:346)
+  ok   the `_mla` pair still carries the PER-HEAD query geometry: `qk_nope_head_dim + qk_rope_head_dim` and `v_head_dim` (deepseek.py:347-348)
+  ok   the KDA head count travels in BOTH spellings -- ours and llama.cpp's ssm.* (conversion/glm5next.py:78-80 at PR 27752) -- so either reader can load this file
+  ok   the short-conv kernel size is carried
+  ok   `indexer.kpool` is 4, the CHECKPOINT value, not the config class default of 16
+  ok   `indexer.top_k` is 2048
+  ok   mHC stream count is carried
+  ok   `hc_eps` is 1e-6 and is a DIFFERENT constant from rms_norm_eps 1e-5
+  ok   `rms_norm_eps` is 1e-5
+  ok   the AUTHORITATIVE per-layer schedule is carried as `layer_types`
+  ok   no rope frequency is written: the text stack is NoPE end to end
+  ok   MoE routing width is carried
+  ok   the clamped-SwiGLU limit is carried
+  ok   both multimodal token ids travel together
+case: the tensor set is exactly what the topology generates
+  ok   tensor set matches (161 expected). missing=[] extra=[]
+case: the MTP block is dropped, following the reference
+  ok   no `blk.4.*` tensor survives (found [])
+  ok   no MTP-only tensor (`enorm`, `hnorm`, `eh_proj`, `shared_head`) survives
+case: the 288-expert lane is STACKED, not one tensor per expert
+  ok   layer 1 ffn_gate_exps is [ne0=256, ne1=256, ne2=4 experts]
+  ok   no per-expert tensor name leaks into the file
+case: the q2_k arm puts the EXPERTS at Q2_K and the rest at Q6_K
+  ok   all 9 stacked expert tensors are Q2_K
+  ok   a non-expert 2-D weight is Q6_K
+  ok   a 1-D norm stays F32 rather than being quantized
+  ok   `ssm_a` (A_log) stays F32
+case: a row that does not divide the block STEPS DOWN rather than being reshaped
+  ok   the k-pool positional embedding (ne0=64, not a multiple of 256) steps down to Q8_0, whose block is 32
+  ok   the depthwise conv kernel (ne0=4 divides neither 256 nor 32) falls all the way to F32
+case: a convolution kernel with more axes than ggml carries is flattened, not written
+  ok   the 5-D patch-embed kernel is flattened to [1176, 128] rather than written with five axes
+  ok   the flattened patch-embed row (1176) divides neither 256 nor 32, so it lands at F32
+  ok   the 4-D downsample kernel is flattened to a row that DOES divide 256 and is quantized rather than dumped at F32
+  ok   no tensor in the file carries more than ggml's 4 axes
+  ok   3-D shapes are NOT flattened: the depthwise conv stays [k, 1, ch] and the expert lane stays [m, n, experts], because ggml indexes both
+case: the MLA `kv_b_proj` is SPLIT, and its k half is TRANSPOSED
+  ok   attn_k_b is ne [qk_nope=64, kv_lora=128, heads=4] -- the TRANSPOSED half
+  ok   attn_v_b is ne [kv_lora=128, v_head=64, heads=4] -- the untransposed half
+  ok   the fused `attn_kv_b.weight` is NOT written: no reader of this architecture expects one
+case: FP8 e4m3 block dequant and bf16 widening reach the file intact
+  ok   an F32-carried bf16 norm is bit-exact
+  ok   an FP8 e4m3 block-quantized MLA projection round-trips through Q6_K within 2% (max rel 0.0176)
+  ok   the stacked expert lane round-trips through Q2_K (max rel 0.3107)
+  ok   every expert slab is nearest its OWN expert: the lane is in expert order, not permuted
+case: `ssm_a` holds -exp(A_log), and the split halves hold the right slices
+  ok   `ssm_a` is -exp(A_log) exactly, not A_log
+  ok   -exp(A_log) differs from A_log on this fixture, so the check above can fail
+  ok   every `ssm_a` entry is strictly negative, which is what makes `log(-x)` defined on the loader side
+  ok   blk.2.attn_k_b.weight carries its own half of `kv_b_proj` (max rel 0.0040)
+  ok   blk.2.attn_v_b.weight carries its own half of `kv_b_proj` (max rel 0.0040)
+  ok   attn_k_b is nearer the K half than the V half: the two are not swapped
+case: an unimplemented arm is REFUSED by name
+  ok   --arm iq2_xxs is refused and names the missing part (imatrix) and why it is unreachable here
+  ok   --arm iq1_s is refused and names the missing part (imatrix) and why it is unreachable here
+  ok   --arm iq2_s is refused and names the missing part (imatrix) and why it is unreachable here
+  ok   --arm q4_k is refused and names the unported encoder
+  ok   --arm q3_k is refused and names the unported encoder
+  ok   --keep-mtp is refused and names the owed item that would carry it
+case: a checkpoint of another architecture is REFUSED, not converted
+  ok   a non-glm5_next config is refused by name
+case: an FP8 tensor with no scale companion is REFUSED, not guessed
+  ok   a missing `weight_scale_inv` is refused rather than treated as 1.0
+case: --dry-run reports the arm's size without writing a byte
+  ok   --dry-run --arm q2_k exits 0
+  ok   --dry-run --arm q6_k exits 0
+  ok   --dry-run --arm q8_0 exits 0
+  ok   the arms order by size q2_k < q6_k < q8_0 (4720672 < 5881888 < 7240184)
+  ok   --dry-run writes nothing into the source directory
+
+All cases passed.

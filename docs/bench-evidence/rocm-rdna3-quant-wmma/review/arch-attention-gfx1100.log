@@ -1,0 +1,16 @@
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+===============================================================================
+/home/vikash/oracle/rdna3-wmma-latest/review-wmma/arch-source/test.cpp:114:
+TEST CASE:  quantized WMMA admits only measured device names and HIP features
+
+/home/vikash/oracle/rdna3-wmma-latest/review-wmma/arch-source/test.cpp:131: ERROR: CHECK_FALSE( vt::rocm::GcnArchNameIsGfx12PrefillWmma("gfx1100") ) is NOT correct!
+  values: CHECK_FALSE( true )
+
+/home/vikash/oracle/rdna3-wmma-latest/review-wmma/arch-source/test.cpp:132: ERROR: CHECK_FALSE( vt::rocm::GcnArchNameIsGfx12PrefillWmma("gfx1100:xnack-") ) is NOT correct!
+  values: CHECK_FALSE( true )
+
+===============================================================================
+[doctest] test cases:  1 |  0 passed | 1 failed | 15 skipped
+[doctest] assertions: 31 | 29 passed | 2 failed |
+[doctest] Status: FAILURE!

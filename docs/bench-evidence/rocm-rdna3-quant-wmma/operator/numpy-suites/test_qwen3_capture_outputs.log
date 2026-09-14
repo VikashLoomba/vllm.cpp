@@ -1,0 +1,355 @@
+test_capture_rechecks_artifacts_package_and_scripts_after_generation (__main__.CaptureOutputTests.test_capture_rechecks_artifacts_package_and_scripts_after_generation) ... ok
+test_existing_outputs_are_not_overwritten (__main__.CaptureOutputTests.test_existing_outputs_are_not_overwritten) ... ok
+test_explicit_default_manifest_path_is_allowed (__main__.CaptureOutputTests.test_explicit_default_manifest_path_is_allowed) ... FAIL
+test_installed_wheel_vcs_prefix_is_verified_and_qualified (__main__.CaptureOutputTests.test_installed_wheel_vcs_prefix_is_verified_and_qualified) ... ok
+test_legacy_capture_records_and_rechecks_consumed_distribution_metadata (__main__.CaptureOutputTests.test_legacy_capture_records_and_rechecks_consumed_distribution_metadata) ... FAIL
+test_legacy_distribution_is_preserved_but_cannot_feed_strict_capture (__main__.CaptureOutputTests.test_legacy_distribution_is_preserved_but_cannot_feed_strict_capture) ... FAIL
+test_legacy_explicit_default_manifest_and_replacement_keep_valid_hashes (__main__.CaptureOutputTests.test_legacy_explicit_default_manifest_and_replacement_keep_valid_hashes) ... FAIL
+test_legacy_neartie_protects_symlinked_inputs (__main__.CaptureOutputTests.test_legacy_neartie_protects_symlinked_inputs) ... FAIL
+test_legacy_neartie_provenance_preserves_every_input_and_alias (__main__.CaptureOutputTests.test_legacy_neartie_provenance_preserves_every_input_and_alias) ... FAIL
+test_legacy_output_hardlink_cannot_overwrite_an_input (__main__.CaptureOutputTests.test_legacy_output_hardlink_cannot_overwrite_an_input) ... FAIL
+test_legacy_output_symlink_cannot_overwrite_an_input (__main__.CaptureOutputTests.test_legacy_output_symlink_cannot_overwrite_an_input) ... FAIL
+test_legacy_provenance_preserves_hardlinked_inputs (__main__.CaptureOutputTests.test_legacy_provenance_preserves_hardlinked_inputs) ... FAIL
+test_legacy_publication_preserves_capture_inputs (__main__.CaptureOutputTests.test_legacy_publication_preserves_capture_inputs) ... FAIL
+test_legacy_publication_protects_selected_distribution_metadata (__main__.CaptureOutputTests.test_legacy_publication_protects_selected_distribution_metadata) ... FAIL
+test_legacy_publication_refuses_aliases_between_output_destinations (__main__.CaptureOutputTests.test_legacy_publication_refuses_aliases_between_output_destinations) ... FAIL
+test_legacy_replacement_and_manifestless_teacher_forcing_remain_usable (__main__.CaptureOutputTests.test_legacy_replacement_and_manifestless_teacher_forcing_remain_usable) ... FAIL
+test_neartie_does_not_replace_existing_strict_outputs (__main__.CaptureOutputTests.test_neartie_does_not_replace_existing_strict_outputs) ... FAIL
+test_neartie_rechecks_its_runtime_and_input_bytes (__main__.CaptureOutputTests.test_neartie_rechecks_its_runtime_and_input_bytes) ... FAIL
+test_neartie_refuses_cache_mode_seed_and_token_mismatches (__main__.CaptureOutputTests.test_neartie_refuses_cache_mode_seed_and_token_mismatches) ... FAIL
+test_neartie_refuses_changed_capture_identity_metadata (__main__.CaptureOutputTests.test_neartie_refuses_changed_capture_identity_metadata) ... FAIL
+test_neartie_refuses_changed_constructor_sampling_state (__main__.CaptureOutputTests.test_neartie_refuses_changed_constructor_sampling_state) ... FAIL
+test_neartie_refuses_input_hash_drift_and_missing_provenance (__main__.CaptureOutputTests.test_neartie_refuses_input_hash_drift_and_missing_provenance) ... FAIL
+test_neartie_refuses_nonfinite_and_sub_millinat_drift (__main__.CaptureOutputTests.test_neartie_refuses_nonfinite_and_sub_millinat_drift) ... FAIL
+test_neartie_requires_complete_observed_capture_identity (__main__.CaptureOutputTests.test_neartie_requires_complete_observed_capture_identity) ... FAIL
+test_nondeterminism_and_prompt_drift_write_nothing (__main__.CaptureOutputTests.test_nondeterminism_and_prompt_drift_write_nothing) ... FAIL
+test_normalized_sampling_records_the_upstream_seed_sentinel (__main__.CaptureOutputTests.test_normalized_sampling_records_the_upstream_seed_sentinel) ... FAIL
+test_observed_cache_and_model_identity_must_agree (__main__.CaptureOutputTests.test_observed_cache_and_model_identity_must_agree) ... ok
+test_publication_failure_rolls_back_new_outputs (__main__.CaptureOutputTests.test_publication_failure_rolls_back_new_outputs) ... ok
+test_sampling_records_constructor_state_without_claiming_request_resolution (__main__.CaptureOutputTests.test_sampling_records_constructor_state_without_claiming_request_resolution) ... FAIL
+test_short_outputs_use_the_same_padding_in_both_arrays (__main__.CaptureOutputTests.test_short_outputs_use_the_same_padding_in_both_arrays) ... FAIL
+test_teacher_forcing_uses_our_prefix_and_preserves_gap_units (__main__.CaptureOutputTests.test_teacher_forcing_uses_our_prefix_and_preserves_gap_units) ... FAIL
+test_ten_runs_publish_numpy_and_actual_provenance (__main__.CaptureOutputTests.test_ten_runs_publish_numpy_and_actual_provenance) ... FAIL
+
+======================================================================
+FAIL: test_explicit_default_manifest_path_is_allowed (__main__.CaptureOutputTests.test_explicit_default_manifest_path_is_allowed)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 120, in test_explicit_default_manifest_path_is_allowed
+    provenance = self.capture("--provenance-out", str(self.out / "oracle-provenance.json"))
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 19, in capture
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_legacy_capture_records_and_rechecks_consumed_distribution_metadata (__main__.CaptureOutputTests.test_legacy_capture_records_and_rechecks_consumed_distribution_metadata)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 607, in test_legacy_capture_records_and_rechecks_consumed_distribution_metadata
+    self.prepare_legacy_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 402, in prepare_legacy_neartie
+    self.assertEqual(result.returncode, 0, result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_legacy_distribution_is_preserved_but_cannot_feed_strict_capture (__main__.CaptureOutputTests.test_legacy_distribution_is_preserved_but_cannot_feed_strict_capture)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 295, in test_legacy_distribution_is_preserved_but_cannot_feed_strict_capture
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+AssertionError: 1 != 0 : oracle execution: production; enforce_eager=False
+ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_legacy_explicit_default_manifest_and_replacement_keep_valid_hashes (__main__.CaptureOutputTests.test_legacy_explicit_default_manifest_and_replacement_keep_valid_hashes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 594, in test_legacy_explicit_default_manifest_and_replacement_keep_valid_hashes
+    self.prepare_legacy_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 402, in prepare_legacy_neartie
+    self.assertEqual(result.returncode, 0, result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_legacy_neartie_protects_symlinked_inputs (__main__.CaptureOutputTests.test_legacy_neartie_protects_symlinked_inputs)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 464, in test_legacy_neartie_protects_symlinked_inputs
+    self.prepare_legacy_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 402, in prepare_legacy_neartie
+    self.assertEqual(result.returncode, 0, result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_legacy_neartie_provenance_preserves_every_input_and_alias (__main__.CaptureOutputTests.test_legacy_neartie_provenance_preserves_every_input_and_alias)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 409, in test_legacy_neartie_provenance_preserves_every_input_and_alias
+    self.prepare_legacy_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 402, in prepare_legacy_neartie
+    self.assertEqual(result.returncode, 0, result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_legacy_output_hardlink_cannot_overwrite_an_input (__main__.CaptureOutputTests.test_legacy_output_hardlink_cannot_overwrite_an_input)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 494, in test_legacy_output_hardlink_cannot_overwrite_an_input
+    self.prepare_legacy_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 402, in prepare_legacy_neartie
+    self.assertEqual(result.returncode, 0, result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_legacy_output_symlink_cannot_overwrite_an_input (__main__.CaptureOutputTests.test_legacy_output_symlink_cannot_overwrite_an_input)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 451, in test_legacy_output_symlink_cannot_overwrite_an_input
+    self.prepare_legacy_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 402, in prepare_legacy_neartie
+    self.assertEqual(result.returncode, 0, result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_legacy_provenance_preserves_hardlinked_inputs (__main__.CaptureOutputTests.test_legacy_provenance_preserves_hardlinked_inputs)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 474, in test_legacy_provenance_preserves_hardlinked_inputs
+    self.prepare_legacy_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 402, in prepare_legacy_neartie
+    self.assertEqual(result.returncode, 0, result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_legacy_publication_preserves_capture_inputs (__main__.CaptureOutputTests.test_legacy_publication_preserves_capture_inputs)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 436, in test_legacy_publication_preserves_capture_inputs
+    self.prepare_legacy_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 402, in prepare_legacy_neartie
+    self.assertEqual(result.returncode, 0, result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_legacy_publication_protects_selected_distribution_metadata (__main__.CaptureOutputTests.test_legacy_publication_protects_selected_distribution_metadata)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 507, in test_legacy_publication_protects_selected_distribution_metadata
+    self.prepare_legacy_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 402, in prepare_legacy_neartie
+    self.assertEqual(result.returncode, 0, result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_legacy_publication_refuses_aliases_between_output_destinations (__main__.CaptureOutputTests.test_legacy_publication_refuses_aliases_between_output_destinations)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 549, in test_legacy_publication_refuses_aliases_between_output_destinations
+    self.prepare_legacy_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 402, in prepare_legacy_neartie
+    self.assertEqual(result.returncode, 0, result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_legacy_replacement_and_manifestless_teacher_forcing_remain_usable (__main__.CaptureOutputTests.test_legacy_replacement_and_manifestless_teacher_forcing_remain_usable)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 94, in test_legacy_replacement_and_manifestless_teacher_forcing_remain_usable
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+AssertionError: 1 != 0 : oracle execution: production; enforce_eager=False
+ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_neartie_does_not_replace_existing_strict_outputs (__main__.CaptureOutputTests.test_neartie_does_not_replace_existing_strict_outputs)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 257, in test_neartie_does_not_replace_existing_strict_outputs
+    self.prepare_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 190, in prepare_neartie
+    self.capture()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 19, in capture
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_neartie_rechecks_its_runtime_and_input_bytes (__main__.CaptureOutputTests.test_neartie_rechecks_its_runtime_and_input_bytes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 274, in test_neartie_rechecks_its_runtime_and_input_bytes
+    self.prepare_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 190, in prepare_neartie
+    self.capture()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 19, in capture
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_neartie_refuses_cache_mode_seed_and_token_mismatches (__main__.CaptureOutputTests.test_neartie_refuses_cache_mode_seed_and_token_mismatches)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 213, in test_neartie_refuses_cache_mode_seed_and_token_mismatches
+    self.prepare_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 190, in prepare_neartie
+    self.capture()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 19, in capture
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_neartie_refuses_changed_capture_identity_metadata (__main__.CaptureOutputTests.test_neartie_refuses_changed_capture_identity_metadata)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 235, in test_neartie_refuses_changed_capture_identity_metadata
+    self.prepare_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 190, in prepare_neartie
+    self.capture()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 19, in capture
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_neartie_refuses_changed_constructor_sampling_state (__main__.CaptureOutputTests.test_neartie_refuses_changed_constructor_sampling_state)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 351, in test_neartie_refuses_changed_constructor_sampling_state
+    self.prepare_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 190, in prepare_neartie
+    self.capture()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 19, in capture
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_neartie_refuses_input_hash_drift_and_missing_provenance (__main__.CaptureOutputTests.test_neartie_refuses_input_hash_drift_and_missing_provenance)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 222, in test_neartie_refuses_input_hash_drift_and_missing_provenance
+    self.prepare_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 190, in prepare_neartie
+    self.capture()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 19, in capture
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_neartie_refuses_nonfinite_and_sub_millinat_drift (__main__.CaptureOutputTests.test_neartie_refuses_nonfinite_and_sub_millinat_drift)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 265, in test_neartie_refuses_nonfinite_and_sub_millinat_drift
+    self.prepare_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 190, in prepare_neartie
+    self.capture()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 19, in capture
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_neartie_requires_complete_observed_capture_identity (__main__.CaptureOutputTests.test_neartie_requires_complete_observed_capture_identity)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 363, in test_neartie_requires_complete_observed_capture_identity
+    self.prepare_neartie()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 190, in prepare_neartie
+    self.capture()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 19, in capture
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_nondeterminism_and_prompt_drift_write_nothing (__main__.CaptureOutputTests.test_nondeterminism_and_prompt_drift_write_nothing)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 72, in test_nondeterminism_and_prompt_drift_write_nothing
+    self.assert_refused(result, "NONDETERMINISTIC")
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_tools.py", line 184, in assert_refused
+    self.assertIn(reason, result.stderr, result.stdout + result.stderr)
+AssertionError: 'NONDETERMINISTIC' not found in 'ARTIFACT_MISMATCH: imported and installed vLLM versions differ\n' : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_normalized_sampling_records_the_upstream_seed_sentinel (__main__.CaptureOutputTests.test_normalized_sampling_records_the_upstream_seed_sentinel)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 82, in test_normalized_sampling_records_the_upstream_seed_sentinel
+    provenance = self.capture("--seed", "-1")
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 19, in capture
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_sampling_records_constructor_state_without_claiming_request_resolution (__main__.CaptureOutputTests.test_sampling_records_constructor_state_without_claiming_request_resolution)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 334, in test_sampling_records_constructor_state_without_claiming_request_resolution
+    capture = self.capture("--seed", "-1")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 19, in capture
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_short_outputs_use_the_same_padding_in_both_arrays (__main__.CaptureOutputTests.test_short_outputs_use_the_same_padding_in_both_arrays)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 75, in test_short_outputs_use_the_same_padding_in_both_arrays
+    self.capture(env={"FAKE_SHORT": "1"})
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 19, in capture
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_teacher_forcing_uses_our_prefix_and_preserves_gap_units (__main__.CaptureOutputTests.test_teacher_forcing_uses_our_prefix_and_preserves_gap_units)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 198, in test_teacher_forcing_uses_our_prefix_and_preserves_gap_units
+    our = self.prepare_neartie()
+          ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 190, in prepare_neartie
+    self.capture()
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 19, in capture
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+======================================================================
+FAIL: test_ten_runs_publish_numpy_and_actual_provenance (__main__.CaptureOutputTests.test_ten_runs_publish_numpy_and_actual_provenance)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 28, in test_ten_runs_publish_numpy_and_actual_provenance
+    provenance = self.capture("--kv-cache-dtype", dtype, "--seed", "17",
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/vikash/vllm.cpp-rdna3-wmma/tests/scripts/test_qwen3_capture_outputs.py", line 19, in capture
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+AssertionError: 1 != 0 : ARTIFACT_MISMATCH: imported and installed vLLM versions differ
+
+
+----------------------------------------------------------------------
+Ran 32 tests in 11.782s
+
+FAILED (failures=27)

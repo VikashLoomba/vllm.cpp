@@ -1,0 +1,279 @@
+{
+  "selection": "Bounded review report, gate log copies, mutation results, and restoration evidence. Copy adaptations are explicit per file. Full ISA, raw matrices, and duplicate comparison JSON remain at the recorded source paths.",
+  "files": {
+    "review-report.json": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/review-report.json",
+      "bytes": 19556,
+      "sha256": "0756bc8af9132833d90db6b84301d7d75755021fa8a02317d7076d3d7bb0a417"
+    },
+    "arch-mutation-results.json": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/arch-mutation-results.json",
+      "bytes": 7169,
+      "sha256": "fc2eac6bd9bae617231ec9ffe3a0dc9ed07fb82daa3b16796f5f3dbd3464bc9c"
+    },
+    "mmq-mutation-results.json": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/mmq-mutation-results.json",
+      "bytes": 912,
+      "sha256": "e2ec70d64ad24142e46e9d766eb7ac016d307c763d70e35660075c49827bb860"
+    },
+    "mmq-finite-output-results.json": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/mmq-finite-output-results.json",
+      "bytes": 407,
+      "sha256": "0f638a588fbacc3a219dfe8076620a9bc39a8da2cbc387dd05dc4735e97c1b9c"
+    },
+    "tile-body-identity.json": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/tile-body-identity.json",
+      "bytes": 321,
+      "sha256": "50624963d2c847a629959f98d817e9ee833410e618eb386c5371428d13e4124e"
+    },
+    "implementation-receipt-audit.json": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/implementation-receipt-audit.json",
+      "bytes": 2277,
+      "sha256": "61bfe2f57e707631bd55b91cfe0bfac77b5910c3e714e6b4c67e9d814bf41ac6"
+    },
+    "native-build-provenance.json": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/native-build-provenance.json",
+      "bytes": 1789,
+      "sha256": "1e096221205b015f0f500f8c4344b20743f3793cb368ae3eaa501b35cd58eddc"
+    },
+    "native-output-deduplication.json": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/native-output-deduplication.json",
+      "bytes": 247,
+      "sha256": "61dfca1ab2e0d7f0ee6e0c06ae0ab5a70f946fc3be82a040b6eb076ecf296e62"
+    },
+    "arch-reject-valid-features.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/arch-reject-valid-features.log",
+      "bytes": 1390,
+      "sha256": "b9f3f4345d37b82953cf4919a9bd36a64559c7f4e396ac76c55386092da815b4"
+    },
+    "arch-remove-gfx1100.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/arch-remove-gfx1100.log",
+      "bytes": 1162,
+      "sha256": "2e5574f569f0bda48783e0b550fb560b68933563de3300c38bd91f2ce7572b2d"
+    },
+    "arch-attention-gfx1100.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/arch-attention-gfx1100.log",
+      "bytes": 929,
+      "sha256": "122853ca648670e9dae45149d7ed4d70774b6327177b0859e490cb7efc5782aa"
+    },
+    "arch-unchanged.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/arch-unchanged.log",
+      "bytes": 295,
+      "sha256": "6650220a546c7b6d0f9a5b8a408d08746167e8e876aae8140002c106beb8d7f6"
+    },
+    "arch-remove-gfx1201.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/arch-remove-gfx1201.log",
+      "bytes": 952,
+      "sha256": "c8442838f40d1696a6d8150ea43e059899a91b403544b0ad44c4277948cd7226"
+    },
+    "arch-ignore-invalid-features.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/arch-ignore-invalid-features.log",
+      "bytes": 2088,
+      "sha256": "d505d8f7dd9067a93bc38f811ced05ae6cbbfcdc98785ab4783facbee580ef37"
+    },
+    "arch-remove-gfx1200.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/arch-remove-gfx1200.log",
+      "bytes": 945,
+      "sha256": "8720a6da62fb61069b2172d55ab0bc0e989ae4197c8677e6e52390b971fceac8"
+    },
+    "arch-admit-unmeasured-gfx11.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/arch-admit-unmeasured-gfx11.log",
+      "bytes": 2249,
+      "sha256": "71138e4ca4a5cc981cf6af8c791e7f5d9130739b486711842a37ef653f071f75"
+    },
+    "mmq-input-hash.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/mmq-input-hash.log",
+      "bytes": 55,
+      "sha256": "51cfc1042a30457032729933e9d1254bade5045d6c4c0c707c08a980204a7889"
+    },
+    "mmq-output-dtype.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/mmq-output-dtype.log",
+      "bytes": 69,
+      "sha256": "a96dcf0da181f0abdf7f37157877f7d5c96e397f4800f15c40b9d8198df299bb"
+    },
+    "mmq-missing-case.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/mmq-missing-case.log",
+      "bytes": 76,
+      "sha256": "e68967153fec50fd8e8c1d200b54d1273fe31f9d6965628ec0d9ff1415e2a150"
+    },
+    "mmq-corrupt-output.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/mmq-corrupt-output.log",
+      "bytes": 216,
+      "sha256": "d9f8deff1e30887fe75b685df117a204de1c0c203929aa4710c068ec067cb9a2"
+    },
+    "admission-build.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/admission-build.log",
+      "bytes": 432,
+      "sha256": "3f994a4883aaf8e05133e1e693323fad570766407721fb90e1137cb1993d633a"
+    },
+    "admission-focused.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/admission-focused.log",
+      "bytes": 4446,
+      "sha256": "3ef7f2123810482900d85fb62ee90ba5b4f2f8369b669bf852bba1402ef7464e"
+    },
+    "admission-public.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/admission-public.log",
+      "bytes": 1030,
+      "sha256": "7166cab659b3876b5b1ca714f1ff0f4bb30f523aa6cf6c361f4f98381a36b32d"
+    },
+    "admission-restoration.json": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/admission-restoration.json",
+      "bytes": 222,
+      "sha256": "19631dcd5773bde5ff92c3936de245a43b2c227aaa27ce6f7b10338996da34c1"
+    },
+    "delete-q4-build.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/delete-q4-build.log",
+      "bytes": 432,
+      "sha256": "3f994a4883aaf8e05133e1e693323fad570766407721fb90e1137cb1993d633a"
+    },
+    "delete-q4-focused.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/delete-q4-focused.log",
+      "bytes": 2745,
+      "sha256": "4953d2e2e4ef70f267c809785ce01e3fa6757fffd2fbd3fdfea75b9bb4a2560b"
+    },
+    "delete-q4-public.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/delete-q4-public.log",
+      "bytes": 1344,
+      "sha256": "1a15379b24f53b4dc5245b4b279ef45c4fa386b93c4bb097d6d00e2204b3a592"
+    },
+    "delete-q4-restoration.json": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/delete-q4-restoration.json",
+      "bytes": 222,
+      "sha256": "19631dcd5773bde5ff92c3936de245a43b2c227aaa27ce6f7b10338996da34c1"
+    },
+    "delete-q6-build.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/delete-q6-build.log",
+      "bytes": 432,
+      "sha256": "3f994a4883aaf8e05133e1e693323fad570766407721fb90e1137cb1993d633a"
+    },
+    "delete-q6-focused.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/delete-q6-focused.log",
+      "bytes": 2748,
+      "sha256": "53d7d6d7817415d24db0df92deda060a82ba6c98fb08c61c2b3f1e22e14824df"
+    },
+    "delete-q6-public.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/delete-q6-public.log",
+      "bytes": 1291,
+      "sha256": "95be0cebe5d9fe2ac1193e83abf451352dfc6bfecd45dfa7758b01461ce7802c",
+      "raw_source_sha256": "ee7ca061b7c078bb5b42a1298e203cbfd1061b934d42ab280186fd45d1a25629",
+      "raw_source_bytes": 1292,
+      "copy_adaptation": "Trailing line whitespace and trailing blank lines removed to satisfy git diff --check. Raw source retained at source path."
+    },
+    "delete-q6-restoration.json": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/delete-q6-restoration.json",
+      "bytes": 222,
+      "sha256": "19631dcd5773bde5ff92c3936de245a43b2c227aaa27ce6f7b10338996da34c1"
+    },
+    "delete-q6-zero-build.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/delete-q6-zero-build.log",
+      "bytes": 432,
+      "sha256": "a584afbd4e06ed967938817a425d488e94bfcf30913cb5d19167591c0b683278"
+    },
+    "delete-q6-zero-focused.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/delete-q6-zero-focused.log",
+      "bytes": 2751,
+      "sha256": "aa38909d22a84a281a36bd58b2dfda422e9b1baf6f63f5c421956b38a9395d3c"
+    },
+    "delete-q6-zero-public.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/delete-q6-zero-public.log",
+      "bytes": 1344,
+      "sha256": "5c8c17181ee74898938a4465b8b9a716b8f5168253d25f1e1f64615838069a4b"
+    },
+    "delete-q6-zero-restoration.json": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/delete-q6-zero-restoration.json",
+      "bytes": 222,
+      "sha256": "19631dcd5773bde5ff92c3936de245a43b2c227aaa27ce6f7b10338996da34c1"
+    },
+    "scalar-control-build.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/scalar-control-build.log",
+      "bytes": 432,
+      "sha256": "a584afbd4e06ed967938817a425d488e94bfcf30913cb5d19167591c0b683278"
+    },
+    "scalar-control-focused.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/scalar-control-focused.log",
+      "bytes": 4470,
+      "sha256": "13a1036c611f53b496a169442bfbf99e08c086a784bade52881c09a5028d23a9"
+    },
+    "scalar-control-public.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/scalar-control-public.log",
+      "bytes": 553,
+      "sha256": "22dd1fd3ff10eaed51bcb62bc002d2517fac339a80ea9d832acb10254ad69ae2"
+    },
+    "scalar-control-restoration.json": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/scalar-control-restoration.json",
+      "bytes": 222,
+      "sha256": "19631dcd5773bde5ff92c3936de245a43b2c227aaa27ce6f7b10338996da34c1"
+    },
+    "logs/rdna3-wmma-review-configure.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/logs/rdna3-wmma-review-configure.log",
+      "bytes": 1899,
+      "sha256": "6b25996fe2760a2d90599afc1d5d76c8840953e5f10bb4ac042c5ee66a4be638",
+      "raw_source_sha256": "55cf035001f760b8c7df1b7ec297c56daa174f4f962523a91aceb09388b7939e",
+      "raw_source_bytes": 1904,
+      "copy_adaptation": "Trailing line whitespace and trailing blank lines removed to satisfy git diff --check. Raw source retained at source path."
+    },
+    "logs/rdna3-wmma-review-arch-full.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/logs/rdna3-wmma-review-arch-full.log",
+      "bytes": 298,
+      "sha256": "c379abc214ea72cd18194c463d169e9651334fb3d8519afb8236fe9821caed16"
+    },
+    "logs/rdna3-wmma-review-full-hip.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/logs/rdna3-wmma-review-full-hip.log",
+      "bytes": 4302,
+      "sha256": "26c4409c88162ef1ccaeb26455cfdad7fe6f2fe03325fe9b6256f92e8571990c"
+    },
+    "logs/rdna3-wmma-review-public.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/logs/rdna3-wmma-review-public.log",
+      "bytes": 1098,
+      "sha256": "e254626f04443f04e63c501353531943e9e5a2b29e7a39df96fd4bbaa6c85c39"
+    },
+    "logs/rdna3-wmma-review-full-preflight.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/logs/rdna3-wmma-review-full-preflight.log",
+      "bytes": 14764,
+      "sha256": "ec1450ee19fe4edfa4dfb96b5a4d86b376f8c4e9b6e2e7ab99db701c3b6ddf3b"
+    },
+    "logs/rdna3-wmma-review-focused-default.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/logs/rdna3-wmma-review-focused-default.log",
+      "bytes": 295,
+      "sha256": "ccee473aed799e96afda40fd490df4b66b77d0495cdf151b0ff6b17458f86047"
+    },
+    "logs/rdna3-wmma-review-focused-scalar.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/logs/rdna3-wmma-review-focused-scalar.log",
+      "bytes": 295,
+      "sha256": "ccee473aed799e96afda40fd490df4b66b77d0495cdf151b0ff6b17458f86047"
+    },
+    "logs/rdna3-wmma-review-own-comparison.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/logs/rdna3-wmma-review-own-comparison.log",
+      "bytes": 9200,
+      "sha256": "a146fac589f94b5db0dc91582392c1e76c0ce68d089126dae0bed720465e0766"
+    },
+    "logs/rdna3-wmma-review-restored-build.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/logs/rdna3-wmma-review-restored-build.log",
+      "bytes": 247,
+      "sha256": "5302a6eda06711320e54f375c63d6731225181ea3486836cf04ff8dd6a108af0"
+    },
+    "logs/rdna3-wmma-review-restored-focused.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/logs/rdna3-wmma-review-restored-focused.log",
+      "bytes": 295,
+      "sha256": "ccee473aed799e96afda40fd490df4b66b77d0495cdf151b0ff6b17458f86047"
+    },
+    "logs/rdna3-wmma-review-restored-public.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/logs/rdna3-wmma-review-restored-public.log",
+      "bytes": 1098,
+      "sha256": "e254626f04443f04e63c501353531943e9e5a2b29e7a39df96fd4bbaa6c85c39"
+    },
+    "logs/rdna3-wmma-review-mutation-q6.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/logs/rdna3-wmma-review-mutation-q6.log",
+      "bytes": 1750,
+      "sha256": "bdf1f97fb39f8a78ec56d3a5016df5664c917b62a5f47a9ca1873bd4af384689",
+      "raw_source_sha256": "3a84f4313b45e9ca02e2f029f35bc9e6e88de46c9ecc7ff39fcf400106418b0e",
+      "raw_source_bytes": 1752,
+      "copy_adaptation": "Trailing line whitespace and trailing blank lines removed to satisfy git diff --check. Raw source retained at source path."
+    },
+    "logs/rdna3-wmma-review-mutation-q6-zero.log": {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/review-wmma/logs/rdna3-wmma-review-mutation-q6-zero.log",
+      "bytes": 1087,
+      "sha256": "085b5aff7622298e7cf350b5d459ea9bf5e8615046c3771ec1aacdee954b4e65"
+    }
+  }
+}

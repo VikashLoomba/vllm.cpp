@@ -1,0 +1,26 @@
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+===============================================================================
+/home/vikash/oracle/rdna3-wmma-latest/review-wmma/arch-source/test.cpp:114:
+TEST CASE:  quantized WMMA admits only measured device names and HIP features
+
+/home/vikash/oracle/rdna3-wmma-latest/review-wmma/arch-source/test.cpp:120: ERROR: CHECK( GcnArchNameHasQuantWmma(name) ) is NOT correct!
+  values: CHECK( false )
+  logged: std::string(name) := gfx1100:xnack-
+
+/home/vikash/oracle/rdna3-wmma-latest/review-wmma/arch-source/test.cpp:120: ERROR: CHECK( GcnArchNameHasQuantWmma(name) ) is NOT correct!
+  values: CHECK( false )
+  logged: std::string(name) := gfx1100:sramecc+:xnack-
+
+/home/vikash/oracle/rdna3-wmma-latest/review-wmma/arch-source/test.cpp:120: ERROR: CHECK( GcnArchNameHasQuantWmma(name) ) is NOT correct!
+  values: CHECK( false )
+  logged: std::string(name) := gfx1200:sramecc-
+
+/home/vikash/oracle/rdna3-wmma-latest/review-wmma/arch-source/test.cpp:120: ERROR: CHECK( GcnArchNameHasQuantWmma(name) ) is NOT correct!
+  values: CHECK( false )
+  logged: std::string(name) := gfx1201:xnack+:sramecc+
+
+===============================================================================
+[doctest] test cases:  1 |  0 passed | 1 failed | 15 skipped
+[doctest] assertions: 31 | 27 passed | 4 failed |
+[doctest] Status: FAILURE!

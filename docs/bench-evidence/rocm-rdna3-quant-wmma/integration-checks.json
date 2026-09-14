@@ -1,0 +1,49 @@
+{
+  "scope": "Records-only integration of operator and independent review evidence. Product files remain byte-identical to c3fe98ba6. Prior complete implementation and reviewer preflight receipts cover unchanged executable content.",
+  "commands": [
+    {
+      "command": "git diff --cached --check",
+      "exit": 0
+    },
+    {
+      "command": "git diff --exit-code c3fe98ba6c55ce71e75746e1b944a27640464e0f -- include src tests tools",
+      "exit": 0
+    },
+    {
+      "command": "python3 scripts/check-agent-record.py",
+      "exit": 0
+    },
+    {
+      "command": "python3 scripts/check-symbol-anchors.py",
+      "exit": 0
+    },
+    {
+      "command": "python3 scripts/check-now-current.py --staged",
+      "exit": 0
+    },
+    {
+      "command": "python3 scripts/check-role-discipline.py",
+      "exit": 0
+    }
+  ],
+  "receipt_seal_checks": [
+    {
+      "manifest": "operator/receipt.json",
+      "checked_files": 19,
+      "exit": 0
+    },
+    {
+      "manifest": "review/receipt-manifest.json",
+      "checked_files": 53,
+      "exit": 0
+    }
+  ],
+  "full_preflight_repeated_for_records_only_delta": false,
+  "GPU_commands": 0,
+  "remote_writes": 0,
+  "pending": [
+    "G4 operator model correctness and measurements",
+    "PR-size gate against final integrated diff"
+  ],
+  "copy_adaptations": "Three reviewer logs remove trailing whitespace and trailing blank lines. The review manifest records both original source and copied byte hashes."
+}

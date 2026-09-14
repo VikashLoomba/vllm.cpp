@@ -1,0 +1,41 @@
+["flock", "/home/vikash/gpu.lock", "env", "-u", "VT_ROCM_QUANT_WMMA", "HIP_VISIBLE_DEVICES=0", "ROCR_VISIBLE_DEVICES=0", "timeout", "180", "/home/vikash/vllm.cpp-rdna3-wmma-review-scratch/build-rdna3-wmma-review-scratch/tests/test_backend_cross_device", "--test-case=*keep-quant*WMMA*,*keep-quant GEMM matches the CPU oracle when*"]
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+===============================================================================
+/home/vikash/vllm.cpp-rdna3-wmma-review-scratch/tests/vt/test_backend_cross_device.cpp:3687:
+TEST CASE:  keep-quant Q6_K WMMA tile arm matches the CPU oracle on gfx1100 and RDNA4
+
+/home/vikash/vllm.cpp-rdna3-wmma-review-scratch/tests/vt/test_backend_cross_device.cpp:3760: ERROR: CHECK( Nmse(ref, dout.Download()) <= kNmseTol ) is NOT correct!
+  values: CHECK( 1 <= 0.0005 )
+  logged: bf16_out := false
+
+/home/vikash/vllm.cpp-rdna3-wmma-review-scratch/tests/vt/test_backend_cross_device.cpp:3769: ERROR: CHECK( Nmse(ref, gotf) <= kNmseTol ) is NOT correct!
+  values: CHECK( 1 <= 0.0005 )
+  logged: bf16_out := true
+
+===============================================================================
+/home/vikash/vllm.cpp-rdna3-wmma-review-scratch/tests/vt/test_backend_cross_device.cpp:3883:
+TEST CASE:  keep-quant GEMM matches the CPU oracle when M and N are not multiples of 16
+
+/home/vikash/vllm.cpp-rdna3-wmma-review-scratch/tests/vt/test_backend_cross_device.cpp:3965: ERROR: CHECK( Nmse(ref, dout.Download()) <= kNmseTol ) is NOT correct!
+  values: CHECK( 0.822588 <= 0.0005 )
+  logged: std::string(f.name) := q6_K
+
+===============================================================================
+/home/vikash/vllm.cpp-rdna3-wmma-review-scratch/tests/vt/test_backend_cross_device.cpp:3993:
+TEST CASE:  keep-quant GEMM matches the CPU oracle when only one of M/N is misaligned
+
+/home/vikash/vllm.cpp-rdna3-wmma-review-scratch/tests/vt/test_backend_cross_device.cpp:4086: ERROR: CHECK( Nmse(ref, dout.Download()) <= kNmseTol ) is NOT correct!
+  values: CHECK( 0.870016 <= 0.0005 )
+  logged: std::string(shape.label) := M misaligned, N aligned (bottom-strip-only remainder)
+          std::string(f.name) := q6_K
+
+/home/vikash/vllm.cpp-rdna3-wmma-review-scratch/tests/vt/test_backend_cross_device.cpp:4086: ERROR: CHECK( Nmse(ref, dout.Download()) <= kNmseTol ) is NOT correct!
+  values: CHECK( 0.96546 <= 0.0005 )
+  logged: std::string(shape.label) := N misaligned, M aligned (right-strip-only remainder)
+          std::string(f.name) := q6_K
+
+===============================================================================
+[doctest] test cases:  4 |  1 passed | 3 failed | 57 skipped
+[doctest] assertions: 46 | 41 passed | 5 failed |
+[doctest] Status: FAILURE!

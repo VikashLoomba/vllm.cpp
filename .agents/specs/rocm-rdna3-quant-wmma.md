@@ -13,7 +13,9 @@ Commit this specification before implementation.
 G1-G3 on physical gfx1100. Both executing tile bodies remain unchanged.
 The 240 original primary fixture cases pass with their existing tolerances.
 The public gate matches every captured logit and completion token against its
-scalar control. G4 and fresh review remain with the coordinating operator.
+scalar control. Fresh review passes with no findings, and the operator's
+independent HIP gate passes with the same five baseline resource skips.
+G4 remains with the coordinating operator.
 [Implementation receipts](../../docs/bench-evidence/rocm-rdna3-quant-wmma/README.md)
 record the commands, red-first results, full HIP gate, and mutations.
 

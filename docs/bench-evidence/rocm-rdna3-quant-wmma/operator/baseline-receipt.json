@@ -1,0 +1,22 @@
+{
+  "date": "2026-09-14T04:18:59.204093+00:00",
+  "source_base": "cef9f821632eb33156bb7d24a0a85eeab7f7484a",
+  "head": "a5b5c92f2604386fcf162d5e12a42988f412db3b",
+  "gpu_lock": "/home/vikash/gpu.lock",
+  "hip_visible_devices": "0",
+  "rocr_visible_devices": "0",
+  "sha256": {
+    "/home/vikash/vllm.cpp-rdna3-wmma/build-rdna3-wmma-operator/CMakeCache.txt": "954c83c11c4af88e1ba503b1190cdc3da89051fde30abf1d7f32afff2a55ca01",
+    "/home/vikash/vllm.cpp-rdna3-wmma/build-rdna3-wmma-operator/libvllm.so.0.0.3": "8e167de4c2bbb9208db909757f79fed9540b3b666f2e96ae484a065d8cc0f37d",
+    "/home/vikash/vllm.cpp-rdna3-wmma/build-rdna3-wmma-operator/examples/vllm-bench": "d31a547825e436ff4f9e49683aeea6c599c60e8def2470aa37e27fee42cc6e98",
+    "/opt/rocm/core-10.0/include/rocwmma/internal/wmma_impl.hpp": "ae8d7771d037979371e6029b7e4b1627cdeb5a53d300ca65371bf1731aea8688",
+    "/opt/rocm/core-10.0/include/rocwmma/internal/io_layout.hpp": "f8782f48bb17b3405465f9b7c002628dfea37a37124be2b9e40d29eb7ab31635",
+    "/opt/rocm/core-10.0/include/rocwmma/internal/mma_config.hpp": "b746e3f83824b5723aa0889f897ee9f38f367bc630087670dfdcb0775e5193c0",
+    "/opt/rocm/core-10.0/include/rocwmma/internal/config.hpp": "9015b7f60ac362ba8e3cb31a7659846046961ba51a7dc0abc4a071709670c055"
+  },
+  "baseline_tests": {
+    "focused": "3 of 3 pass,6.73s",
+    "broad": "28 registered,23 executed,5 skipped,exit0,33.71s"
+  },
+  "preflight": "Only failing suite test_agent_onboard also fails pristine baseline and passes39tests with GIT_CONFIG_GLOBAL=/dev/null;12 unrelated skips reported"
+}

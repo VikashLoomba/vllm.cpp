@@ -1,0 +1,2 @@
+REPORT: c3fe98ba6: repository change (include/vt/rocm/rocm_quant_wmma_arch.h, src/vt/rocm/rocm_grouped_gemm.hip, tests/CMakeLists.txt, tests/capi/rocm_quant_gather_fixture.h, ... (+5)) reached main without arriving on a task branch. Work happens in its own worktree on a `row/<ID>` branch and lands through a reviewed PR or an authorized local merge naming that branch; never directly on the shared checkout
+OK: every change on main arrived on a task branch.

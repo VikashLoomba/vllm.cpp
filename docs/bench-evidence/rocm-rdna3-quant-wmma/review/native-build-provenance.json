@@ -1,0 +1,35 @@
+{
+  "head": "c3fe98ba6c55ce71e75746e1b944a27640464e0f",
+  "status": "",
+  "compiler": "AMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 8f497e0992fb7513f7f78a6f6b6f1056c375e961)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-10.0/lib/llvm/bin\n",
+  "files": {
+    "/home/vikash/vllm.cpp-rdna3-wmma-review/src/vt/rocm/rocm_grouped_gemm.hip": {
+      "bytes": 92976,
+      "sha256": "22c2f031af3db6454d73d7cc6213861ed4af4907e1d53c82c2b621dc81deb367"
+    },
+    "/home/vikash/vllm.cpp-rdna3-wmma-review/include/vt/rocm/rocm_quant_wmma_arch.h": {
+      "bytes": 1265,
+      "sha256": "b5e429843c9e8bb082e5b747bc03fe7ad8e50adc9edeab9b6c0c7ec9b7f80d10"
+    },
+    "/home/vikash/vllm.cpp-rdna3-wmma-review/build-rdna3-wmma-review/CMakeFiles/vllm.dir/src/vt/rocm/rocm_grouped_gemm.hip.o": {
+      "bytes": 445688,
+      "sha256": "9e568d93072f5e8a4b4d19ebd1a5b6fb2ca586d814a4437a5f127ec07ccd7bda"
+    },
+    "/home/vikash/vllm.cpp-rdna3-wmma-review/build-rdna3-wmma-review/tests/test_backend_cross_device": {
+      "bytes": 33335488,
+      "sha256": "7a0c025495d2ee96a6524ccba5808ba02ba38829721d88e5608582ebbfc10295"
+    },
+    "/home/vikash/vllm.cpp-rdna3-wmma-review/build-rdna3-wmma-review/tests/test_capi_rocm_quant_wmma": {
+      "bytes": 32243080,
+      "sha256": "95be875bf5468d2ced858c0db285bf3120caea258b3c0b77661cd8bbc015d6ec"
+    },
+    "/home/vikash/vllm.cpp-rdna3-wmma-review/build-rdna3-wmma-review/tests/rocm_quant_wmma_capture": {
+      "bytes": 32213608,
+      "sha256": "dbb903ab1f975a3e5f0c79702f51376b2b1e84fb9c8eb3e2b57bab62435a3352"
+    },
+    "/opt/rocm/include/rocwmma/internal/wmma_impl.hpp": {
+      "bytes": 142214,
+      "sha256": "ae8d7771d037979371e6029b7e4b1627cdeb5a53d300ca65371bf1731aea8688"
+    }
+  }
+}

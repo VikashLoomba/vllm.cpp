@@ -1,0 +1,4 @@
+{
+  "include/vt/rocm/rocm_quant_wmma_arch.h": "b5e429843c9e8bb082e5b747bc03fe7ad8e50adc9edeab9b6c0c7ec9b7f80d10",
+  "src/vt/rocm/rocm_grouped_gemm.hip": "22c2f031af3db6454d73d7cc6213861ed4af4907e1d53c82c2b621dc81deb367"
+}

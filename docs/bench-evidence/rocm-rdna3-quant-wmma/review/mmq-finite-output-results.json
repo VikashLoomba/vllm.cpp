@@ -1,0 +1,6 @@
+{
+  "verdict": "PASS",
+  "mutation": "finite native output changed to 10000.0",
+  "comparison_error": "Tensor-likes are not close!\n\nMismatched elements: 1 / 5376 (0.0%)\nGreatest absolute difference: 10000.0 at index (0,) (up to 1 allowed)\nGreatest relative difference: 18528.0 at index (0,) (up to 0.1 allowed)",
+  "restored_sha256": "6048b5a368f048cec6145d2d46edbdaa9b01bae86a1d9daec7ab025095508918"
+}

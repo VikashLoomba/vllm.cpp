@@ -1,14 +1,14 @@
 ID: ISSUE-LOCAL-01M2F0PQWGSCXG0N4951NF9DPZ
 Title: Enable the existing quantized WMMA prefill kernels on gfx1100
 Row: KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA3
-State: OPEN
+State: CLOSED
 Kind: feature
 GitHub: -
 Mirror: PENDING
 Availability: FULL
 Created: 2026-09-13
 Updated: 2026-09-13
-Closed: -
+Closed: 2026-09-13
 
 ## Problem
 
@@ -16,4 +16,4 @@ Current main compiles and dispatches its generic rocWMMA Q4_K and Q6_K prefill k
 
 ## Resolution
 
--
+13 September 2026: The landing change admits physical gfx1100 through the existing Q4_K and Q6_K WMMA dispatch. Independent review and operator verification pass the architecture, 240 original matrix, and public 1024-logit gates. Eight exact native prompt arrays and all generated IDs in six native processes match both task-pinned oracles. Native traces contain 152 WMMA calls per prefill and zero during decode. The observed prefill ratio is 1.2891 under dynamic clocks. docs/bench-evidence/rocm-rdna3-quant-wmma/model-summary.md retains every value, ratio, failed attempt, and measurement limit. ISSUE-LOCAL-01M2F4WCD6ZK5VH5S8TF83APD6 remains open for whole-model floors and accepted clock attribution.

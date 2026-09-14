@@ -1,0 +1,13 @@
+{
+  "status": "PASS",
+  "checks": [
+    "Python AST syntax",
+    "exact GGUF model argv and SHA256 in both prepare-only reports",
+    "same eight-request dataset",
+    "600-second trace bound",
+    "task-local temporary directories",
+    "running driver and completed adapter sources unchanged",
+    "prior manifest and archived bytes unchanged"
+  ],
+  "gpu_executed": false
+}

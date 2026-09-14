@@ -23,10 +23,14 @@ Every GPU invocation held `/home/vikash/gpu.lock` and selected device 0 with
 | G5 broad HIP gate | Satisfied with the five baseline resource skips listed below. All 29 registered tests have zero failures after a clean rebuild. | [HIP gate](hip-gate-green.log) |
 | G5 repository preflight | Executed with exit 0 and 12 unchanged skips. The skips remain unavailable checks, rather than passes. | [First](preflight-first.log), [staged](preflight-staged.log) |
 | G5 implementer mutations | Satisfied. Four CPU policy mutations and four public production mutations fail. The immutable original files retain their hashes. | [CPU mutations](cpu-mutations.json), [production mutations](production-mutations.json) |
-| G4 full-model correctness and performance | Pending the coordinating operator's model and oracle runs. No throughput, latency, or memory claim is made here. | Owning spec |
-| G5 fresh review | Satisfied. Independent review of the immutable implementation passes with no findings. | [Review report](review/review-report.json) |
-| G5 operator HIP verification | Satisfied with the same five baseline resource skips. The independent build and all 29 registered tests exit 0. | [Operator receipt](operator/receipt.json) |
-| G5 operator repository preflight | Full run exits 1 on branch-role classification. The role check exits 0 after the branch rename. Seven skipped NumPy suites subsequently execute with exit 0. | [Original failure](operator/preflight-original-failure.log), [resolution](operator/role-after-rename.log), [supplement](operator/receipt.json) |
+| G4 full-model correctness | Satisfied. All eight native prompt arrays match the primary. All 128 generated IDs in each of six native processes match both oracles. | [Model receipts](model-summary.md) |
+| G4 same-binary measurement | Executed. Prefill records 224.12 versus 173.86 tokens/s. Accepted clock attribution remains pending. | [Values and limits](model-summary.md#recorded-axes) |
+| G4 whole-model floor | Failing on the recorded below-floor axes. Comparable oracle traces and clock-window reproduction remain pending. | [Owned gaps](../../../.agents/issues/_owed/ISSUE-LOCAL-01M2F4WCD6ZK5VH5S8TF83APD6.md) |
+| G4 model path | Satisfied. Each of eight enabled prefill windows contains 152 WMMA calls. Disabled and decode windows contain zero. | [Trace summary](model-adapters-native-trace-pair-summary.json) |
+| G5 fresh review | Satisfied. Independent review of the immutable implementation passes with no findings. | [Review report](review-review-report.json) |
+| G5 operator HIP verification | Satisfied with the same five baseline resource skips. The independent build and all 29 registered tests exit 0. | [Operator receipt](operator-receipt.json) |
+| G5 operator repository preflight | Full run exits 1 on branch-role classification. The role check exits 0 after the branch rename. Seven skipped NumPy suites subsequently execute with exit 0. | [Original failure](operator-preflight-original-failure.log), [resolution](operator-role-after-rename.log), [supplement](operator-receipt.json) |
+| G5 operator original upstream fixture gate | Satisfied. The operator independently captures and compares all 240 original matrix cases. | [Capture](model-operator-mmq-report.json), [comparison](model-operator-mmq-comparison.json) |
 
 The existing physical fixtures preserve the partial four-wave block at
 `M=32, N=48, K=512`, both output dtypes, joint tails, and separate bottom and
@@ -217,16 +221,16 @@ The reviewer mutates seven architecture policies, five MMQ guarantees, admission
 both production launch sites, and the scalar override. Every intended defect
 fails its gate. The additional Q6_K mutation writes finite zeros while retaining
 the counter, and the public token comparison fails. Source hashes match the
-immutable implementation after restoration. The [review report](review/review-report.json)
+immutable implementation after restoration. The [review report](review-review-report.json)
 records commands, exits, scratch harness corrections, and remaining obligations.
-The [receipt manifest](review/receipt-manifest.json) seals the bounded log copies and records whitespace-only copy adaptations.
+The [receipt manifest](review-receipt-manifest.json) seals the bounded log copies and records whitespace-only copy adaptations.
 Full ISA and raw matrices remain at their recorded source locations.
 
 The operator separately builds Release binaries in
 `/home/vikash/vllm.cpp-rdna3-wmma/build-rdna3-wmma-operator`.
 The architecture suite passes 16 cases and 109 assertions.
 The broad HIP gate exits 0 in 34.00 seconds, with 29 registered tests and the
-same five baseline resource skips. The [operator receipt](operator/receipt.json)
+same five baseline resource skips. The [operator receipt](operator-receipt.json)
 seals build, binary, baseline, and candidate evidence. Its target recipe is a
 reconstruction from CMakeCache and CTest registration. The original complete
 build argument list was not retained.
@@ -245,13 +249,35 @@ failures because its installed vLLM metadata conflicts with the fixture runtime.
 The isolated rerun exposes only existing NumPy and `numpy.libs` through
 `PYTHONPATH`, using `/usr/bin/python3`. The Qwen tools suite passes 17 cases,
 and the outputs suite passes 32 cases. All seven suites exit 0 without package,
-checker, or repository changes. The [initial results](operator/numpy-suites/summary.json)
-and [isolated reruns](operator/numpy-suites/numpy-only-summary.json) preserve
+checker, or repository changes. The [initial results](operator-numpy-suites-summary.json)
+and [isolated reruns](operator-numpy-suites-numpy-only-summary.json) preserve
 both dispositions. The original preflight's skipped results remain unchanged.
 
 The prompt-adherence suite still skips five real-checkpoint subcases because
-`VT_LTX25_ADHERENCE_MODEL` is unset. The [operator receipt](operator/receipt.json)
+`VT_LTX25_ADHERENCE_MODEL` is unset. The [operator receipt](operator-receipt.json)
 names each case. Four argument-dependent checks concern unchanged ARM, CPU,
 CUDA, and Triton build surfaces. They are outside this HIP admission change.
 The fifth, PR size, remains pending the final integrated diff.
-G4 model correctness and measurements remain pending with the operator.
+The [G4 model record](model-summary.md) contains completed correctness, native
+path traces, and measurements against both task-pinned oracles.
+Every below-floor axis remains open in the dedicated performance issue.
+The failed primary RPC attempt, later container teardown, and wrong native model
+argument retain separate receipts. None is relabeled as a successful process run.
+
+## Final records verification
+
+The [final records receipt](final-records-verification.json) records the complete
+preflight and the scoped checks after the lifecycle and evidence updates.
+The full preflight exits 1 on the unchanged onboarding fixture's branch-name
+assumption. The fixture expects `master`, while global Git configuration selects
+`main`. The committed spec ancestor records the same baseline failure.
+All 39 cases pass with `GIT_CONFIG_GLOBAL=/dev/null`.
+The original full run retains 12 skips, with their separate operator resolutions
+and remaining resource limits unchanged.
+
+Record, staged NOW, symbol-anchor, conflict, prompt-contract, and staged-role
+checks pass. The source diff against the reviewed implementation is empty for
+`include`, `src`, `tests`, and `tools`.
+The [path map](evidence-path-map.json) preserves the earlier nested receipt names.
+The flattened staged paths classify under the unchanged checker.
+The exact commit-range classification is checked before handoff.

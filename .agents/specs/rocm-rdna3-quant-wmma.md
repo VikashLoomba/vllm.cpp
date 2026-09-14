@@ -9,15 +9,19 @@ Commit this specification before implementation.
 
 ## Now
 
-`SPIKE`. Implementation `c3fe98ba6c55ce71e75746e1b944a27640464e0f` passes
-G1-G3 on physical gfx1100. Both executing tile bodies remain unchanged.
-The 240 original primary fixture cases pass with their existing tolerances.
-The public gate matches every captured logit and completion token against its
-scalar control. Fresh review passes with no findings, and the operator's
-independent HIP gate passes with the same five baseline resource skips.
-G4 remains with the coordinating operator.
+`DONE` for architecture admission, 13 September 2026.
+Implementation `c3fe98ba6c55ce71e75746e1b944a27640464e0f` passes G1-G3 and
+fresh mutation review. Both executing tile bodies remain unchanged.
+The operator independently reproduces the hardware, public, and 240 original
+primary fixture gates. G5 retains its explicitly recorded baseline resource skips.
+G4 executes both task-pinned oracles and six native processes with exact input
+and generated token IDs. Native traces prove prefill-only WMMA dispatch.
+The observed prefill ratio is 1.2891 with WMMA enabled.
+Full-model floors remain failing, and accepted clock attribution remains pending
+under the dedicated issue in `## Owed`.
 [Implementation receipts](../../docs/bench-evidence/rocm-rdna3-quant-wmma/README.md)
-record the commands, red-first results, full HIP gate, and mutations.
+and [model receipts](../../docs/bench-evidence/rocm-rdna3-quant-wmma/model-summary.md)
+record commands, results, mutations, and measurement limits.
 
 ## Scope
 
@@ -140,8 +144,13 @@ Do not silently broaden the row or claim an unrun gate passed.
 
 ## Owed
 
-This row owns its implementation and verification gates. No correctness or
-performance claim exists until its corresponding receipts are recorded.
+`ISSUE-LOCAL-01M2F4WCD6ZK5VH5S8TF83APD6` owns the remaining full-model
+performance gaps on the retained gfx1100 workload. It includes every below-floor
+axis, matching oracle traces, comparable timing windows, and accepted clock
+attribution. The [model record](../../docs/bench-evidence/rocm-rdna3-quant-wmma/model-summary.md)
+retains all measured values, ratios, and limits. This debt is separate from
+architecture admission and from the deferred Qwen state characterization.
+
 Other formats, grouped expert tiles, and other RDNA3 devices keep their prior
 owners. The parent RDNA4 row and its open cooperative-tile work remain separate.
 
@@ -149,4 +158,36 @@ owners. The parent RDNA4 row and its open cooperative-tile work remain separate.
 
 | ID | Upstream source | Local anchor | Tests and evidence | Spec | State | Owner | Issue |
 |---|---|---|---|---|---|---|---|
-| `KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA3` | Pinned llama.cpp RDNA3 integer WMMA; rocWMMA 2.2.1 gfx11 fragments | `KQuantGemmKWmmaQ4K`, `KQuantGemmKWmmaQ6K` | [G1-G3 receipts](../../docs/bench-evidence/rocm-rdna3-quant-wmma/README.md), G4 and fresh review pending | [This spec](rocm-rdna3-quant-wmma.md) | `SPIKE` | RDNA3 helper; coordinating operator | `ISSUE-LOCAL-01M2F0PQWGSCXG0N4951NF9DPZ` |
+| `KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA3` | Pinned llama.cpp RDNA3 integer WMMA; rocWMMA 2.2.1 gfx11 fragments | `KQuantGemmKWmmaQ4K`, `KQuantGemmKWmmaQ6K` | [G1-G5 receipts](../../docs/bench-evidence/rocm-rdna3-quant-wmma/README.md), independent review and operator verification | [This spec](rocm-rdna3-quant-wmma.md) | `DONE` | RDNA3 helper; coordinating operator | `ISSUE-LOCAL-01M2F0PQWGSCXG0N4951NF9DPZ` |
+
+## Outcome
+
+The existing generic rocWMMA tile bodies execute correctly on physical gfx1100.
+Architecture admission is sufficient. No arithmetic or fragment-layout repair
+is needed. The Q4_K and Q6_K bodies retain their original byte hashes.
+The original 240 plugin cases preserve every input mode and tolerance.
+The public gate matches 1024 logits and eight completion tokens against scalar.
+Independent mutations detect missing admission, missing launches, scalar-control
+changes, and finite corrupted output. The operator repeats the applicable gates.
+
+The full-model workload uses eight requests with 183 and 174 input tokens in
+alternating order. Exact input arrays and all 128 generated IDs match the primary
+and llama.cpp captures. All six native process outputs match both oracles.
+The enabled trace contains 152 WMMA calls per prefill and zero during decode.
+The scalar trace contains no WMMA calls.
+
+Enabled and disabled median prefill rates are 224.12 and 173.86 tokens/s.
+Median first-token latencies are 386.51 and 617.09 ms.
+Mean per-stream decode rates are 53.33 and 53.15 tokens/s.
+Sampled whole-device memory peaks are 4.864 and 4.857 GB.
+These dynamic-clock observations motivate retaining the enabled default.
+They do not establish clock-attributed performance or full-model parity.
+The dedicated performance issue retains every below-floor axis and missing
+measurement obligation. No apparent performance limit is accepted.
+
+The default architecture predicate adds only measured gfx1100 to gfx1200/gfx1201.
+Other gfx11 devices remain excluded because they lack their own physical evidence.
+The attention predicate remains unchanged because its gfx1100 body is not enabled.
+The scalar environment override remains available for reproducible controls.
+Output dtypes, quantization formats, and tile arithmetic retain their prior values
+because this row proves admission without changing those contracts.

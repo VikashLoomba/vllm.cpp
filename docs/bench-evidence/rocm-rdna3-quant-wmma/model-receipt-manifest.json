@@ -1,0 +1,1015 @@
+{
+  "recorded_utc": "2026-09-14T05:06:06.265976+00:00",
+  "scope": "Bounded G4 model evidence and operator original-MMQ capture; raw matrices and full traces remain external.",
+  "files": [
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/HANDOFF.md",
+      "source_bytes": 17112,
+      "source_sha256": "f8aeb5b132d332d416ce9d8a61aa997db695664053ea05a4a67b86885706ffc3",
+      "copy": "model-adapters-HANDOFF.md",
+      "copy_bytes": 17112,
+      "copy_sha256": "f8aeb5b132d332d416ce9d8a61aa997db695664053ea05a4a67b86885706ffc3",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/adapter-manifest.json",
+      "source_bytes": 40635,
+      "source_sha256": "c89ed2148cc9d1c1ccfde308f861fbdcdb416c6e6e39d342fa5e83b0b936f254",
+      "copy": "model-adapters-adapter-manifest.json",
+      "copy_bytes": 40635,
+      "copy_sha256": "c89ed2148cc9d1c1ccfde308f861fbdcdb416c6e6e39d342fa5e83b0b936f254",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/adapter-manifest-gguf-trace.json",
+      "source_bytes": 44732,
+      "source_sha256": "c401010ff823eab2f025a09cbebb957b85ec93e15e6ce591fda0150d8f5f2184",
+      "copy": "model-adapters-adapter-manifest-gguf-trace.json",
+      "copy_bytes": 44732,
+      "copy_sha256": "c401010ff823eab2f025a09cbebb957b85ec93e15e6ce591fda0150d8f5f2184",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/capture_primary.py",
+      "source_bytes": 11553,
+      "source_sha256": "055f4b29f43d7f1defb2ae4b04709d1ea847bb2534341fc35712c4b8e789c308",
+      "copy": "model-adapters-capture_primary.py",
+      "copy_bytes": 11553,
+      "copy_sha256": "055f4b29f43d7f1defb2ae4b04709d1ea847bb2534341fc35712c4b8e789c308",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/capture_llama.cpp",
+      "source_bytes": 17413,
+      "source_sha256": "b1a327d86a4b19ea0636f8bc37d8b1d4de00fe46bd528e011500238e7a22cb80",
+      "copy": "model-adapters-capture_llama.cpp.txt",
+      "copy_bytes": 17413,
+      "copy_sha256": "b1a327d86a4b19ea0636f8bc37d8b1d4de00fe46bd528e011500238e7a22cb80",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/build_llama_adapter.sh",
+      "source_bytes": 437,
+      "source_sha256": "5afdc37c0de789d73ba1cb94d1f2e4a8640f35275312c0fac743fd5e2da223ef",
+      "copy": "model-adapters-build_llama_adapter.sh",
+      "copy_bytes": 437,
+      "copy_sha256": "5afdc37c0de789d73ba1cb94d1f2e4a8640f35275312c0fac743fd5e2da223ef",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/closed_loop_metrics.py",
+      "source_bytes": 11056,
+      "source_sha256": "c03582073458fea18811ce080a712133b408cd5dcccb10fe5f77c76a117890ae",
+      "copy": "model-adapters-closed_loop_metrics.py",
+      "copy_bytes": 11056,
+      "copy_sha256": "c03582073458fea18811ce080a712133b408cd5dcccb10fe5f77c76a117890ae",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/monitor_command.py",
+      "source_bytes": 9737,
+      "source_sha256": "e1a783c81649ea3ea13f15ad03308272cdae67249fb38390bfa005f4f1216f1d",
+      "copy": "model-adapters-monitor_command.py",
+      "copy_bytes": 9737,
+      "copy_sha256": "e1a783c81649ea3ea13f15ad03308272cdae67249fb38390bfa005f4f1216f1d",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/run_native_ab.py",
+      "source_bytes": 15285,
+      "source_sha256": "397f10f847ad3e9643d6a95cfcbf66d4beaa2eb7b3b72b2e474659dafe847c7e",
+      "copy": "model-adapters-run_native_ab.py",
+      "copy_bytes": 15285,
+      "copy_sha256": "397f10f847ad3e9643d6a95cfcbf66d4beaa2eb7b3b72b2e474659dafe847c7e",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/run_native_trace.py",
+      "source_bytes": 6603,
+      "source_sha256": "f8c131d1fbcbaf9e54b8a34756e1d7cd4ea2692b7a9ee3b01f671be958529c7b",
+      "copy": "model-adapters-run_native_trace.py",
+      "copy_bytes": 6603,
+      "copy_sha256": "f8c131d1fbcbaf9e54b8a34756e1d7cd4ea2692b7a9ee3b01f671be958529c7b",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/aggregate_oracle_captures.py",
+      "source_bytes": 6488,
+      "source_sha256": "3ef9b56075cd1986f54771b4a7f29c8b802d6f71b244a1a9bc4dd245c55e7bf4",
+      "copy": "model-adapters-aggregate_oracle_captures.py",
+      "copy_bytes": 6488,
+      "copy_sha256": "3ef9b56075cd1986f54771b4a7f29c8b802d6f71b244a1a9bc4dd245c55e7bf4",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/python-gpu-named-under-lock.sh",
+      "source_bytes": 1267,
+      "source_sha256": "44043dc3072cba0296f0f148406b8b4b56d78d02db285eb49761260cdec15a59",
+      "copy": "model-adapters-python-gpu-named-under-lock.sh",
+      "copy_bytes": 1267,
+      "copy_sha256": "44043dc3072cba0296f0f148406b8b4b56d78d02db285eb49761260cdec15a59",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/retry_primary_under_lock.sh",
+      "source_bytes": 677,
+      "source_sha256": "e7947eb4c2935f74f34fe9200c401677117d22316c2eb299688f3a72a27f2fd1",
+      "copy": "model-adapters-retry_primary_under_lock.sh",
+      "copy_bytes": 677,
+      "copy_sha256": "e7947eb4c2935f74f34fe9200c401677117d22316c2eb299688f3a72a27f2fd1",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/seal_adapter_manifest.py",
+      "source_bytes": 4946,
+      "source_sha256": "d62dc73ef8128bed4f777a163a07845b490bd82ae90d446ebf8c5d1162b355d4",
+      "copy": "model-adapters-seal_adapter_manifest.py",
+      "copy_bytes": 4946,
+      "copy_sha256": "d62dc73ef8128bed4f777a163a07845b490bd82ae90d446ebf8c5d1162b355d4",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/seal_trace_model_fix_manifest.py",
+      "source_bytes": 3073,
+      "source_sha256": "8d46df17ff263b9026983313f96e27bf59c160fcb4798f5665dc8ef6b401c114",
+      "copy": "model-adapters-seal_trace_model_fix_manifest.py",
+      "copy_bytes": 3073,
+      "copy_sha256": "8d46df17ff263b9026983313f96e27bf59c160fcb4798f5665dc8ef6b401c114",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/primary-model.json",
+      "source_bytes": 30536,
+      "source_sha256": "f152650d003011ab1bbb0155f40331a1839c466af0c4e5fc193b36705eade0ba",
+      "copy": "model-adapters-primary-model.json",
+      "copy_bytes": 30536,
+      "copy_sha256": "f152650d003011ab1bbb0155f40331a1839c466af0c4e5fc193b36705eade0ba",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/primary-model-retry.json",
+      "source_bytes": 79325,
+      "source_sha256": "caad2b4491b3fd7e8e538ec0a739cc9f39748d4e7a491365a7930a168b9f8040",
+      "copy": "model-adapters-primary-model-retry.json",
+      "copy_bytes": 79325,
+      "copy_sha256": "caad2b4491b3fd7e8e538ec0a739cc9f39748d4e7a491365a7930a168b9f8040",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/primary-retry-teardown.json",
+      "source_bytes": 754,
+      "source_sha256": "217a2a80748702b3ec330b7f83713dbada40a6b4e34732f77748e62fdd80d5ae",
+      "copy": "model-adapters-primary-retry-teardown.json",
+      "copy_bytes": 754,
+      "copy_sha256": "217a2a80748702b3ec330b7f83713dbada40a6b4e34732f77748e62fdd80d5ae",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/llama-model.json",
+      "source_bytes": 68712,
+      "source_sha256": "41211f9ee03aeb17c246f52f224a4aa6b719de57dcd4d539fdaef26e503b6c5f",
+      "copy": "model-adapters-llama-model.json",
+      "copy_bytes": 68712,
+      "copy_sha256": "41211f9ee03aeb17c246f52f224a4aa6b719de57dcd4d539fdaef26e503b6c5f",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/oracle-whole-workload.json",
+      "source_bytes": 136896,
+      "source_sha256": "dd6924f9e65f6b612836e64767559af2d323eb4df752424586a92378667a506c",
+      "copy": "model-adapters-oracle-whole-workload.json",
+      "copy_bytes": 136896,
+      "copy_sha256": "dd6924f9e65f6b612836e64767559af2d323eb4df752424586a92378667a506c",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/prompt-ids-retry.json",
+      "source_bytes": 4532,
+      "source_sha256": "ad4e063aff43e9a45d595eb32c9867fabc7f9dd1fbc496476a6cac1489251b3b",
+      "copy": "model-adapters-prompt-ids-retry.json",
+      "copy_bytes": 4532,
+      "copy_sha256": "ad4e063aff43e9a45d595eb32c9867fabc7f9dd1fbc496476a6cac1489251b3b",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/trace-gguf-model-check.json",
+      "source_bytes": 377,
+      "source_sha256": "60abb9deaf962f85a8326909cf96c4d5cc7a5991b401dd95861b4813ecd67c19",
+      "copy": "model-adapters-trace-gguf-model-check.json",
+      "copy_bytes": 377,
+      "copy_sha256": "60abb9deaf962f85a8326909cf96c4d5cc7a5991b401dd95861b4813ecd67c19",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model/summary.json",
+      "source_bytes": 24131,
+      "source_sha256": "db6e149601cde5e7e26e753ef56e4efd37a0dc27f8518d8f8a545d51fd69fed9",
+      "copy": "model-adapters-native-ab-model-summary.json",
+      "copy_bytes": 24131,
+      "copy_sha256": "db6e149601cde5e7e26e753ef56e4efd37a0dc27f8518d8f8a545d51fd69fed9",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/summary.json",
+      "source_bytes": 71209,
+      "source_sha256": "0a2ad9fbed727c3777055c0ede8c8c5c6e92e4f4d9782635b686db5b5edbb520",
+      "copy": "model-adapters-native-ab-model-gguf-summary.json",
+      "copy_bytes": 71209,
+      "copy_sha256": "0a2ad9fbed727c3777055c0ede8c8c5c6e92e4f4d9782635b686db5b5edbb520",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/workload-eight.json",
+      "source_bytes": 8159,
+      "source_sha256": "82a32ee193938d245f363b4bfd170df555870efca505db8048abe27ccde00777",
+      "copy": "model-adapters-native-ab-model-gguf-workload-eight.json",
+      "copy_bytes": 8159,
+      "copy_sha256": "82a32ee193938d245f363b4bfd170df555870efca505db8048abe27ccde00777",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/history/trace-gguf-fix-before/archive-map.json",
+      "source_bytes": 892,
+      "source_sha256": "78fda853afa77e21f2d6d642aebc58c4f9fa85e7c3bb96eca586c13ae7fd9b24",
+      "copy": "model-adapters-history-trace-gguf-fix-before-archive-map.json",
+      "copy_bytes": 892,
+      "copy_sha256": "78fda853afa77e21f2d6d642aebc58c4f9fa85e7c3bb96eca586c13ae7fd9b24",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/history/trace-gguf-fix-before/run_native_trace.py",
+      "source_bytes": 6175,
+      "source_sha256": "c49a39c43dd77f5548c010ddcd10dda4ef07e4673f935dab745e1b5b655c7a88",
+      "copy": "model-adapters-history-trace-gguf-fix-before-run_native_trace.py",
+      "copy_bytes": 6175,
+      "copy_sha256": "c49a39c43dd77f5548c010ddcd10dda4ef07e4673f935dab745e1b5b655c7a88",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/history/trace-gguf-fix-before/HANDOFF.md",
+      "source_bytes": 15901,
+      "source_sha256": "92baebc89b7b478da8429784169a8e3e25c7d1b2aeb48fefc144df7463731c0d",
+      "copy": "model-adapters-history-trace-gguf-fix-before-HANDOFF.md",
+      "copy_bytes": 15901,
+      "copy_sha256": "92baebc89b7b478da8429784169a8e3e25c7d1b2aeb48fefc144df7463731c0d",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/logs/build-provenance.json",
+      "source_bytes": 11566,
+      "source_sha256": "a9ff8246fc9993f864eeec15392395811ef129512526b5a5bb9a98ef9d2447b5",
+      "copy": "model-logs-build-provenance.json",
+      "copy_bytes": 11566,
+      "copy_sha256": "a9ff8246fc9993f864eeec15392395811ef129512526b5a5bb9a98ef9d2447b5",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/logs/import-provenance.json",
+      "source_bytes": 2881,
+      "source_sha256": "9a1fa88bb359da713eecfcb3deddd2a3906863de97dca4e4976c06c59566a5a1",
+      "copy": "model-logs-import-provenance.json",
+      "copy_bytes": 2881,
+      "copy_sha256": "9a1fa88bb359da713eecfcb3deddd2a3906863de97dca4e4976c06c59566a5a1",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/logs/HANDOFF.md",
+      "source_bytes": 5463,
+      "source_sha256": "facaf3f8b60c07248ed179fe0d29105945bcbb895bec35e372a99c0b2fba012a",
+      "copy": "model-logs-HANDOFF.md",
+      "copy_bytes": 5463,
+      "copy_sha256": "facaf3f8b60c07248ed179fe0d29105945bcbb895bec35e372a99c0b2fba012a",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/logs/build-vllm.sh",
+      "source_bytes": 2271,
+      "source_sha256": "5a96e298a8693dfa98db87cf26f7c1d479a694090d86231a9ff0d4e5c032169f",
+      "copy": "model-logs-build-vllm.sh",
+      "copy_bytes": 2271,
+      "copy_sha256": "5a96e298a8693dfa98db87cf26f7c1d479a694090d86231a9ff0d4e5c032169f",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/logs/llama-build-command.sh",
+      "source_bytes": 538,
+      "source_sha256": "f5b1aeb467a12f85a18e7a0607f0a49561221f5b2e763423fdb2a9e99b558bbd",
+      "copy": "model-logs-llama-build-command.sh",
+      "copy_bytes": 538,
+      "copy_sha256": "f5b1aeb467a12f85a18e7a0607f0a49561221f5b2e763423fdb2a9e99b558bbd",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/logs/plugin-source-artifact-verification.json",
+      "source_bytes": 288,
+      "source_sha256": "ac1ec33a6fed8169d4fb7e2c42bdb1c6c17be2ed4ff52115f5542badc411e148",
+      "copy": "model-logs-plugin-source-artifact-verification.json",
+      "copy_bytes": 288,
+      "copy_sha256": "ac1ec33a6fed8169d4fb7e2c42bdb1c6c17be2ed4ff52115f5542badc411e148",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/logs/qwen35-4b-upstream-config.json",
+      "source_bytes": 3161,
+      "source_sha256": "ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670",
+      "copy": "model-logs-qwen35-4b-upstream-config.json",
+      "copy_bytes": 3161,
+      "copy_sha256": "ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/logs/primary-model.log",
+      "source_bytes": 16526,
+      "source_sha256": "483d59df05fceda47df259974518b1e65de54a85974ed7245b5e46ae84055f65",
+      "copy": "model-logs-primary-model.log.gz",
+      "copy_bytes": 5513,
+      "copy_sha256": "f174ba3afa3ff6982caa764d605d69dfab56e3b92527cf75d7db03d21b1e6fbf",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/logs/vllm-build-attempt3.log",
+      "source_bytes": 1914629,
+      "source_sha256": "98cbb406f397931bb9120a9808d322f8adeb234ec3d1511559a1dc433610df4b",
+      "copy": "model-logs-vllm-build-attempt3.log.gz",
+      "copy_bytes": 82870,
+      "copy_sha256": "4028f97a6da640e9851aae21727392b7ce7993e881003ca16920ce5fcb0bbafa",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/logs/llama-configure.log",
+      "source_bytes": 2433,
+      "source_sha256": "489fe2e4773c09c9c80125fbae21c4f3446728a5f6d9b3fcd3db9a2802fc9332",
+      "copy": "model-logs-llama-configure.log.gz",
+      "copy_bytes": 926,
+      "copy_sha256": "473438c26483d8c3e168bf57983fc8517b45309434863a4752098ee4e44f0751",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/logs/llama-build.log",
+      "source_bytes": 35795,
+      "source_sha256": "dcf1a2d953efe6122b6c1dd460a18614f748e35161d0f1336a9cbc208c1d3ed5",
+      "copy": "model-logs-llama-build.log.gz",
+      "copy_bytes": 3742,
+      "copy_sha256": "393feb1d6c2e3c25d355d7d7db779c5ae43ad15d720ebf6cb65c12aa25cf2cfc",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/primary-model-retry-monitor.jsonl",
+      "source_bytes": 683288,
+      "source_sha256": "27384dc9c75fb53d3996340d22554dd62010a6712481ed552d9209edfccc03a1",
+      "copy": "model-adapters-primary-model-retry-monitor.jsonl.gz",
+      "copy_bytes": 35892,
+      "copy_sha256": "a063c4c39638a48d2a5a21d0ba5109207bf24947ce541f3690675c0972861847",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/primary-model-retry-monitor.stderr.log",
+      "source_bytes": 2712,
+      "source_sha256": "fe8990df5242966a82d1aa900522fd9fbe55414f690b32c685455466c6305545",
+      "copy": "model-adapters-primary-model-retry-monitor.stderr.log.gz",
+      "copy_bytes": 806,
+      "copy_sha256": "8f31cb5ac2ba97331c41121498562a556734d48b166319b13a76cb73e2d71b54",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/primary-model-retry-monitor.stdout.log",
+      "source_bytes": 12526,
+      "source_sha256": "ecf55f50e3cd1e86388b82661af8b4333989c48d1c6cc6a45ae9c55df29df355",
+      "copy": "model-adapters-primary-model-retry-monitor.stdout.log.gz",
+      "copy_bytes": 4485,
+      "copy_sha256": "144b86bf01525234f519ba27c8e3e79b4202c7843c9c7f2b74e32512aa969ada",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/llama-model-monitor.jsonl",
+      "source_bytes": 60134,
+      "source_sha256": "05e7569afbb4dbf2eb4dcc09cd358b3a0bc9341c16c3692d58f8269bc644f3fc",
+      "copy": "model-adapters-llama-model-monitor.jsonl.gz",
+      "copy_bytes": 4677,
+      "copy_sha256": "ae8ea5d89dfceeb8cacd7774dfa660da3ae36503173aff77a43dd20c12540eab",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/llama-model-monitor.stderr.log",
+      "source_bytes": 73585,
+      "source_sha256": "3c3b975bc3a957027caddfe946b35ab709890a491d2adea64b7cf071396ab12f",
+      "copy": "model-adapters-llama-model-monitor.stderr.log.gz",
+      "copy_bytes": 7222,
+      "copy_sha256": "2e3ad66aefa34d495d828b9b0801e616bd7b949c561146117f7b3b9d7a541dc8",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/llama-model-monitor.stdout.log",
+      "source_bytes": 115,
+      "source_sha256": "3a9a3cdad85b99d2d4b5543570d517097184f056df3a4a7c5fae9611df8412cf",
+      "copy": "model-adapters-llama-model-monitor.stdout.log.gz",
+      "copy_bytes": 125,
+      "copy_sha256": "97899d2893bedc9d31919f91c454bc599df30bc61ef13eca705bea3aadb46085",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model/on1.cpu-contention.json",
+      "source_bytes": 1796,
+      "source_sha256": "9a8161cadc22129c8dc32bf8bbf796b180351f632e1b9694ac1c31af43fcf973",
+      "copy": "model-adapters-native-ab-model-on1.cpu-contention.json",
+      "copy_bytes": 1796,
+      "copy_sha256": "9a8161cadc22129c8dc32bf8bbf796b180351f632e1b9694ac1c31af43fcf973",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model/on1.monitor.jsonl",
+      "source_bytes": 17997,
+      "source_sha256": "294468acc0dc011c2187d8f0f2f75f0b7db8c7fa7ec6c89c71703b57ff804cce",
+      "copy": "model-adapters-native-ab-model-on1.monitor.jsonl.gz",
+      "copy_bytes": 2426,
+      "copy_sha256": "11139fc73eea8292a4793b470a10934dfec52ba51627a7c686b86339bc2ed404",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model/on1.monitor.stderr.log",
+      "source_bytes": 597,
+      "source_sha256": "6bca1dbd4c9f4151344ae97d08b03a8e8fa433f501133570f72dd4dbd1a48e11",
+      "copy": "model-adapters-native-ab-model-on1.monitor.stderr.log.gz",
+      "copy_bytes": 357,
+      "copy_sha256": "293355657cd6d0bd6e2f230a5b81e0bfe1fd09511a2e0e12d6896e7eedac4ac0",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model/on1.monitor.stdout.log",
+      "source_bytes": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "copy": "model-adapters-native-ab-model-on1.monitor.stdout.log.gz",
+      "copy_bytes": 20,
+      "copy_sha256": "f61f27bd17de546264aa58f40f3aafaac7021e0ef69c17f6b1b4cd7664a037ec",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/off1.monitor.jsonl",
+      "source_bytes": 95008,
+      "source_sha256": "9ddf210ed56fdd66381c4f75f50ef1514b553ab20f366acec674d349ce2e9f45",
+      "copy": "model-adapters-native-ab-model-gguf-off1.monitor.jsonl.gz",
+      "copy_bytes": 6983,
+      "copy_sha256": "a28aa2bea358a926997024516efa47bd0048dfb121b9508d5cc5f44578711037",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/off1.monitor.stderr.log",
+      "source_bytes": 670,
+      "source_sha256": "6acb9bd6d6b659ac3bb72530b17951ae9c45e69eeb268735eb277c082462f4d8",
+      "copy": "model-adapters-native-ab-model-gguf-off1.monitor.stderr.log.gz",
+      "copy_bytes": 465,
+      "copy_sha256": "ba2b0078d12b8b5b8e42042bd14bf859061ff23a83a4b311e1aae000e72a2b3e",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/off1.monitor.stdout.log",
+      "source_bytes": 2222,
+      "source_sha256": "4156753bf1cec63392b803209dd2a78cda09ad0f2017934af59815c86567c738",
+      "copy": "model-adapters-native-ab-model-gguf-off1.monitor.stdout.log.gz",
+      "copy_bytes": 687,
+      "copy_sha256": "14c3c3c173a16780c0dd97d5c509ed42413b16692476433ffaa95695c987161f",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/off2.monitor.jsonl",
+      "source_bytes": 100298,
+      "source_sha256": "7b13f14c5d585ed8a690defe84956cf578ee712bee9fc1bf949e016ef40c457a",
+      "copy": "model-adapters-native-ab-model-gguf-off2.monitor.jsonl.gz",
+      "copy_bytes": 7343,
+      "copy_sha256": "76d112f26d962fa63aaf4fae80801b254003e3addcc1dcce8a634679b127ece9",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/off2.monitor.stderr.log",
+      "source_bytes": 670,
+      "source_sha256": "6acb9bd6d6b659ac3bb72530b17951ae9c45e69eeb268735eb277c082462f4d8",
+      "copy": "model-adapters-native-ab-model-gguf-off2.monitor.stderr.log.gz",
+      "copy_bytes": 465,
+      "copy_sha256": "ba2b0078d12b8b5b8e42042bd14bf859061ff23a83a4b311e1aae000e72a2b3e",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/off2.monitor.stdout.log",
+      "source_bytes": 2222,
+      "source_sha256": "95af05cfba9de92c858124bf59a3a018f40b0735e39c5e43cd1b0fc41b13c474",
+      "copy": "model-adapters-native-ab-model-gguf-off2.monitor.stdout.log.gz",
+      "copy_bytes": 687,
+      "copy_sha256": "696cb43a5320d7021eb97fec12c15e9e277dfe826f3799a0e17441dcb717ff87",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/off3.monitor.jsonl",
+      "source_bytes": 100286,
+      "source_sha256": "513414c63a200995f1bc5231f23f556a47556ca4bada8bc35ea45b28b7e271cd",
+      "copy": "model-adapters-native-ab-model-gguf-off3.monitor.jsonl.gz",
+      "copy_bytes": 7406,
+      "copy_sha256": "2bce973fdbedd7133b278a9fb9c2a7ee283e87980f8916a94c7b59b59f58d861",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/off3.monitor.stderr.log",
+      "source_bytes": 670,
+      "source_sha256": "6acb9bd6d6b659ac3bb72530b17951ae9c45e69eeb268735eb277c082462f4d8",
+      "copy": "model-adapters-native-ab-model-gguf-off3.monitor.stderr.log.gz",
+      "copy_bytes": 465,
+      "copy_sha256": "ba2b0078d12b8b5b8e42042bd14bf859061ff23a83a4b311e1aae000e72a2b3e",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/off3.monitor.stdout.log",
+      "source_bytes": 2222,
+      "source_sha256": "e117c438afe0594bbafff02325f76396a5f2293820548bf90b2bbeca70a8f62a",
+      "copy": "model-adapters-native-ab-model-gguf-off3.monitor.stdout.log.gz",
+      "copy_bytes": 686,
+      "copy_sha256": "b46c9fcf801d56e14e35265a6444be564ff8f8ced8d7b938449e777f3ff548fe",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/on1.monitor.jsonl",
+      "source_bytes": 89735,
+      "source_sha256": "bd3b0d94e0ae6ba1b5dbf6efae9f410a68588096702b44bb70e80adc5c3cb9c9",
+      "copy": "model-adapters-native-ab-model-gguf-on1.monitor.jsonl.gz",
+      "copy_bytes": 6925,
+      "copy_sha256": "33367ce038085d2e00c1dbc9ee2886fd599b977ab3b3353c0ac989499167024b",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/on1.monitor.stderr.log",
+      "source_bytes": 670,
+      "source_sha256": "6acb9bd6d6b659ac3bb72530b17951ae9c45e69eeb268735eb277c082462f4d8",
+      "copy": "model-adapters-native-ab-model-gguf-on1.monitor.stderr.log.gz",
+      "copy_bytes": 465,
+      "copy_sha256": "ba2b0078d12b8b5b8e42042bd14bf859061ff23a83a4b311e1aae000e72a2b3e",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/on1.monitor.stdout.log",
+      "source_bytes": 2222,
+      "source_sha256": "7c869eecc39aa95e72d6943643c0ff70f0134171646fb8315f051d5561a65ee7",
+      "copy": "model-adapters-native-ab-model-gguf-on1.monitor.stdout.log.gz",
+      "copy_bytes": 686,
+      "copy_sha256": "0947b226c037b04a6945d59dbd17b83d7a0a959274f99f9229f7ad72480d169f",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/on2.monitor.jsonl",
+      "source_bytes": 88977,
+      "source_sha256": "6e4f395a5b06cc3781a8912ac52a7c6838beeb15bf38a4b6efd53cc077b003d2",
+      "copy": "model-adapters-native-ab-model-gguf-on2.monitor.jsonl.gz",
+      "copy_bytes": 6939,
+      "copy_sha256": "6b0095c9a0af5ad981a4e4a9ed8525476f86eaa4d2a39bcf256bd5aab7ba3332",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/on2.monitor.stderr.log",
+      "source_bytes": 670,
+      "source_sha256": "6acb9bd6d6b659ac3bb72530b17951ae9c45e69eeb268735eb277c082462f4d8",
+      "copy": "model-adapters-native-ab-model-gguf-on2.monitor.stderr.log.gz",
+      "copy_bytes": 465,
+      "copy_sha256": "ba2b0078d12b8b5b8e42042bd14bf859061ff23a83a4b311e1aae000e72a2b3e",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/on2.monitor.stdout.log",
+      "source_bytes": 2222,
+      "source_sha256": "64c2d394869e055a2de61e2e9d8efad876dc04a5c9da6b40f5fb72b381566d8d",
+      "copy": "model-adapters-native-ab-model-gguf-on2.monitor.stdout.log.gz",
+      "copy_bytes": 685,
+      "copy_sha256": "79f45aa80829a1f948634031d1450ff529fb9d93f4922e10cccbe170968fbf53",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/on3.monitor.jsonl",
+      "source_bytes": 88257,
+      "source_sha256": "85a43aa74d4b4380d2633f45caa07318535b595beecb410b5f4babe23190c5cd",
+      "copy": "model-adapters-native-ab-model-gguf-on3.monitor.jsonl.gz",
+      "copy_bytes": 6847,
+      "copy_sha256": "f951475ad2320c1c3e3e6c926e0f93840645af10a033972bd635134ddd25ba31",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/on3.monitor.stderr.log",
+      "source_bytes": 670,
+      "source_sha256": "6acb9bd6d6b659ac3bb72530b17951ae9c45e69eeb268735eb277c082462f4d8",
+      "copy": "model-adapters-native-ab-model-gguf-on3.monitor.stderr.log.gz",
+      "copy_bytes": 465,
+      "copy_sha256": "ba2b0078d12b8b5b8e42042bd14bf859061ff23a83a4b311e1aae000e72a2b3e",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/on3.monitor.stdout.log",
+      "source_bytes": 2222,
+      "source_sha256": "1d6e9ebf36719533dd25ce6a8ce5ac01b77b5bcc31829eba366e9d1fbe685e38",
+      "copy": "model-adapters-native-ab-model-gguf-on3.monitor.stdout.log.gz",
+      "copy_bytes": 683,
+      "copy_sha256": "96c9463352d502d4056301bec5403f92ba05746eea45c14f153321a9ef56abd5",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/off1.cpu-contention.json",
+      "source_bytes": 1780,
+      "source_sha256": "96565b697ce24b5dc96d08017019535ce405a3ec299594014b0e0c8f509eae87",
+      "copy": "model-adapters-native-ab-model-gguf-off1.cpu-contention.json",
+      "copy_bytes": 1780,
+      "copy_sha256": "96565b697ce24b5dc96d08017019535ce405a3ec299594014b0e0c8f509eae87",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/off2.cpu-contention.json",
+      "source_bytes": 1794,
+      "source_sha256": "9c8fd937babf1ddc20abee86441ae617ddd4d8ce3cfa5c70997413a9a91a302a",
+      "copy": "model-adapters-native-ab-model-gguf-off2.cpu-contention.json",
+      "copy_bytes": 1794,
+      "copy_sha256": "9c8fd937babf1ddc20abee86441ae617ddd4d8ce3cfa5c70997413a9a91a302a",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/off3.cpu-contention.json",
+      "source_bytes": 1794,
+      "source_sha256": "4da094f8bc8cec03095c82fcb57b03d2f9dfa2bb9de1f44c5b34fd900b9bb1b3",
+      "copy": "model-adapters-native-ab-model-gguf-off3.cpu-contention.json",
+      "copy_bytes": 1794,
+      "copy_sha256": "4da094f8bc8cec03095c82fcb57b03d2f9dfa2bb9de1f44c5b34fd900b9bb1b3",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/on1.cpu-contention.json",
+      "source_bytes": 1783,
+      "source_sha256": "16eb3baa807bd363b4b88b533170058fce6729bb74d7141a776c9812baf1115b",
+      "copy": "model-adapters-native-ab-model-gguf-on1.cpu-contention.json",
+      "copy_bytes": 1783,
+      "copy_sha256": "16eb3baa807bd363b4b88b533170058fce6729bb74d7141a776c9812baf1115b",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/on2.cpu-contention.json",
+      "source_bytes": 1794,
+      "source_sha256": "fa334e0ff9f5210f37bde1618850d6cc5a618af8d62cc86015543c8cabae3483",
+      "copy": "model-adapters-native-ab-model-gguf-on2.cpu-contention.json",
+      "copy_bytes": 1794,
+      "copy_sha256": "fa334e0ff9f5210f37bde1618850d6cc5a618af8d62cc86015543c8cabae3483",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/on3.cpu-contention.json",
+      "source_bytes": 1785,
+      "source_sha256": "6c9de89ebbc797daf8ac01a3e3ffb8bc4b5c2f28af3b1003a3d1bee2b2f6cf25",
+      "copy": "model-adapters-native-ab-model-gguf-on3.cpu-contention.json",
+      "copy_bytes": 1785,
+      "copy_sha256": "6c9de89ebbc797daf8ac01a3e3ffb8bc4b5c2f28af3b1003a3d1bee2b2f6cf25",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/off1.output-token-ids.json",
+      "source_bytes": 610,
+      "source_sha256": "2999b766a20e2babf8a69d5da0a0d0dfc548760efc93c45ac17b5e4b50a04630",
+      "copy": "model-adapters-native-ab-model-gguf-off1.output-token-ids.json",
+      "copy_bytes": 610,
+      "copy_sha256": "2999b766a20e2babf8a69d5da0a0d0dfc548760efc93c45ac17b5e4b50a04630",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/off2.output-token-ids.json",
+      "source_bytes": 610,
+      "source_sha256": "2999b766a20e2babf8a69d5da0a0d0dfc548760efc93c45ac17b5e4b50a04630",
+      "copy": "model-adapters-native-ab-model-gguf-off2.output-token-ids.json",
+      "copy_bytes": 610,
+      "copy_sha256": "2999b766a20e2babf8a69d5da0a0d0dfc548760efc93c45ac17b5e4b50a04630",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/off3.output-token-ids.json",
+      "source_bytes": 610,
+      "source_sha256": "2999b766a20e2babf8a69d5da0a0d0dfc548760efc93c45ac17b5e4b50a04630",
+      "copy": "model-adapters-native-ab-model-gguf-off3.output-token-ids.json",
+      "copy_bytes": 610,
+      "copy_sha256": "2999b766a20e2babf8a69d5da0a0d0dfc548760efc93c45ac17b5e4b50a04630",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/on1.output-token-ids.json",
+      "source_bytes": 610,
+      "source_sha256": "2999b766a20e2babf8a69d5da0a0d0dfc548760efc93c45ac17b5e4b50a04630",
+      "copy": "model-adapters-native-ab-model-gguf-on1.output-token-ids.json",
+      "copy_bytes": 610,
+      "copy_sha256": "2999b766a20e2babf8a69d5da0a0d0dfc548760efc93c45ac17b5e4b50a04630",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/on2.output-token-ids.json",
+      "source_bytes": 610,
+      "source_sha256": "2999b766a20e2babf8a69d5da0a0d0dfc548760efc93c45ac17b5e4b50a04630",
+      "copy": "model-adapters-native-ab-model-gguf-on2.output-token-ids.json",
+      "copy_bytes": 610,
+      "copy_sha256": "2999b766a20e2babf8a69d5da0a0d0dfc548760efc93c45ac17b5e4b50a04630",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-ab-model-gguf/on3.output-token-ids.json",
+      "source_bytes": 610,
+      "source_sha256": "2999b766a20e2babf8a69d5da0a0d0dfc548760efc93c45ac17b5e4b50a04630",
+      "copy": "model-adapters-native-ab-model-gguf-on3.output-token-ids.json",
+      "copy_bytes": 610,
+      "copy_sha256": "2999b766a20e2babf8a69d5da0a0d0dfc548760efc93c45ac17b5e4b50a04630",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/mmq-native-operator/report.json",
+      "source_bytes": 32689,
+      "source_sha256": "ef12cb966bfec0f4224d73dcab609b9d9f509e14287c8d2ec8768c385d5eba11",
+      "copy": "model-operator-mmq-report.json",
+      "copy_bytes": 32689,
+      "copy_sha256": "ef12cb966bfec0f4224d73dcab609b9d9f509e14287c8d2ec8768c385d5eba11",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/mmq-native-operator/comparison.json",
+      "source_bytes": 59993,
+      "source_sha256": "5588ba567595a156283bb426b29477f212b84923dec26b2226f4326d2dc50518",
+      "copy": "model-operator-mmq-comparison.json",
+      "copy_bytes": 59993,
+      "copy_sha256": "5588ba567595a156283bb426b29477f212b84923dec26b2226f4326d2dc50518",
+      "adaptation": "none"
+    },
+    {
+      "source": "/tmp/rdna3-wmma-operator-mmq-capture.log",
+      "source_bytes": 8240,
+      "source_sha256": "93d32553e425e8c32a734f3298cf9857b44f97ad771679a28293bcd52d89af6f",
+      "copy": "model-operator-mmq-capture.log.gz",
+      "copy_bytes": 681,
+      "copy_sha256": "a028751bc32005c5751d4b99999f19f35037febeb828199b1b49693ee47450cf",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/tmp/rdna3-wmma-operator-mmq-compare.log",
+      "source_bytes": 9200,
+      "source_sha256": "a146fac589f94b5db0dc91582392c1e76c0ce68d089126dae0bed720465e0766",
+      "copy": "model-operator-mmq-compare.log.gz",
+      "copy_bytes": 683,
+      "copy_sha256": "76560ddde671ab67ba2c33e2b1e9ecfb1f4d468b3b286729ddbf7751d1d9dc4b",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-pair-summary.json",
+      "source_bytes": 17135,
+      "source_sha256": "f8bf1319834b1856c053b853cd05729380ed7672cdcdbb42d92b95aff2061047",
+      "copy": "model-adapters-native-trace-pair-summary.json",
+      "copy_bytes": 17135,
+      "copy_sha256": "f8bf1319834b1856c053b853cd05729380ed7672cdcdbb42d92b95aff2061047",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/recipe-and-result.json",
+      "source_bytes": 15306,
+      "source_sha256": "86fc930e0ee16c13d51ea5038feb7835b98333251205681d4df626a3f14e733a",
+      "copy": "model-adapters-native-trace-on-recipe-and-result.json",
+      "copy_bytes": 15306,
+      "copy_sha256": "86fc930e0ee16c13d51ea5038feb7835b98333251205681d4df626a3f14e733a",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_kernel_stats.csv",
+      "source_bytes": 8424,
+      "source_sha256": "2cb8e512704e0660f77f87cf0cbf64e13c67702561359f1f477cbbf094b813e8",
+      "copy": "model-adapters-native-trace-on-rocprof-native-on_kernel_stats.csv.gz",
+      "copy_bytes": 2430,
+      "copy_sha256": "06a5a33bbe77f25da7aab08d9e1158190c1f7e808d3a1c3dd0770cd0f1208829",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/monitor.stderr.log",
+      "source_bytes": 5677,
+      "source_sha256": "ac42715e7d7e7faf55cedcbb4c85f713214ae364d77d3897a404f5d892e8d00d",
+      "copy": "model-adapters-native-trace-on-monitor.stderr.log.gz",
+      "copy_bytes": 1236,
+      "copy_sha256": "e58dcb62a55c0b51a92af78c34c70302b61d42c13a370964b31df79e1e19e045",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/monitor.stdout.log",
+      "source_bytes": 2222,
+      "source_sha256": "408bff6fcbd28403fa001686e515330d25fcda870d831cf3b2bdb0c184d09881",
+      "copy": "model-adapters-native-trace-on-monitor.stdout.log.gz",
+      "copy_bytes": 690,
+      "copy_sha256": "ecf96703a9c5dd53e7a2ee9aae0189eaf75fc899d687c6a9a9a8b8a07e6ae531",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/monitor.jsonl",
+      "source_bytes": 155436,
+      "source_sha256": "ab8b50d48cb6fe97519829e9297a0fad55f0b23df4ee140e46defe86b9618cea",
+      "copy": "model-adapters-native-trace-on-monitor.jsonl.gz",
+      "copy_bytes": 11309,
+      "copy_sha256": "19e845bcabcd3fdaa612f824f5bc2c857d1f292a1b484420493e92aa2f4d9b6c",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/output-token-ids.json",
+      "source_bytes": 610,
+      "source_sha256": "2999b766a20e2babf8a69d5da0a0d0dfc548760efc93c45ac17b5e4b50a04630",
+      "copy": "model-adapters-native-trace-on-output-token-ids.json",
+      "copy_bytes": 610,
+      "copy_sha256": "2999b766a20e2babf8a69d5da0a0d0dfc548760efc93c45ac17b5e4b50a04630",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-off/recipe-and-result.json",
+      "source_bytes": 15352,
+      "source_sha256": "0d3d6bfb5ca0fe65db35454fda4e47661bf69b0725a258a07e7b1578fefbb155",
+      "copy": "model-adapters-native-trace-off-recipe-and-result.json",
+      "copy_bytes": 15352,
+      "copy_sha256": "0d3d6bfb5ca0fe65db35454fda4e47661bf69b0725a258a07e7b1578fefbb155",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-off/rocprof/native-off_kernel_stats.csv",
+      "source_bytes": 7789,
+      "source_sha256": "f06583731c584c0ed882acc85d62465573eacbaad0b6f9315fa966978ea3ea0d",
+      "copy": "model-adapters-native-trace-off-rocprof-native-off_kernel_stats.csv.gz",
+      "copy_bytes": 2310,
+      "copy_sha256": "86251886fb8a65fa2d0fcce84d71590da3f4cfb8a53d58510844d5fc62970012",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-off/monitor.stderr.log",
+      "source_bytes": 5702,
+      "source_sha256": "f0f754677eb66e07dac16c43b5975384ab01ff4f29844599c946f75170072d6e",
+      "copy": "model-adapters-native-trace-off-monitor.stderr.log.gz",
+      "copy_bytes": 1235,
+      "copy_sha256": "741dc0e02e1d902cdafc375871aee9abc149a2c9bdeed42066b06e074ea2163d",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-off/monitor.stdout.log",
+      "source_bytes": 2222,
+      "source_sha256": "1daf831ffb9347ea49c52016581dd880f976262dd1d32e1195b6f851e098ab99",
+      "copy": "model-adapters-native-trace-off-monitor.stdout.log.gz",
+      "copy_bytes": 691,
+      "copy_sha256": "04a1d2320693a08640e3ddac3c1b820576d166b1c12012a6a03cf6fca7d91b63",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-off/monitor.jsonl",
+      "source_bytes": 169032,
+      "source_sha256": "b2595fa27cf2336b823630f65c57c91ea2879a15a6802f01576a7652f52dfce4",
+      "copy": "model-adapters-native-trace-off-monitor.jsonl.gz",
+      "copy_bytes": 12309,
+      "copy_sha256": "ebc3762e0eaf60379b432b8765443004fd6da6d159ce5c356492d92a3d427183",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-off/output-token-ids.json",
+      "source_bytes": 610,
+      "source_sha256": "2999b766a20e2babf8a69d5da0a0d0dfc548760efc93c45ac17b5e4b50a04630",
+      "copy": "model-adapters-native-trace-off-output-token-ids.json",
+      "copy_bytes": 610,
+      "copy_sha256": "2999b766a20e2babf8a69d5da0a0d0dfc548760efc93c45ac17b5e4b50a04630",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-prompt-identity/result.json",
+      "source_bytes": 4047,
+      "source_sha256": "48a36769e1b945cae4d3937b7142ba126bd0288a48e34f3525538794b5ca1040",
+      "copy": "model-native-prompt-identity-result.json",
+      "copy_bytes": 4047,
+      "copy_sha256": "48a36769e1b945cae4d3937b7142ba126bd0288a48e34f3525538794b5ca1040",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-prompt-identity/native-ids.stdout",
+      "source_bytes": 24523,
+      "source_sha256": "5adc141f726e3925fccecc22dd032c6055f40e397f637132f15dbb49694aa9d1",
+      "copy": "model-native-prompt-identity-native-ids.stdout.txt",
+      "copy_bytes": 24523,
+      "copy_sha256": "5adc141f726e3925fccecc22dd032c6055f40e397f637132f15dbb49694aa9d1",
+      "adaptation": "filename suffix .txt; bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-prompt-identity/green-exact-id-match.stdout",
+      "source_bytes": 1000,
+      "source_sha256": "c4e5c40f4123228423251cb7c93ea9687176b57f5a0608ec0fd7eae9427365c3",
+      "copy": "model-native-prompt-identity-green-exact-id-match.stdout.txt",
+      "copy_bytes": 1000,
+      "copy_sha256": "c4e5c40f4123228423251cb7c93ea9687176b57f5a0608ec0fd7eae9427365c3",
+      "adaptation": "filename suffix .txt; bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-prompt-identity/red-same-count-id-change.stdout",
+      "source_bytes": 1104,
+      "source_sha256": "3b33bc4f7b5af1a83b9964ace81c763ceacd12ad225ca2e5f39d7a668fc2baa4",
+      "copy": "model-native-prompt-identity-red-same-count-id-change.stdout.txt",
+      "copy_bytes": 1104,
+      "copy_sha256": "3b33bc4f7b5af1a83b9964ace81c763ceacd12ad225ca2e5f39d7a668fc2baa4",
+      "adaptation": "filename suffix .txt; bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-prompt-identity/commands.json",
+      "source_bytes": 6323,
+      "source_sha256": "7210fb253134ece5f77147c43a620d6a16bb5ace7b08143ece7db93d55076fb5",
+      "copy": "model-native-prompt-identity-commands.json",
+      "copy_bytes": 6323,
+      "copy_sha256": "7210fb253134ece5f77147c43a620d6a16bb5ace7b08143ece7db93d55076fb5",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-prompt-identity/manifest.json",
+      "source_bytes": 4028,
+      "source_sha256": "bd726c6edd4908f320ab3a90ef9dd3c0f24badeed5b5ce206eccd7acecf7fb5d",
+      "copy": "model-native-prompt-identity-manifest.json",
+      "copy_bytes": 4028,
+      "copy_sha256": "bd726c6edd4908f320ab3a90ef9dd3c0f24badeed5b5ce206eccd7acecf7fb5d",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-prompt-identity/run_receipt.py",
+      "source_bytes": 9171,
+      "source_sha256": "f9f895a7d509cfe2569829cd1b59d7507598d4a68f741a41649bbd1de0e08f8b",
+      "copy": "model-native-prompt-identity-run_receipt.py",
+      "copy_bytes": 9171,
+      "copy_sha256": "f9f895a7d509cfe2569829cd1b59d7507598d4a68f741a41649bbd1de0e08f8b",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-prompt-identity/compare_ids.py",
+      "source_bytes": 2338,
+      "source_sha256": "b7cb7c8552b3ec060e1da79a44db2008f9c6dd8eecf674ee3802dfba76b5bf40",
+      "copy": "model-native-prompt-identity-compare_ids.py",
+      "copy_bytes": 2338,
+      "copy_sha256": "b7cb7c8552b3ec060e1da79a44db2008f9c6dd8eecf674ee3802dfba76b5bf40",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-prompt-identity/native_prompt_ids.cpp",
+      "source_bytes": 2476,
+      "source_sha256": "553ea359cd311848f1c5513a6a0d44d4a5fd8d7a373a7f65ae114df40e32ff0e",
+      "copy": "model-native-prompt-identity-native_prompt_ids.cpp.txt",
+      "copy_bytes": 2476,
+      "copy_sha256": "553ea359cd311848f1c5513a6a0d44d4a5fd8d7a373a7f65ae114df40e32ff0e",
+      "adaptation": "filename suffix .txt; bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-prompt-identity/inputs-before.json",
+      "source_bytes": 4418,
+      "source_sha256": "2ef230148bfdbf67346ef562561870abe3ec199ea398d1d11acbf0ea8bf6094f",
+      "copy": "model-native-prompt-identity-inputs-before.json",
+      "copy_bytes": 4418,
+      "copy_sha256": "2ef230148bfdbf67346ef562561870abe3ec199ea398d1d11acbf0ea8bf6094f",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-prompt-identity/inputs-after.json",
+      "source_bytes": 4418,
+      "source_sha256": "2ef230148bfdbf67346ef562561870abe3ec199ea398d1d11acbf0ea8bf6094f",
+      "copy": "model-native-prompt-identity-inputs-after.json",
+      "copy_bytes": 4418,
+      "copy_sha256": "2ef230148bfdbf67346ef562561870abe3ec199ea398d1d11acbf0ea8bf6094f",
+      "adaptation": "none"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-prompt-identity/compiler-version.stdout",
+      "source_bytes": 246,
+      "source_sha256": "88b7c4b67564a146863224148116065fee418539f0a408f3636a68f3bde51805",
+      "copy": "model-native-prompt-identity-compiler-version.stdout.txt.gz",
+      "copy_bytes": 214,
+      "copy_sha256": "de3ac602067ca75437daa4f3dcb3f8328958113ec53aa1408130312ca6c45ebd",
+      "adaptation": "gzip with mtime zero; decompressed bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-prompt-identity/linker-version.stdout",
+      "source_bytes": 212,
+      "source_sha256": "47b34721af0f75f7b296d974ac0331de5fec932c50d31ab812b51f6b9ad850d6",
+      "copy": "model-native-prompt-identity-linker-version.stdout.txt",
+      "copy_bytes": 212,
+      "copy_sha256": "47b34721af0f75f7b296d974ac0331de5fec932c50d31ab812b51f6b9ad850d6",
+      "adaptation": "filename suffix .txt; bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-prompt-identity/product-source-equality.stdout",
+      "source_bytes": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "copy": "model-native-prompt-identity-product-source-equality.stdout.txt",
+      "copy_bytes": 0,
+      "copy_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "adaptation": "filename suffix .txt; bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-prompt-identity/product-source-equality.stderr",
+      "source_bytes": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "copy": "model-native-prompt-identity-product-source-equality.stderr.txt",
+      "copy_bytes": 0,
+      "copy_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "adaptation": "filename suffix .txt; bytes unchanged"
+    },
+    {
+      "source": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-prompt-identity/README.md",
+      "source_bytes": 2753,
+      "source_sha256": "d11994e379da43b3350537198301885bbc9a68b1e9ed6416ae28343367a6f9be",
+      "copy": "model-native-prompt-identity-README.md",
+      "copy_bytes": 2753,
+      "copy_sha256": "d11994e379da43b3350537198301885bbc9a68b1e9ed6416ae28343367a6f9be",
+      "adaptation": "none"
+    }
+  ],
+  "copy_root": "docs/bench-evidence/rocm-rdna3-quant-wmma"
+}

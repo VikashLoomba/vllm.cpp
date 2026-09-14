@@ -1,0 +1,15 @@
+{
+  "ps": {
+    "argv": [
+      "ps",
+      "-eo",
+      "pid,ppid,stat,psr,pcpu,pmem,comm",
+      "--sort=-pcpu"
+    ],
+    "exit_code": 0,
+    "stdout": "    PID    PPID STAT PSR %CPU %MEM COMMAND\n 723829  723821 Sl    15  7.0  0.2 agent-8e55cc8\n2404307 2404100 S     21  3.1  0.0 python\n   5238       1 Sl    21  0.8  0.0 mintreport-tray\n3810237 1831498 Sl    33  0.8  0.2 2.1.260\n 741641       1 Ssl   10  0.7  0.3 codex\n1843130 1831498 Sl    10  0.6  0.2 2.1.260\n2452314 1831498 Sl    45  0.6  0.2 2.1.260\n4059929       1 Ssl    9  0.5  0.0 tailscaled\n1832713 1831498 Sl    19  0.5  0.2 2.1.260\n   1855       1 Ssl   29  0.4  0.0 OpenLinkHub\n1852369       1 Sl     5  0.3  0.1 zellij\n3809533 3809532 Sl+    1  0.3  0.6 MainThread\n2404443       2 I     21  0.2  0.0 kworker/21:1-mm_percpu_wq\n    324       2 S     41  0.1  0.0 kcompactd0\n   3520    3464 Sl    12  0.1  0.0 cinnamon\n2286681 2286667 Sl    23  0.1  0.1 MainThread\n2286632  741641 Sl    23  0.0  0.0 npm exec @autom\n2353930       2 I     16  0.0  0.0 kworker/16:0-rcu_gp\n   2660       1 Ssl   23  0.0  0.0 redis-server\n2348000       2 I     15  0.0  0.0 kworker/15:1-events\n2286667 2286666 Sl    45  0.0  0.0 MainThread\n1564708 1564691 Sl    47  0.0  0.1 MainThread\n2353934       2 I     21  0.0  0.0 kworker/21:4-events\n1777113       2 I     23  0.0  0.0 kworker/u192:2-sdma0\n2404100  741641 Ss    40  0.0  0.0 flock\n1551123 1551112 Sl    23  0.0  0.1 MainThread\n     15       2 I     25  0.0  0.0 rcu_preempt\n1700056       2 I     17  0.0  0.0 kworker/u198:0-flush-259:2\n    358       2 S     22  0.0  0.0 kswapd0\n2399667       2 I     17  0.0  0.0 kworker/17:3-events\n",
+    "stderr": ""
+  },
+  "loadavg": "2.75 3.33 5.72 1/3115 2405814",
+  "sampled_utc": "2026-09-14T04:58:28.229511+00:00"
+}

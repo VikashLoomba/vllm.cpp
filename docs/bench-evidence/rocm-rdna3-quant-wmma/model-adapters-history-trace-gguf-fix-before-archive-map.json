@@ -1,0 +1,17 @@
+[
+  {
+    "original_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/run_native_trace.py",
+    "archive_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/history/trace-gguf-fix-before/run_native_trace.py",
+    "sha256": "c49a39c43dd77f5548c010ddcd10dda4ef07e4673f935dab745e1b5b655c7a88"
+  },
+  {
+    "original_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/HANDOFF.md",
+    "archive_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/history/trace-gguf-fix-before/HANDOFF.md",
+    "sha256": "92baebc89b7b478da8429784169a8e3e25c7d1b2aeb48fefc144df7463731c0d"
+  },
+  {
+    "original_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/adapter-manifest.json",
+    "archive_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/history/trace-gguf-fix-before/adapter-manifest.json",
+    "sha256": "c89ed2148cc9d1c1ccfde308f861fbdcdb416c6e6e39d342fa5e83b0b936f254"
+  }
+]

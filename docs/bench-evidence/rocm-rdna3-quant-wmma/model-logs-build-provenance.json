@@ -1,0 +1,277 @@
+{
+  "sealed_utc": "2026-09-14T04:17:50.310488+00:00",
+  "image": "sha256:80aab4c182a1f3eeebe286173977e57fcaf10a049b41f475655b35d285de31dc",
+  "vllm": {
+    "git_head": "39545e475d3627287ff69c25465dc0bd405f67e1",
+    "git_status": "",
+    "tracked_python_files": 2473,
+    "matching_files": 2473,
+    "missing": [],
+    "mismatches": []
+  },
+  "gguf_plugin": {
+    "git_head": "d4c1f0d082fc7cd4350da56689109a01c1f29d6c",
+    "git_status": "",
+    "tracked_python_files": 111,
+    "matching_files": 111,
+    "missing": [],
+    "mismatches": []
+  },
+  "gguf_python": {
+    "git_head": "093a2f86c3e37c54fa3e1f9efb17b304f3433abd",
+    "git_status": "",
+    "tracked_python_files": 17,
+    "matching_files": 17,
+    "missing": [],
+    "mismatches": []
+  },
+  "wheel": {
+    "/home/vikash/oracle/rdna3-wmma-latest/wheel/vllm-0.28.1rc1.dev812+g39545e475-cp312-cp312-linux_x86_64.whl": {
+      "bytes": 21869209,
+      "sha256": "010076f9e982d9f4ffaca90014ed4ae5204bc68b09c77843cab7b6bea5b3c276"
+    }
+  },
+  "extensions": {
+    "_C_stable_libtorch.abi3.so": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/.venv/lib/python3.12/site-packages/vllm/_C_stable_libtorch.abi3.so",
+      "bytes": 17848904,
+      "sha256": "3e1c77c70ca9cda8bc9e5495b36b155cd1a9f1e2598c8086b774545024df09a2",
+      "native_sha256": "f4c4b5ae44360dd63c5ee59829c5fc29e8630035e624c2a5db81a9ff066d95b2",
+      "matches_native": false,
+      "matches_cmake_install_output": true,
+      "matches_wheel": true,
+      "sections_changed_by_cmake_install": [
+        ".dynstr"
+      ],
+      "native_host_code_matches": true,
+      "gpu_sections": {
+        ".hip_fatbin": {
+          "bytes": 14234728,
+          "native_sha256": "cba647db9d5f95c891dc09a1434a0e76e27a982caaa006e8663c484d9448f7a0",
+          "installed_sha256": "cba647db9d5f95c891dc09a1434a0e76e27a982caaa006e8663c484d9448f7a0",
+          "matches": true
+        },
+        ".hipFatBinSegment": {
+          "bytes": 576,
+          "native_sha256": "10d6af5f212eb6ee63e782d26324f7dad1840bf4bd7872d0b5d8d0c0bea1b1a5",
+          "installed_sha256": "10d6af5f212eb6ee63e782d26324f7dad1840bf4bd7872d0b5d8d0c0bea1b1a5",
+          "matches": true
+        }
+      }
+    },
+    "_moe_C_stable_libtorch.abi3.so": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/.venv/lib/python3.12/site-packages/vllm/_moe_C_stable_libtorch.abi3.so",
+      "bytes": 19375016,
+      "sha256": "46bd1b72b07311888b33ae21e2a0750bedab8b2dfcd3efa952f9acba15e0391f",
+      "native_sha256": "62d61d75124d7680c04f3e6ea4885c9890fe2f8bd34c7cd46b2a7d4d9d92f644",
+      "matches_native": false,
+      "matches_cmake_install_output": true,
+      "matches_wheel": true,
+      "sections_changed_by_cmake_install": [
+        ".dynstr"
+      ],
+      "native_host_code_matches": true,
+      "gpu_sections": {
+        ".hip_fatbin": {
+          "bytes": 15217568,
+          "native_sha256": "443737ba8203ae4374249568e8cbca0ebf093633665d5c0a5d89a37e5ae978a1",
+          "installed_sha256": "443737ba8203ae4374249568e8cbca0ebf093633665d5c0a5d89a37e5ae978a1",
+          "matches": true
+        },
+        ".hipFatBinSegment": {
+          "bytes": 72,
+          "native_sha256": "82b96589b129fb8b2ce1332304a5d12af7e5f1ecd00d6c5377fffe8001f3c24a",
+          "installed_sha256": "82b96589b129fb8b2ce1332304a5d12af7e5f1ecd00d6c5377fffe8001f3c24a",
+          "matches": true
+        }
+      }
+    },
+    "cumem_allocator.abi3.so": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/.venv/lib/python3.12/site-packages/vllm/cumem_allocator.abi3.so",
+      "bytes": 25248,
+      "sha256": "88004522e9c131b1cc8c1334cd01d72481cb5a5b6b06924b5602af4b8b4b8c54",
+      "native_sha256": "ab43b274c296efd455ea010e83c3bfe3b0e7ed97f0e127c398e05a72382ce228",
+      "matches_native": false,
+      "matches_cmake_install_output": true,
+      "matches_wheel": true,
+      "sections_changed_by_cmake_install": [
+        ".dynstr",
+        ".dynamic"
+      ],
+      "native_host_code_matches": true,
+      "gpu_sections": {}
+    },
+    "_rocm_C.abi3.so": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/.venv/lib/python3.12/site-packages/vllm/_rocm_C.abi3.so",
+      "bytes": 45801152,
+      "sha256": "bdbeb1a3fc6c30ac59bead0e423036cbaafd504026c55ec7a24af41fa1e2369f",
+      "native_sha256": "11107a237504797be1e1c0d25d24dba3fc29398f8582f528794fc89104b2ae87",
+      "matches_native": false,
+      "matches_cmake_install_output": true,
+      "matches_wheel": true,
+      "sections_changed_by_cmake_install": [
+        ".dynstr"
+      ],
+      "native_host_code_matches": true,
+      "gpu_sections": {
+        ".hip_fatbin": {
+          "bytes": 37653424,
+          "native_sha256": "f95348d7cb49a5b1d19fc70c8567a08039d367b8b60b5ada2a4471b76e2f9bb2",
+          "installed_sha256": "f95348d7cb49a5b1d19fc70c8567a08039d367b8b60b5ada2a4471b76e2f9bb2",
+          "matches": true
+        },
+        ".hipFatBinSegment": {
+          "bytes": 144,
+          "native_sha256": "4756c6ac3e4a2823b100c0d4c15503f7ed945705579cde265fe9aed178c97906",
+          "installed_sha256": "4756c6ac3e4a2823b100c0d4c15503f7ed945705579cde265fe9aed178c97906",
+          "matches": true
+        }
+      }
+    },
+    "_C.abi3.so": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/.venv/lib/python3.12/site-packages/vllm/_C.abi3.so",
+      "bytes": 1120136,
+      "sha256": "33c5db0ba5a8a5b65ee8ce2ff867f1c347c51b3b3359aa40f59058035bc6bad8",
+      "native_sha256": "7cb03f50bef76ed7649ffb203943945dacaffc49e44bab8d16498355d9aa42f0",
+      "matches_native": false,
+      "matches_cmake_install_output": true,
+      "matches_wheel": true,
+      "sections_changed_by_cmake_install": [
+        ".dynstr"
+      ],
+      "native_host_code_matches": true,
+      "gpu_sections": {
+        ".hip_fatbin": {
+          "bytes": 908768,
+          "native_sha256": "b270aa64a82ca8c0a5363b8c7047f40bba538167364f5eaf1442e2e6dc72b934",
+          "installed_sha256": "b270aa64a82ca8c0a5363b8c7047f40bba538167364f5eaf1442e2e6dc72b934",
+          "matches": true
+        },
+        ".hipFatBinSegment": {
+          "bytes": 24,
+          "native_sha256": "ffeafe9bbc6d00a276a9f753063743dea936c1db6bb80586a875618d2ca34d6e",
+          "installed_sha256": "ffeafe9bbc6d00a276a9f753063743dea936c1db6bb80586a875618d2ca34d6e",
+          "matches": true
+        }
+      }
+    },
+    "spinloop.abi3.so": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/.venv/lib/python3.12/site-packages/vllm/spinloop.abi3.so",
+      "bytes": 9504,
+      "sha256": "0262bfff3dd4e71cb13535318a043db7c8ca5133d152fe5893c3288bd9419f25",
+      "native_sha256": "e17fabb9dd4e80f5debc23eec6fbc9f1c95ce71480db15377f018310abf108b8",
+      "matches_native": false,
+      "matches_cmake_install_output": true,
+      "matches_wheel": true,
+      "sections_changed_by_cmake_install": [
+        ".dynstr",
+        ".dynamic"
+      ],
+      "native_host_code_matches": true,
+      "gpu_sections": {}
+    },
+    "fs_io_C.abi3.so": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/.venv/lib/python3.12/site-packages/vllm/fs_io_C.abi3.so",
+      "bytes": 20448,
+      "sha256": "cf60d6b2ec94285c2db279d766f9b57831e522f721de0cccbf2dde789e3e53e4",
+      "native_sha256": "1f16cb8fd2903ddf6b358c04706a3cf2698fa5ffb5b67d4c44050c9ed13a196c",
+      "matches_native": false,
+      "matches_cmake_install_output": true,
+      "matches_wheel": true,
+      "sections_changed_by_cmake_install": [
+        ".dynstr",
+        ".dynamic"
+      ],
+      "native_host_code_matches": true,
+      "gpu_sections": {}
+    }
+  },
+  "llama_binaries": {
+    "libllama-server-impl.so": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/llama-build/bin/libllama-server-impl.so",
+      "bytes": 7334144,
+      "sha256": "cb536478c9f527ce6d3916c85f7d8bc6b5338d7948e65f7ac8df2b393cfd5110"
+    },
+    "llama-bench": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/llama-build/bin/llama-bench",
+      "bytes": 6440,
+      "sha256": "35fab32eca1ff46846db06da8cb060ee05bcb856ff9a27d1d49792a0c663aac5"
+    },
+    "libllama.so.0.4.0": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/llama-build/bin/libllama.so.0.4.0",
+      "bytes": 4351928,
+      "sha256": "bc16f794b4560b5dca79df0ebefd22cf4b53fe3cd3dd6db1c9839c04caf32326"
+    },
+    "llama-server": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/llama-build/bin/llama-server",
+      "bytes": 6536,
+      "sha256": "bc23cea7508252499d94e89d8fa966f3afde4a6a2008ff87c0308c4dd0a2003a"
+    },
+    "libggml-base.so.0.23.0": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/llama-build/bin/libggml-base.so.0.23.0",
+      "bytes": 931024,
+      "sha256": "a73bb21c5aa1c38068d74b496984822f91da8f49d3459bc26dd1d7691de21378"
+    },
+    "libllama-cli-impl.so": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/llama-build/bin/libllama-cli-impl.so",
+      "bytes": 245824,
+      "sha256": "fe419c0dcf2cb075efe88837c6216875c5b53f35640b326536af871f0abe64ab"
+    },
+    "libggml-hip.so.0.23.0": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/llama-build/bin/libggml-hip.so.0.23.0",
+      "bytes": 69934936,
+      "sha256": "a33eb605c76fd525b5888f085c511b2755ec9eee6e5bef302347f61fcb2761e3"
+    },
+    "libllama-bench-impl.so": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/llama-build/bin/libllama-bench-impl.so",
+      "bytes": 485288,
+      "sha256": "57a10177a398325b77f5e6c03a3dd9321b0aed22c950e7c47b3567536064e683"
+    },
+    "llama-cli": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/llama-build/bin/llama-cli",
+      "bytes": 6568,
+      "sha256": "8ab07b1a0551e6effd5f1c0f83470966b0b30baf64712504292766c150ca3f71"
+    },
+    "libmtmd.so.0.4.0": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/llama-build/bin/libmtmd.so.0.4.0",
+      "bytes": 1701384,
+      "sha256": "5badda25ff30206b91bfc70ed96a7ae0ff64b8baa88176b88b557d580910c71e"
+    },
+    "libllama-common.so.0.4.0": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/llama-build/bin/libllama-common.so.0.4.0",
+      "bytes": 6133992,
+      "sha256": "7454dcf3ab3e16ee27dd5e01ae1b5b189cf74a2a4b818f0a34d390f202e83e61"
+    },
+    "libggml.so.0.23.0": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/llama-build/bin/libggml.so.0.23.0",
+      "bytes": 48880,
+      "sha256": "52902fb4652461e54b607a7231c9d8f2c53fd4e2b242d21edf3a6c566ca7336a"
+    },
+    "libggml-cpu.so.0.23.0": {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/llama-build/bin/libggml-cpu.so.0.23.0",
+      "bytes": 1320968,
+      "sha256": "80ef0324294f9a5b51a4e2a3234d7987f105a07e2245651bf0a659ab759ffcfb"
+    }
+  },
+  "original_source_status": {
+    "/home/vikash/oracle/gfx1100-active-2773/source": {
+      "head": "e126687a9a828d513c01a07cd69f025f27d63280",
+      "status": ""
+    },
+    "/home/vikash/oracle/llama.cpp-b10451-clean": {
+      "head": "10bf611e533d81f739128304991c5e133c6aebd8",
+      "status": ""
+    }
+  },
+  "limits": [
+    "No GPU execution or model gate occurred during preparation.",
+    "Torch 2.12.0+git6bbd260 reused from container; vLLM expects >=2.13.0 and emitted a build warning.",
+    "Optional Rust frontend and Rust tool parser absent because no Rust compiler is installed in the container.",
+    "Optional mooncake-transfer-engine-rocm absent by coordinating-task direction."
+  ],
+  "build_exit_codes": {
+    "vllm-build-attempt3.exit": "0",
+    "llama-build.exit": "0"
+  },
+  "binary_install_transformation": "CMake removes build-only RPATH during installation; native host code and embedded GPU code are identical. Installed binaries also match CMake install output and wheel members byte-for-byte."
+}

@@ -1,0 +1,65 @@
+{
+  "python": "/home/vikash/oracle/rdna3-wmma-latest/.venv/bin/python",
+  "python_version": "3.12.13 (main, Mar  4 2026, 09:23:07) [GCC 11.4.0]",
+  "imports": {
+    "torch": {
+      "file": "/usr/local/lib/python3.12/dist-packages/torch/__init__.py",
+      "version": "2.12.0+git6bbd260",
+      "sha256": "d9dfff4b75d46e4c75572200a3466b70231d05b0318e38ac1bd121789165fb49"
+    },
+    "triton": {
+      "file": "/usr/local/lib/python3.12/dist-packages/triton/__init__.py",
+      "version": "3.7.1",
+      "sha256": "fc8d0ce7535a4773769dfdcdb3a8b7bcee1bf58d3d03cc318529104c1e1431fd"
+    },
+    "vllm": {
+      "file": "/home/vikash/oracle/rdna3-wmma-latest/.venv/lib/python3.12/site-packages/vllm/__init__.py",
+      "version": "0.28.1rc1.dev812+g39545e475",
+      "sha256": "fd3708e5a13abe98c566afd79a6b1987cef70c0548bb19c1218ff6a7f9d43346"
+    },
+    "vllm._C": {
+      "file": "/home/vikash/oracle/rdna3-wmma-latest/.venv/lib/python3.12/site-packages/vllm/_C.abi3.so",
+      "version": null,
+      "sha256": "33c5db0ba5a8a5b65ee8ce2ff867f1c347c51b3b3359aa40f59058035bc6bad8"
+    },
+    "vllm._C_stable_libtorch": {
+      "file": "/home/vikash/oracle/rdna3-wmma-latest/.venv/lib/python3.12/site-packages/vllm/_C_stable_libtorch.abi3.so",
+      "version": null,
+      "sha256": "3e1c77c70ca9cda8bc9e5495b36b155cd1a9f1e2598c8086b774545024df09a2"
+    },
+    "vllm._moe_C_stable_libtorch": {
+      "file": "/home/vikash/oracle/rdna3-wmma-latest/.venv/lib/python3.12/site-packages/vllm/_moe_C_stable_libtorch.abi3.so",
+      "version": null,
+      "sha256": "46bd1b72b07311888b33ae21e2a0750bedab8b2dfcd3efa952f9acba15e0391f"
+    },
+    "vllm._rocm_C": {
+      "file": "/home/vikash/oracle/rdna3-wmma-latest/.venv/lib/python3.12/site-packages/vllm/_rocm_C.abi3.so",
+      "version": null,
+      "sha256": "bdbeb1a3fc6c30ac59bead0e423036cbaafd504026c55ec7a24af41fa1e2369f"
+    },
+    "vllm_gguf_plugin": {
+      "file": "/home/vikash/oracle/rdna3-wmma-latest/.venv/lib/python3.12/site-packages/vllm_gguf_plugin/__init__.py",
+      "version": null,
+      "sha256": "3e047fe518dc5b3f7ca2e2068cc6921b8b82c84cc87d23e79807a4cc6ccb0a04"
+    },
+    "vllm_gguf_plugin._C_gguf": {
+      "file": "/home/vikash/oracle/rdna3-wmma-latest/.venv/lib/python3.12/site-packages/vllm_gguf_plugin/_C_gguf.abi3.so",
+      "version": null,
+      "sha256": "592af79c210496e96eaa7bd409ae0a67e7de8c334aa9f782082c7639ba300138"
+    }
+  },
+  "packages": {
+    "vllm": "0.28.1rc1.dev812+g39545e475",
+    "vllm-gguf-plugin": "0.0.5+d4c1f0d.gfx1100",
+    "torch": "2.12.0+git6bbd260",
+    "triton": "3.7.1+gitf0b55c07",
+    "transformers": "5.16.1",
+    "huggingface_hub": "1.31.0",
+    "mcp": "2.2.0",
+    "tblib": "3.1.0",
+    "mooncake-transfer-engine-rocm": null
+  },
+  "errors": {},
+  "llm_import": "<class 'vllm.entrypoints.llm.LLM'>",
+  "sampling_params_import": "<class 'vllm.sampling_params.SamplingParams'>"
+}

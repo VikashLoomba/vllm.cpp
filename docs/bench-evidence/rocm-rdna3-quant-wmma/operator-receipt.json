@@ -39,7 +39,7 @@
       "branch": "row/KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA3-coordinator",
       "command": "python3 scripts/check-role-discipline.py",
       "exit": 0,
-      "receipt": "role-after-rename.log",
+      "receipt": "operator-role-after-rename.log",
       "checker_changed": false,
       "interpretation": "The row branch retains a REPORT for pending task content instead of failing as if it landed on main."
     },
@@ -102,97 +102,97 @@
     }
   },
   "receipts": {
-    "baseline-receipt.json": {
+    "operator-baseline-receipt.json": {
       "source": "/home/vikash/.cache/rdna3-wmma-operator/baseline-receipt.json",
       "bytes": 1561,
       "sha256": "431c2359f7cfc91e526f2c56e1de2d424a9e8d34552478032ddbbf7eebaa490f"
     },
-    "baseline-focused.log": {
+    "operator-baseline-focused.log": {
       "source": "/home/vikash/.cache/rdna3-wmma-operator/rdna3-wmma-baseline-tests.log",
       "bytes": 571,
       "sha256": "b61a72054345f5ac1700b9e4ac06f60df206da24e152f261c355121e0ce695ed"
     },
-    "baseline-broad.log": {
+    "operator-baseline-broad.log": {
       "source": "/home/vikash/.cache/rdna3-wmma-operator/rdna3-wmma-full-baseline-tests.log",
       "bytes": 4161,
       "sha256": "09fb787ca37c76cc1b1b4f326c33ebcc2abdeee29e0ddec89490c080e59a901a"
     },
-    "candidate-arch.log": {
+    "operator-candidate-arch.log": {
       "source": "/tmp/rdna3-wmma-operator-arch.log",
       "bytes": 298,
       "sha256": "c379abc214ea72cd18194c463d169e9651334fb3d8519afb8236fe9821caed16"
     },
-    "candidate-build.log": {
+    "operator-candidate-build.log": {
       "source": "/tmp/rdna3-wmma-operator-candidate-build.log",
       "bytes": 1476,
       "sha256": "29dd8869a86e57d16ab383b8363a469022cf85846a1bb50b209a21bc19d9634e"
     },
-    "candidate-tests.log": {
+    "operator-candidate-tests.log": {
       "source": "/tmp/rdna3-wmma-operator-candidate-tests.log",
       "bytes": 4292,
       "sha256": "773c6aa335445e86daac0a72724264879f2fbcc1d0d2cbaa15fd2316e6638496"
     },
-    "preflight-original-failure.log": {
+    "operator-preflight-original-failure.log": {
       "source": "/tmp/rdna3-wmma-operator-final-preflight.log",
       "bytes": 10236,
       "sha256": "5de69dfe39fa8edfc84dd0db93ba05bab138495ff4b07b862d0ccd81aeccaa2a"
     },
-    "role-after-rename.log": {
+    "operator-role-after-rename.log": {
       "source": "/tmp/rdna3-wmma-operator-role-after-rename.log",
       "bytes": 459,
       "sha256": "c74252602e074405820799bbdffbc6b37332b79d83492d2ad23850c5089a0236"
     },
-    "numpy-suites/numpy-only-summary.json": {
+    "operator-numpy-suites-numpy-only-summary.json": {
       "source": "/home/vikash/.cache/rdna3-wmma-operator/numpy-suites/numpy-only-summary.json",
       "bytes": 143,
       "sha256": "aebbb38abf42d409da85e0aa3de3797f8a50e7644916cb0ae99f3e475dcd4e9b"
     },
-    "numpy-suites/summary.json": {
+    "operator-numpy-suites-summary.json": {
       "source": "/home/vikash/.cache/rdna3-wmma-operator/numpy-suites/summary.json",
       "bytes": 508,
       "sha256": "1301a34c3b4a1ddbd1431de495bf25cfb3787ffd123cc96c7e43b85f25908a7f"
     },
-    "numpy-suites/test_convert_glm5_next_gguf.log": {
+    "operator-numpy-suites-test_convert_glm5_next_gguf.log": {
       "source": "/home/vikash/.cache/rdna3-wmma-operator/numpy-suites/test_convert_glm5_next_gguf.log",
       "bytes": 7328,
       "sha256": "c7277c96d32273ddae18257eb79e97a06f241066e8175f9d832175f46b17be09"
     },
-    "numpy-suites/test_ltx25_absolute_reference.log": {
+    "operator-numpy-suites-test_ltx25_absolute_reference.log": {
       "source": "/home/vikash/.cache/rdna3-wmma-operator/numpy-suites/test_ltx25_absolute_reference.log",
       "bytes": 4318,
       "sha256": "c60b955a1193840d4ef06a7450c16a3f83cef86f4ebed8df2d319fb87c1f5cd6"
     },
-    "numpy-suites/test_ltx25_adherence_detail_loss.log": {
+    "operator-numpy-suites-test_ltx25_adherence_detail_loss.log": {
       "source": "/home/vikash/.cache/rdna3-wmma-operator/numpy-suites/test_ltx25_adherence_detail_loss.log",
       "bytes": 8376,
       "sha256": "b868c28455caaf78944887455a406d93fe47412b5198b882726da78522bf567e"
     },
-    "numpy-suites/test_ltx25_prompt_adherence.log": {
+    "operator-numpy-suites-test_ltx25_prompt_adherence.log": {
       "source": "/home/vikash/.cache/rdna3-wmma-operator/numpy-suites/test_ltx25_prompt_adherence.log",
       "bytes": 7594,
       "sha256": "66226fb508b845f4a59aa868f3c1da654a35ea7c0afb535e42f057653c6cbdc5"
     },
-    "numpy-suites/test_ltx25_render_compare.log": {
+    "operator-numpy-suites-test_ltx25_render_compare.log": {
       "source": "/home/vikash/.cache/rdna3-wmma-operator/numpy-suites/test_ltx25_render_compare.log",
       "bytes": 164,
       "sha256": "72e3eed62562f4f3e2562c1102d68847ba01466de0d045095bd8f6365a5ad7e9"
     },
-    "numpy-suites/test_qwen3_capture_outputs-numpy-only.log": {
+    "operator-numpy-suites-test_qwen3_capture_outputs-numpy-only.log": {
       "source": "/home/vikash/.cache/rdna3-wmma-operator/numpy-suites/test_qwen3_capture_outputs-numpy-only.log",
       "bytes": 4972,
       "sha256": "14ced4f5d32f2ba7dc94437fc0045ba971cda03ce985016f5a5e48072f66542a"
     },
-    "numpy-suites/test_qwen3_capture_outputs.log": {
+    "operator-numpy-suites-test_qwen3_capture_outputs.log": {
       "source": "/home/vikash/.cache/rdna3-wmma-operator/numpy-suites/test_qwen3_capture_outputs.log",
       "bytes": 27959,
       "sha256": "22c43fe58915716853f11a2a1c5a2fd29b9fe800cbe0da4f9ed3a5c4b1857ee5"
     },
-    "numpy-suites/test_qwen3_capture_tools-numpy-only.log": {
+    "operator-numpy-suites-test_qwen3_capture_tools-numpy-only.log": {
       "source": "/home/vikash/.cache/rdna3-wmma-operator/numpy-suites/test_qwen3_capture_tools-numpy-only.log",
       "bytes": 11245,
       "sha256": "cdb23e47644b3b49a220383a237c9f2ec4fbb25e269387fb8391edf01489f09b"
     },
-    "numpy-suites/test_qwen3_capture_tools.log": {
+    "operator-numpy-suites-test_qwen3_capture_tools.log": {
       "source": "/home/vikash/.cache/rdna3-wmma-operator/numpy-suites/test_qwen3_capture_tools.log",
       "bytes": 12258,
       "sha256": "8597b7908d8f6da3270a91018187173ebbbd46a6dba5e481f6fd04c78b2571ef"
@@ -226,7 +226,7 @@
     "findings": "NONE",
     "implementation_sha": "c3fe98ba6c55ce71e75746e1b944a27640464e0f",
     "evidence_sha": "c176168cbbdcca700b6346ebb6a1914033b85eda",
-    "receipt": "../review/review-report.json"
+    "receipt": "review-review-report.json"
   },
   "build_configuration": {
     "CMAKE_BUILD_TYPE": "Release",
@@ -544,5 +544,6 @@
       ]
     },
     "original_preflight_skip_disposition_preserved": true
-  }
+  },
+  "copy_root": "docs/bench-evidence/rocm-rdna3-quant-wmma"
 }

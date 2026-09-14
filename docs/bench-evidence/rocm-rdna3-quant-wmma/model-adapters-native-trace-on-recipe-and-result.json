@@ -1,0 +1,552 @@
+{
+  "status": "COMPLETE",
+  "arm": "on",
+  "argv": [
+    "/home/vikash/oracle/rdna3-wmma-latest/adapters/run_native_trace.py",
+    "--arm",
+    "on",
+    "--output-dir",
+    "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on"
+  ],
+  "adapter": {
+    "path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/run_native_trace.py",
+    "resolved_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/run_native_trace.py",
+    "sha256": "f8c131d1fbcbaf9e54b8a34756e1d7cd4ea2692b7a9ee3b01f671be958529c7b",
+    "stat": [
+      66309,
+      4612152,
+      6603,
+      1789361971099973393,
+      1789361971099973393
+    ]
+  },
+  "phase": "complete",
+  "binary": {
+    "path": "/home/vikash/vllm.cpp-rdna3-wmma/build-rdna3-wmma-operator/examples/vllm-bench",
+    "resolved_path": "/home/vikash/vllm.cpp-rdna3-wmma/build-rdna3-wmma-operator/examples/vllm-bench",
+    "sha256": "ae64e829a31ff62b3b1dac2a56b35ec8fdb449ee681b8f62aeab2c432583b902",
+    "stat": [
+      66309,
+      4601425,
+      32315864,
+      1789360008243853412,
+      1789360008245853428
+    ]
+  },
+  "model": {
+    "path": "/home/vikash/models/Qwen3.5-4B-Q4_K_M-unsloth-e87f1764.gguf",
+    "resolved_path": "/home/vikash/models/Qwen3.5-4B-Q4_K_M-unsloth-e87f1764.gguf",
+    "sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+    "stat": [
+      66309,
+      119839892,
+      2740937888,
+      1787995127572958838,
+      1787995129132981824
+    ]
+  },
+  "profiler": {
+    "path": "/opt/rocm/bin/rocprofv3",
+    "resolved_path": "/opt/rocm/core-10.0/bin/rocprofv3",
+    "sha256": "2d220ded2167097e480e6866a916b575548d56bed8a823a4e505f7133868f0a6",
+    "stat": [
+      66309,
+      52593259,
+      95727,
+      1787266423000000000,
+      1787946912530145205
+    ]
+  },
+  "profiler_version": {
+    "argv": [
+      "/opt/rocm/bin/rocprofv3",
+      "--version"
+    ],
+    "exit_code": 0,
+    "stdout": "             version: 1.3.5\n        git_revision: 6b0e43f341195e203754e08f850e437ff2fc09f9\n        library_arch: x86_64-unknown-linux-gnu\n         system_name: Linux\n    system_processor: x86_64\n      system_version: 6.12.73-95.123.amzn2023.x86_64\n         compiler_id: Clang\n    compiler_version: 23.0.0\n        rocm_version: 10.0.0\n",
+    "stderr": ""
+  },
+  "revision": {
+    "argv": [
+      "git",
+      "-C",
+      "/home/vikash/vllm.cpp-rdna3-wmma",
+      "rev-parse",
+      "HEAD"
+    ],
+    "exit_code": 0,
+    "stdout": "6e65c6fad158c7d2e7cd2f583c6b50e1ab694cbf\n",
+    "stderr": ""
+  },
+  "original_dataset": {
+    "path": "/home/vikash/oracle/rdna3-wmma-latest/qwen35-4b-text/workload.json",
+    "resolved_path": "/home/vikash/oracle/rdna3-wmma-latest/qwen35-4b-text/workload.json",
+    "sha256": "4cab7f33eef255088ed38506aedb5750f3dfc0201a5c86459b385a1f5430468b",
+    "stat": [
+      66309,
+      4601165,
+      2042,
+      1789359425030664149,
+      1789359769692833552
+    ]
+  },
+  "expanded_dataset": {
+    "path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/workload-eight.json",
+    "resolved_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/workload-eight.json",
+    "sha256": "82a32ee193938d245f363b4bfd170df555870efca505db8048abe27ccde00777",
+    "stat": [
+      66309,
+      5803231,
+      8159,
+      1789362100955359709,
+      1789362100955359709
+    ]
+  },
+  "original_record_index_for_request": [
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1
+  ],
+  "rocprof_tmpdir": "/home/vikash/oracle/rdna3-wmma-latest/cache/rocprof/native-trace-on",
+  "traced_argv": [
+    "env",
+    "-u",
+    "VT_ROCM_QUANT_WMMA",
+    "HIP_VISIBLE_DEVICES=0",
+    "ROCR_VISIBLE_DEVICES=0",
+    "ROCPROF_TMPDIR=/home/vikash/oracle/rdna3-wmma-latest/cache/rocprof/native-trace-on",
+    "TMPDIR=/home/vikash/oracle/rdna3-wmma-latest/cache/rocprof/native-trace-on",
+    "/opt/rocm/bin/rocprofv3",
+    "--hip-trace",
+    "--kernel-trace",
+    "--memory-copy-trace",
+    "--memory-allocation-trace",
+    "--marker-trace",
+    "--stats",
+    "--output-config",
+    "--output-format",
+    "csv",
+    "json",
+    "--output-directory",
+    "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof",
+    "--output-file",
+    "native-on",
+    "--",
+    "/home/vikash/vllm.cpp-rdna3-wmma/build-rdna3-wmma-operator/examples/vllm-bench",
+    "--model",
+    "/home/vikash/models/Qwen3.5-4B-Q4_K_M-unsloth-e87f1764.gguf",
+    "--dataset-path",
+    "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/workload-eight.json",
+    "--num-prompts",
+    "8",
+    "--input-len",
+    "256",
+    "--output-len",
+    "16",
+    "--concurrency",
+    "1",
+    "--max-num-batched-tokens",
+    "512",
+    "--num-blocks",
+    "64",
+    "--temperature",
+    "0",
+    "--seed",
+    "0",
+    "--skip-chat-template",
+    "--ignore-eos",
+    "--output-token-ids",
+    "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/output-token-ids.json"
+  ],
+  "monitor_argv": [
+    "/home/vikash/.venv/bin/python",
+    "/home/vikash/oracle/rdna3-wmma-latest/adapters/monitor_command.py",
+    "--output-jsonl",
+    "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/monitor.jsonl",
+    "--interval-seconds",
+    "0.05",
+    "--timeout-seconds",
+    "600",
+    "--",
+    "env",
+    "-u",
+    "VT_ROCM_QUANT_WMMA",
+    "HIP_VISIBLE_DEVICES=0",
+    "ROCR_VISIBLE_DEVICES=0",
+    "ROCPROF_TMPDIR=/home/vikash/oracle/rdna3-wmma-latest/cache/rocprof/native-trace-on",
+    "TMPDIR=/home/vikash/oracle/rdna3-wmma-latest/cache/rocprof/native-trace-on",
+    "/opt/rocm/bin/rocprofv3",
+    "--hip-trace",
+    "--kernel-trace",
+    "--memory-copy-trace",
+    "--memory-allocation-trace",
+    "--marker-trace",
+    "--stats",
+    "--output-config",
+    "--output-format",
+    "csv",
+    "json",
+    "--output-directory",
+    "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof",
+    "--output-file",
+    "native-on",
+    "--",
+    "/home/vikash/vllm.cpp-rdna3-wmma/build-rdna3-wmma-operator/examples/vllm-bench",
+    "--model",
+    "/home/vikash/models/Qwen3.5-4B-Q4_K_M-unsloth-e87f1764.gguf",
+    "--dataset-path",
+    "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/workload-eight.json",
+    "--num-prompts",
+    "8",
+    "--input-len",
+    "256",
+    "--output-len",
+    "16",
+    "--concurrency",
+    "1",
+    "--max-num-batched-tokens",
+    "512",
+    "--num-blocks",
+    "64",
+    "--temperature",
+    "0",
+    "--seed",
+    "0",
+    "--skip-chat-template",
+    "--ignore-eos",
+    "--output-token-ids",
+    "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/output-token-ids.json"
+  ],
+  "trace_scope": "unfiltered HIP API, kernel dispatch, memory copy/allocation, and ROCTx traces; no hardware counter or ATT collection",
+  "interpretation": "trace overhead changes timings; use these runs to identify executing paths, not as the unprofiled performance denominator",
+  "gpu_busy_percent_before": 0,
+  "exit_code": 0,
+  "generated_token_ids": [
+    [
+      271,
+      248068,
+      198,
+      90700,
+      8340,
+      25,
+      271,
+      16,
+      13,
+      220,
+      2972,
+      2014,
+      53983,
+      279,
+      5952,
+      64700
+    ],
+    [
+      271,
+      248068,
+      198,
+      90700,
+      8340,
+      25,
+      271,
+      16,
+      13,
+      220,
+      2972,
+      2014,
+      53983,
+      279,
+      5952,
+      64700
+    ],
+    [
+      271,
+      248068,
+      198,
+      90700,
+      8340,
+      25,
+      271,
+      16,
+      13,
+      220,
+      2972,
+      2014,
+      53983,
+      279,
+      5952,
+      64700
+    ],
+    [
+      271,
+      248068,
+      198,
+      90700,
+      8340,
+      25,
+      271,
+      16,
+      13,
+      220,
+      2972,
+      2014,
+      53983,
+      279,
+      5952,
+      64700
+    ],
+    [
+      271,
+      248068,
+      198,
+      90700,
+      8340,
+      25,
+      271,
+      16,
+      13,
+      220,
+      2972,
+      2014,
+      53983,
+      279,
+      5952,
+      64700
+    ],
+    [
+      271,
+      248068,
+      198,
+      90700,
+      8340,
+      25,
+      271,
+      16,
+      13,
+      220,
+      2972,
+      2014,
+      53983,
+      279,
+      5952,
+      64700
+    ],
+    [
+      271,
+      248068,
+      198,
+      90700,
+      8340,
+      25,
+      271,
+      16,
+      13,
+      220,
+      2972,
+      2014,
+      53983,
+      279,
+      5952,
+      64700
+    ],
+    [
+      271,
+      248068,
+      198,
+      90700,
+      8340,
+      25,
+      271,
+      16,
+      13,
+      220,
+      2972,
+      2014,
+      53983,
+      279,
+      5952,
+      64700
+    ]
+  ],
+  "metrics_with_profiler_overhead": {
+    "Async scheduling enabled": 0.0,
+    "Pretokenized prompt admission": 1.0,
+    "Ignore EOS (requested)": 1.0,
+    "Ignore EOS (resolved sampling)": 1.0,
+    "Maximum concurrent batches": 1.0,
+    "Successful requests": 8.0,
+    "Maximum request concurrency": 1.0,
+    "Benchmark duration (s)": 11.12,
+    "Total input tokens": 1428.0,
+    "Total generated tokens": 128.0,
+    "Request throughput (req/s)": 0.72,
+    "Output token throughput (tok/s)": 11.51,
+    "Total token throughput (tok/s)": 139.87,
+    "Mean TTFT (ms)": 859.43,
+    "Median TTFT (ms)": 395.15,
+    "P99 TTFT (ms)": 3568.89,
+    "Mean TPOT (ms)": 35.41,
+    "Median TPOT (ms)": 33.81,
+    "P99 TPOT (ms)": 48.99,
+    "Mean ITL (ms)": 35.41,
+    "Median ITL (ms)": 20.63,
+    "P99 ITL (ms)": 202.18,
+    "Mean E2EL (ms)": 1390.53,
+    "Median E2EL (ms)": 961.22,
+    "P99 E2EL (ms)": 4084.28,
+    "Input token throughput (tok/s, over whole run)": 128.37,
+    "Prefill token throughput (tok/s, in/TTFT)": 207.7,
+    "Output (decode) token throughput (tok/s)": 11.51,
+    "Mean per-stream decode rate (tok/s)": 28.24
+  },
+  "trace_files": [
+    {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_agent_info.csv",
+      "resolved_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_agent_info.csv",
+      "sha256": "90f47b57110e910cd39ed10f58a95a8f16bd1dadc12bb286363a2014e0ea9f40",
+      "stat": [
+        66309,
+        5803273,
+        2126,
+        1789362119318581800,
+        1789362119318581800
+      ]
+    },
+    {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_config.json",
+      "resolved_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_config.json",
+      "sha256": "d98d4842506a05ed16b9632f3d83e6e79652cd0fb28a4ebf2be5c567d66315bd",
+      "stat": [
+        66309,
+        5803257,
+        15406,
+        1789362117310560335,
+        1789362117310560335
+      ]
+    },
+    {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_domain_stats.csv",
+      "resolved_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_domain_stats.csv",
+      "sha256": "361570fa7ed7a70eeeddb7cac004c82f1103fbb9e8db9829d4df6434239a5c73",
+      "stat": [
+        66309,
+        5803275,
+        402,
+        1789362119319581810,
+        1789362119319581810
+      ]
+    },
+    {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_hip_api_stats.csv",
+      "resolved_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_hip_api_stats.csv",
+      "sha256": "91e4603c6e300a198137bfcad021a8b20edee6e10d360b4219fce31e3af1ff19",
+      "stat": [
+        66309,
+        5803263,
+        2559,
+        1789362117803565605,
+        1789362117803565605
+      ]
+    },
+    {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_hip_api_trace.csv",
+      "resolved_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_hip_api_trace.csv",
+      "sha256": "ebaa19247bf1abc9a092c1d329630209de1b048054e4b596e18eb943339e42f1",
+      "stat": [
+        66309,
+        5803265,
+        73868422,
+        1789362119239580956,
+        1789362119239580956
+      ]
+    },
+    {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_kernel_stats.csv",
+      "resolved_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_kernel_stats.csv",
+      "sha256": "2cb8e512704e0660f77f87cf0cbf64e13c67702561359f1f477cbbf094b813e8",
+      "stat": [
+        66309,
+        5803259,
+        8424,
+        1789362117340257989,
+        1789362117340257989
+      ]
+    },
+    {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_kernel_trace.csv",
+      "resolved_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_kernel_trace.csv",
+      "sha256": "426c624bf0e39efa15968319c2b530f546a979d0d068d05a5b9cfe9a46e0c440",
+      "stat": [
+        66309,
+        5803261,
+        29038874,
+        1789362117608563521,
+        1789362117608563521
+      ]
+    },
+    {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_memory_allocation_stats.csv",
+      "resolved_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_memory_allocation_stats.csv",
+      "sha256": "89f3003237f18be6869d937d0bdff1883c7c105627c9ed90f20ed5b76d0ffc26",
+      "stat": [
+        66309,
+        5803270,
+        352,
+        1789362119309581703,
+        1789362119309581703
+      ]
+    },
+    {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_memory_allocation_trace.csv",
+      "resolved_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_memory_allocation_trace.csv",
+      "sha256": "1ca6216e4a5148e2fcaa7da56f20b3723f66ea04dfd6cd4dd3a57da69ddf42e5",
+      "stat": [
+        66309,
+        5803272,
+        157890,
+        1789362119316581778,
+        1789362119316581778
+      ]
+    },
+    {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_memory_copy_stats.csv",
+      "resolved_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_memory_copy_stats.csv",
+      "sha256": "c4e0cbbeaefac10c4261855b333ebd3ed8cda55c3b33a2df071fb1d16b4bedaf",
+      "stat": [
+        66309,
+        5803267,
+        174,
+        1789362119274581330,
+        1789362119274581330
+      ]
+    },
+    {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_memory_copy_trace.csv",
+      "resolved_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_memory_copy_trace.csv",
+      "sha256": "bab74d3d2c9771480974ec9aeadf2aea0bdd293c358c73c1c04174da37cdec71",
+      "stat": [
+        66309,
+        5803268,
+        30363,
+        1789362119283581426,
+        1789362119283581426
+      ]
+    },
+    {
+      "path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_results.json",
+      "resolved_path": "/home/vikash/oracle/rdna3-wmma-latest/adapters/native-trace-on/rocprof/native-on_results.json",
+      "sha256": "14f3b41e8ea47a850c3c8b69628699a8b07e5099ebc7815167717a4984df90ed",
+      "stat": [
+        66309,
+        5803277,
+        382548823,
+        1789362123435625784,
+        1789362123435625784
+      ]
+    }
+  ]
+}

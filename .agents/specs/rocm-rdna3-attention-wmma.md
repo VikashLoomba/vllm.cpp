@@ -8,18 +8,26 @@ Integration: one pull request, following the repository default.
 
 ## Now
 
-`SPIKE`. The developer requests architecture admission, correctness, compiled
+`ACTIVE`. The developer requests architecture admission, correctness, compiled
 resource inspection, performance measurement, and end-to-end validation.
 The developer explicitly forbids subagents for this task. This session performs
 implementation and validation. Independent human review remains due at the MR.
 The existing quantized admission is separately implemented in PR #3187.
+
+The kernel compiles on gfx1100/1200/1201 and passes ten primary array cases.
+The original 96-token gate passes after linear RoPE and BF16 head corrections.
+The expanded 256-token gate fails on four WMMA and three scalar requests.
+Keep gfx1100 opt-in. Default enablement and full-model performance acceptance
+remain blocked by ISSUE-LOCAL-01M2HQEEXHD2B0BT3N71HQ0CRZ. The draft MR is not
+merge-ready. [Measured report](../../docs/bench-evidence/rocm-rdna3-attention-wmma/README.md).
 
 ## Scope
 
 Admit gfx1100 to the existing BF16 SharedK rocWMMA attention prefill kernel.
 Preserve the current gfx1200 and gfx1201 behavior. Keep other gfx11 targets
 excluded. Preserve head dimension 256, query-to-KV head ratio two, one request,
-at least 64 query tokens, BF16 buffers, and the existing scalar override.
+at least 64 query tokens, BF16 buffers, and the existing scalar override. Gfx1100 requires explicit opt-in until
+the expanded token gate passes; preserve the gfx12 default.
 Do not enable the deferred dimension-512 WMMA arm or alter quantized dispatch.
 The quantized implementation in PR #3187 remains a separate reviewed change.
 
@@ -115,4 +123,4 @@ checkpoint provenance, and return codes in the task's ignored build directory.
 
 | ID | Upstream source | Local anchor | Tests and evidence | Spec | State | Owner | Issue |
 |---|---|---|---|---|---|---|---|
-| `BACKEND-ROCM-RDNA3-WMMA-ATTN` | vLLM prefix prefill at e126687a9a; rocWMMA 2.2.1 gfx11 BF16 | `PagedAttnPrefillSharedKWmma` | Gates in this spec | [This spec](rocm-rdna3-attention-wmma.md) | `SPIKE` | Codex, single-agent user direction | `ISSUE-LOCAL-01M2HK0GFJDRXXAAA8F0014XQQ` |
+| `BACKEND-ROCM-RDNA3-WMMA-ATTN` | vLLM prefix prefill at e126687a9a; rocWMMA 2.2.1 gfx11 BF16 | `PagedAttnPrefillSharedKWmma` | Gates in this spec | [This spec](rocm-rdna3-attention-wmma.md) | `ACTIVE` | Codex, single-agent user direction | `ISSUE-LOCAL-01M2HK0GFJDRXXAAA8F0014XQQ` |

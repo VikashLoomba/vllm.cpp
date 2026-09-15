@@ -12,13 +12,12 @@ Integration: one pull request, following the repository default.
 gfx1100 attention gate exposed the missing formula. No subagents may be used.
 This session implements and validates it; independent human review remains due.
 
-The linear leaf, config, loader, and model routing are implemented. The five
-focused suites pass, including twelve frozen primary cache/rotation cases.
-Removing scaling or routing sliding layers to the global cache makes the
-focused tests fail. The real 4B model loads; its scalar attention control differs
-from the primary at one exact tied-token position. Combining this prerequisite
-with the gfx1100 WMMA admission produces all 96 primary token IDs. Final source
-integration and the attention row's performance gate remain in progress.
+The linear leaf, config, loader, and model routing are implemented. Twelve
+primary array cases and the focused suites pass. The combined source build
+passes all original 96 public tokens. The wider 256-token gate still fails,
+even after correcting the final projection dtype. The attention row retains
+that separate numerical gap and keeps gfx1100 WMMA opt-in.
+[Measured report](../../docs/bench-evidence/rocm-rdna3-attention-wmma/README.md).
 
 ## Problem and scope
 

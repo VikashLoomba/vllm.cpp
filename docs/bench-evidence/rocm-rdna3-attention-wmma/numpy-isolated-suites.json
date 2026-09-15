@@ -1,0 +1,9 @@
+{
+  "test_qwen3_capture_tools": 0,
+  "test_qwen3_capture_outputs": 0,
+  "test_ltx25_render_compare": 0,
+  "test_ltx25_absolute_reference": 0,
+  "test_ltx25_prompt_adherence": 0,
+  "test_ltx25_adherence_detail_loss": 0,
+  "test_convert_glm5_next_gguf": 0
+}

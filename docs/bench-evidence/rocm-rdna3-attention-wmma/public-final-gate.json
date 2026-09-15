@@ -1,0 +1,11 @@
+{
+  "token_exact": 96,
+  "wmma_dispatches": 102,
+  "scratch_bytes": 0,
+  "runtime_vgpr": [
+    80
+  ],
+  "runtime_sgpr": [
+    128
+  ]
+}

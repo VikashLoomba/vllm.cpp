@@ -1,0 +1,7 @@
+{
+  "pr": 3187,
+  "head": "6d748d8e59d12f8ee2aa9d7fc250d8d48b361f75",
+  "object_sha256": "55ec9348210144334dc3834c263e9476ac05e6d3320e82005db33581ea8f7054",
+  "tool": "/opt/rocm/llvm/bin/llvm-readelf --notes",
+  "note": "Measured the existing PR build object. No quantized source change in this branch."
+}

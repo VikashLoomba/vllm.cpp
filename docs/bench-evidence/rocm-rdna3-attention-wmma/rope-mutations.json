@@ -1,0 +1,14 @@
+[
+  {
+    "name": "unscaled",
+    "exit_code": 1,
+    "source_sha256": "c474dfd6f0601c82057e9f9046dd0e5f56733d9969a594fe9a80ca7e03a2ba99",
+    "restored_byte_exact": true
+  },
+  {
+    "name": "sliding",
+    "exit_code": 1,
+    "source_sha256": "c579ae994a4b30343bd87b634c7eed220990d9b7e9f727559219956e6641c020",
+    "restored_byte_exact": true
+  }
+]

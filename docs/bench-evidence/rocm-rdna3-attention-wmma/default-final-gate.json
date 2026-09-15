@@ -1,0 +1,5 @@
+{
+  "default_wmma_dispatches": 0,
+  "explicit_scalar_wmma_dispatches": 0,
+  "scalar_token_exact": 96
+}

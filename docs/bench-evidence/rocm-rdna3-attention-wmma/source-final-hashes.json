@@ -1,0 +1,13 @@
+{
+  "src/vt/rocm/rocm_paged_attn.hip": "786ee8673bc9402a6cc6200c334d2f6d82cab3b791f651d253cb5851160975c3",
+  "src/vllm/model_executor/models/gemma3.cpp": "c795391d3d9813500b1ff039761407e720d5690662e494313ec0408683a2d643",
+  "src/vllm/model_executor/models/gemma3_weights.cpp": "6a5b45ead708b32c9de2d1c0c00f6b42f8b35c0ee06c8b2110f47bd91bae9d64",
+  "include/vt/rocm/rocm_attn_wmma_arch.h": "18bf0bab622bc59ff749c3efd889ad28dafffa0aba84b8abc633246981906724",
+  "src/vllm/model_executor/layers/rotary_embedding/linear_scaling_rope.cpp": "c474dfd6f0601c82057e9f9046dd0e5f56733d9969a594fe9a80ca7e03a2ba99",
+  "tools/rocm_attn_wmma/model_capture.cpp": "65718df56872305cdacfdbe3604bee5934968705bc349384ee1759bf8d2fafa1",
+  "tools/rocm_attn_wmma/capture.cpp": "2b09883b4f974a71848cd2d746d11d25acfd5e40ea2c1e75f593804f1abee92e",
+  "tools/rocm_attn_wmma/bench.cpp": "fb0900a4b0b03f3809cc24903f4518d252286a5982b2aa2ef61a4e6f065fca10",
+  "build-rdna3-attn/libvllm.a": "16e41d8617b07a69621e667ad0cb67ac7dd2dad5a47ffa4920c4b173c5889398",
+  "build-rdna3-attn/model-capture": "39b5ed5fd1e3a3cde73644d6f648c780a2a7b55fdf61def3917e6d7f28596016",
+  "build-rdna3-attn/attn-capture": "e455bee831b2f049977e18fcc9962ba3acef6834abdf17e2511eadc1d679d995"
+}

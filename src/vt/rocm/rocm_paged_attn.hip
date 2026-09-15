@@ -3,8 +3,9 @@
 // Supports bf16/f32 query x bf16/f32 KV (mixed allowed).
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
-// rocWMMA only on gfx12 (R9700). Fat builds also emit gfx1036 — must not include there.
-#if defined(__gfx1200__) || defined(__gfx1201__)
+// Compile the same rocWMMA BF16 tiles for the admitted RDNA3 and RDNA4 targets.
+// Keep this set aligned with GcnArchNameHasSharedKAttentionWmma at host dispatch.
+#if defined(__gfx1100__) || defined(__gfx1200__) || defined(__gfx1201__)
 #include <rocwmma/rocwmma.hpp>
 #define VT_ROCWMMA_OK 1
 #endif
@@ -19,6 +20,7 @@
 #include "vt/backend.h"
 #include "vt/fp8_kv.h"
 #include "vt/rocm/rocm_arch.h"
+#include "vt/rocm/rocm_attn_wmma_arch.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -35,8 +37,8 @@ inline void Check(hipError_t err, const char* what) {
   }
 }
 
-// Per-device, once: launch SharedK WMMA only when this device's gcnArchName is
-// gfx1200/gfx1201 (prefix). Not per-build, not getenv. Device kernel body
+// Per-device, once: launch SharedK WMMA only on an admitted device.
+// Not per-build, not getenv. Device kernel body
 // still uses VT_ROCWMMA_OK (#785).
 bool PrefillSharedKWmmaHostOk() {
   int dev = 0;
@@ -53,7 +55,9 @@ bool PrefillSharedKWmmaHostOk() {
       slots[static_cast<unsigned>(dev)].ok = false;
       return;
     }
-    slots[static_cast<unsigned>(dev)].ok = GcnArchNameIsGfx12PrefillWmma(prop.gcnArchName);
+    slots[static_cast<unsigned>(dev)].ok =
+        SharedKAttentionWmmaEnabled(
+            prop.gcnArchName, std::getenv("VT_ATTN_PREFILL_SHAREDK_WMMA"));
   });
   return slots[static_cast<unsigned>(dev)].ok;
 }
@@ -2168,7 +2172,8 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
         return e[0] != '0';
       }();
       static const bool sharedk_wmma = [] {
-        // Default ON: d=256 Q-smem WMMA only. d=512 stays scalar SharedK
+        // Default ON where the host policy allows it; gfx1100 requires opt-in.
+        // Only d=256 Q-smem WMMA is admitted. d=512 stays scalar SharedK
         // until a separately gated kernel repair (shipping f58b spills).
         // =0 forces scalar SharedK for A/B.
         const char* e = std::getenv("VT_ATTN_PREFILL_SHAREDK_WMMA");
@@ -2187,7 +2192,7 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
                   static_cast<size_t>(2 * bn) * static_cast<size_t>(d));
         };
         const unsigned z_groups = (qg == 8 && d == 512) ? 4u : 1u;
-        // Host must not launch WMMA stubs on non-gfx1200/1201 devices
+        // Host must not launch WMMA stubs on devices excluded at compilation
         // (kernel body is empty there → silent garbage out). Runtime prefix
         // match on hipDeviceProp_t.gcnArchName; VT_ROCWMMA_OK is device-only.
         if (sharedk_wmma && PrefillSharedKWmmaHostOk()) {

@@ -14,6 +14,11 @@ projection. The corrected projection passes 1510 focused assertions. Both
 tied and untied heads fail the new dtype assertion before correction. The user authorized correctness repairs and prohibits subagents.
 Independent human review remains due. This prerequisite has its own worktree.
 
+The running primary confirms BF16 hidden states, weights, and projection
+output. Both controls pass the original 96 tokens after correction. The
+expanded 256-token gate still fails and is retained by the attention row.
+[Measured report](../../docs/bench-evidence/rocm-rdna3-attention-wmma/README.md).
+
 ## Scope and design
 
 Gemma 3 resolves BF16 activations and weights, but its final projection writes
@@ -27,7 +32,8 @@ Do not modify attention arithmetic, sampling, token gates, or other models.
 vLLM `e126687a9a828d513c01a07cd69f025f27d63280`:
 `model_executor/models/gemma3.py::compute_logits` calls `LogitsProcessor`.
 `model_executor/layers/logits_processor.py::_apply_head` uses model dtype by
-default. `UnquantizedEmbeddingMethod.apply` calls `torch.nn.functional.linear`.
+default. `UnquantizedEmbeddingMethod.apply` calls `dispatch_unquantized_gemm`.
+On ROCm, `layers/utils.py:260-346` selects the skinny kernel or Torch GEMM.
 `v1/sample/sampler.py:97` widens the already rounded logits to FP32.
 The running primary BF16 model reproduces its generated IDs across two runs.
 

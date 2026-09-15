@@ -1,0 +1,107 @@
+{
+  "reference": "build-rdna3-attn/evidence/primary-fixed",
+  "native": "build-rdna3-attn/evidence/mutation-launch/output",
+  "cases": [
+    {
+      "name": "case00-t64-p0-h2-w-1",
+      "max_abs": 64.0009994506836,
+      "differing_words": 32768,
+      "finite": true,
+      "violations": 32768,
+      "atol": 0.0001,
+      "rtol": 0.0,
+      "passed": false
+    },
+    {
+      "name": "case01-t79-p19-h8-w15",
+      "max_abs": 64.00053405761719,
+      "differing_words": 161792,
+      "finite": true,
+      "violations": 161792,
+      "atol": 0.0001,
+      "rtol": 0.0,
+      "passed": false
+    },
+    {
+      "name": "case02-t257-p19-h8-w2047",
+      "max_abs": 64.00035858154297,
+      "differing_words": 526336,
+      "finite": true,
+      "violations": 526336,
+      "atol": 0.0001,
+      "rtol": 0.0,
+      "passed": false
+    },
+    {
+      "name": "case03-t64-p0-h2-w-1",
+      "max_abs": 65.9609375,
+      "differing_words": 32768,
+      "finite": true,
+      "violations": 32768,
+      "atol": 0.015,
+      "rtol": 0.01,
+      "passed": false
+    },
+    {
+      "name": "case04-t79-p19-h8-w15",
+      "max_abs": 65.7265625,
+      "differing_words": 161792,
+      "finite": true,
+      "violations": 161792,
+      "atol": 0.015,
+      "rtol": 0.01,
+      "passed": false
+    },
+    {
+      "name": "case05-t257-p19-h8-w1023",
+      "max_abs": 65.5859375,
+      "differing_words": 526336,
+      "finite": true,
+      "violations": 526336,
+      "atol": 0.015,
+      "rtol": 0.01,
+      "passed": false
+    },
+    {
+      "name": "case06-t79-p19-h2-w15",
+      "max_abs": 65.875,
+      "differing_words": 40448,
+      "finite": true,
+      "violations": 40448,
+      "atol": 0.015,
+      "rtol": 0.01,
+      "passed": false
+    },
+    {
+      "name": "case07-t79-p19-h2-w-1",
+      "max_abs": 64.91015625,
+      "differing_words": 40448,
+      "finite": true,
+      "violations": 40448,
+      "atol": 0.015,
+      "rtol": 0.01,
+      "passed": false
+    },
+    {
+      "name": "case08-t1024-p0-h8-w1023",
+      "max_abs": 64.0009994506836,
+      "differing_words": 2097152,
+      "finite": true,
+      "violations": 2097152,
+      "atol": 0.0001,
+      "rtol": 0.0,
+      "passed": false
+    },
+    {
+      "name": "case09-t2048-p0-h8-w-1",
+      "max_abs": 64.00099182128906,
+      "differing_words": 4194304,
+      "finite": true,
+      "violations": 4194304,
+      "atol": 0.0001,
+      "rtol": 0.0,
+      "passed": false
+    }
+  ],
+  "passed": false
+}

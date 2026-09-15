@@ -25,6 +25,20 @@ PR #3195 stays open during these repairs. Independent human review remains
 due after the final gates. The row stays ACTIVE until the work lands.
 [Measured report](../../docs/bench-evidence/rocm-rdna3-attention-wmma/README.md).
 
+### Captured pool ownership witness (15 September 2026)
+
+The exact-token workload detects deleted graph dispatch and stale uploads.
+Deleting scratch pinning stays token-green because these requests do not hold
+another allocation that aliases the captured temporary storage. Preserve that
+negative mutation result. Add a test probe through the public completion ABI:
+after the first request captures decode, hold pool allocations from every
+recorded decode demand class, fill them with canaries, replay later requests,
+and verify their bytes remain unchanged. Return allocations through the pool.
+The probe must pass on the retained implementation and fail when the production
+pin call is removed. It tests an overlapping allocation lifetime without
+freeing graph addresses or relying on a GPU memory fault. Exact model outputs
+still use the existing primary manifest and references. No golden changes.
+
 ## Scope
 
 Admit gfx1100 to the existing BF16 SharedK rocWMMA attention prefill kernel.

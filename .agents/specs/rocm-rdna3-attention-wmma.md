@@ -137,6 +137,22 @@ cache-table shape changes, graph opt-out, and captured scratch ownership.
 Repeat idle performance after exact outputs. This remains part of
 ISSUE-LOCAL-01M2HQEEXHD2B0BT3N71HQ0CRZ and the same reviewable MR.
 
+### Decode output-column partition (15 September 2026)
+
+The retained graph, selector and bounds-record changes reach 65.50 and
+65.57 tokens/s, against the current primary's 66.57. Test two workgroups per
+KV head, each computing 128 of the 256 output columns. Each group retains
+the complete QK reduction, both query heads, and the primary's key-tile loop.
+PV accumulates the same terms in the same order for each owned coordinate.
+No partial-output reduction or new rounding boundary is needed. The groups
+write disjoint output columns through the existing attention entry point.
+
+Require all twenty decoder fixtures to remain byte-identical to the primary,
+including NaN cache tails, non-power-of-two blocks, and windows. The runtime
+witness must require the new grid's two column groups, and static resources
+must stay spill-free for every admitted tile. Retain this partition only if
+repeated end-to-end measurements improve after exact model output.
+
 ### Remaining decode launch costs (15 September 2026)
 
 The final block-16 comparison still owes about 0.38 ms per output token.

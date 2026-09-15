@@ -1,0 +1,60 @@
+{
+  "full_preflight_exit": 0,
+  "failed_checks": 0,
+  "host_translation_units": {
+    "passed": 657,
+    "total": 657
+  },
+  "raw_log_sha256": "fc338995fafcb6733d1a36a3e218d65d98b4f484240664325ad961eecddee57d",
+  "command": [
+    "env",
+    "GIT_CONFIG_GLOBAL=/dev/null",
+    "scripts/agent-preflight.sh",
+    "--staged",
+    "--quiet"
+  ],
+  "skip_disposition": {
+    "satisfied_separately": [
+      "test_qwen3_capture_tools",
+      "test_qwen3_capture_outputs",
+      "test_ltx25_render_compare",
+      "test_ltx25_absolute_reference",
+      "test_ltx25_prompt_adherence",
+      "test_ltx25_adherence_detail_loss",
+      "test_convert_glm5_next_gguf",
+      "check-cpu-isa-build.py",
+      "check-pr-size.py"
+    ],
+    "narrowly_inapplicable": [
+      "check-arm-isa-build.py: x86 host build",
+      "check-cuda-fat-gencode.py: CUDA disabled",
+      "check-triton-aot-multiarch.py: no AOT package changed"
+    ]
+  },
+  "unrelated_unavailable_subcases": "Five CLIP-checkpoint cases in the LTX adherence suite remain unavailable and are not reported as passes.",
+  "external_runtime_limits": [
+    "physical RDNA4",
+    "CUDA execution of cache branch"
+  ],
+  "independent_review": "pending human review; developer forbids subagents",
+  "final_delta": {
+    "source_commit": "f7b5f8dd9",
+    "scope": "pinned embedding bounds readback in one HIP translation unit; full-preflight host translation units unchanged",
+    "satisfied": [
+      "Release gfx1100 link",
+      "gfx1200 and gfx1201 compile",
+      "1121 assertions in 13 ROCm backend cases",
+      "20/20 focused CTest entries",
+      "16/16 public model configurations with 3072 exact output tokens",
+      "18/18 performance runs with 256 exact tokens each",
+      "live graph-pool canary catches removed pinning"
+    ],
+    "receipts": [
+      "pinned-embedding-compile.json",
+      "pinned-final-regressions.txt",
+      "pinned-final-model-gates.json",
+      "pinned-final-performance.json",
+      "pinned-final-pool-canary-mutation.json"
+    ]
+  }
+}

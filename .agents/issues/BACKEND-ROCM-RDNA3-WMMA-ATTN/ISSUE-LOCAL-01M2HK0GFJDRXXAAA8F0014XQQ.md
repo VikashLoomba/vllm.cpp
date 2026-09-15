@@ -16,15 +16,15 @@ The production BF16 SharedK attention prefill kernel uses portable rocWMMA fragm
 
 ## Resolution
 
-15 September 2026, branch evidence before landing: default gfx1100 WMMA
-passes the original 96-token and expanded 256-token gates with block sizes
-16 and 32. Compiled Gemma boundaries, device RoPE caches, gfx11 packed
-operands, and decode accumulation account for the repaired differences.
-The attention kernel has zero spills. Three alternating pairs measure a
-1.149x median model prefill improvement over scalar at block size 32.
+15 September 2026, branch evidence before landing: gfx1100 uses WMMA prefill
+by default. Scalar and default prefill pass the unchanged original 96-token
+and expanded 256-token workloads with blocks 16 and 32, in graph and eager
+modes. The dedicated decoder and prefill have zero VGPR/SGPR spills and zero
+private scratch. Physical traces verify production dispatch and graph reuse.
+The Gemma 1B checkpoint-dependent regressions now execute and pass.
 
-[Measured report](../../../docs/bench-evidence/rocm-rdna3-attention-wmma/README.md).
+The continuation issue ISSUE-LOCAL-01M2HQEEXHD2B0BT3N71HQ0CRZ carries the
+scalar arithmetic, decode latency, host memory, and final measurement repairs.
+[Final report](../../../docs/bench-evidence/rocm-rdna3-attention-wmma/README.md).
 PR #3195 carries the implementation for independent human review. Keep this
-issue open until the work lands. Expanded scalar fallback token parity and
-full-model decode/latency/host-memory performance parity remain open axes;
-they do not require the now-correct gfx1100 prefill path to remain opt-in.
+issue open until the work lands. Physical RDNA4 remains unavailable.

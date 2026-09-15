@@ -1,0 +1,65 @@
+{
+  "name": "release-validation-v1-r0-b16-wmma",
+  "start": {
+    "event": "start",
+    "argv": [
+      "/home/vikash/vllm.cpp-rdna3-wmma-attn/build-rdna3-attn/attn-warm-bench",
+      "/home/vikash/models/gemma-3-4b-it-text-bf46152c",
+      "/home/vikash/vllm.cpp-rdna3-wmma-attn/build-rdna3-attn/evidence/model-warm-manifest.json",
+      "/home/vikash/vllm.cpp-rdna3-wmma-attn/build-rdna3-attn/evidence/release-validation-v1-r0-b16-wmma.json"
+    ],
+    "monitor_argv": [
+      "/home/vikash/oracle/rdna3-wmma-latest/adapters/monitor_command.py",
+      "--repo",
+      "/home/vikash/vllm.cpp-rdna3-wmma-attn",
+      "--sysfs-device",
+      "/sys/class/drm/card1/device",
+      "--output-jsonl",
+      "/home/vikash/vllm.cpp-rdna3-wmma-attn/build-rdna3-attn/evidence/release-validation-v1-r0-b16-wmma.jsonl",
+      "--timeout-seconds",
+      "900",
+      "--interval-seconds",
+      "0.1",
+      "--",
+      "/home/vikash/vllm.cpp-rdna3-wmma-attn/build-rdna3-attn/attn-warm-bench",
+      "/home/vikash/models/gemma-3-4b-it-text-bf46152c",
+      "/home/vikash/vllm.cpp-rdna3-wmma-attn/build-rdna3-attn/evidence/model-warm-manifest.json",
+      "/home/vikash/vllm.cpp-rdna3-wmma-attn/build-rdna3-attn/evidence/release-validation-v1-r0-b16-wmma.json"
+    ],
+    "monitor_sha256": "e1a783c81649ea3ea13f15ad03308272cdae67249fb38390bfa005f4f1216f1d",
+    "helper_sha256": "d2b806bece74a05d55c8fdf6b8a217e603c1a3ae30fa31891221c8a6324157c8",
+    "boot_id": "2c176325-618c-43da-9f8e-ea0491635f38",
+    "sysfs_device": "/sys/class/drm/card1/device",
+    "resolved_device": "/sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/0000:02:00.0/0000:03:00.0",
+    "interval_seconds": 0.1,
+    "timeout_seconds": 900.0,
+    "docker_name": null,
+    "device_baseline": {
+      "mem_info_vram_used": 337829888,
+      "mem_info_vram_total": 25753026560,
+      "gpu_busy_percent": 0,
+      "pp_dpm_sclk": "S: 0Mhz *\n1: 500Mhz \n2: 2482Mhz",
+      "scope": "whole device; VRAM includes allocations by other processes"
+    },
+    "stdout_log": "/home/vikash/vllm.cpp-rdna3-wmma-attn/build-rdna3-attn/evidence/release-validation-v1-r0-b16-wmma.stdout.log",
+    "stderr_log": "/home/vikash/vllm.cpp-rdna3-wmma-attn/build-rdna3-attn/evidence/release-validation-v1-r0-b16-wmma.stderr.log",
+    "utc": "2026-09-15T18:53:17.599682+00:00",
+    "elapsed_seconds": 0.0011004917323589325
+  },
+  "end": {
+    "event": "end",
+    "status": "COMPLETE",
+    "exit_code": 0,
+    "samples": 99,
+    "sampled_peaks": {
+      "rss_bytes": 1964380160,
+      "pss_bytes": 1959281664,
+      "device_vram_used_bytes": 11117318144
+    },
+    "peak_scope": "maximum observed samples, not a continuous or process-GPU peak",
+    "command_stdout_sha256": "54251d7b1b70b8b00a994d36dcc4455baa04b9af859ffa878e005f5be7dc478d",
+    "command_stderr_sha256": "a6f2dd6c088349fa05a8deef109bf361f10ea87fc45506009494f82140c38b00",
+    "utc": "2026-09-15T18:53:29.763676+00:00",
+    "elapsed_seconds": 12.16508781677112
+  }
+}

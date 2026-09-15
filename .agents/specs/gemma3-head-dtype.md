@@ -15,8 +15,10 @@ tied and untied heads fail the new dtype assertion before correction. The user a
 Independent human review remains due. This prerequisite has its own worktree.
 
 The running primary confirms BF16 hidden states, weights, and projection
-output. Both controls pass the original 96 tokens after correction. The
-expanded 256-token gate still fails and is retained by the attention row.
+output. The combined original 96-token and expanded 256-token gates pass
+with block sizes 16 and 32 in both prefill controls. Graph and eager decode
+produce the same primary tokens. The attention row owns the combined final
+gates. The row remains ACTIVE until the reviewed change lands.
 [Measured report](../../docs/bench-evidence/rocm-rdna3-attention-wmma/README.md).
 
 ## Scope and design

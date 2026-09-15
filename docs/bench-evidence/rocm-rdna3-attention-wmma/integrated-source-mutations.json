@@ -1,0 +1,18 @@
+[
+  {
+    "mutation": "integrated-mutation-graph-callsite",
+    "source": "src/vllm/model_executor/models/gemma3_registry.cpp",
+    "source_sha256": "3e4aa020f7f173377d224975edfb65ffca92a3d77af813502fde5a3f35d0708e",
+    "gate_exit": 1,
+    "failure": "ValueError: graph replay dispatch differs: launches=0 captures=0",
+    "source_byte_exact": true
+  },
+  {
+    "mutation": "integrated-mutation-graph-refresh",
+    "source": "src/vllm/model_executor/models/gemma3.cpp",
+    "source_sha256": "de12d40ca0f80861b95db4105d6c78c102b072f4ce70f8427c5c5754b6d45af3",
+    "gate_exit": 1,
+    "failure": "ValueError: warmup: output token IDs differ",
+    "source_byte_exact": true
+  }
+]

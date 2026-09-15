@@ -13,10 +13,12 @@ gfx1100 attention gate exposed the missing formula. No subagents may be used.
 This session implements and validates it; independent human review remains due.
 
 The linear leaf, config, loader, and model routing are implemented. Twelve
-primary array cases and the focused suites pass. The combined source build
-passes all original 96 public tokens. The wider 256-token gate still fails,
-even after correcting the final projection dtype. The attention row retains
-that separate numerical gap and keeps gfx1100 WMMA opt-in.
+primary array cases and the focused suites pass. Device cache construction
+matches the executing primary. Incremental loading avoids the unused host
+cache. The combined original 96-token and expanded 256-token gates pass
+with block sizes 16 and 32, scalar and default WMMA prefill, and graph and
+eager decode. The attention row carries the final performance evidence.
+The row remains ACTIVE until the reviewed change lands.
 [Measured report](../../docs/bench-evidence/rocm-rdna3-attention-wmma/README.md).
 
 ## Problem and scope

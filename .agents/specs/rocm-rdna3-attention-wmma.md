@@ -24,13 +24,14 @@ templates and prefill use zero scratch on gfx1100. gfx1200 and gfx1201 compile.
 DOT2 arithmetic and fully masked tiles explain the scalar failures. A dedicated
 128-thread decoder, captured Gemma forward, and exact normalization/selection
 changes close the measured decode deficit. Incremental staging and device RoPE
-construction remove unused host storage. Three Release comparisons clear the
-primary's sampled latency and throughput floors, with block-16 decode at parity.
+construction remove unused host storage. Three final Release comparisons clear the
+primary's sampled latency and throughput floors. Block-16 decode is 66.58
+versus 66.48 tokens/s, at parity. Block-32 decode is 70.01 versus 44.65 tokens/s.
 The prior unoptimized performance report is superseded and retained.
 
-The branch integrates main ea6da1f80. PR #3195 stays open for final repository
-checks and publication of the integrated evidence. Independent human review
-remains due. The row stays ACTIVE until the work lands.
+The branch integrates main ea6da1f80. PR #3195 carries the final evidence.
+All 657 affected host translation units compile. Final HIP compilation and
+the repeated 20-test regression set pass. Independent human review remains due. The row stays ACTIVE until the work lands.
 [Measured report](../../docs/bench-evidence/rocm-rdna3-attention-wmma/README.md).
 
 ### Pin the embedding bounds readback (15 September 2026)

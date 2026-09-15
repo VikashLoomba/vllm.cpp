@@ -1,0 +1,6 @@
+{
+  "failure": "comparison adapter referenced nonexistent primary directory",
+  "correction": "use the existing immutable reference directory from release-arrays-default-comparison.json",
+  "reference": "/home/vikash/vllm.cpp-rdna3-wmma-attn/build-rdna3-attn/evidence/primary-fixed",
+  "product_change": false
+}

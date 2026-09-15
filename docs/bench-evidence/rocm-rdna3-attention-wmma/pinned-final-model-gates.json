@@ -1,0 +1,306 @@
+[
+  {
+    "token_exact": 288,
+    "arm": "scalar",
+    "prefill_dispatches": 306,
+    "decode_dispatches": 9486,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      80,
+      144
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "off",
+    "graph_launches": 0,
+    "graph_captures": 0,
+    "name": "pinned-final-b16-expanded-off-scalar",
+    "receipt_sha256": "397c2eb99aac20cd6c18fed32b087c2326c0b96bae2d20d33ff2bcf989f2e829"
+  },
+  {
+    "token_exact": 288,
+    "arm": "wmma",
+    "prefill_dispatches": 306,
+    "decode_dispatches": 9486,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      104,
+      144
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "off",
+    "graph_launches": 0,
+    "graph_captures": 0,
+    "name": "pinned-final-b16-expanded-off-wmma",
+    "receipt_sha256": "f4afe460a38f7106b0f25a2528ec0636a0319406b402cb47e2e8645ba33b5250"
+  },
+  {
+    "token_exact": 288,
+    "arm": "scalar",
+    "prefill_dispatches": 306,
+    "decode_dispatches": 9486,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      80,
+      144
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "on",
+    "graph_launches": 278,
+    "graph_captures": 1,
+    "name": "pinned-final-b16-expanded-on-scalar",
+    "receipt_sha256": "ac34edd87e7c5a5f7258796b17813bbb62488b86451ddc7ceb8263578713d2b0"
+  },
+  {
+    "token_exact": 288,
+    "arm": "wmma",
+    "prefill_dispatches": 306,
+    "decode_dispatches": 9486,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      104,
+      144
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "on",
+    "graph_launches": 278,
+    "graph_captures": 1,
+    "name": "pinned-final-b16-expanded-on-wmma",
+    "receipt_sha256": "5efc49ca512577b327b62b2e66a42ebfc4e507ab0d5c4c29e3e81cb450f757e5"
+  },
+  {
+    "token_exact": 96,
+    "arm": "scalar",
+    "prefill_dispatches": 102,
+    "decode_dispatches": 3162,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      80,
+      144
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "off",
+    "graph_launches": 0,
+    "graph_captures": 0,
+    "name": "pinned-final-b16-original-off-scalar",
+    "receipt_sha256": "73286aa88e5a1b396d4279467cdf6ed6212c3f273ff517c394b62afa810acfc0"
+  },
+  {
+    "token_exact": 96,
+    "arm": "wmma",
+    "prefill_dispatches": 102,
+    "decode_dispatches": 3162,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      104,
+      144
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "off",
+    "graph_launches": 0,
+    "graph_captures": 0,
+    "name": "pinned-final-b16-original-off-wmma",
+    "receipt_sha256": "1f0e0d742b3850ac3fe9c9ce5096ae4d169a9a23a2916407da4e6a6c19feae85"
+  },
+  {
+    "token_exact": 96,
+    "arm": "scalar",
+    "prefill_dispatches": 102,
+    "decode_dispatches": 3162,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      80,
+      144
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "on",
+    "graph_launches": 92,
+    "graph_captures": 1,
+    "name": "pinned-final-b16-original-on-scalar",
+    "receipt_sha256": "0558016785e4a7f1ee372168fefc5a0e0a64a4d1b8138a2c12dc9245131f53d0"
+  },
+  {
+    "token_exact": 96,
+    "arm": "wmma",
+    "prefill_dispatches": 102,
+    "decode_dispatches": 3162,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      104,
+      144
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "on",
+    "graph_launches": 92,
+    "graph_captures": 1,
+    "name": "pinned-final-b16-original-on-wmma",
+    "receipt_sha256": "20213e14cfc738546090734e4aaab5d1d7d7bb9dd616316694063dbc9f16a038"
+  },
+  {
+    "token_exact": 288,
+    "arm": "scalar",
+    "prefill_dispatches": 306,
+    "decode_dispatches": 9486,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      80,
+      184
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "off",
+    "graph_launches": 0,
+    "graph_captures": 0,
+    "name": "pinned-final-b32-expanded-off-scalar",
+    "receipt_sha256": "5e99d3749b7990e4c845fb4adc10397792c2d5bd797e31d2f76d8177ab13025a"
+  },
+  {
+    "token_exact": 288,
+    "arm": "wmma",
+    "prefill_dispatches": 306,
+    "decode_dispatches": 9486,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      104,
+      184
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "off",
+    "graph_launches": 0,
+    "graph_captures": 0,
+    "name": "pinned-final-b32-expanded-off-wmma",
+    "receipt_sha256": "4ee88d45f56e9aecac45c89a9b7cd19ff68a72213eddb1be072081082c8359da"
+  },
+  {
+    "token_exact": 288,
+    "arm": "scalar",
+    "prefill_dispatches": 306,
+    "decode_dispatches": 9486,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      80,
+      184
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "on",
+    "graph_launches": 278,
+    "graph_captures": 1,
+    "name": "pinned-final-b32-expanded-on-scalar",
+    "receipt_sha256": "685253dac7d34948c5a9a415695ba9178538f49004a7dca568be89a8a016a108"
+  },
+  {
+    "token_exact": 288,
+    "arm": "wmma",
+    "prefill_dispatches": 306,
+    "decode_dispatches": 9486,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      104,
+      184
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "on",
+    "graph_launches": 278,
+    "graph_captures": 1,
+    "name": "pinned-final-b32-expanded-on-wmma",
+    "receipt_sha256": "13071b0938379bc743a4c7a399ef1668ba42bbbc572228babc9709c6f3e614cc"
+  },
+  {
+    "token_exact": 96,
+    "arm": "scalar",
+    "prefill_dispatches": 102,
+    "decode_dispatches": 3162,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      80,
+      184
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "off",
+    "graph_launches": 0,
+    "graph_captures": 0,
+    "name": "pinned-final-b32-original-off-scalar",
+    "receipt_sha256": "457aeeb3ca6543d4f9d595ea3488869fa8729ee07dfd0a17347ff5d05487d197"
+  },
+  {
+    "token_exact": 96,
+    "arm": "wmma",
+    "prefill_dispatches": 102,
+    "decode_dispatches": 3162,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      104,
+      184
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "off",
+    "graph_launches": 0,
+    "graph_captures": 0,
+    "name": "pinned-final-b32-original-off-wmma",
+    "receipt_sha256": "1bc6c5d1e288ef75d81155167c443250271af73149a9ebbecb207ae6a8bb9ee6"
+  },
+  {
+    "token_exact": 96,
+    "arm": "scalar",
+    "prefill_dispatches": 102,
+    "decode_dispatches": 3162,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      80,
+      184
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "on",
+    "graph_launches": 92,
+    "graph_captures": 1,
+    "name": "pinned-final-b32-original-on-scalar",
+    "receipt_sha256": "be2d5826ad74e4bc6c2f6232b85b1e224c3744874e167daedd5814a3e92b7528"
+  },
+  {
+    "token_exact": 96,
+    "arm": "wmma",
+    "prefill_dispatches": 102,
+    "decode_dispatches": 3162,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      104,
+      184
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "on",
+    "graph_launches": 92,
+    "graph_captures": 1,
+    "name": "pinned-final-b32-original-on-wmma",
+    "receipt_sha256": "8cdef956109e847e549ed42a274e1469d9886d0d1341169f888f270ead648ae7"
+  }
+]

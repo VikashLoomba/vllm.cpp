@@ -1,0 +1,6 @@
+{
+  "mutation": "remove production PinForGraph call",
+  "original_expanded_token_gate_exit": 0,
+  "interpretation": "Sequential requests did not detect overlapping live allocations. Add the public graph pool canary probe; its exact source mutation fails.",
+  "unchanged_workloads_and_references": true
+}

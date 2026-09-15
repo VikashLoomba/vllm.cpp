@@ -1,0 +1,78 @@
+{
+  "question": "Does process-memory sampling explain isolated long requests?",
+  "result": "not established; retain the original sampling method and all runs",
+  "runs": [
+    {
+      "repeat": 0,
+      "arm": "sampled",
+      "decode_tokens_per_second": 66.50404819701332,
+      "mean_tpot_ms": 15.036678625000002,
+      "max_request_tpot_ms": 16.807191741935494,
+      "token_exact": 256,
+      "raw": "build-rdna3-attn/evidence/pinned-monitor-r0-sampled.json"
+    },
+    {
+      "repeat": 0,
+      "arm": "unsampled",
+      "decode_tokens_per_second": 66.60334221415134,
+      "mean_tpot_ms": 15.014261548387104,
+      "max_request_tpot_ms": 16.828592741935505,
+      "token_exact": 256,
+      "raw": "build-rdna3-attn/evidence/pinned-monitor-r0-unsampled.json"
+    },
+    {
+      "repeat": 1,
+      "arm": "sampled",
+      "decode_tokens_per_second": 66.59814437300311,
+      "mean_tpot_ms": 15.015433379032254,
+      "max_request_tpot_ms": 16.770364677419334,
+      "token_exact": 256,
+      "raw": "build-rdna3-attn/evidence/pinned-monitor-r1-sampled.json"
+    },
+    {
+      "repeat": 1,
+      "arm": "unsampled",
+      "decode_tokens_per_second": 66.60690745064427,
+      "mean_tpot_ms": 15.013457887096772,
+      "max_request_tpot_ms": 16.782325516129024,
+      "token_exact": 256,
+      "raw": "build-rdna3-attn/evidence/pinned-monitor-r1-unsampled.json"
+    },
+    {
+      "repeat": 2,
+      "arm": "sampled",
+      "decode_tokens_per_second": 66.61284526045742,
+      "mean_tpot_ms": 15.012119600806452,
+      "max_request_tpot_ms": 16.773666838709676,
+      "token_exact": 256,
+      "raw": "build-rdna3-attn/evidence/pinned-monitor-r2-sampled.json"
+    },
+    {
+      "repeat": 2,
+      "arm": "unsampled",
+      "decode_tokens_per_second": 66.53214353715043,
+      "mean_tpot_ms": 15.030328903225803,
+      "max_request_tpot_ms": 16.812465258064506,
+      "token_exact": 256,
+      "raw": "build-rdna3-attn/evidence/pinned-monitor-r2-unsampled.json"
+    },
+    {
+      "repeat": 3,
+      "arm": "sampled",
+      "decode_tokens_per_second": 66.53757049028785,
+      "mean_tpot_ms": 15.029102995967742,
+      "max_request_tpot_ms": 16.839163870967738,
+      "token_exact": 256,
+      "raw": "build-rdna3-attn/evidence/pinned-monitor-r3-sampled.json"
+    },
+    {
+      "repeat": 3,
+      "arm": "unsampled",
+      "decode_tokens_per_second": 65.87841007958122,
+      "mean_tpot_ms": 15.179479874999998,
+      "max_request_tpot_ms": 18.11076548387097,
+      "token_exact": 256,
+      "raw": "build-rdna3-attn/evidence/pinned-monitor-r3-unsampled.json"
+    }
+  ]
+}

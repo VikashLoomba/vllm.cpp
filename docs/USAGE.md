@@ -326,10 +326,18 @@ the Gemma 3 text loader does not provide a GGUF quantized arm or the vision towe
 On gfx1100, eligible BF16 attention prefills use rocWMMA by default. The path
 requires head dimension 256, two query heads per KV head, one request, and at
 least 64 query tokens. `VT_ATTN_PREFILL_SHAREDK_WMMA=0` selects scalar prefill.
-The gfx1100 single-query WMMA decode prerequisite remains enabled in both
-prefill controls. Other gfx11 targets remain excluded. See the
-[correctness and performance evidence](bench-evidence/rocm-rdna3-attention-wmma/README.md)
-for the validated workload and the scalar control's numerical limitation.
+The gfx1100 single-query WMMA decoder remains enabled in both prefill controls.
+Both controls pass the declared exact-token gates. Other gfx11 targets remain
+excluded. Eligible single-request Gemma 3 decode uses a HIP graph by default
+with BF16 cache blocks of 16 or 32 tokens. `VLLM_CPP_CUDAGRAPH=0` selects eager
+execution. See the [correctness and performance evidence](bench-evidence/rocm-rdna3-attention-wmma/README.md)
+for the validated workloads, build, and measurements.
+
+The existing Gemma 3 1B regression uses BF16 safetensors from
+[unsloth/gemma-3-1b-it at 5b11413a10db4e486ef16a20101fd028f8f2499c](https://huggingface.co/unsloth/gemma-3-1b-it/tree/5b11413a10db4e486ef16a20101fd028f8f2499c).
+Its `model.safetensors` is 1,999,811,208 bytes, SHA-256
+`3d4ef8d71c14db7e448a09ebe891cfb6bf32c57a9b44499ae0d1c098e48516b6`.
+The regression resolves this pinned snapshot through the local HuggingFace cache.
 
 ## Disabling a model's sliding window
 

@@ -1,0 +1,12 @@
+{
+  "native_bytes": 570425344,
+  "native_layers": 34,
+  "native_context_capacity": 4096,
+  "primary_padded_layers": 35,
+  "primary_shared_pool_page_bytes": 327680,
+  "primary_pages_for_capacity": 1798,
+  "primary_null_pages": 1,
+  "primary_required_bytes": 589496320,
+  "primary_sliding_alignment_pages": 6,
+  "source": "vllm/v1/kv_cache_interface.py:710-739; vllm/v1/core/kv_cache_utils.py:2029-2058,2307-2319 @ e126687a9a"
+}

@@ -1,0 +1,345 @@
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+===============================================================================
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:287:
+TEST CASE:  gemma3 forward: real gemma-3-1b-it GPU greedy vs oracle
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:341: SUCCESS: REQUIRE_FALSE( cases[ci].prompt.empty() ) is correct!
+  values: REQUIRE_FALSE( false )
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:342: SUCCESS: CHECK( cases[ci].prompt.front() == 2 ) is correct!
+  values: CHECK( 2 == 2 )
+  logged: gemma3 p0: vLLM prompt must begin with BOS (2)
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p0 step0 argmax=9079 (vLLM greedy set {9079 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p0 step0: our argmax 9079 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p0 step1 argmax=236761 (vLLM greedy set {236761 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p0 step1: our argmax 236761 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p0 step2 argmax=108 (vLLM greedy set {108 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p0 step2: our argmax 108 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p0 step3 argmax=818 (vLLM greedy set {818 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p0 step3: our argmax 818 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p0 step4 argmax=7488 (vLLM greedy set {7488 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p0 step4: our argmax 7488 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p0 step5 argmax=3207 (vLLM greedy set {3207 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p0 step5: our argmax 3207 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p0 step6 argmax=528 (vLLM greedy set {528 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p0 step6: our argmax 528 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p0 step7 argmax=7001 (vLLM greedy set {7001 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p0 step7: our argmax 7001 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:341: SUCCESS: REQUIRE_FALSE( cases[ci].prompt.empty() ) is correct!
+  values: REQUIRE_FALSE( false )
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:342: SUCCESS: CHECK( cases[ci].prompt.front() == 2 ) is correct!
+  values: CHECK( 2 == 2 )
+  logged: gemma3 p1: vLLM prompt must begin with BOS (2)
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p1 step0 argmax=52895 (vLLM greedy set {52895 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p1 step0: our argmax 52895 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p1 step1 argmax=236764 (vLLM greedy set {236764 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p1 step1: our argmax 236764 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p1 step2 argmax=532 (vLLM greedy set {532 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p1 step2: our argmax 532 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p1 step3 argmax=625 (vLLM greedy set {625 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p1 step3: our argmax 625 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p1 step4 argmax=236789 (vLLM greedy set {236789 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p1 step4: our argmax 236789 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p1 step5 argmax=236751 (vLLM greedy set {236751 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p1 step5: our argmax 236751 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p1 step6 argmax=496 (vLLM greedy set {496 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p1 step6: our argmax 496 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p1 step7 argmax=9995 (vLLM greedy set {9995 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p1 step7: our argmax 9995 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:341: SUCCESS: REQUIRE_FALSE( cases[ci].prompt.empty() ) is correct!
+  values: REQUIRE_FALSE( false )
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:342: SUCCESS: CHECK( cases[ci].prompt.front() == 2 ) is correct!
+  values: CHECK( 2 == 2 )
+  logged: gemma3 p2: vLLM prompt must begin with BOS (2)
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p2 step0 argmax=236743 (vLLM greedy set {236743 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p2 step0: our argmax 236743 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p2 step1 argmax=236770 (vLLM greedy set {236770 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p2 step1: our argmax 236770 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p2 step2 argmax=236771 (vLLM greedy set {236771 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p2 step2: our argmax 236771 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p2 step3 argmax=236771 (vLLM greedy set {236771 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p2 step3: our argmax 236771 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p2 step4 argmax=10674 (vLLM greedy set {10674 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p2 step4: our argmax 10674 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p2 step5 argmax=57356 (vLLM greedy set {57356 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p2 step5: our argmax 57356 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p2 step6 argmax=236761 (vLLM greedy set {236761 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p2 step6: our argmax 236761 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p2 step7 argmax=108 (vLLM greedy set {108 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p2 step7: our argmax 108 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:341: SUCCESS: REQUIRE_FALSE( cases[ci].prompt.empty() ) is correct!
+  values: REQUIRE_FALSE( false )
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:342: SUCCESS: CHECK( cases[ci].prompt.front() == 2 ) is correct!
+  values: CHECK( 2 == 2 )
+  logged: gemma3 p3: vLLM prompt must begin with BOS (2)
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p3 step0 argmax=16107 (vLLM greedy set {16107 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p3 step0: our argmax 16107 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p3 step1 argmax=236761 (vLLM greedy set {236761 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p3 step1: our argmax 236761 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p3 step2 argmax=108 (vLLM greedy set {108 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p3 step2: our argmax 108 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p3 step3 argmax=818 (vLLM greedy set {818 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p3 step3: our argmax 818 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p3 step4 argmax=7395 (vLLM greedy set {7395 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p3 step4: our argmax 7395 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p3 step5 argmax=6581 (vLLM greedy set {6581 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p3 step5: our argmax 6581 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p3 step6 argmax=573 (vLLM greedy set {573 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p3 step6: our argmax 573 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p3 step7 argmax=5122 (vLLM greedy set {5122 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p3 step7: our argmax 5122 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:341: SUCCESS: REQUIRE_FALSE( cases[ci].prompt.empty() ) is correct!
+  values: REQUIRE_FALSE( false )
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:342: SUCCESS: CHECK( cases[ci].prompt.front() == 2 ) is correct!
+  values: CHECK( 2 == 2 )
+  logged: gemma3 p4: vLLM prompt must begin with BOS (2)
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p4 step0 argmax=9142 (vLLM greedy set {9142 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p4 step0: our argmax 9142 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p4 step1 argmax=7693 (vLLM greedy set {7693 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p4 step1: our argmax 7693 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p4 step2 argmax=236761 (vLLM greedy set {236761 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p4 step2: our argmax 236761 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p4 step3 argmax=108 (vLLM greedy set {108 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p4 step3: our argmax 108 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p4 step4 argmax=818 (vLLM greedy set {818 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p4 step4: our argmax 818 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p4 step5 argmax=1855 (vLLM greedy set {1855 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p4 step5: our argmax 1855 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p4 step6 argmax=6207 (vLLM greedy set {6207 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p4 step6: our argmax 6207 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p4 step7 argmax=529 (vLLM greedy set {529 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p4 step7: our argmax 529 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:341: SUCCESS: REQUIRE_FALSE( cases[ci].prompt.empty() ) is correct!
+  values: REQUIRE_FALSE( false )
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:342: SUCCESS: CHECK( cases[ci].prompt.front() == 2 ) is correct!
+  values: CHECK( 2 == 2 )
+  logged: gemma3 p5: vLLM prompt must begin with BOS (2)
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p5 step0 argmax=3730 (vLLM greedy set {3730 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p5 step0: our argmax 3730 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p5 step1 argmax=236764 (vLLM greedy set {236764 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p5 step1: our argmax 236764 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p5 step2 argmax=107 (vLLM greedy set {107 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p5 step2: our argmax 107 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p5 step3 argmax=236777 (vLLM greedy set {236777 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p5 step3: our argmax 236777 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p5 step4 argmax=1133 (vLLM greedy set {1133 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p5 step4: our argmax 1133 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p5 step5 argmax=531 (vLLM greedy set {531 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p5 step5: our argmax 531 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p5 step6 argmax=9039 (vLLM greedy set {9039 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p5 step6: our argmax 9039 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:391: MESSAGE: gemma3 p5 step7 argmax=496 (vLLM greedy set {496 }) 11
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:394: SUCCESS: CHECK( member ) is correct!
+  values: CHECK( true )
+  logged: gemma3 p5 step7: our argmax 496 not in vLLM greedy set
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:399: MESSAGE: gemma3 GPU greedy-vs-oracle: 48/48 greedy tokens match vLLM (SACRED gate)
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vllm/models/test_gemma3_forward.cpp:401: SUCCESS: CHECK( total_ok == total_steps ) is correct!
+  values: CHECK( 48 == 48 )
+
+===============================================================================
+[doctest] test cases:  1 |  1 passed | 0 failed | 4 skipped
+[doctest] assertions: 61 | 61 passed | 0 failed |
+[doctest] Status: SUCCESS!

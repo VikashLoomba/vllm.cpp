@@ -1,0 +1,290 @@
+[
+  {
+    "token_exact": 288,
+    "arm": "scalar",
+    "prefill_dispatches": 306,
+    "decode_dispatches": 9486,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      80,
+      144
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "off",
+    "graph_launches": 0,
+    "graph_captures": 0,
+    "name": "integrated-b16-expanded-off-scalar"
+  },
+  {
+    "token_exact": 288,
+    "arm": "wmma",
+    "prefill_dispatches": 306,
+    "decode_dispatches": 9486,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      104,
+      144
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "off",
+    "graph_launches": 0,
+    "graph_captures": 0,
+    "name": "integrated-b16-expanded-off-wmma"
+  },
+  {
+    "token_exact": 288,
+    "arm": "scalar",
+    "prefill_dispatches": 306,
+    "decode_dispatches": 9486,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      80,
+      144
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "on",
+    "graph_launches": 278,
+    "graph_captures": 1,
+    "name": "integrated-b16-expanded-on-scalar"
+  },
+  {
+    "token_exact": 288,
+    "arm": "wmma",
+    "prefill_dispatches": 306,
+    "decode_dispatches": 9486,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      104,
+      144
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "on",
+    "graph_launches": 278,
+    "graph_captures": 1,
+    "name": "integrated-b16-expanded-on-wmma"
+  },
+  {
+    "token_exact": 96,
+    "arm": "scalar",
+    "prefill_dispatches": 102,
+    "decode_dispatches": 3162,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      80,
+      144
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "off",
+    "graph_launches": 0,
+    "graph_captures": 0,
+    "name": "integrated-b16-original-off-scalar"
+  },
+  {
+    "token_exact": 96,
+    "arm": "wmma",
+    "prefill_dispatches": 102,
+    "decode_dispatches": 3162,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      104,
+      144
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "off",
+    "graph_launches": 0,
+    "graph_captures": 0,
+    "name": "integrated-b16-original-off-wmma"
+  },
+  {
+    "token_exact": 96,
+    "arm": "scalar",
+    "prefill_dispatches": 102,
+    "decode_dispatches": 3162,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      80,
+      144
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "on",
+    "graph_launches": 92,
+    "graph_captures": 1,
+    "name": "integrated-b16-original-on-scalar"
+  },
+  {
+    "token_exact": 96,
+    "arm": "wmma",
+    "prefill_dispatches": 102,
+    "decode_dispatches": 3162,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      104,
+      144
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "on",
+    "graph_launches": 92,
+    "graph_captures": 1,
+    "name": "integrated-b16-original-on-wmma"
+  },
+  {
+    "token_exact": 288,
+    "arm": "scalar",
+    "prefill_dispatches": 306,
+    "decode_dispatches": 9486,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      80,
+      184
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "off",
+    "graph_launches": 0,
+    "graph_captures": 0,
+    "name": "integrated-b32-expanded-off-scalar"
+  },
+  {
+    "token_exact": 288,
+    "arm": "wmma",
+    "prefill_dispatches": 306,
+    "decode_dispatches": 9486,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      104,
+      184
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "off",
+    "graph_launches": 0,
+    "graph_captures": 0,
+    "name": "integrated-b32-expanded-off-wmma"
+  },
+  {
+    "token_exact": 288,
+    "arm": "scalar",
+    "prefill_dispatches": 306,
+    "decode_dispatches": 9486,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      80,
+      184
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "on",
+    "graph_launches": 278,
+    "graph_captures": 1,
+    "name": "integrated-b32-expanded-on-scalar"
+  },
+  {
+    "token_exact": 288,
+    "arm": "wmma",
+    "prefill_dispatches": 306,
+    "decode_dispatches": 9486,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      104,
+      184
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "on",
+    "graph_launches": 278,
+    "graph_captures": 1,
+    "name": "integrated-b32-expanded-on-wmma"
+  },
+  {
+    "token_exact": 96,
+    "arm": "scalar",
+    "prefill_dispatches": 102,
+    "decode_dispatches": 3162,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      80,
+      184
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "off",
+    "graph_launches": 0,
+    "graph_captures": 0,
+    "name": "integrated-b32-original-off-scalar"
+  },
+  {
+    "token_exact": 96,
+    "arm": "wmma",
+    "prefill_dispatches": 102,
+    "decode_dispatches": 3162,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      104,
+      184
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "off",
+    "graph_launches": 0,
+    "graph_captures": 0,
+    "name": "integrated-b32-original-off-wmma"
+  },
+  {
+    "token_exact": 96,
+    "arm": "scalar",
+    "prefill_dispatches": 102,
+    "decode_dispatches": 3162,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      80,
+      184
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "on",
+    "graph_launches": 92,
+    "graph_captures": 1,
+    "name": "integrated-b32-original-on-scalar"
+  },
+  {
+    "token_exact": 96,
+    "arm": "wmma",
+    "prefill_dispatches": 102,
+    "decode_dispatches": 3162,
+    "scratch_bytes": 0,
+    "runtime_vgpr": [
+      104,
+      184
+    ],
+    "runtime_sgpr": [
+      128
+    ],
+    "graph": "on",
+    "graph_launches": 92,
+    "graph_captures": 1,
+    "name": "integrated-b32-original-on-wmma"
+  }
+]

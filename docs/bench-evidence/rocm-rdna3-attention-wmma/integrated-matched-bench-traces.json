@@ -1,0 +1,568 @@
+[
+  {
+    "block_size": 16,
+    "arm": "native",
+    "trace_sha256": "6ea26a5aa9816c0a392b754b646d1e038b1ee1c95d85b87558700ec52dbcebf5",
+    "window": "final 1207-token request, 31 decode steps, first attention start through last attention end",
+    "attention_calls": 1054,
+    "attention_mean_us": 201.99881973434535,
+    "attention_scratch_bytes": [
+      0
+    ],
+    "span_ms": 551.271234,
+    "kernel_ms": 491.933827,
+    "kernel_groups": [
+      {
+        "kernel": "void vt::rocm::(anonymous namespace)::wvSplitKSml<1>(int, int, int, int, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16*, int, int)",
+        "calls": 4242,
+        "sum_ms": 264.249263,
+        "mean_us": 62.29355563413484
+      },
+      {
+        "kernel": "void vt::rocm::(anonymous namespace)::Rdna3DecodeWmma<16, 16>(__hip_bfloat16*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, int const*, int const*, long, long, long, long, long, long, long, long, float, float, int, int)",
+        "calls": 1054,
+        "sum_ms": 212.906756,
+        "mean_us": 201.99881973434535
+      },
+      {
+        "kernel": "void vt::rocm::(anonymous namespace)::Sandwich2560Kernel<true>(__hip_bfloat16*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16*, float)",
+        "calls": 1053,
+        "sum_ms": 4.713379,
+        "mean_us": 4.476143399810066
+      },
+      {
+        "kernel": "void vt::rocm::(anonymous namespace)::Sandwich2560Kernel<false>(__hip_bfloat16*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16*, float)",
+        "calls": 1053,
+        "sum_ms": 4.037789,
+        "mean_us": 3.8345574548907884
+      },
+      {
+        "kernel": "void vt::rocm::GemmaQkNormRopeRowsK<__hip_bfloat16, int>(__hip_bfloat16*, __hip_bfloat16*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, int const*, long, long, long, long, long, int, float, bool)",
+        "calls": 1053,
+        "sum_ms": 1.866851,
+        "mean_us": 1.7728879392212726
+      },
+      {
+        "kernel": "void vt::rocm::ReshapeAndCacheK<unsigned short>(unsigned short const*, unsigned short const*, unsigned short*, unsigned short*, long const*, long, long, long, long, long, long, long, long)",
+        "calls": 1053,
+        "sum_ms": 1.667612,
+        "mean_us": 1.5836771130104463
+      },
+      {
+        "kernel": "vt::rocm::(anonymous namespace)::GeluKernel(__hip_bfloat16*, __hip_bfloat16 const*, long, long)",
+        "calls": 1053,
+        "sum_ms": 1.103087,
+        "mean_us": 1.0475660018993354
+      },
+      {
+        "kernel": "__amd_rocclr_copyBuffer",
+        "calls": 212,
+        "sum_ms": 0.703206,
+        "mean_us": 3.317009433962264
+      },
+      {
+        "kernel": "void vt::rocm::(anonymous namespace)::ArgmaxK<float, 256, 32>(long*, float const*, long, long, float*)",
+        "calls": 30,
+        "sum_ms": 0.194881,
+        "mean_us": 6.496033333333334
+      },
+      {
+        "kernel": "vt::rocm::(anonymous namespace)::ScaledKernel(__hip_bfloat16*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16*, long, float, float)",
+        "calls": 30,
+        "sum_ms": 0.171202,
+        "mean_us": 5.706733333333333
+      },
+      {
+        "kernel": "void vt::rocm::(anonymous namespace)::EmbeddingKernel<__hip_bfloat16, __hip_bfloat16, int>(__hip_bfloat16*, __hip_bfloat16 const*, int const*, long, long, long, vt::rocm::(anonymous namespace)::EmbeddingErr*, bool)",
+        "calls": 30,
+        "sum_ms": 0.08956,
+        "mean_us": 2.985333333333333
+      },
+      {
+        "kernel": "__amd_rocclr_fillBufferUnAligned",
+        "calls": 30,
+        "sum_ms": 0.089321,
+        "mean_us": 2.9773666666666667
+      },
+      {
+        "kernel": "vt::rocm::CastF32K(float*, __hip_bfloat16 const*, long, long, long)",
+        "calls": 30,
+        "sum_ms": 0.07623999999999999,
+        "mean_us": 2.541333333333333
+      },
+      {
+        "kernel": "vt::rocm::(anonymous namespace)::ArgmaxPartsK(long*, long const*, float const*)",
+        "calls": 30,
+        "sum_ms": 0.06468,
+        "mean_us": 2.156
+      }
+    ]
+  },
+  {
+    "block_size": 16,
+    "arm": "primary",
+    "trace_sha256": "a38c06e8083ed7836305e96134bb45cc61c26a1a080f7ac0be176d923c257999",
+    "window": "final 1207-token request, 31 decode steps, first attention start through last attention end",
+    "attention_calls": 1054,
+    "attention_mean_us": 201.655330170778,
+    "attention_scratch_bytes": [
+      824,
+      896
+    ],
+    "span_ms": 549.204753,
+    "kernel_ms": 495.3471799999999,
+    "kernel_groups": [
+      {
+        "kernel": "void wvSplitK_hf_sml_<__hip_bfloat16, 32, 2, 16, 8, 2, 1>(int, int, int, int, int, int, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16*, int, int)",
+        "calls": 4242,
+        "sum_ms": 264.00165999999996,
+        "mean_us": 62.23518623290901
+      },
+      {
+        "kernel": "kernel_paged_attention_2d",
+        "calls": 1054,
+        "sum_ms": 212.544718,
+        "mean_us": 201.655330170778
+      },
+      {
+        "kernel": "triton_poi_fused_4",
+        "calls": 1023,
+        "sum_ms": 4.149342,
+        "mean_us": 4.056052785923754
+      },
+      {
+        "kernel": "triton_red_fused__to_copy_add_fused_add_rms_norm_rms_norm_2",
+        "calls": 1053,
+        "sum_ms": 3.5549720000000002,
+        "mean_us": 3.3760417853751186
+      },
+      {
+        "kernel": "triton_red_fused__to_copy_add_fused_add_rms_norm_rms_norm_0",
+        "calls": 1053,
+        "sum_ms": 3.030134,
+        "mean_us": 2.8776201329534663
+      },
+      {
+        "kernel": "void vllm::reshape_and_cache_kernel<__hip_bfloat16, __hip_bfloat16, (vllm::Fp8KVCacheDataType)0>(__hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16*, __hip_bfloat16*, long const*, int, int, int, int, int, int, float const*, float const*)",
+        "calls": 1053,
+        "sum_ms": 2.771128,
+        "mean_us": 2.631650522317189
+      },
+      {
+        "kernel": "triton_red_fused_3",
+        "calls": 1023,
+        "sum_ms": 1.4907270000000001,
+        "mean_us": 1.4572111436950146
+      },
+      {
+        "kernel": "triton_poi_fused_gelu_mul_slice_1",
+        "calls": 1053,
+        "sum_ms": 1.231168,
+        "mean_us": 1.1692003798670465
+      },
+      {
+        "kernel": "__amd_rocclr_copyBuffer",
+        "calls": 152,
+        "sum_ms": 0.36288,
+        "mean_us": 2.3873684210526314
+      },
+      {
+        "kernel": "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4, 4> >(at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4, 4>)",
+        "calls": 30,
+        "sum_ms": 0.236921,
+        "mean_us": 7.897366666666667
+      },
+      {
+        "kernel": "_gumbel_sample_kernel",
+        "calls": 30,
+        "sum_ms": 0.23444299999999998,
+        "mean_us": 7.814766666666666
+      },
+      {
+        "kernel": "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})",
+        "calls": 30,
+        "sum_ms": 0.222001,
+        "mean_us": 7.400033333333334
+      },
+      {
+        "kernel": "_compute_slot_mappings_kernel",
+        "calls": 30,
+        "sum_ms": 0.195561,
+        "mean_us": 6.5187
+      },
+      {
+        "kernel": "_gather_block_tables_kernel",
+        "calls": 30,
+        "sum_ms": 0.1312,
+        "mean_us": 4.373333333333334
+      },
+      {
+        "kernel": "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})",
+        "calls": 30,
+        "sum_ms": 0.12708000000000003,
+        "mean_us": 4.236000000000001
+      },
+      {
+        "kernel": "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})",
+        "calls": 30,
+        "sum_ms": 0.12504200000000001,
+        "mean_us": 4.168066666666666
+      },
+      {
+        "kernel": "triton_red_fused__to_copy_add_embedding_mul_rms_norm_0",
+        "calls": 30,
+        "sum_ms": 0.11136,
+        "mean_us": 3.712
+      },
+      {
+        "kernel": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::array<char*, 1ul> >(int, at::native::FillFunctor<int>, std::array<char*, 1ul>)",
+        "calls": 60,
+        "sum_ms": 0.10784,
+        "mean_us": 1.7973333333333332
+      },
+      {
+        "kernel": "_post_update_kernel",
+        "calls": 30,
+        "sum_ms": 0.093401,
+        "mean_us": 3.113366666666667
+      },
+      {
+        "kernel": "_combine_sampled_and_draft_tokens_kernel",
+        "calls": 30,
+        "sum_ms": 0.092321,
+        "mean_us": 3.077366666666667
+      },
+      {
+        "kernel": "triton_poi_fused_2",
+        "calls": 30,
+        "sum_ms": 0.08624,
+        "mean_us": 2.8746666666666667
+      },
+      {
+        "kernel": "_get_num_sampled_and_rejected_kernel",
+        "calls": 30,
+        "sum_ms": 0.086201,
+        "mean_us": 2.8733666666666666
+      },
+      {
+        "kernel": "void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<bool>, std::array<char*, 1ul> >(int, at::native::FillFunctor<bool>, std::array<char*, 1ul>)",
+        "calls": 30,
+        "sum_ms": 0.08208,
+        "mean_us": 2.736
+      },
+      {
+        "kernel": "void at::native::_scatter_gather_elementwise_kernel<256, 4, at::native::_cuda_scatter_gather_internal_kernel<false, at::native::OpaqueType<8>, long>::operator()<at::native::TensorAssign>(at::TensorIterator&, long, long, long, at::native::TensorAssign const&)::{lambda(int)#1}>(int, at::native::_cuda_scatter_gather_internal_kernel<false, at::native::OpaqueType<8>, long>::operator()<at::native::TensorAssign>(at::TensorIterator&, long, long, long, at::native::TensorAssign const&)::{lambda(int)#1})",
+        "calls": 30,
+        "sum_ms": 0.07884000000000001,
+        "mean_us": 2.628
+      },
+      {
+        "kernel": "void (anonymous namespace)::elementwise_kernel_with_index<int, at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}>(int, at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}, function_traits<at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}>::result_type*)",
+        "calls": 30,
+        "sum_ms": 0.06336,
+        "mean_us": 2.112
+      },
+      {
+        "kernel": "_prepare_pos_seq_lens_kernel",
+        "calls": 30,
+        "sum_ms": 0.06336,
+        "mean_us": 2.112
+      },
+      {
+        "kernel": "triton_red_fused_1",
+        "calls": 30,
+        "sum_ms": 0.062200000000000005,
+        "mean_us": 2.0733333333333333
+      },
+      {
+        "kernel": "_apply_write_kernel",
+        "calls": 2,
+        "sum_ms": 0.011,
+        "mean_us": 5.5
+      }
+    ]
+  },
+  {
+    "block_size": 32,
+    "arm": "native",
+    "trace_sha256": "54c13c891c802a5c0716e36b3e6bc1855b553e9244f5b3a9a1d30cc6a9184631",
+    "window": "final 1207-token request, 31 decode steps, first attention start through last attention end",
+    "attention_calls": 1054,
+    "attention_mean_us": 173.0087011385199,
+    "attention_scratch_bytes": [
+      0
+    ],
+    "span_ms": 518.58567,
+    "kernel_ms": 461.780178,
+    "kernel_groups": [
+      {
+        "kernel": "void vt::rocm::(anonymous namespace)::wvSplitKSml<1>(int, int, int, int, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16*, int, int)",
+        "calls": 4242,
+        "sum_ms": 264.290391,
+        "mean_us": 62.303251060820365
+      },
+      {
+        "kernel": "void vt::rocm::(anonymous namespace)::Rdna3DecodeWmma<32, 32>(__hip_bfloat16*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, int const*, int const*, long, long, long, long, long, long, long, long, float, float, int, int)",
+        "calls": 1054,
+        "sum_ms": 182.351171,
+        "mean_us": 173.0087011385199
+      },
+      {
+        "kernel": "void vt::rocm::(anonymous namespace)::Sandwich2560Kernel<true>(__hip_bfloat16*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16*, float)",
+        "calls": 1053,
+        "sum_ms": 4.69299,
+        "mean_us": 4.456780626780627
+      },
+      {
+        "kernel": "void vt::rocm::(anonymous namespace)::Sandwich2560Kernel<false>(__hip_bfloat16*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16*, float)",
+        "calls": 1053,
+        "sum_ms": 4.310664,
+        "mean_us": 4.0936980056980055
+      },
+      {
+        "kernel": "void vt::rocm::GemmaQkNormRopeRowsK<__hip_bfloat16, int>(__hip_bfloat16*, __hip_bfloat16*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, int const*, long, long, long, long, long, int, float, bool)",
+        "calls": 1053,
+        "sum_ms": 1.875412,
+        "mean_us": 1.7810180436847103
+      },
+      {
+        "kernel": "void vt::rocm::ReshapeAndCacheK<unsigned short>(unsigned short const*, unsigned short const*, unsigned short*, unsigned short*, long const*, long, long, long, long, long, long, long, long)",
+        "calls": 1053,
+        "sum_ms": 1.776695,
+        "mean_us": 1.687269705603039
+      },
+      {
+        "kernel": "vt::rocm::(anonymous namespace)::GeluKernel(__hip_bfloat16*, __hip_bfloat16 const*, long, long)",
+        "calls": 1053,
+        "sum_ms": 1.102085,
+        "mean_us": 1.0466144349477684
+      },
+      {
+        "kernel": "__amd_rocclr_copyBuffer",
+        "calls": 211,
+        "sum_ms": 0.637962,
+        "mean_us": 3.023516587677725
+      },
+      {
+        "kernel": "void vt::rocm::(anonymous namespace)::ArgmaxK<float, 256, 32>(long*, float const*, long, long, float*)",
+        "calls": 30,
+        "sum_ms": 0.200161,
+        "mean_us": 6.672033333333333
+      },
+      {
+        "kernel": "vt::rocm::(anonymous namespace)::ScaledKernel(__hip_bfloat16*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16*, long, float, float)",
+        "calls": 30,
+        "sum_ms": 0.175003,
+        "mean_us": 5.833433333333333
+      },
+      {
+        "kernel": "__amd_rocclr_fillBufferUnAligned",
+        "calls": 30,
+        "sum_ms": 0.11928100000000001,
+        "mean_us": 3.9760333333333335
+      },
+      {
+        "kernel": "void vt::rocm::(anonymous namespace)::EmbeddingKernel<__hip_bfloat16, __hip_bfloat16, int>(__hip_bfloat16*, __hip_bfloat16 const*, int const*, long, long, long, vt::rocm::(anonymous namespace)::EmbeddingErr*, bool)",
+        "calls": 30,
+        "sum_ms": 0.11008,
+        "mean_us": 3.6693333333333333
+      },
+      {
+        "kernel": "vt::rocm::CastF32K(float*, __hip_bfloat16 const*, long, long, long)",
+        "calls": 30,
+        "sum_ms": 0.076641,
+        "mean_us": 2.5547
+      },
+      {
+        "kernel": "vt::rocm::(anonymous namespace)::ArgmaxPartsK(long*, long const*, float const*)",
+        "calls": 30,
+        "sum_ms": 0.061642,
+        "mean_us": 2.0547333333333335
+      }
+    ]
+  },
+  {
+    "block_size": 32,
+    "arm": "primary",
+    "trace_sha256": "eea64c4ace892dec69bb5bc88e8b169685ea7792394eb8d99032c8be47ec381a",
+    "window": "final 1207-token request, 31 decode steps, first attention start through last attention end",
+    "attention_calls": 1054,
+    "attention_mean_us": 509.29322390891843,
+    "attention_scratch_bytes": [
+      2148,
+      2160
+    ],
+    "span_ms": 873.579505,
+    "kernel_ms": 819.162065,
+    "kernel_groups": [
+      {
+        "kernel": "kernel_paged_attention_2d",
+        "calls": 1054,
+        "sum_ms": 536.7950579999999,
+        "mean_us": 509.29322390891843
+      },
+      {
+        "kernel": "void wvSplitK_hf_sml_<__hip_bfloat16, 32, 2, 16, 8, 2, 1>(int, int, int, int, int, int, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16 const*, __hip_bfloat16*, int, int)",
+        "calls": 4242,
+        "sum_ms": 265.919075,
+        "mean_us": 62.68719354078265
+      },
+      {
+        "kernel": "triton_red_fused__to_copy_add_fused_add_rms_norm_rms_norm_2",
+        "calls": 1053,
+        "sum_ms": 3.545618,
+        "mean_us": 3.367158594491928
+      },
+      {
+        "kernel": "triton_red_fused__to_copy_add_fused_add_rms_norm_rms_norm_0",
+        "calls": 1053,
+        "sum_ms": 3.017656,
+        "mean_us": 2.865770180436847
+      },
+      {
+        "kernel": "reshape_and_cache_kernel_flash",
+        "calls": 1053,
+        "sum_ms": 2.299257,
+        "mean_us": 2.1835299145299145
+      },
+      {
+        "kernel": "triton_poi_fused_4",
+        "calls": 1023,
+        "sum_ms": 2.210129,
+        "mean_us": 2.1604389051808406
+      },
+      {
+        "kernel": "triton_red_fused_3",
+        "calls": 1023,
+        "sum_ms": 1.4861659999999999,
+        "mean_us": 1.452752688172043
+      },
+      {
+        "kernel": "triton_poi_fused_gelu_mul_slice_1",
+        "calls": 1053,
+        "sum_ms": 1.353925,
+        "mean_us": 1.2857787274453942
+      },
+      {
+        "kernel": "__amd_rocclr_copyBuffer",
+        "calls": 151,
+        "sum_ms": 0.354161,
+        "mean_us": 2.345437086092715
+      },
+      {
+        "kernel": "_gumbel_sample_kernel",
+        "calls": 30,
+        "sum_ms": 0.24072300000000002,
+        "mean_us": 8.0241
+      },
+      {
+        "kernel": "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4, 4> >(at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4, 4>)",
+        "calls": 30,
+        "sum_ms": 0.235243,
+        "mean_us": 7.841433333333333
+      },
+      {
+        "kernel": "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<2> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})",
+        "calls": 30,
+        "sum_ms": 0.22040200000000001,
+        "mean_us": 7.346733333333334
+      },
+      {
+        "kernel": "_compute_slot_mappings_kernel",
+        "calls": 30,
+        "sum_ms": 0.19436099999999998,
+        "mean_us": 6.4787
+      },
+      {
+        "kernel": "_gather_block_tables_kernel",
+        "calls": 30,
+        "sum_ms": 0.12768000000000002,
+        "mean_us": 4.256
+      },
+      {
+        "kernel": "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<4> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})",
+        "calls": 30,
+        "sum_ms": 0.127641,
+        "mean_us": 4.2547
+      },
+      {
+        "kernel": "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1}>(long, at::native::gpu_index_kernel<at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1}>(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>, at::native::index_kernel_impl<at::native::OpaqueType<8> >(at::TensorIteratorBase&, c10::ArrayRef<long>, c10::ArrayRef<long>)::{lambda(char*, char const*, long)#1} const&, bool)::{lambda(int)#1})",
+        "calls": 30,
+        "sum_ms": 0.12360000000000002,
+        "mean_us": 4.12
+      },
+      {
+        "kernel": "triton_red_fused__to_copy_add_embedding_mul_rms_norm_0",
+        "calls": 30,
+        "sum_ms": 0.110361,
+        "mean_us": 3.6787
+      },
+      {
+        "kernel": "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::array<char*, 1ul> >(int, at::native::FillFunctor<int>, std::array<char*, 1ul>)",
+        "calls": 60,
+        "sum_ms": 0.109402,
+        "mean_us": 1.8233666666666666
+      },
+      {
+        "kernel": "_post_update_kernel",
+        "calls": 30,
+        "sum_ms": 0.092561,
+        "mean_us": 3.085366666666667
+      },
+      {
+        "kernel": "_combine_sampled_and_draft_tokens_kernel",
+        "calls": 30,
+        "sum_ms": 0.09028,
+        "mean_us": 3.009333333333333
+      },
+      {
+        "kernel": "_get_num_sampled_and_rejected_kernel",
+        "calls": 30,
+        "sum_ms": 0.08712099999999999,
+        "mean_us": 2.9040333333333335
+      },
+      {
+        "kernel": "triton_poi_fused_2",
+        "calls": 30,
+        "sum_ms": 0.08536099999999999,
+        "mean_us": 2.8453666666666666
+      },
+      {
+        "kernel": "void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<bool>, std::array<char*, 1ul> >(int, at::native::FillFunctor<bool>, std::array<char*, 1ul>)",
+        "calls": 30,
+        "sum_ms": 0.08088200000000001,
+        "mean_us": 2.696066666666667
+      },
+      {
+        "kernel": "void at::native::_scatter_gather_elementwise_kernel<256, 4, at::native::_cuda_scatter_gather_internal_kernel<false, at::native::OpaqueType<8>, long>::operator()<at::native::TensorAssign>(at::TensorIterator&, long, long, long, at::native::TensorAssign const&)::{lambda(int)#1}>(int, at::native::_cuda_scatter_gather_internal_kernel<false, at::native::OpaqueType<8>, long>::operator()<at::native::TensorAssign>(at::TensorIterator&, long, long, long, at::native::TensorAssign const&)::{lambda(int)#1})",
+        "calls": 30,
+        "sum_ms": 0.07808,
+        "mean_us": 2.602666666666667
+      },
+      {
+        "kernel": "triton_red_fused_1",
+        "calls": 30,
+        "sum_ms": 0.062962,
+        "mean_us": 2.0987333333333336
+      },
+      {
+        "kernel": "_prepare_pos_seq_lens_kernel",
+        "calls": 30,
+        "sum_ms": 0.06280000000000001,
+        "mean_us": 2.0933333333333333
+      },
+      {
+        "kernel": "void (anonymous namespace)::elementwise_kernel_with_index<int, at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}>(int, at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}, function_traits<at::native::arange_cuda_out(c10::Scalar const&, c10::Scalar const&, c10::Scalar const&, at::Tensor&)::{lambda()#1}::operator()() const::{lambda()#3}::operator()() const::{lambda(long)#1}>::result_type*)",
+        "calls": 30,
+        "sum_ms": 0.04648000000000001,
+        "mean_us": 1.5493333333333335
+      },
+      {
+        "kernel": "_apply_write_kernel",
+        "calls": 1,
+        "sum_ms": 0.00508,
+        "mean_us": 5.08
+      }
+    ]
+  }
+]

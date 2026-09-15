@@ -7,7 +7,7 @@ GitHub: -
 Mirror: PENDING
 Availability: FULL
 Created: 2026-09-14
-Updated: 2026-09-14
+Updated: 2026-09-15
 Closed: -
 
 ## Problem
@@ -16,4 +16,11 @@ The pinned unsloth/gemma-3-4b-it checkpoint at bf46152c47f5dd20b896357cb51abc4c0
 
 ## Resolution
 
--
+15 September 2026, branch evidence before landing. The loader accepts and validates linear RoPE, global layers apply the scale,
+and device cache construction matches the primary. Twelve array cases and
+the combined public model gates pass.
+
+The original 96-token and expanded 256-token workloads pass with cache blocks
+16 and 32, scalar and default WMMA prefill, and graph and eager decode.
+[Combined evidence](../../../docs/bench-evidence/rocm-rdna3-attention-wmma/README.md).
+PR #3195 carries this prerequisite. Keep the issue open until landing.

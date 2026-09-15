@@ -1,0 +1,23 @@
+import hashlib,json,statistics
+from pathlib import Path
+e=Path('build-rdna3-attn/evidence');runs=[]
+for block in (16,32):
+ for r in range(3):
+  for arm in ('primary','wmma','scalar'):
+   name=f'pinned-final-r{r}-b{block}-{arm}';p=e/(name+'.json');d=json.loads(p.read_text());monitor=[json.loads(x)for x in (e/(name+'.jsonl')).read_text().splitlines()];start=monitor[0];end=monitor[-1];assert end['exit_code']==0
+   if arm=='primary':
+    m=d['metrics'];tpot=m['tpot_ms']['mean'];ttft=m['ttft_ms']['mean'];e2e=m['e2el_ms']['mean'];prefill=(518+1207)*4/(ttft*8/1000)
+   else:tpot=d['mean_tpot_ms'];ttft=d['mean_ttft_ms'];e2e=d['mean_e2el_ms'];prefill=d['prefill_tokens_per_second']
+   runs.append(dict(name=name,block_size=block,repeat=r,arm=arm,token_exact=256,metrics=dict(decode_tokens_per_second=1000/tpot,prefill_tokens_per_second=prefill,mean_tpot_ms=tpot,mean_ttft_ms=ttft,mean_e2el_ms=e2e,**end['sampled_peaks']),command=start['argv'],baseline=start['device_baseline'],utc=start['utc'],output_sha256=hashlib.sha256(p.read_bytes()).hexdigest()))
+medians={}
+for block in (16,32):
+ arms={}
+ for arm in ('primary','wmma','scalar'):
+  found=[r['metrics']for r in runs if r['block_size']==block and r['arm']==arm]
+  arms[arm]={k:statistics.median(x[k]for x in found)for k in found[0]}
+ arms['wmma_over_primary']={k:arms['wmma'][k]/arms['primary'][k]for k in arms['wmma']}
+ arms['wmma_over_scalar']={k:arms['wmma'][k]/arms['scalar'][k]for k in arms['wmma']}
+ medians[str(block)]=arms
+report={'native_source_commit':'f7b5f8dd9','build_type':'Release','optimization':'host and HIP -O3 -DNDEBUG -ffp-contract=off','workload':'one untimed warmup, eight distinct 518/1207-token requests, 32 output tokens each, concurrency one','primary_pin':'e126687a9a828d513c01a07cd69f025f27d63280','primary_configuration':'production compilation and graphs; default KV reservation','summary':'median of three run means; all runs retained; decode rate is 1000 / mean TPOT on both engines','memory_scope':'sampled process tree RSS/PSS and whole-device VRAM; production primary reserves more KV capacity','runs':runs,'medians':medians}
+(e/'pinned-final-performance.json').write_text(json.dumps(report,indent=2)+'\n')
+print(json.dumps(medians,indent=2))

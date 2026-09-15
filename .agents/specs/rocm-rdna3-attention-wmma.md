@@ -14,12 +14,11 @@ The developer explicitly forbids subagents for this task. This session performs
 implementation and validation. Independent human review remains due at the MR.
 The existing quantized admission is separately implemented in PR #3187.
 
-The kernel compiles on gfx1100/1200/1201 and passes ten primary array cases.
-The original 96-token gate passes after linear RoPE and BF16 head corrections.
-The expanded 256-token gate fails on four WMMA and three scalar requests.
-Keep gfx1100 opt-in. Default enablement and full-model performance acceptance
-remain blocked by ISSUE-LOCAL-01M2HQEEXHD2B0BT3N71HQ0CRZ. The draft MR is not
-merge-ready. [Measured report](../../docs/bench-evidence/rocm-rdna3-attention-wmma/README.md).
+The WMMA path passes the unchanged expanded 256-token gate after repairing
+compiled Gemma arithmetic, device RoPE caches, and attention accumulation.
+Default admission, fallback controls, final resource and performance checks,
+and review records remain active under ISSUE-LOCAL-01M2HQEEXHD2B0BT3N71HQ0CRZ.
+[Measured report](../../docs/bench-evidence/rocm-rdna3-attention-wmma/README.md).
 
 ## Scope
 
@@ -165,6 +164,26 @@ Extend resident tensor initialization with a callback for generated device data.
 Gemma's compiled path uses that shared seam to build each cache once on-device,
 then narrows it to BF16. Keep the CPU loader cache for materialized backends.
 Test both theta values, scaled positions, invalid factors, and full-model tokens.
+
+The completed compiler inspection also fixes reduction and contraction order.
+Q/K norms use 64-element tiles and eight adjacent elements per lane. Hidden
+norms use 1024-element tiles and four adjacent elements per lane, reduce each
+half-wave before combining halves, and divide by width before adding epsilon.
+The second rotary coordinate contracts `second*cos + first*sin` with the
+first product fused. Real-model Q/K and sandwich outputs now match exactly.
+
+Decode source spells `acc += dot(P,V)`, but the executing Triton IR folds
+that addition into the dot accumulator. Preserve the scaled accumulator in
+WMMA. This restores the expanded WMMA gate to 256/256 matching tokens.
+
+The dimension-256 decode repair is a correctness prerequisite on gfx1100.
+Enable it independently of the prefill-only environment switch, for a single
+query and one request with cache blocks at most 64. Keep the existing gfx12
+decode selection. Both prefill A/B arms then use the same repaired decoder.
+Retain the existing GQA/decode switches as their broader controls. Do not admit
+short multi-token prefill through this prerequisite. Test that the default
+prefill path launches on gfx1100 and that its explicit disable retains the
+scalar prefill control. Repeat both full-model gates after this separation.
 
 Add focused primary-generated fixtures for these expressions, including
 nonuniform gamma, BF16 rounding boundaries, full/partial rotary dimensions,

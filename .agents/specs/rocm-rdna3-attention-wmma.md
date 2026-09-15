@@ -151,6 +151,21 @@ Do not index accumulator coordinates or alter gfx12's public MMA operation.
 Verify the operand capture, score intermediates, token gates, and resources
 before accepting this adapter. Retain the AMD license for adapted glue.
 
+The complete first-layer QKV projection is byte-identical on unique4, but
+its CPU-built RoPE cache differs from the executing primary's GPU-built cache.
+`rotary_embedding/base.py:89-112` explicitly builds inverse frequencies and
+trigonometric values on the device. A HIP FP32 prototype matches all 33,554,432
+local and 268,435,456 global BF16 cache values. Substituting those cache bytes
+restores unique4's 16-token diagnostic sequence.
+
+Extend `RopeCosSinCache` with an explicit linear factor. Positive factors use
+the primary's FP32 reciprocal-power, position division, and trigonometry.
+Factor one expresses the unscaled local cache. Zero preserves existing callers.
+Extend resident tensor initialization with a callback for generated device data.
+Gemma's compiled path uses that shared seam to build each cache once on-device,
+then narrows it to BF16. Keep the CPU loader cache for materialized backends.
+Test both theta values, scaled positions, invalid factors, and full-model tokens.
+
 Add focused primary-generated fixtures for these expressions, including
 nonuniform gamma, BF16 rounding boundaries, full/partial rotary dimensions,
 and two/three operand residual expressions. Capture red before each repair,

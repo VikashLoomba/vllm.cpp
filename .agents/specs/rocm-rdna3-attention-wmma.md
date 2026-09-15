@@ -100,6 +100,20 @@ contains the intermediate-layer stores and returns its BF16 residual. Module
 norm, without a residual consumer. Both are retained in the task's primary
 compiler cache and will be sealed with hashes in the evidence.
 
+Intermediate capture additionally establishes the initial embedding boundary:
+the first norm's variance uses the FP32 scaled embedding, while its numerator
+reloads the BF16 scaled embedding. Add a typed scaled-norm operation through
+`FusedChain`; its outputs remain BF16. Matching this boundary made layer zero's
+QKV input and output byte-identical for the failing unique7 prefill and decode.
+
+The affected attention paths also owe the primary's aligned key tiles and
+BF16 probability conversion before PV. Update dimension-256 SharedK scalar,
+SharedK WMMA, and GQA decode with the executing unified-attention softmax
+expression. Preserve dimension-512 behavior. Export actual layer-zero Q/K/V
+and attention outputs to distinguish kernel arithmetic from model-front-end
+differences. A scratch FP32-buffer experiment is diagnostic evidence only;
+the implementation must keep BF16 buffers and use typed shared fusion calls.
+
 Add focused primary-generated fixtures for these expressions, including
 nonuniform gamma, BF16 rounding boundaries, full/partial rotary dimensions,
 and two/three operand residual expressions. Capture red before each repair,

@@ -14,16 +14,36 @@ The developer explicitly forbids subagents for this task. This session performs
 implementation and validation. Independent human review remains due at the MR.
 The existing quantized admission is separately implemented in PR #3187.
 
-The WMMA path passes the unchanged expanded 256-token gate after repairing
-compiled Gemma arithmetic, device RoPE caches, and attention accumulation.
-Default admission and both cache-block gates pass. Three alternating pairs
-measure 1.149x median model prefill versus scalar, with zero attention spills.
-The default remains on. The developer rejects stopping with locally fixable
-RDNA3 gaps. Scalar expanded-token differences, decode latency, host memory,
-and checkpoint-dependent regression tests remain implementation obligations.
-PR #3195 stays open during these repairs. Independent human review remains
-due after the final gates. The row stays ACTIVE until the work lands.
+Default gfx1100 WMMA and the corrected scalar control pass the unchanged
+original and expanded token gates at cache blocks 16 and 32, both with graph
+replay and eager execution. The integrated matrix passes 16 configurations
+and 3072 output tokens. All 20 decode fixtures are byte-exact. The 20 focused
+regressions include the downloaded Gemma 1B checkpoint bodies. All four decode
+templates and prefill use zero scratch on gfx1100. gfx1200 and gfx1201 compile.
+
+DOT2 arithmetic and fully masked tiles explain the scalar failures. A dedicated
+128-thread decoder, captured Gemma forward, and exact normalization/selection
+changes close the measured decode deficit. Incremental staging and device RoPE
+construction remove unused host storage. Three Release comparisons clear the
+primary's sampled latency and throughput floors, with block-16 decode at parity.
+The prior unoptimized performance report is superseded and retained.
+
+The branch integrates main ea6da1f80. PR #3195 stays open for final repository
+checks and publication of the integrated evidence. Independent human review
+remains due. The row stays ACTIVE until the work lands.
 [Measured report](../../docs/bench-evidence/rocm-rdna3-attention-wmma/README.md).
+
+### Pin the embedding bounds readback (15 September 2026)
+
+The integrated block-16 medians are 66.4774 native and 66.4976 primary tokens
+per second. One native outlier lowers the median below the literal floor.
+Preserve all samples. The bounds check still copies its 16-byte result into
+pageable stack memory before synchronization on every token. Test a fixed
+pinned host record per queue through the same shared scratch bookkeeping.
+Keep invalid-ID errors synchronous and clear the device record on each call.
+Validate alternating invalid/valid IDs and both integer widths, then repeat
+unchanged exact model gates and performance. Reject the candidate if it does
+not reduce measured overhead. Do not change the summary statistic or floor.
 
 ### Captured pool ownership witness (15 September 2026)
 

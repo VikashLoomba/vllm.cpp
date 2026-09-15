@@ -135,6 +135,22 @@ If necessary, carry the same matrix arithmetic into dimension-256 GQA decode.
 Record this prerequisite separately from prefill acceleration and test its
 resources and performance. Do not change dimension-512 or quantized paths.
 
+A 15 September operand capture identifies a gfx11 rocWMMA 2.2.1 difference:
+`PreMmaXFormA/B` swap the two eight-element halves in lanes 16 through 31.
+The executing Triton kernel duplicates lanes 0 through 15 without this swap.
+Both matrices remain mathematically equivalent, but 1,936,922 of 5,696,064
+captured QK scores differ by up to 1.526e-5. The diagnostic primary kernel
+reproduces its original output byte-for-byte, so the comparison is gateable.
+
+Add a gfx1100-only adapter around rocWMMA's packed MMA input seam. Keep its
+input/output transforms, accumulator representation, and matrix instruction.
+Broadcast the lower-half packed inputs into the upper half before MMA.
+This requires rocWMMA's header implementation types; record the tested 2.2.1
+version and isolate that dependency in one architecture-specific header.
+Do not index accumulator coordinates or alter gfx12's public MMA operation.
+Verify the operand capture, score intermediates, token gates, and resources
+before accepting this adapter. Retain the AMD license for adapted glue.
+
 Add focused primary-generated fixtures for these expressions, including
 nonuniform gamma, BF16 rounding boundaries, full/partial rotary dimensions,
 and two/three operand residual expressions. Capture red before each repair,

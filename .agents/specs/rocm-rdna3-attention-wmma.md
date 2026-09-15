@@ -162,6 +162,20 @@ independent across keys. The candidate must preserve each score's D reduction,
 each online softmax update, and each PV accumulator's order. Apply the same
 exact-output, resource and repeated-model gates as the rejected partition.
 
+The paired-QK candidate also regressed: 59.57 and 59.59 tokens/s at block 16.
+Retain the unpartitioned zero-spill decoder. Trace differences outside attention
+include one QKV split and two Q/K normalization launches per layer. For the
+compiled Gemma single-token path, use contiguous views of the merged QKV
+owner and keep that owner alive through attention. Multi-token and unmerged
+paths retain materialized buffers. This removes a copy without changing bytes.
+
+Combine the compiled Gemma Q and K row kernels through the existing
+`AttnQkNormRope`/`FusedChain` provider. Reuse one row implementation. Preserve
+its reduction order: four positions per lane, eight adjacent lane values
+summed sequentially, then an eight-group 4/2/1 fold. Warp shuffles can replace
+block barriers while preserving each addition. Require the frozen primary
+Q/K fixtures, non-Gemma regressions, both model block sizes, and actual traces.
+
 ### Remaining decode launch costs (15 September 2026)
 
 The final block-16 comparison still owes about 0.38 ms per output token.

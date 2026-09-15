@@ -75,6 +75,39 @@ change or a newly claimed multimodal capability.
 
 ## Gates
 
+### Expanded-gate repair design (15 September 2026)
+
+The developer requests resolving the opt-in blockers and publishing a ready MR.
+ISSUE-LOCAL-01M2HQEEXHD2B0BT3N71HQ0CRZ owns the remaining numerical repair.
+The executing primary at the same pin exposes three materialized boundaries
+that the original Gemma implementation does not mirror:
+
+- `activation.py:451-464` selects erf GELU on ROCm. Its generated GeGLU kernel
+  retains the activation in FP32 through the gate/up multiply.
+- The generated Q/K preamble combines Gemma normalization and cached rotation
+  before its single BF16 output store. Extend the existing gate-free
+  `AttnQkNormRope` realization to honor its Gemma flag and route Gemma through
+  `FusedChain` with the corresponding recipe.
+- The generated sandwich norms evaluate `Npost(a) + base`, then
+  `Npost(delta) + (Npost(a) + base)` in FP32. They round only the normalized
+  output and the next-layer residual to BF16. Preserve BF16 operand ownership
+  across the MLP and extend the typed residual-expression/FusedChain seam to
+  represent normalized operands. Do not allocate a persistent FP32 residual.
+
+The generated module `cycnctzmkc6yjxbdnjsayvhkrt7wcw2yzliovagbbvctjna42lab.py`
+contains the intermediate-layer stores and returns its BF16 residual. Module
+`cduy4zdp3dldo7p3yvkxoff27y2ioqz3atgb4yqnwofcobarhk5l.py` contains the final
+norm, without a residual consumer. Both are retained in the task's primary
+compiler cache and will be sealed with hashes in the evidence.
+
+Add focused primary-generated fixtures for these expressions, including
+nonuniform gamma, BF16 rounding boundaries, full/partial rotary dimensions,
+and two/three operand residual expressions. Capture red before each repair,
+then green and production reachability. Preserve existing backend defaults
+outside the measured ROCm Gemma3 path. Run the unchanged original 96-token
+and expanded 256-token gates with scalar and WMMA controls. Investigate any
+remaining differences; these source findings alone do not prove token parity.
+
 1. Before admission, the CPU predicate case rejects the requested gfx1100
    target and a physical production-dispatch witness fails to observe WMMA.
 2. Compile the actual translation unit for gfx1100. Inspect generated ISA for

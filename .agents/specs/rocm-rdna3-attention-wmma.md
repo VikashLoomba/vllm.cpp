@@ -152,6 +152,12 @@ outside the decode graph. Test stream-ordered allocation, copy and release,
 with exception-safe cleanup. Preserve rejection of negative and upper-bound
 IDs, repeated calls after rejection, and both index widths. Retain either
 change only after its focused tests and repeated model measurements pass.
+Stream-ordered allocation preserved tokens but regressed block-16 decode to
+54.77 and 56.74 tokens/s. Reject that allocation candidate. Test the existing
+`vt::GrowOnlyStreamScratch` seam instead: one 16-byte bounds record per queue
+identity, cleared before each use, with stream synchronization before return.
+The shared seam retains its allocation for process lifetime. A changed queue
+identity gets a separate record; a native stream-handle reuse cannot alias it.
 These repairs belong to ISSUE-LOCAL-01M2HQEEXHD2B0BT3N71HQ0CRZ.
 
 ### Expanded-gate repair design (15 September 2026)

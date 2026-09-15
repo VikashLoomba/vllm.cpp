@@ -182,6 +182,9 @@ inline std::vector<float> WeightF32(const OwnedTensor& w) {
 // The callback runs only on the first device allocation. CPU uses host bytes.
 inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = {},
                              const std::function<void(Tensor&)>& initialize = {}) {
+  if (initialize)
+    VT_CHECK(w.rank > 0 && w.rank <= vt::kMaxRank,
+             "resident generated tensor requires a valid rank");
   if (shape.empty()) shape.assign(w.shape, w.shape + w.rank);
   // HOST-POINTER ALIASING IS A CPU PROPERTY, NOT A "NOT-CUDA" PROPERTY.
   // This read `!is_cuda()`, which is true for kMETAL, kVULKAN and kXPU as well
@@ -232,11 +235,22 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
            "resident weight: an elem_kn_repacked ([K,N]) weight reached device "
            "staging; VT_CPU_ELEM_KN_REPACK is a CPU-only load transform");
   if (!w.d_dev) {
-    VT_CHECK(!w.bytes.empty(),
+    VT_CHECK(!w.bytes.empty() || initialize,
              std::string("resident weight: EMPTY tensor has no host bytes to "
                          "upload (device-staging arm, dtype ") +
                  vt::Name(w.dtype) + ", rank " + std::to_string(w.rank) + ")");
-    const size_t nb = w.bytes.size();
+    size_t nb = w.bytes.size();
+    if (initialize) {
+      VT_CHECK(!shape.empty() && shape.size() <= vt::kMaxRank,
+               "resident generated tensor requires a valid rank");
+      nb = vt::SizeOf(w.dtype);
+      for (const int64_t dim : shape) {
+        VT_CHECK(dim > 0 && nb > 0 &&
+                     static_cast<uint64_t>(dim) <= static_cast<uint64_t>(INT64_MAX) / nb,
+                 "resident generated tensor size overflow");
+        nb *= static_cast<size_t>(dim);
+      }
+    }
     void* p = d.b.Alloc(nb);
     // Issue #150 accounting: this is the ONE host->device weight upload. When
     // `w.bytes` borrows the safetensors mapping (ENG-LOAD-DIRECT-UPLOAD) the
@@ -252,6 +266,7 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
       d.b.Copy(d.q, p, w.bytes.data(), nb);
     }
     w.d_dev = std::move(owner);
+    if (initialize && w.bytes.empty()) w.host_released = true;
     // THE SOURCE PAGES ARE SPENT, AND THIS IS THE ARM QWEN4-EXP ACTUALLY TAKES.
     // The identical release landed first in `qwen3_5.cpp`'s own `ResidentWeight`
     // (the TU-local one, which shadows this function inside that file), and that

@@ -6,11 +6,11 @@
 //      lm_head) composes, runs finite + deterministic; and the sqrt(hidden)
 //      embed-scale is APPLIED (a no-scale variant differs).
 //
-//  (2) Real-checkpoint CUDA greedy vs the vLLM 0.25.0 oracle (dgx-only), the SACRED
+//  (2) Real-checkpoint GPU greedy vs the pinned vLLM oracle, the SACRED
 //      gate. TOKENIZER-FREE: our BPE tokenizer does not validate Gemma's
 //      byte_fallback tokenizer.json (the SentencePiece/BPE loader gap, mirroring
 //      the Mistral gate), so we feed vLLM's EXACT prompt token ids (incl. the BOS
-//      the tokenizer prepends — bos_token_id=2, verified) straight into our CUDA
+//      the tokenizer prepends — bos_token_id=2, verified) straight into our GPU
 //      prefill and greedy-decode by RE-PREFILLING the growing prefix, checking each
 //      greedy token against vLLM's greedy set (K-run near-tie-robust:
 //      [[near-tie-distributional-gate]]). This isolates + validates the FORWARD
@@ -265,32 +265,42 @@ namespace {
 std::string FindGemma3Snap() {
   const char* home = std::getenv("HOME");
   if (home == nullptr) return "";
-  const fs::path snaps = fs::path(home) /
-      ".cache/huggingface/hub/models--google--gemma-3-1b-it/snapshots";
-  std::error_code ec;
-  if (!fs::is_directory(snaps, ec)) return "";
-  for (const auto& e : fs::directory_iterator(snaps, ec))
-    if (fs::exists(e.path() / "config.json", ec) &&
-        fs::exists(e.path() / "model.safetensors", ec))
-      return e.path().string();
+  for (const char* owner : {"google", "unsloth"}) {
+    const fs::path snaps = fs::path(home) / ".cache/huggingface/hub" /
+                           (std::string("models--") + owner + "--gemma-3-1b-it") / "snapshots";
+    std::error_code ec;
+    if (!fs::is_directory(snaps, ec)) continue;
+    for (const auto& e : fs::directory_iterator(snaps, ec)) {
+      if (fs::exists(e.path() / "config.json", ec) &&
+          fs::exists(e.path() / "model.safetensors", ec))
+        return e.path().string();
+    }
+  }
   return "";
 }
 }  // namespace
 
-// THE SACRED MODEL CORRECTNESS GATE (dgx-only, GPU), TOKENIZER-FREE. Feeds vLLM's
-// EXACT prompt token ids (incl. BOS) into our CUDA prefill and greedy-decodes by
-// re-prefilling the growing prefix, checking each argmax against vLLM 0.25.0's
-// greedy set (K-run near-tie-robust). Oracle table captured on dgx via
-// scripts/gemma3-oracle-capture.py.
-TEST_CASE("gemma3 forward: real gemma-3-1b-it CUDA greedy vs oracle (dgx-only, SACRED)") {
+// Feed the primary's prompt IDs into GPU prefill and re-prefill the growing
+// prefix. The original vLLM 0.25.0 table was reconfirmed byte-for-byte with
+// e126687a9 on gfx1100 and unsloth/gemma-3-1b-it@5b11413a10db4e486ef16a20101fd028f8f2499c.
+// The six prompts and all 48 singleton greedy expectations remain unchanged.
+TEST_CASE("gemma3 forward: real gemma-3-1b-it GPU greedy vs oracle") {
   const std::string snap = FindGemma3Snap();
   if (snap.empty()) {
-    MESSAGE("SKIP: gemma-3-1b-it checkpoint absent (CUDA greedy vs oracle)");
+    MESSAGE("SKIP: gemma-3-1b-it checkpoint absent (GPU greedy vs oracle)");
     return;
   }
-  vt::Backend* cuda = nullptr;
-  try { cuda = &vt::GetBackend(vt::DeviceType::kCUDA); }
-  catch (...) { MESSAGE("SKIP: no CUDA backend registered"); return; }
+  vt::Backend* gpu = nullptr;
+  try {
+    gpu = &vt::GetBackend(vt::DeviceType::kCUDA);
+  } catch (...) {
+    try {
+      gpu = &vt::GetBackend(vt::DeviceType::kROCM);
+    } catch (...) {
+      MESSAGE("SKIP: no CUDA or ROCm backend registered");
+      return;
+    }
+  }
 
   const HfConfig cfg = vllm::LoadHfConfig(snap + "/config.json");
   std::vector<vllm::SafetensorsFile> shards;
@@ -337,15 +347,15 @@ TEST_CASE("gemma3 forward: real gemma-3-1b-it CUDA greedy vs oracle (dgx-only, S
       const int64_t T = static_cast<int64_t>(tokens.size());
       std::vector<int32_t> positions(static_cast<size_t>(T));
       for (int64_t t = 0; t < T; ++t) positions[static_cast<size_t>(t)] = static_cast<int32_t>(t);
-      vt::Queue q = cuda->CreateQueue();
+      vt::Queue q = gpu->CreateQueue();
       const int64_t bs = 128;  // one block covers the short gate contexts (< sliding_window)
       const size_t cbytes =
           static_cast<size_t>(1 * 2 * bs * Hkv * Dh) * vt::SizeOf(DType::kBF16);
       std::vector<void*> devbuf;
       std::vector<PagedKvCache> attn_kv;
       for (int64_t l = 0; l < cfg.num_hidden_layers; ++l) {
-        void* p = cuda->Alloc(cbytes);
-        cuda->Memset(q, p, 0, cbytes);
+        void* p = gpu->Alloc(cbytes);
+        gpu->Memset(q, p, 0, cbytes);
         devbuf.push_back(p);
         PagedKvCache kv;
         kv.data = p; kv.dtype = DType::kBF16; kv.num_blocks = 1;
@@ -371,7 +381,7 @@ TEST_CASE("gemma3 forward: real gemma-3-1b-it CUDA greedy vs oracle (dgx-only, S
       const float* last = logits.data() + (T - 1) * V;
       int argmax = 0;
       for (int64_t v = 1; v < V; ++v) if (last[v] > last[argmax]) argmax = static_cast<int>(v);
-      for (void* p : devbuf) cuda->Free(p);
+      for (void* p : devbuf) gpu->Free(p);
 
       const std::vector<int32_t>& want = cases[ci].cont[step];
       const bool member = std::find(want.begin(), want.end(), argmax) != want.end();
@@ -386,7 +396,7 @@ TEST_CASE("gemma3 forward: real gemma-3-1b-it CUDA greedy vs oracle (dgx-only, S
       tokens.push_back(want.size() == 1 ? want[0] : argmax);
     }
   }
-  MESSAGE("gemma3 CUDA greedy-vs-oracle: " << total_ok << "/" << total_steps
-          << " greedy tokens match vLLM (SACRED gate)");
+  MESSAGE("gemma3 GPU greedy-vs-oracle: " << total_ok << "/" << total_steps
+                                          << " greedy tokens match vLLM (SACRED gate)");
   CHECK(total_ok == total_steps);
 }

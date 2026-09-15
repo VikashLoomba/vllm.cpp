@@ -89,8 +89,8 @@ struct Gemma3Weights {
 // (q/k/v merged), self_attn.{q,k}_norm, mlp.{gate,up,down}_proj (gate/up merged);
 // model.embed_tokens, model.norm; the checkpoint's lm_head.weight is absent/
 // skipped when tied (vLLM skip_prefixes=["lm_head."]). BF16 text path only.
-Gemma3Weights LoadGemma3ForCausalLMWeights(
-    const std::vector<SafetensorsFile>& shards, const HfConfig& config);
+Gemma3Weights LoadGemma3ForCausalLMWeights(const std::vector<SafetensorsFile>& shards,
+                                           const HfConfig& config, vt::Queue* load_queue = nullptr);
 
 // The Gemma-3 dense forward. Per decoder layer (gemma3.py::Gemma3DecoderLayer):
 //   input_layernorm (fused add, Gemma) -> attn(qkv, per-head Gemma q/k norm,

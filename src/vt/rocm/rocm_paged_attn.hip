@@ -3,6 +3,9 @@
 // Supports bf16/f32 query x bf16/f32 KV (mixed allowed).
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+
+#include "rocm_rdna3_attn_decode.h"
+#include "rocm_rdna3_dot2.h"
 // Compile the same rocWMMA BF16 tiles for the admitted RDNA3 and RDNA4 targets.
 // Keep this set aligned with GcnArchNameHasSharedKAttentionWmma at host dispatch.
 #if defined(__gfx1100__) || defined(__gfx1200__) || defined(__gfx1201__)
@@ -1623,11 +1626,10 @@ __device__ void SharedKTileValue64(const float (&scores)[QG][2], const __hip_bfl
 #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2)
       tile_max = fmaxf(tile_max, __shfl_xor(tile_max, offset));
-    float next = fmaxf(m[h], tile_max);
-    if (!(next > -INFINITY)) next = 0.f;
-    const float alpha = FastExp(m[h] - next);
-    const float p0 = FastExp(scores[h][0] - next);
-    const float p1 = FastExp(scores[h][1] - next);
+    const float next = fmaxf(m[h], tile_max);
+    const float alpha = m[h] > -INFINITY ? FastExp(m[h] - next) : 0.f;
+    const float p0 = next > -INFINITY ? FastExp(scores[h][0] - next) : 0.f;
+    const float p1 = next > -INFINITY ? FastExp(scores[h][1] - next) : 0.f;
     float sum = 0.f;
 #pragma unroll
     for (int i = 0; i < 32; ++i) {
@@ -1642,6 +1644,23 @@ __device__ void SharedKTileValue64(const float (&scores)[QG][2], const __hip_bfl
 #pragma unroll
     for (int i = 0; i < EPL; ++i) out[h][i] *= alpha;
   }
+#if defined(__gfx1100__)
+  for (int kk = 0; kk < n_k; kk += 2) {
+    float v0[EPL], v1[EPL] = {};
+    LoadRowEplBf16<EPL>(values, static_cast<int64_t>(kk) * EPL * 32, lane, v0);
+    if (kk + 1 < n_k)
+      LoadRowEplBf16<EPL>(values, static_cast<int64_t>(kk + 1) * EPL * 32, lane, v1);
+#pragma unroll
+    for (int h = 0; h < QG; ++h) {
+      const float p0 = __shfl(probabilities[h][kk / 32], kk % 32);
+      const float p1 = __shfl(probabilities[h][kk / 32], kk % 32 + 1);
+      const unsigned p = AttentionBf16Pair(p0, p1);
+#pragma unroll
+      for (int i = 0; i < EPL; ++i)
+        out[h][i] = AttentionDot2(p, AttentionBf16Pair(v0[i], v1[i]), out[h][i]);
+    }
+  }
+#else
 #pragma unroll 1
   for (int kk = 0; kk < n_k; ++kk) {
     float v[EPL];
@@ -1653,6 +1672,7 @@ __device__ void SharedKTileValue64(const float (&scores)[QG][2], const __hip_bfl
       for (int i = 0; i < EPL; ++i) out[h][i] += p * v[i];
     }
   }
+#endif
 }
 
 template <int QG, int EPL, int BM, int BN, typename TKV = __hip_bfloat16,
@@ -1861,6 +1881,24 @@ __global__ void PagedAttnPrefillSharedK(TO* out, const TQ* query,
 #pragma unroll
       for (int hh = 0; hh < QG; ++hh) scores[hh][0] = scores[hh][1] = -INFINITY;
       if (live) {
+#if defined(__gfx1100__)
+        // Each lane owns a key score. Preserve the primary's consecutive
+        // BF16 DOT2 chain across D rather than reducing separate lane sums.
+        for (int half = 0; half < 2; ++half) {
+          const int kk = lane + 32 * half;
+          const int64_t j = j0 + kk;
+          if (kk >= n_k || j < jmin || j > jmax) continue;
+#pragma unroll
+          for (int hh = 0; hh < QG; ++hh) {
+            const auto* qp =
+                reinterpret_cast<const unsigned*>(query + ((t_base + qq) * hq + h0 + hh) * d);
+            const auto* kp = reinterpret_cast<const unsigned*>(k_sm + kk * d);
+            float dot = 0.f;
+            for (int i = 0; i < d_expect / 2; ++i) dot = AttentionDot2(qp[i], kp[i], dot);
+            scores[hh][half] = Softcap(dot * scale, softcap);
+          }
+        }
+#else
         for (int kk = 0; kk < n_k; ++kk) {
           const int64_t j = j0 + kk;
           if (j < jmin || j > jmax) continue;
@@ -1877,6 +1915,7 @@ __global__ void PagedAttnPrefillSharedK(TO* out, const TQ* query,
             if (lane == kk % 32) scores[hh][kk / 32] = score;
           }
         }
+#endif
       }
       __syncthreads();
       const int d8 = static_cast<int>(d) / 8;
@@ -2527,16 +2566,21 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
       // both prefill control arms. Keep other targets and short prefill unchanged.
       if (d == 256 && num_reqs == 1 && total_q == 1 && block_size <= 64 &&
           SharedKAttentionWmmaHostOk(/*decode=*/true)) {
-        constexpr int BM = 16, BN = 64;
-        const dim3 grid(static_cast<unsigned>((total_q + BM - 1) / BM),
-                        static_cast<unsigned>(num_kv_heads));
-        PagedAttnPrefillSharedKWmma<2, 8, BM, BN, false><<<grid, BM * 32, 49152, st>>>(
-            out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
-            v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
-            query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
-            bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale, args.logits_soft_cap,
-            args.causal, window_left, window_right);
-        Check(hipGetLastError(), "paged_attention sharedk_wmma decode launch");
+        if (block_size < 16 && (block_size & (block_size - 1)) == 0) {
+          // Preserve the existing sub-16 cache-block realization.
+          PagedAttnPrefillSharedKWmma<2, 8, 16, 64, false>
+              <<<dim3(1, static_cast<unsigned>(num_kv_heads)), 512, 49152, st>>>(
+                  out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(),
+                  k_cache.Ptr<__hip_bfloat16>(), v_cache.Ptr<__hip_bfloat16>(),
+                  block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+                  query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
+                  bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+                  args.logits_soft_cap, args.causal, window_left, window_right);
+          Check(hipGetLastError(), "paged_attention sharedk_wmma decode launch");
+        } else {
+          Rdna3AttentionDecode(q, out, query, k_cache, v_cache, block_table, seq_lens, args,
+                               window_left, window_right);
+        }
         return;
       }
       if (prefill_sharedk && total_q >= 64 && num_reqs == 1) {

@@ -246,10 +246,10 @@ void SigmoidGateBf16KernelRocm(Queue& q, Tensor& out, const Tensor& attn,
 // so the f32 carrier keeps the norm's own bits and only the narrowing point
 // moves.
 template <typename T, typename Tid>
-__global__ void AttnQkNormRopeRowK(T* x, const T* w, const T* cache, const Tid* positions,
-                                   int64_t cache_rows, int64_t heads, int64_t dh,
-                                   int64_t row_stride, int rot, float eps, bool neox, bool gemma) {
-  const int64_t row = blockIdx.x;
+__device__ void AttnQkNormRopeRow(int64_t row, T* x, const T* w, const T* cache,
+                                  const Tid* positions, int64_t cache_rows, int64_t heads,
+                                  int64_t dh, int64_t row_stride, int rot, float eps, bool neox,
+                                  bool gemma) {
   const int64_t pos = static_cast<int64_t>(positions[row / heads]);
   if (rot <= 0 || pos < 0 || pos >= cache_rows) return;
   T* xrow = x + row * row_stride;
@@ -266,27 +266,31 @@ __global__ void AttnQkNormRopeRowK(T* x, const T* w, const T* cache, const Tid* 
       acc += v * v;
     }
   }
-  partial[threadIdx.x] = acc;
-  __syncthreads();
+  float total;
   if (compiled256) {
-    float lane_sum = 0.f;
-    if (threadIdx.x < 8) {
-      lane_sum = partial[threadIdx.x * 8];
-      for (int j = 1; j < 8; ++j) lane_sum += partial[threadIdx.x * 8 + j];
+    const int lane = threadIdx.x & 31;
+    float group = __shfl(acc, lane & ~7);
+#pragma unroll
+    for (int j = 1; j < 8; ++j) group += __shfl(acc, (lane & ~7) + j);
+    if (threadIdx.x < 64 && (lane & 7) == 0) partial[threadIdx.x / 8] = group;
+    __syncthreads();
+    float reduced = lane < 8 ? partial[lane] : 0.f;
+#pragma unroll
+    for (int stride = 4; stride; stride /= 2) reduced += __shfl_xor(reduced, stride);
+    total = __shfl(reduced, 0);
+  } else {
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+    for (int stride = kBlock / 2; stride > 0; stride /= 2) {
+      if (static_cast<int>(threadIdx.x) < stride)
+        partial[threadIdx.x] += partial[threadIdx.x + stride];
+      __syncthreads();
     }
-    __syncthreads();
-    if (threadIdx.x < 8) partial[threadIdx.x] = lane_sum;
-    __syncthreads();
+    total = partial[0];
   }
-  for (int stride = compiled256 ? 4 : kBlock / 2; stride > 0; stride /= 2) {
-    if (static_cast<int>(threadIdx.x) < stride)
-      partial[threadIdx.x] += partial[threadIdx.x + stride];
-    __syncthreads();
-  }
-  const float variance = partial[0] / static_cast<float>(dh) + eps;
-  const float inv = gemma
-                        ? __builtin_amdgcn_rsqf(fmaf(partial[0], 1.f / static_cast<float>(dh), eps))
-                        : 1.0f / sqrtf(variance);
+  const float variance = total / static_cast<float>(dh) + eps;
+  const float inv = gemma ? __builtin_amdgcn_rsqf(fmaf(total, 1.f / static_cast<float>(dh), eps))
+                          : 1.0f / sqrtf(variance);
   const int64_t half = rot / 2;
   // One thread per rotation PAIR, both stores from the values read before either
   // write, because the rotation is in place (RopeFromCacheK, rocm_dense_basic.hip
@@ -305,6 +309,28 @@ __global__ void AttnQkNormRopeRowK(T* x, const T* w, const T* cache, const Tid* 
   for (int64_t j = rot + threadIdx.x; j < dh; j += kBlock) {
     St(xrow, j, Ld(xrow, j) * inv * (Ld(w, j) + (gemma ? 1.f : 0.f)));
   }
+}
+
+template <typename T, typename Tid>
+__global__ void AttnQkNormRopeRowK(T* x, const T* w, const T* cache, const Tid* positions,
+                                   int64_t cache_rows, int64_t heads, int64_t dh,
+                                   int64_t row_stride, int rot, float eps, bool neox, bool gemma) {
+  AttnQkNormRopeRow(blockIdx.x, x, w, cache, positions, cache_rows, heads, dh, row_stride, rot, eps,
+                    neox, gemma);
+}
+
+template <typename T, typename Tid>
+__global__ void GemmaQkNormRopeRowsK(T* query, T* key, const T* qw, const T* kw, const T* cache,
+                                     const Tid* positions, int64_t cache_rows, int64_t hq,
+                                     int64_t hkv, int64_t q_stride, int64_t k_stride, int rot,
+                                     float eps, bool neox) {
+  const int64_t token = blockIdx.x / (hq + hkv), head = blockIdx.x % (hq + hkv);
+  if (head < hq)
+    AttnQkNormRopeRow(token * hq + head, query, qw, cache, positions, cache_rows, hq, 256, q_stride,
+                      rot, eps, neox, true);
+  else
+    AttnQkNormRopeRow(token * hkv + head - hq, key, kw, cache, positions, cache_rows, hkv, 256,
+                      k_stride, rot, eps, neox, true);
 }
 
 void AttnQkNormRopeGateKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out,
@@ -399,6 +425,13 @@ void AttnQkNormRopeKernelRocm(Queue& q, Tensor& q3, Tensor& k3, const Tensor& q_
   auto launch = [&](auto t_tag, auto id_tag) {
     using T = decltype(t_tag);
     using Tid = decltype(id_tag);
+    if (na.gemma && dh == 256 && hq > 0 && hkv > 0) {
+      GemmaQkNormRopeRowsK<T, Tid><<<static_cast<unsigned>(t * (hq + hkv)), kBlock, 0, s>>>(
+          q3.Ptr<T>(), k3.Ptr<T>(), q_norm.Ptr<T>(), k_norm.Ptr<T>(), cos_sin.Ptr<T>(),
+          positions.Ptr<Tid>(), cos_sin.shape[0], hq, hkv, q3.stride[1], k3.stride[1], rot, na.eps,
+          ra.is_neox_style);
+      return;
+    }
     if (hq > 0)
       AttnQkNormRopeRowK<T, Tid><<<static_cast<unsigned>(t * hq), kBlock, 0, s>>>(
           q3.Ptr<T>(), q_norm.Ptr<T>(), cos_sin.Ptr<T>(), positions.Ptr<Tid>(), cos_sin.shape[0],

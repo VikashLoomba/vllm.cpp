@@ -8,11 +8,13 @@ namespace vt {
 namespace {
 size_t CheckRow(const Queue& q, const Tensor& t, int64_t rows, int64_t width) {
   VT_CHECK(rows >= 0 && width > 0 && t.rank == 2 && t.shape[0] == rows && t.shape[1] == width &&
-               t.dtype == DType::kBF16 && t.IsContiguous() && t.device == q.device,
+               t.dtype == DType::kBF16 && t.device == q.device,
            "compiled_gemma: expected contiguous BF16 [T,H] on queue device");
   VT_CHECK(static_cast<uint64_t>(width) <= std::numeric_limits<size_t>::max() / 2 &&
                static_cast<uint64_t>(rows) <= std::numeric_limits<size_t>::max() / 2 / width,
            "compiled_gemma: row storage overflow");
+  // Validate the product before IsContiguous() multiplies the dimensions.
+  VT_CHECK(t.IsContiguous(), "compiled_gemma: expected contiguous BF16 [T,H] on queue device");
   const size_t bytes = static_cast<size_t>(rows) * static_cast<size_t>(width) * 2;
   const auto address = reinterpret_cast<uintptr_t>(t.data);
   VT_CHECK(bytes == 0 || (address && address % 2 == 0 &&

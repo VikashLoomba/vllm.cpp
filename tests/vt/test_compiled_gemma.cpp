@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <vector>
@@ -242,6 +243,10 @@ TEST_CASE("compiled Gemma validates ownership and empty batches") {
                       doctest::Contains("scale must be finite and positive"));
   }
   scaled.scale = 2.f;
+  auto oversized = x;
+  oversized.shape[0] = std::numeric_limits<int64_t>::max();
+  CHECK_THROWS_WITH(vt::FusedChain(queue, out, oversized, weight, scaled, res),
+                    doctest::Contains("row storage overflow"));
   auto wrong = x;
   wrong.dtype = vt::DType::kF32;
   CHECK_THROWS_WITH(vt::FusedChain(queue, out, wrong, weight, scaled, res),

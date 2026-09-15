@@ -138,6 +138,13 @@ Physical RDNA4 execution is unavailable. Cross-compilation is the narrower
 result. Old Gemma 1B checkpoint-dependent test bodies remain skipped because
 their checkpoint is absent. The public 4B gate supplies actual model execution.
 
+The final review moves the oversized-row check before stride multiplication.
+The [UBSan probe](review-overflow-gate.json) detects signed overflow before
+the repair and passes afterward. [Fusion tests](review-validation-tests.txt)
+pass five cases and 412 assertions. The rebuilt public capture repeats the
+expanded 256-token gate and its warm-up exactly.
+[Final source and executable identities](review-source-identity.json).
+
 ## Registers and spills
 
 | Target | Compiler VGPR | Compiler SGPR | VGPR/SGPR spills | Private bytes | Total LDS bytes |

@@ -1,0 +1,10 @@
+[
+  {
+    "arm": "before",
+    "exit_code": 1
+  },
+  {
+    "arm": "after",
+    "exit_code": 0
+  }
+]

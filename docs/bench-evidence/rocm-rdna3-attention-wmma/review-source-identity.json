@@ -8,7 +8,7 @@
     "include/vt/recipes.h": "14b7dd266793bae6d54190a54e79718dd52511996b46ad4d2998241fef8676eb",
     "include/vt/rocm/rocm_attn_wmma_arch.h": "44563de65046d2e0ba64bfd251ff43ac0a689dd3e4a571c470851a160c09da5e",
     "src/vllm/model_executor/models/gemma3.cpp": "dcb86150026e39cc2202fbab33078450300e8ce0347bf2f810adcd1a77aadc84",
-    "src/vt/compiled_gemma.cpp": "b0b7d4f903572f6dec5e91e115e6e7f19788131523bb20d88b4ef392693d36c6",
+    "src/vt/compiled_gemma.cpp": "6fe7f7fb5a3565ad096992637d25a3f13376400c8cc5e8354877181ae3be92be",
     "src/vt/cpu/cpu_compiled_gemma.cpp": "bdca6783281ee17ca6d51f838dd5a08ec553dd83115ca7477f34d119d094fdea",
     "src/vt/cpu/cpu_ops.cpp": "34a521f46100508db474167d22a7ee3e63a6ba3271b4438ec220c70d3dd6df22",
     "src/vt/cuda/cuda_ops.cu": "3250bea0ce71bdf8ff8da932f88782ad8ac379b989c5b3df3d4261b781924481",
@@ -66,7 +66,7 @@
     "tests/vt/fixtures/compiled_gemma/scaled3-res.bin": "ac26ff3d2ab3937b3569a2722ce468c1330abc57431dbcf9f929701ca2a1854e",
     "tests/vt/fixtures/compiled_gemma/scaled3-w.bin": "c787528d5cf6604926b0f848ba9dbd5a787c8f34b11675617b45082a66a07320",
     "tests/vt/fixtures/compiled_gemma/scaled3-x.bin": "df4ffffc32e670f2516d2c34c26163fe68907aaffdbfddcbbe7c09ccd179e893",
-    "tests/vt/test_compiled_gemma.cpp": "1a37a8aa141fda1864165947a9f790410608d315ca307303ddcfcb13f7f736a6",
+    "tests/vt/test_compiled_gemma.cpp": "7c413e2356ce78f6f888620bec55e59498a9758283fe4c57e02325aae489181d",
     "tests/vt/test_rocm_arch.cpp": "e2bbec42ad2ec5d77a40ae6e01c80a958b76a8bd50daf3b7db68e3ba302cddd2",
     "tools/rocm_attn_wmma/bench.cpp": "811d5991595d67243690aa91bfde74887ab6b2e66b6583f91e64d8e422ab2eda",
     "tools/rocm_attn_wmma/compiled_gemma_primary.py": "535c895bf9d3e6664c189cc6452a98d7a826bb6bcf2ad526a69eb6051e0689ee",
@@ -75,10 +75,10 @@
     "tools/rocm_attn_wmma/rope_cache_primary.py": "54a39eae9edd5795f67309976bed40f6ee5a03da679d6543fdcda19550f0af21",
     "tools/rocm_attn_wmma/validate_model.py": "11f1cdd553c9e7561a79b01e5f677725dd22ca65f694ff9004bb9c43ebf508a0"
   },
-  "final_model_capture_sha256": "cfc750c0bf732c15cf36aa8536550ebff9e337311f92b74e6be78bb3a36c5647",
-  "final_library_sha256": "f9a62075241ea4623d94a12960f688447a8bcb2b1ca1524521a43c2b95c2aad3",
+  "final_model_capture_sha256": "fc7d7fb46b0661e6893632c87299e2bb4d337b004c8d843d01786e53625b7b08",
+  "final_library_sha256": "505973745ede2a126b692bb611984620414854215c9eec482155f76bf779888f",
   "perf_binary_sha256": "3ca2ef287909e4cfb3c44ceca10831e97841a75a306e1e151e960812dfbb5518",
-  "after_perf_changes": "clang-format on changed HIP lines, corrected LDS comments, and a decode-launch error label; no arithmetic or dispatch change",
-  "final_gate": "14 focused CTest entries; expanded default 256 tokens plus 32-token warmup exact",
+  "after_perf_changes": "clang-format on changed HIP lines, corrected LDS comments, and a decode-launch error label; no arithmetic or dispatch change; reject overflowing row dimensions before stride multiplication",
+  "final_gate": "14 focused CTest entries, then 5 compiled-expression tests/412 assertions after overflow fix; final default expanded 256 plus warmup 32 tokens exact",
   "measured_current_attention_tokens_equal_except_error_label": true
 }

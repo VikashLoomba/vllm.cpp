@@ -1,4 +1,0 @@
-[
-  {"mutation": "default", "exit_code": 1, "source_byte_exact": true, "source_sha256": "44563de65046d2e0ba64bfd251ff43ac0a689dd3e4a571c470851a160c09da5e"},
-  {"mutation": "admission", "exit_code": 1, "source_byte_exact": true, "source_sha256": "44563de65046d2e0ba64bfd251ff43ac0a689dd3e4a571c470851a160c09da5e"}
-]

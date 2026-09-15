@@ -405,9 +405,11 @@ the stated end-to-end gate passes, or report the measured blocker precisely.
 
 ## Evidence
 
-Store concise receipts under `docs/bench-evidence/rocm-rdna3-attention-wmma/`.
-Retain full logs, arrays, traces, compiler output, source hashes, commands,
-checkpoint provenance, and return codes in the task's ignored build directory.
+Keep one validation summary under `docs/bench-evidence/rocm-rdna3-attention-wmma/`.
+The developer requested removing detailed receipts from the implementation diff.
+Preserve the complete report and receipts at commit `b962497b67c7f82d331aa657b25cc5c96533d611`,
+retained by the fork tag `evidence/rdna3-wmma-2026-09-15`. The summary links there.
+Retain raw arrays, traces, compiler output, and logs in the ignored build directory.
 
 ## Row inventory
 

@@ -1,8 +1,0 @@
-{
-  "token_exact": 96,
-  "total_dispatches": 45018,
-  "attention_kernels": {
-    "kernel_paged_attention_2d": 3672,
-    "_prepare_prefill_inputs_kernel": 4
-  }
-}

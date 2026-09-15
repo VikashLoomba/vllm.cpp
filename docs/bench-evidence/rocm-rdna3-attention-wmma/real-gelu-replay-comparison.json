@@ -1,6 +1,0 @@
-{
-  "cases": 544,
-  "bf16_words": 5570560,
-  "byte_exact": true,
-  "manifest_sha256": "b4fc59bd71c62f6830a7c98eda53339d70b108cb9859690a1d640e5a4c1ea7ed"
-}

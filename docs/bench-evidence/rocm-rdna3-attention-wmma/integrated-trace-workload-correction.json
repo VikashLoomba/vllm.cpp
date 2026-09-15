@@ -1,5 +1,0 @@
-{
-  "old_capture_traces": "Primary capture requests five log probabilities, native token capture does not. Those traces diagnose attention only; their full spans are not matched performance evidence.",
-  "accepted_traces": "integrated-matched-bench-* on both engines: bench mode, no log probabilities, same warm-up and eight requests, concurrency one, 32 output tokens, identical model and block size.",
-  "earlier_measurements_preserved": true
-}

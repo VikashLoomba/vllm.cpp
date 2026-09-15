@@ -1,6 +1,0 @@
-[
-  "    .group_segment_fixed_size: 24576\n    .name:           _ZN2vt4rocm12_GLOBAL__N_118KQuantGemmKWmmaQ6KIfEEvPT_PKhPKNS_3cpu9BlockQ8_KEllll\n    .private_segment_fixed_size: 0\n    .sgpr_count:     23\n    .sgpr_spill_count: 0\n    .vgpr_count:     188\n    .vgpr_spill_count: 0\n    .wavefront_size: 32",
-  "    .group_segment_fixed_size: 25600\n    .name:           _ZN2vt4rocm12_GLOBAL__N_118KQuantGemmKWmmaQ4KIfEEvPT_PKhPKNS_3cpu9BlockQ8_KEllll\n    .private_segment_fixed_size: 620\n    .sgpr_count:     22\n    .sgpr_spill_count: 0\n    .vgpr_count:     192\n    .vgpr_spill_count: 154\n    .wavefront_size: 32",
-  "    .group_segment_fixed_size: 24576\n    .name:           _ZN2vt4rocm12_GLOBAL__N_118KQuantGemmKWmmaQ6KItEEvPT_PKhPKNS_3cpu9BlockQ8_KEllll\n    .private_segment_fixed_size: 0\n    .sgpr_count:     23\n    .sgpr_spill_count: 0\n    .vgpr_count:     188\n    .vgpr_spill_count: 0\n    .wavefront_size: 32",
-  "    .group_segment_fixed_size: 25600\n    .name:           _ZN2vt4rocm12_GLOBAL__N_118KQuantGemmKWmmaQ4KItEEvPT_PKhPKNS_3cpu9BlockQ8_KEllll\n    .private_segment_fixed_size: 620\n    .sgpr_count:     22\n    .sgpr_spill_count: 0\n    .vgpr_count:     192\n    .vgpr_spill_count: 154\n    .wavefront_size: 32"
-]

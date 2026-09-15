@@ -1,8 +1,0 @@
-[
-  {
-    "weight_dtype": "torch.bfloat16",
-    "hidden_dtype": "torch.bfloat16",
-    "projection_dtype": "torch.bfloat16",
-    "configured_head_dtype": "torch.bfloat16"
-  }
-]

@@ -1,8 +1,0 @@
-{
-  "tensors": 444,
-  "all_exported_tensor_hashes_match": true,
-  "shards": {
-    "model-00001-of-00002.safetensors": "bde036062da4e2656333ebd9ee5255f3f1bada2663f21d058fc0131ecdb6103f",
-    "model-00002-of-00002.safetensors": "366b61e031d11d92fd4c5c22682932a83e271365c086802cdb2415a20e78858d"
-  }
-}

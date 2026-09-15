@@ -1,7 +1,0 @@
-{
-  "repo": "unsloth/gemma-3-1b-it",
-  "revision": "5b11413a10db4e486ef16a20101fd028f8f2499c",
-  "filename": "model.safetensors",
-  "size": 1999811208,
-  "sha256": "3d4ef8d71c14db7e448a09ebe891cfb6bf32c57a9b44499ae0d1c098e48516b6"
-}

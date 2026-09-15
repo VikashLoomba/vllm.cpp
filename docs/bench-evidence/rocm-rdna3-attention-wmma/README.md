@@ -51,6 +51,8 @@ checkpoint hashes, output tokens, resource counts, traces, all repetitions,
 and failed experiments. The snapshot is preserved by the separate
 `evidence/rdna3-wmma-2026-09-15` tag in `VikashLoomba/vllm.cpp`.
 Evidence links use the immutable snapshot commit. Runtime code, regression
-fixtures, and validation tools remain in this change.
+fixtures, and validation tools remain in this change. All 44 regression tensors
+use one `cases.bin` and a manifest of offsets, sizes, shapes, and hashes.
+`tools/rocm_attn_wmma/compiled_gemma_primary.py` regenerates the complete bundle.
 
 [archive]: https://github.com/VikashLoomba/vllm.cpp/blob/b962497b67c7f82d331aa657b25cc5c96533d611/docs/bench-evidence/rocm-rdna3-attention-wmma/README.md

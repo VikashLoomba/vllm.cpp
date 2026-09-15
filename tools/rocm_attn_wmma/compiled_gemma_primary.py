@@ -1,4 +1,4 @@
-"""Export the pinned primary's executing compiled Gemma expressions."""
+"""Export compiled Gemma expressions and RoPE samples into one fixture bundle."""
 
 import ast, hashlib, importlib.util, json
 from pathlib import Path
@@ -6,6 +6,11 @@ import torch
 from torch._inductor.async_compile import AsyncCompile
 import argparse
 import vllm
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding.linear_scaling_rope import (
+    LinearScalingRotaryEmbedding,
+)
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--layer-module", type=Path, required=True)
@@ -54,17 +59,20 @@ for name, path in sources.items():
     }
     torch.cuda.synchronize()
 torch.manual_seed(91015)
+payload = bytearray()
 
 
 def rnd(shape, scale=1.0):
     return (torch.randn(shape, device="cuda") * scale).bfloat16()
 
 
-def store(name, t):
+def store(t):
     data = t.contiguous().view(torch.uint8).cpu().numpy().tobytes()
-    (dst / (name + ".bin")).write_bytes(data)
+    offset = len(payload)
+    payload.extend(data)
     return {
-        "file": name + ".bin",
+        "offset": offset,
+        "bytes": len(data),
         "shape": list(t.shape),
         "dtype": str(t.dtype),
         "sha256": hashlib.sha256(data).hexdigest(),
@@ -76,6 +84,8 @@ report = {
     "pin": "e126687a9a828d513c01a07cd69f025f27d63280",
     "sources": manifest,
     "cases": [],
+    "origin": "Frozen executing torch.compile kernels, ROCm production Gemma3 at the "
+    "recorded vLLM pin. Harness extraction preserves generated expressions and stores.",
 }
 for rows in (1, 3):
     m = mods["layer"]
@@ -100,7 +110,7 @@ for rows in (1, 3):
     for name, t in dict(
         a=a, base=base, delta=delta, wa=wa, wd=wd, w=w, out2=out2, out3=out3, res=res
     ).items():
-        c[name] = store(c["name"] + "-" + name, t)
+        c[name] = store(t)
     report["cases"].append(c)
     qkv = rnd((rows, 4096))
     qw = rnd((256,), 0.5)
@@ -130,7 +140,7 @@ for rows in (1, 3):
     )
     c = {"name": f"qk{rows}", "kind": "qk", "rows": rows}
     for name, t in dict(qkv=qkv, qw=qw, kw=kw, cs=cs, pos=pos, qo=qo, ko=ko).items():
-        c[name] = store(c["name"] + "-" + name, t)
+        c[name] = store(t)
     report["cases"].append(c)
     if rows == 1:
         x = rnd((rows, 20480), 2)
@@ -140,8 +150,8 @@ for rows in (1, 3):
             {
                 "name": "gelu",
                 "kind": "gelu",
-                "x": store("gelu-x", x),
-                "out": store("gelu-out", out),
+                "x": store(x),
+                "out": store(out),
             }
         )
 for rows in (1, 3):
@@ -162,7 +172,37 @@ for rows in (1, 3):
         "width": 2560,
     }
     for name, t in dict(x=table[:rows], w=w, res=res, out=out).items():
-        c[name] = store(c["name"] + "-" + name, t)
+        c[name] = store(t)
     report["cases"].append(c)
+report["rope_cache_source"] = (
+    "vllm/model_executor/layers/rotary_embedding/base.py:89-112 and "
+    "linear_scaling_rope.py:107-127; executing Gemma3 layer buffers on gfx1100"
+)
+report["rope_cache"] = []
+torch.set_default_device("cuda")
+with set_current_vllm_config(VllmConfig()):
+    for name, base, factor, positions in [
+        ("local", 10000.0, 1.0, [0, 42, 53, 64, 86, 106, 518, 1207, 4095, 131071]),
+        ("global", 1000000.0, 8.0, [0, 82, 107, 212, 518, 1207, 4095, 131071, 1048575]),
+    ]:
+        if factor == 1.0:
+            rope = RotaryEmbedding(256, 256, 131072, base, True, torch.bfloat16)
+        else:
+            rope = LinearScalingRotaryEmbedding(
+                256, 256, 131072, base, True, factor, torch.bfloat16
+            )
+        sample = rope.cos_sin_cache[positions].contiguous()
+        report["rope_cache"].append(
+            dict(
+                name=name,
+                base=base,
+                factor=factor,
+                positions=positions,
+                **store(sample),
+            )
+        )
+report["data_file"] = "cases.bin"
+report["data_bytes"] = len(payload)
+(dst / report["data_file"]).write_bytes(payload)
 (dst / "manifest.json").write_text(json.dumps(report, indent=2) + "\n")
 print("EXPORTED", len(report["cases"]), flush=True)

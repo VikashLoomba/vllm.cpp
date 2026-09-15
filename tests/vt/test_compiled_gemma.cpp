@@ -27,6 +27,18 @@ std::vector<char> Read(const Path& path) {
   REQUIRE(f.good());
   return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
 }
+struct FixtureBundle {
+  const Json manifest = Json::parse(Read(fixtures / "manifest.json"));
+  const std::vector<char> data = Read(fixtures / manifest.at("data_file").get<std::string>());
+  FixtureBundle() { REQUIRE(data.size() == manifest.at("data_bytes").get<size_t>()); }
+  std::vector<char> Slice(const Json& entry) const {
+    const auto offset = entry.at("offset").get<size_t>();
+    const auto size = entry.at("bytes").get<size_t>();
+    REQUIRE(offset <= data.size());
+    REQUIRE(size <= data.size() - offset);
+    return {data.begin() + offset, data.begin() + offset + size};
+  }
+};
 struct Storage {
   vt::Backend& backend;
   vt::Queue q;
@@ -38,8 +50,8 @@ struct Storage {
     for (void* p : allocations) backend.Free(p);
     backend.DestroyQueue(q);
   }
-  vt::Tensor Upload(const Json& entry, bool poison) {
-    auto bytes = Read(fixtures / entry.at("file").get<std::string>());
+  vt::Tensor Upload(const FixtureBundle& bundle, const Json& entry, bool poison) {
+    auto bytes = bundle.Slice(entry);
     const auto shape = entry.at("shape").get<std::vector<int64_t>>();
     const auto dtype = entry.at("dtype") == "torch.int64" ? vt::DType::kI64 : vt::DType::kBF16;
     size_t size = vt::SizeOf(dtype);
@@ -72,8 +84,8 @@ struct Storage {
   }
 };
 void Run(vt::DeviceType device) {
-  const auto bytes = Read(fixtures / "manifest.json");
-  const auto manifest = Json::parse(bytes);
+  const FixtureBundle bundle;
+  const auto& manifest = bundle.manifest;
   REQUIRE(manifest.at("pin") == "e126687a9a828d513c01a07cd69f025f27d63280");
   REQUIRE(manifest.at("cases").size() == 7);
   for (const auto& c : manifest.at("cases")) {
@@ -83,10 +95,11 @@ void Run(vt::DeviceType device) {
     Storage s(device);
     std::map<std::string, vt::Tensor> t;
     for (auto it = c.begin(); it != c.end(); ++it) {
-      if (!it.value().is_object() || !it.value().contains("file")) continue;
+      if (!it.value().is_object() || !it.value().contains("offset")) continue;
       const std::string key = it.key();
-      t.emplace(key, s.Upload(it.value(), key.starts_with("out") || key == "res" || key == "qo" ||
-                                              key == "ko"));
+      t.emplace(key,
+                s.Upload(bundle, it.value(),
+                         key.starts_with("out") || key == "res" || key == "qo" || key == "ko"));
     }
     std::vector<std::string> outputs;
     if (kind == "sandwich") {
@@ -143,7 +156,7 @@ void Run(vt::DeviceType device) {
     for (const auto& name : outputs) {
       INFO(name);
       const auto got = s.Download(t.at(name));
-      const auto expected_bytes = Read(fixtures / c.at(name).at("file").get<std::string>());
+      const auto expected_bytes = bundle.Slice(c.at(name));
       REQUIRE(got.size() * 2 == expected_bytes.size());
       std::vector<uint16_t> expected(got.size());
       std::memcpy(expected.data(), expected_bytes.data(), expected_bytes.size());
@@ -165,9 +178,11 @@ TEST_CASE("compiled Gemma frozen primary expressions on ROCm") {
 #ifdef VLLM_CPP_HIP
 TEST_CASE("Gemma device RoPE caches match the executing primary") {
   REQUIRE(vt::rocm::DeviceAvailable());
-  const auto manifest = Json::parse(Read(fixtures / "rope-cache.json"));
+  const FixtureBundle bundle;
+  const auto& manifest = bundle.manifest;
   REQUIRE(manifest.at("pin") == "e126687a9a828d513c01a07cd69f025f27d63280");
-  for (const auto& c : manifest.at("cases")) {
+  REQUIRE(manifest.at("rope_cache").size() == 2);
+  for (const auto& c : manifest.at("rope_cache")) {
     INFO(c.at("name"));
     Storage s(vt::DeviceType::kROCM);
     const auto positions = c.at("positions").get<std::vector<int64_t>>();
@@ -190,7 +205,7 @@ TEST_CASE("Gemma device RoPE caches match the executing primary") {
     vt::RopeCosSinCache(s.q, cache, pos, args);
     vt::CastBf16(s.q, narrowed, cache);
     const auto got = s.Download(narrowed);
-    const auto expected = Read(fixtures / c.at("file").get<std::string>());
+    const auto expected = bundle.Slice(c);
     REQUIRE(got.size() * sizeof(uint16_t) == expected.size());
     CHECK(std::memcmp(got.data(), expected.data(), expected.size()) == 0);
   }

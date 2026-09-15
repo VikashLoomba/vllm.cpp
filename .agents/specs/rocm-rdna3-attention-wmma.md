@@ -18,11 +18,11 @@ The WMMA path passes the unchanged expanded 256-token gate after repairing
 compiled Gemma arithmetic, device RoPE caches, and attention accumulation.
 Default admission and both cache-block gates pass. Three alternating pairs
 measure 1.149x median model prefill versus scalar, with zero attention spills.
-The default remains on. Scalar expanded-token differences and full-model
-decode/latency/host-memory gaps remain explicit in the measured report.
-The host preflight passes its executed checks, including 642 translation
-units. Supplemental checks resolve the applicable skips. PR #3195 is ready
-for independent human review. The row stays ACTIVE until the work lands.
+The default remains on. The developer rejects stopping with locally fixable
+RDNA3 gaps. Scalar expanded-token differences, decode latency, host memory,
+and checkpoint-dependent regression tests remain implementation obligations.
+PR #3195 stays open during these repairs. Independent human review remains
+due after the final gates. The row stays ACTIVE until the work lands.
 [Measured report](../../docs/bench-evidence/rocm-rdna3-attention-wmma/README.md).
 
 ## Scope
@@ -81,6 +81,34 @@ hashes and exported tensor hashes. This is a harness adaptation, not a loader
 change or a newly claimed multimodal capability.
 
 ## Gates
+
+### Complete the local RDNA3 gates (15 September 2026)
+
+ISSUE-LOCAL-01M2HQEEXHD2B0BT3N71HQ0CRZ owns this continuation. Preserve the
+original and expanded workloads, both cache block sizes, and strict tokens.
+The scalar override must remain a real scalar control. Identify its first
+arithmetic difference against captured primary attention before changing it.
+Probe hardware accumulation with fixed operands when reduction order alone
+does not explain the result. Preserve failed candidates and intermediate bytes.
+
+Trace the expanded block-16 workload on both engines with rocprofv3. Separate
+initialization, prefill, and matching decode steps before ranking costs.
+The current decoder launches the 512-thread prefill kernel for one query.
+Investigate a dedicated decode realization through the existing attention seam,
+retaining the primary's tile boundaries, accumulation, and BF16 stores.
+Use new hardware-specific files for new kernels. Measure graph execution,
+launch gaps, and GEMM costs before attributing the full-model deficit.
+
+Inspect host allocation lifetimes, including unused CPU RoPE caches and source
+weight mappings. Remove redundant allocations without changing resident tensor
+ownership or other backend behavior. Compare equal workload and KV capacity.
+Download the authorized Gemma 1B checkpoint and execute the existing regression
+bodies. Keep external hardware limits separate from local implementation work.
+
+Capture a failing focused case for each repair, then require focused green,
+unchanged model tokens, compiled resources, and repeated idle performance.
+Resolve the current main conflict and rerun applicable gates before publishing.
+Do not accept a documented local failure as task completion.
 
 ### Expanded-gate repair design (15 September 2026)
 

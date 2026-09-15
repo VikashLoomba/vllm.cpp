@@ -110,6 +110,33 @@ unchanged model tokens, compiled resources, and repeated idle performance.
 Resolve the current main conflict and rerun applicable gates before publishing.
 Do not accept a documented local failure as task completion.
 
+### Gemma decode graph design (15 September 2026)
+
+The matched Release trace now places 1054 native attention calls at 197.761 us
+median versus 200.582 us in the primary. The full decode span still exceeds
+the primary: 580.720 ms versus 557.097 ms. Native kernels occupy 509.813 ms
+versus 501.899 ms. The remaining launch gaps require graph execution.
+
+Extend the platform's architecture-aware graph policy without changing its
+existing unqualified answer. Admit only the tested linear-RoPE Gemma3,
+gfx1100, one-request, one-query decode path. Keep prefill and other models on
+their current execution routes. Honor the shared graph kill switch.
+Use `vt::GraphCaptureScope` in full mode and `vt::BreakableGraph` for lifetime,
+replay, and errors. Reuse the existing layer forward; never duplicate its
+arithmetic. Keep embedding and input refresh outside capture. Own stable
+metadata and device inputs for the graph lifetime. Warm the exact region,
+measure pool demand, and pin its scratch so an intervening prefill cannot
+reuse a captured address. Reset before changing captured shapes or KV owners.
+Propagate capture failures; unexecuted graph outputs cannot become logits.
+
+The unchanged 96-token and expanded 256-token gates must pass with graph
+replay and its eager control at cache blocks 16 and 32. The expanded sequence
+alternates request lengths and crosses the sliding-window boundary. Trace
+actual graph launches and kernel dispatches, and test repeated request reuse,
+cache-table shape changes, graph opt-out, and captured scratch ownership.
+Repeat idle performance after exact outputs. This remains part of
+ISSUE-LOCAL-01M2HQEEXHD2B0BT3N71HQ0CRZ and the same reviewable MR.
+
 ### Expanded-gate repair design (15 September 2026)
 
 The developer requests resolving the opt-in blockers and publishing a ready MR.

@@ -259,3 +259,31 @@ The ten array cases use five warm-up calls and 1000 timed calls per process,
 with three alternating pairs. Outputs repeat byte-for-byte against the final
 correctness captures. Every case improves, from **1.12× to 2.92×**.
 [Per-case timings and every repeat](release-kernel-performance.json).
+
+
+## Repository checks and disposition
+
+The [full host preflight](review-preflight-host.txt) exits zero with no failed
+checks. All **642 of 642** affected host translation units compile.
+The compile check covers syntax and semantics. The separate HIP build, physical
+tests, and public runs supply linking and execution evidence.
+
+The sweep reports twelve skips. The seven NumPy suites pass separately in an
+isolated host environment. [Commands and results](review-numpy-gates.json).
+Five unrelated CLIP-checkpoint subcases remain unavailable and are not passes.
+The [CPU ISA audit](release-cpu-isa.txt) and
+[path classification](review-pr-classification.txt) pass with their required
+arguments. ARM ISA, CUDA fat-gencode, and Triton AOT packaging checks are
+narrowly inapplicable to this change's build configuration. CUDA execution of
+the positive-factor cache branch is unverified on this ROCm host.
+[Exact gate disposition](review-gate-disposition.json).
+
+An earlier audit selected a Python environment created inside the oracle
+container. Its package links were unavailable on the host. That run was
+terminated and retained. The normal host interpreter supplies the completed
+preflight result. No checker, baseline, or test obligation was weakened.
+
+Default gfx1100 admission, primary token correctness, production reachability,
+resource checks, and scalar/WMMA prefill A/B are satisfied. Expanded scalar
+fallback parity and full-model decode/latency/host-memory parity remain failing
+axes in the owning issue. Independent human review is pending at the MR.

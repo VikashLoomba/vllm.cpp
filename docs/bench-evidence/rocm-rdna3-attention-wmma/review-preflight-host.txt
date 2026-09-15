@@ -1,0 +1,189 @@
+Session role:
+  ok   role=operator row=BACKEND-ROCM-RDNA3-WMMA-ATTN session=ppid:724590 branch=row/BACKEND-ROCM-RDNA3-WMMA-ATTN
+Record gates:
+  ok   check-conflict-markers
+  ok   check-prompt-contract
+  ok   check-agent-record
+  ok   check-release-binary-contract
+  ok   check-release-workflow
+  ok   check-windows-release-state
+  ok   check-container-matrix
+  ok   check-container-workflow
+  ok   check-build-runtime-deps
+  ok   check-lease-ccache
+  ok   claim-view
+  ok   check-readme-structure
+  ok   check-quickstart-recipes
+  ok   check-benchmark-index
+  ok   check-model-checklist
+  ok   check-supported-models
+  ok   check-env-doc
+  ok   check-fusion-consistency
+  ok   check-attention-rung-consistency
+  ok   check-fp4-resident-consistency
+  ok   check-cuda-op-arch-gate
+  ok   check-rocm-dp4a-intrinsic
+  ok   check-runner-routing-consistency
+  ok   check-surface-coverage
+  ok   check-test-registration
+  ok   check-snapshot-pins
+  ok   check-oracle-pins
+  ok   check-oracle-denominator-flags
+  ok   check-now-current
+  ok   check-gate-commands
+  ok   check-symbol-anchors
+  ok   ready-for-helper
+  ok   upstream-inventory
+  ok   audit-live-rows
+Mutation suites:
+  ok   test_check_prompt_contract
+  ok   test_agent_gates
+  ok   test_agent_record
+  ok   test_check_release_binary_contract
+  ok   test_release_manifest
+  ok   test_release_archive
+  ok   test_release_pipeline
+  ok   test_check_windows_release_state
+  ok   test_release_postpublish_audit
+  ok   test_check_container_matrix
+  ok   test_check_container_workflow
+  ok   test_check_build_runtime_deps
+  ok   test_check_lease_ccache
+  ok   test_validate_container_image
+  ok   test_release_index
+  ok   test_release_metadata
+  ok   test_release_accelerator_metadata
+  ok   test_release_macos_metadata
+  ok   test_release_windows_metadata
+  ok   test_cpu_release_gates
+  ok   test_agent_role
+  ok   test_agent_onboard
+  ok   test_agent_start
+  ok   test_gate_bringup
+  ok   test_env_agnostic_tooling
+  ok   test_claim_view
+  ok   test_upstream_inventory
+  ok   test_check_readme_structure
+  ok   test_check_quickstart_recipes
+  ok   test_check_benchmark_index
+  ok   test_check_model_checklist
+  ok   test_check_supported_models
+  ok   test_check_env_doc
+  ok   test_checker_text
+  ok   test_check_fusion_consistency
+  ok   test_check_attention_rung_consistency
+  ok   test_check_fp4_resident_consistency
+  ok   test_check_cuda_op_arch_gate
+  ok   test_check_rocm_dp4a_intrinsic
+  ok   test_rocm_rank_kernels
+  ok   test_check_runner_routing_consistency
+  ok   test_check_surface_coverage
+  ok   test_check_test_registration
+  ok   test_check_snapshot_pins
+  ok   test_check_oracle_pins
+  ok   test_cpu_x86_llamacpp_floor
+  ok   test_audit_live_rows
+  ok   test_check_gate_commands
+  ok   test_gpu_lock_one_truth
+  ok   test_main_baseline
+  ok   test_agent_preflight_skip_report
+  ok   test_agent_pr_body
+  ok   test_agent_issue_index
+  ok   test_check_symbol_anchors
+  ok   test_check_oracle_denominator_flags
+  ok   test_rocm_quant_gather_compare
+  ok   test_rocm_strix_ourarm_staged
+  ok   test_tokengate_buildreq
+  ok   test_check_conflict_markers
+  ok   test_check_tree_compiles
+  ok   test_prepush_checker_names
+  ok   test_ab_arms_differ
+  ok   test_variadic_harness
+  ok   test_ltx25_pixel_ab_harness
+  ok   test_ltx2_dit_attn_knob_arms
+  ok   test_ltx25_ab_memwatch
+  ok   test_ltx2_oracle_goldens
+  ok   test_ltx2_latent_dump
+  ok   test_tower_skip_rss_report
+  ok   test_tower_skip_rss_arm
+  ok   test_ci_walk_base
+  ok   test_rc_stage_checkpoint
+  ok   test_sglang_lease_identity
+  ok   test_q4exp_layerfp_diff
+  SKIP test_qwen3_capture_tools
+         PENDING: numpy is not importable. CI installs python3-numpy for these capture suites.
+  SKIP test_qwen3_capture_outputs
+         PENDING: numpy is not importable. CI installs python3-numpy for these capture suites.
+  SKIP test_ltx25_render_compare
+         numpy is not importable here, and the tool this suite exercises needs it. CI installs python3-numpy and runs the same suite.
+  SKIP test_ltx25_absolute_reference
+         numpy is not importable here, and the tool this suite exercises needs it. CI installs python3-numpy and runs the same suite.
+  SKIP test_ltx25_prompt_adherence
+         numpy is not importable here, and the tool this suite exercises needs it. CI installs python3-numpy and runs the same suite.
+  SKIP test_ltx25_adherence_detail_loss
+         numpy is not importable here, and every case computes over arrays. CI installs python3-numpy and runs the same suite.
+  SKIP test_convert_glm5_next_gguf
+         numpy is not importable here, and the converter this suite exercises needs it. CI installs python3-numpy and runs the same suite.
+  ok   test_check_windows_portability
+  ok   trailer suites
+  ok   commit style suites
+  ok   tools suites
+  SKIP check-arm-isa-build.py
+         needs arguments preflight does not supply: usage: check-arm-isa-build.py [-h] --compile-commands COMPILE_COMMANDS
+  ok   check-attention-rung-consistency.py
+  ok   check-benchmark-index.py
+  ok   check-build-runtime-deps.py
+  ok   check-conflict-markers.py
+  ok   check-container-matrix.py
+  ok   check-container-workflow.py
+  SKIP check-cpu-isa-build.py
+         needs arguments preflight does not supply: usage: check-cpu-isa-build.py [-h] --compile-commands COMPILE_COMMANDS
+  SKIP check-cuda-fat-gencode.py
+         needs arguments preflight does not supply: usage: check-cuda-fat-gencode.py [-h] --compile-commands COMPILE_COMMANDS
+  ok   check-cuda-op-arch-gate.py
+  ok   check-device-leakage.py
+  ok   check-dsv4-gguf-namemap.py
+  ok   check-env-doc.py
+  ok   check-fp4-resident-consistency.py
+  ok   check-fusion-consistency.py
+  ok   check-gate-commands.py
+  ok   check-gemv-invocation-consistency.py
+  ok   check-lease-ccache.py
+  ok   check-model-checklist.py
+  ok   check-oracle-denominator-flags.py
+  ok   check-oracle-pins.py
+  SKIP check-pr-size.py
+         needs arguments preflight does not supply: usage: check-pr-size.py [-h] --base BASE --head HEAD [--branch BRANCH]
+  ok   check-prompt-contract.py
+  ok   check-quickstart-recipes.py
+  ok   check-readme-structure.py
+  ok   check-release-binary-contract.py
+  ok   check-release-workflow.py
+  ok   check-rocm-dp4a-intrinsic.py
+  ok   check-runner-routing-consistency.py
+  ok   check-site.py
+  ok   check-snapshot-pins.py
+  ok   check-supported-models.py
+  ok   check-surface-coverage.py
+  ok   check-symbol-anchors.py
+  ok   check-test-registration.py
+  SKIP check-triton-aot-multiarch.py
+         needs arguments preflight does not supply: usage: check-triton-aot-multiarch.py [-h] --vendored-root VENDORED_ROOT
+  ok   check-windows-portability.py
+  ok   check-windows-release-state.py
+Committed range vs origin/main 8fa38fb5f1c90a627c996df83d6001912a71573d:
+  ok   now-current range
+Tree compiles:
+       compiling what this change reaches. A records-only change returns
+       at once; a wide header change can take minutes.
+  ok   tree-compiles
+         check-tree-compiles: 642 of 642 translation unit(s) in scope compiled (130.6s). This checks syntax and semantics only; it does not link, run, or leave the default host configuration.
+Commit trailers vs origin/main 8fa38fb5f1c90a627c996df83d6001912a71573d:
+  ok   commit-trailers
+  ok   commit-style
+Staged change:
+  ok   now-current --staged
+
+12 gate(s) SKIPPED: test_qwen3_capture_tools test_qwen3_capture_outputs test_ltx25_render_compare test_ltx25_absolute_reference test_ltx25_prompt_adherence test_ltx25_adherence_detail_loss test_convert_glm5_next_gguf check-arm-isa-build.py check-cpu-isa-build.py check-cuda-fat-gencode.py check-pr-size.py check-triton-aot-multiarch.py
+NOT a green preflight: a skipped gate reported nothing about this tree.
+Each reason is printed beside its SKIP above.

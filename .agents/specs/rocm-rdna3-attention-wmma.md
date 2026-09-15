@@ -20,7 +20,9 @@ Default admission and both cache-block gates pass. Three alternating pairs
 measure 1.149x median model prefill versus scalar, with zero attention spills.
 The default remains on. Scalar expanded-token differences and full-model
 decode/latency/host-memory gaps remain explicit in the measured report.
-Repository checks and independent human review complete the MR handoff.
+The host preflight passes its executed checks, including 642 translation
+units. Supplemental checks resolve the applicable skips. PR #3195 is ready
+for independent human review. The row stays ACTIVE until the work lands.
 [Measured report](../../docs/bench-evidence/rocm-rdna3-attention-wmma/README.md).
 
 ## Scope

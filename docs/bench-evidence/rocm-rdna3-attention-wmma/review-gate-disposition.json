@@ -1,0 +1,30 @@
+{
+  "product_head": "f034c48e48779f01c88f64b1b31981954b395f57",
+  "full_preflight_exit_code": 0,
+  "failed_checks": 0,
+  "translation_units": {
+    "passed": 642,
+    "total": 642
+  },
+  "raw_preflight_sha256": "abb733e4177b7ce750a5d1e65fe5199dbe56f721873d73c03d3c59283ce8dc3f",
+  "command": [
+    "env",
+    "GIT_CONFIG_GLOBAL=/dev/null",
+    "scripts/agent-preflight.sh",
+    "--staged",
+    "--quiet"
+  ],
+  "supplemental": "seven NumPy suites pass in format-env; CPU ISA and PR classification pass with their required arguments",
+  "narrowly_inapplicable": [
+    "ARM ISA build flags",
+    "CUDA fat-gencode flags",
+    "Triton AOT multiarch packaging"
+  ],
+  "unavailable": [
+    "five CLIP-checkpoint subcases in the unrelated LTX adherence suite",
+    "physical RDNA4 execution",
+    "old Gemma 1B checkpoint bodies",
+    "CUDA cache execution"
+  ],
+  "earlier_audit": "terminated after selecting a container-created Python environment with unavailable host package links; retained in raw evidence/review-preflight.log"
+}

@@ -1,0 +1,42 @@
+test_a_reference_changes_no_arm_to_arm_check (__main__.OneRenderOrTwo.test_a_reference_changes_no_arm_to_arm_check)
+#1743's checks keep their names, their values and their verdicts. ... ok
+test_with_b_and_a_reference_both_arms_are_judged (__main__.OneRenderOrTwo.test_with_b_and_a_reference_both_arms_are_judged) ... ok
+test_without_a_reference_nothing_absolute_is_checked (__main__.OneRenderOrTwo.test_without_a_reference_nothing_absolute_is_checked)
+#1854 as filed, and it must stay reachable: no reference, no gate, and ... ok
+test_without_b_no_identity_alignment_or_coherence_check_is_emitted (__main__.OneRenderOrTwo.test_without_b_no_identity_alignment_or_coherence_check_is_emitted)
+The single-render path must not report a relative verdict it never ... ok
+test_a_control_without_b_is_refused_rather_than_ignored (__main__.ReferenceIdentity.test_a_control_without_b_is_refused_rather_than_ignored)
+`--control` calibrates a delta between two arms. With no arm B there is ... ok
+test_a_reference_whose_digest_is_absent_is_refused_and_never_compared (__main__.ReferenceIdentity.test_a_reference_whose_digest_is_absent_is_refused_and_never_compared)
+A reference a caller can point anywhere is not a reference. ... ok
+test_an_empty_digest_list_anchors_nothing_and_is_refused (__main__.ReferenceIdentity.test_an_empty_digest_list_anchors_nothing_and_is_refused) ... ok
+test_neither_b_nor_reference_is_refused_by_the_parser (__main__.ReferenceIdentity.test_neither_b_nor_reference_is_refused_by_the_parser) ... ok
+test_one_tampered_frame_is_enough_to_refuse_the_whole_reference (__main__.ReferenceIdentity.test_one_tampered_frame_is_enough_to_refuse_the_whole_reference)
+Every frame's digest is checked, not the first or a sample of them. ... ok
+test_a_different_reference_moves_the_bound (__main__.TheBoundIsTheReference.test_a_different_reference_moves_the_bound)
+The proof that the bound is READ rather than stored. Two references, ... ok
+test_the_ENFORCED_bound_moves_with_the_reference_not_only_the_reported_one (__main__.TheBoundIsTheReference.test_the_ENFORCED_bound_moves_with_the_reference_not_only_the_reported_one)
+THE HOLE A MUTATION FOUND, and the case that closes it. ... ok
+test_the_reported_bound_equals_the_references_own_per_frame_maximum (__main__.TheBoundIsTheReference.test_the_reported_bound_equals_the_references_own_per_frame_maximum)
+Computed here from the reference's pixels, with the tool's own ... ok
+test_only_blockiness_gates_and_the_rest_say_they_do_not (__main__.TheCommittedReference.test_only_blockiness_gates_and_the_rest_say_they_do_not)
+The panel must keep declaring which half decides anything. #1854 ... ok
+test_the_committed_mp4_is_admitted_by_the_default_digest_list (__main__.TheCommittedReference.test_the_committed_mp4_is_admitted_by_the_default_digest_list) ... ok
+test_the_default_digest_list_resolves_from_the_script_itself (__main__.TheCommittedReference.test_the_default_digest_list_resolves_from_the_script_itself)
+No ffmpeg needed. The path is built from the tool's own location, the ... ok
+test_a_block_flattened_render_fails_and_the_run_exits_one (__main__.TheGateFires.test_a_block_flattened_render_fails_and_the_run_exits_one)
+THE CASE THE WHOLE ROW IS FOR. Same fixtures, same reference, one ... ok
+test_a_clean_render_passes_both_blockiness_checks (__main__.TheGateFires.test_a_clean_render_passes_both_blockiness_checks) ... ok
+test_a_degenerate_REFERENCE_is_refused_rather_than_used (__main__.TheGateFires.test_a_degenerate_REFERENCE_is_refused_rather_than_used)
+The instrument's own precondition. A reference whose bands collapsed ... ok
+test_a_degenerate_render_fails_C0_before_any_bound_is_read (__main__.TheGateFires.test_a_degenerate_render_fails_C0_before_any_bound_is_read)
+A blank clip has no off-grid step either, so its blockiness number is ... ok
+test_a_pure_noise_render_PASSES_and_that_is_the_gates_limit (__main__.TheGateFires.test_a_pure_noise_render_PASSES_and_that_is_the_gates_limit)
+THE LIMIT, WRITTEN AS A TEST RATHER THAN AS A PARAGRAPH. ... ok
+test_the_fully_flattened_render_fails_the_DEFINEDNESS_check (__main__.TheGateFires.test_the_fully_flattened_render_fails_the_DEFINEDNESS_check)
+THE MUTE SWITCH THE GUARD EXISTS TO CLOSE. ... ok
+
+----------------------------------------------------------------------
+Ran 21 tests in 3.784s
+
+OK

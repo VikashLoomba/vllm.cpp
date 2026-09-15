@@ -1,0 +1,58 @@
+[
+  {
+    "test": "test_qwen3_capture_tools",
+    "exit_code": 0,
+    "command": [
+      "build-rdna3-attn/format-env/bin/python",
+      "tests/scripts/test_qwen3_capture_tools.py"
+    ]
+  },
+  {
+    "test": "test_qwen3_capture_outputs",
+    "exit_code": 0,
+    "command": [
+      "build-rdna3-attn/format-env/bin/python",
+      "tests/scripts/test_qwen3_capture_outputs.py"
+    ]
+  },
+  {
+    "test": "test_ltx25_render_compare",
+    "exit_code": 0,
+    "command": [
+      "build-rdna3-attn/format-env/bin/python",
+      "tests/scripts/test_ltx25_render_compare.py"
+    ]
+  },
+  {
+    "test": "test_ltx25_absolute_reference",
+    "exit_code": 0,
+    "command": [
+      "build-rdna3-attn/format-env/bin/python",
+      "tests/scripts/test_ltx25_absolute_reference.py"
+    ]
+  },
+  {
+    "test": "test_ltx25_prompt_adherence",
+    "exit_code": 0,
+    "command": [
+      "build-rdna3-attn/format-env/bin/python",
+      "tests/scripts/test_ltx25_prompt_adherence.py"
+    ]
+  },
+  {
+    "test": "test_ltx25_adherence_detail_loss",
+    "exit_code": 0,
+    "command": [
+      "build-rdna3-attn/format-env/bin/python",
+      "tests/scripts/test_ltx25_adherence_detail_loss.py"
+    ]
+  },
+  {
+    "test": "test_convert_glm5_next_gguf",
+    "exit_code": 0,
+    "command": [
+      "build-rdna3-attn/format-env/bin/python",
+      "tests/scripts/test_convert_glm5_next_gguf.py"
+    ]
+  }
+]

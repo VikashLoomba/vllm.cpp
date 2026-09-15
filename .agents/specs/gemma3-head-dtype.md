@@ -8,9 +8,10 @@ Integration: one pull request with the attention campaign, following repository 
 
 ## Now
 
-`SPIKE`. The broader attention workload exposes close-token differences.
+`ACTIVE`. The broader attention workload exposes close-token differences.
 Source inspection identifies a concrete model-format mismatch in the final
-projection. The user authorized correctness repairs and prohibits subagents.
+projection. The corrected projection passes 1510 focused assertions. Both
+tied and untied heads fail the new dtype assertion before correction. The user authorized correctness repairs and prohibits subagents.
 Independent human review remains due. This prerequisite has its own worktree.
 
 ## Scope and design
@@ -61,4 +62,4 @@ This worktree retains its focused red, green, and mutation receipts.
 
 | ID | Upstream source | Local anchor | Tests and evidence | Spec | State | Owner | Issue |
 |---|---|---|---|---|---|---|---|
-| `MODEL-GEMMA3-HEAD-DTYPE` | vLLM logits processor and sampler at e126687a9 | `Gemma3Model::Forward` | Gates above | [This spec](gemma3-head-dtype.md) | `SPIKE` | Codex, single-agent user direction | `ISSUE-LOCAL-01M2HPT4SGDCYZNAYH4VKBZJK4` |
+| `MODEL-GEMMA3-HEAD-DTYPE` | vLLM logits processor and sampler at e126687a9 | `Gemma3Model::Forward` | Gates above | [This spec](gemma3-head-dtype.md) | `ACTIVE` | Codex, single-agent user direction | `ISSUE-LOCAL-01M2HPT4SGDCYZNAYH4VKBZJK4` |

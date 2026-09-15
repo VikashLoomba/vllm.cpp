@@ -179,6 +179,25 @@ TEST_CASE("gemma3 forward: CPU synthetic runs, finite, deterministic") {
   CHECK(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
 }
 
+// vLLM e126687a9: LogitsProcessor._apply_head preserves BF16; the
+// sampler widens afterward. Both public float outputs must retain that round.
+TEST_CASE("gemma3 logits preserve model dtype before widening for sampling") {
+  const auto c = TinyConfig();
+  for (bool tied : {true, false}) {
+    auto w = TinyWeights(c);
+    w.tie_word_embeddings = tied;
+    if (!tied) w.lm_head = MakeBf16({c.hidden_size, c.vocab_size}, false, 900);
+    const auto logits = RunTinyForward(c, w);
+    REQUIRE(logits.size() == static_cast<size_t>(5 * c.vocab_size));
+    size_t non_bf16_values = 0;
+    for (float value : logits) {
+      REQUIRE(std::isfinite(value));
+      non_bf16_values += value != vt::BF16ToF32(vt::F32ToBF16(value));
+    }
+    CHECK_MESSAGE(non_bf16_values == 0, "tied=", tied);
+  }
+}
+
 TEST_CASE("gemma3 linear RoPE uses global scaling only on global layers") {
   auto c = TinyConfig();
   c.max_position_embeddings = 17;

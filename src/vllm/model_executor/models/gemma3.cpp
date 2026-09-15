@@ -353,11 +353,15 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     src = dgather.t();
   }
   const int64_t n_out = src.shape[0];
-  DBuf logits(d, DType::kF32, {n_out, vocab});
+  // vLLM LogitsProcessor._apply_head preserves the BF16 model dtype.
+  DBuf projected(d, DType::kBF16, {n_out, vocab});
   if (tied)
-    vt::MatmulBT(d.q, logits.t(), src, lm);
+    vt::MatmulBT(d.q, projected.t(), src, lm);
   else
-    vt::Matmul(d.q, logits.t(), src, lm);
+    vt::Matmul(d.q, projected.t(), src, lm);
+  // FP32 is the existing runner/sampler boundary, after the model-dtype round.
+  DBuf logits(d, DType::kF32, {n_out, vocab});
+  vt::CastF32(d.q, logits.t(), projected.t());
   return logits;
 }
 

@@ -237,10 +237,13 @@ architecture suite passes 17 cases and 120 assertions. The actual translation
 unit compiles for all three admitted targets. Removing admission or changing
 the gfx1100 default to enabled makes the policy tests fail.
 
-Full preflight retains the repository's argument-dependent checks and seven
+[Full preflight](preflight.txt) completes with zero failed gates and twelve
+skips. It retains the repository's argument-dependent checks and seven
 NumPy-dependent skips on the host Python. The seven NumPy suites pass in a
 separate isolated environment. Its five optional adherence-model subcases
 remain unavailable. The x86 ISA check passes against the actual compile
 commands. ARM, CUDA, and Triton AOT gates are narrowly inapplicable to this
-HIP-only change. PR classification is checked separately at publication.
+HIP-only change. [Path classification](classification.txt) passes separately. The initial
+commit-message paragraph errors were repaired without changing the source tree.
+The final trailer and style gates pass.
 This qualified result is not an all-green readiness claim.

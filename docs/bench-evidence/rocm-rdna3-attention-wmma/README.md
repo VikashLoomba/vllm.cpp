@@ -40,7 +40,7 @@ projects into BF16, as its running model confirms in the
 [dtype receipt](primary-head-dtype-retry.json). The correction uses BF16 output
 and widens it at the existing runner boundary. Tied and untied heads fail the
 new assertion before correction. All 1510 focused forward assertions pass
-[afterward](head-green.log), and the [mutation fails](head-mutation.json).
+[afterward](head-green.txt), and the [mutation fails](head-mutation.json).
 This repair fixes the original scalar tied-token difference. It does not
 resolve the expanded gate.
 
@@ -70,12 +70,12 @@ sampled values, not continuous maxima or equal-capacity tensor comparisons.
 
 | Gate | Observed result | Receipt |
 |---|---|---|
-| Architecture red/green | Three admission assertions fail before the guard change. Initial green: 16 cases, 97 assertions. Final policy: 17 cases, 120 assertions | [Red](arch-red.log), [initial green](arch-green.log), [final](arch-final.log) |
+| Architecture red/green | Three admission assertions fail before the guard change. Initial green: 16 cases, 97 assertions. Final policy: 17 cases, 120 assertions | [Red](arch-red.txt), [initial green](arch-green.txt), [final](arch-final.txt) |
 | Frozen physical P1 | 32,768 outputs, finite, zero tolerance violations, max absolute error 0.00390494 | Raw `wmma/` receipt |
 | Primary attention arrays | All 10 cases pass with WMMA enabled and disabled | [Enabled](primary-vs-on.json), [scalar](primary-vs-off.json) |
-| Linear rotary arrays | Twelve primary cases pass in both layouts and F32/BF16, including multiple factors | [Focused tests](rope-focused-tests.log) |
+| Linear rotary arrays | Twelve primary cases pass in both layouts and F32/BF16, including multiple factors | [Focused tests](rope-focused-tests.txt) |
 | Public real-model gate | Prompt lengths 122, 516, 1205. Each generates 32 exact greedy IDs | [Inputs](model-manifest.json), [final native](source-final-trace-wmma1.json), [primary](model-primary.json) |
-| Focused regressions | 13 registered suites pass | [CTest](source-final-ctest.log) |
+| Focused regressions | 13 registered suites pass | [CTest](source-final-ctest.txt) |
 | Mutations | Removing gfx1100 admission, the production launch, linear scaling, or sliding-cache selection fails | [Final guard/default](final-guard-mutations.json), [launch](mutation-launch.json), [rotary](rope-mutations.json) |
 
 The physical array extensions cover lengths 64, 79, 257, 1024, and 2048,
@@ -133,7 +133,7 @@ is not duplicated here. Its existing build object reports:
 [Metadata](quant-resources.json), [object identity](quant-object.json).
 Q4_K spills remain a tuning cost. The public quantized regression still passes
 all 1024 logits and its four generated IDs exactly against the scalar control.
-[Recheck](quant-public-recheck.log). This does not advance that PR's task oracle
+[Recheck](quant-public-recheck.txt). This does not advance that PR's task oracle
 pin or close its existing full-model performance gaps.
 
 ## Kernel timing

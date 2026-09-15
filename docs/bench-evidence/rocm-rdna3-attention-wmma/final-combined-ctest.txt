@@ -1,0 +1,32 @@
+Internal ctest changing into directory: /home/vikash/vllm.cpp-rdna3-wmma-attn/build-rdna3-attn
+Test project /home/vikash/vllm.cpp-rdna3-wmma-attn/build-rdna3-attn
+      Start  10: test_hf_config
+ 1/13 Test  #10: test_hf_config ..................................   Passed    0.20 sec
+      Start 156: test_gemma3_load
+ 2/13 Test #156: test_gemma3_load ................................   Passed    0.18 sec
+      Start 157: test_gemma3_forward
+ 3/13 Test #157: test_gemma3_forward .............................   Passed    0.30 sec
+      Start 375: test_rotary_embedding
+ 4/13 Test #375: test_rotary_embedding ...........................   Passed    0.20 sec
+      Start 376: test_linear_scaling_rope
+ 5/13 Test #376: test_linear_scaling_rope ........................   Passed    0.24 sec
+      Start 513: test_backend_cross_device
+ 6/13 Test #513: test_backend_cross_device .......................   Passed   17.02 sec
+      Start 514: test_backend_cross_device_vt_attn_decode_d128
+ 7/13 Test #514: test_backend_cross_device_vt_attn_decode_d128 ...   Passed    0.40 sec
+      Start 515: test_rocm_arch
+ 8/13 Test #515: test_rocm_arch ..................................   Passed    0.18 sec
+      Start 521: test_ops_paged_attn_sharedk_wmma_p1
+ 9/13 Test #521: test_ops_paged_attn_sharedk_wmma_p1 .............   Passed    0.22 sec
+      Start 525: test_rocm_backend
+10/13 Test #525: test_rocm_backend ...............................   Passed    0.73 sec
+      Start 674: test_ops_paged_attn
+11/13 Test #674: test_ops_paged_attn .............................   Passed    0.20 sec
+      Start 675: test_paged_attn_route
+12/13 Test #675: test_paged_attn_route ...........................   Passed    0.18 sec
+      Start 676: test_ops_paged_attn_dtype
+13/13 Test #676: test_ops_paged_attn_dtype .......................   Passed    0.21 sec
+
+100% tests passed, 0 tests failed out of 13
+
+Total Test time (real) =  20.30 sec

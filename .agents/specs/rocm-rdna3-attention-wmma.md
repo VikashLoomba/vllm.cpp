@@ -1,0 +1,118 @@
+# Enable rocWMMA attention prefill on gfx1100
+
+Row: `BACKEND-ROCM-RDNA3-WMMA-ATTN`.
+Parent: `BACKEND-ROCM`.
+Issue: `ISSUE-LOCAL-01M2HK0GFJDRXXAAA8F0014XQQ`.
+Base: `31509d91f`.
+Integration: one pull request, following the repository default.
+
+## Now
+
+`SPIKE`. The developer requests architecture admission, correctness, compiled
+resource inspection, performance measurement, and end-to-end validation.
+The developer explicitly forbids subagents for this task. This session performs
+implementation and validation. Independent human review remains due at the MR.
+The existing quantized admission is separately implemented in PR #3187.
+
+## Scope
+
+Admit gfx1100 to the existing BF16 SharedK rocWMMA attention prefill kernel.
+Preserve the current gfx1200 and gfx1201 behavior. Keep other gfx11 targets
+excluded. Preserve head dimension 256, query-to-KV head ratio two, one request,
+at least 64 query tokens, BF16 buffers, and the existing scalar override.
+Do not enable the deferred dimension-512 WMMA arm or alter quantized dispatch.
+The quantized implementation in PR #3187 remains a separate reviewed change.
+
+## Sources and design
+
+The local implementation is
+`src/vt/rocm/rocm_paged_attn.hip::PagedAttnPrefillSharedKWmma`.
+Its 16 by 16 by 16 BF16 fragments accumulate FP32 through rocWMMA's public
+load, multiply, and store operations. Consumers read ordinary shared-memory
+matrices. They do not index the hardware fragment register representation.
+Installed rocWMMA 2.2.1 provides the corresponding gfx1100 operation in
+`internal/wmma_impl.hpp`, using the gfx11 BF16 wave32 builtin.
+
+Use a new attention-specific architecture predicate that accepts gfx1100 plus
+the existing gfx1200/gfx1201 predicate. Preserve the old predicate because
+quantized dispatch also uses it on this base. Admit gfx1100 at the device
+include guard and use the new predicate at the attention runtime launch guard.
+Neither guard alone supplies a working implementation.
+
+The primary pin is vLLM `e126687a9a828d513c01a07cd69f025f27d63280`.
+Read and execute `vllm/v1/attention/ops/prefix_prefill.py::context_attention_fwd`
+on identical exported Q/K/V, cache layouts, windows, lengths, and softcaps.
+Use the head-256, query/KV-ratio-two parameters from
+`tests/kernels/attention/test_prefix_prefill.py`. That suite uses F16 inputs.
+Record the BF16 input extension needed to exercise this existing BF16 kernel,
+and preserve the upstream reference and tolerances. Local fixtures cover 64 and nonmultiple-of-16 query
+lengths, causal and sliding masks, reordered blocks, and softcaps.
+
+The existing attention-parity spec records that WMMA arithmetic still owes a
+comparison with the primary. An architecture guard change does not discharge
+that debt. Capture any numeric difference, and repair only a demonstrated
+defect needed by this admission. Do not widen the correctness tolerance.
+All model-path buffers keep their existing BF16 format. FP32 accumulation
+remains the matrix operation's existing accumulation type.
+
+The real-model artifact is `unsloth/gemma-3-4b-it` at
+`bf46152c47f5dd20b896357cb51abc4c03b8ee8c`. It has eight query heads, four KV
+heads, and head dimension 256. Its two BF16 shards contain a multimodal wrapper.
+For the text-only public entry point, export only `language_model.*` tensors,
+remove that prefix, and flatten `text_config` to `Gemma3ForCausalLM`.
+Preserve every retained tensor's bytes and all text configuration values.
+Run the primary with the identical exported artifact. Record original shard
+hashes and exported tensor hashes. This is a harness adaptation, not a loader
+change or a newly claimed multimodal capability.
+
+## Gates
+
+1. Before admission, the CPU predicate case rejects the requested gfx1100
+   target and a physical production-dispatch witness fails to observe WMMA.
+2. Compile the actual translation unit for gfx1100. Inspect generated ISA for
+   BF16 WMMA and record VGPR count, spills, private bytes, and LDS bytes for
+   the production specialization. Compile gfx1200 and gfx1201 as controls.
+   A spill is measured debt, not an assumed architecture incompatibility.
+3. Run the existing frozen SharedK fixture through `vt::PagedAttention` and
+   compare finite output against its declared oracle. Extend physical cases
+   through the same entry point for tails and masks. Run enabled and disabled
+   controls in separate processes because the environment is cached.
+4. Execute the pinned primary on the same arrays. Record absolute errors,
+   output dtypes, and tolerance verdicts. Preserve every failed attempt.
+5. Enter through the public load/completion API using a deterministic model
+   fixture and a pinned real Gemma 3 4B text checkpoint. Trace the call site,
+   compare generated IDs, and retain logits when tokens differ. The user
+   authorized downloading weights on 14 September 2026. Do not claim a
+   synthetic fixture establishes full-checkpoint correctness.
+6. After correctness, run same-binary scalar/WMMA comparisons on an idle local
+   RX 7900 XTX under `/home/vikash/gpu.lock`. Alternate order across repeats.
+   Record prefill and decode rates, latency, memory, clock samples, and boot ID.
+   Trace both primary and native with rocprofv3. Below-floor axes remain gaps.
+7. Run CPU architecture tests, the HIP attention and cross-device tests, and
+   full preflight. Qualify baseline skips and failures. Mutate admission and
+   the production launch in a scratch copy and prove the focused gate fails.
+   This session's mutation checks do not claim independent review.
+
+## Risks and stop conditions
+
+rocWMMA's gfx11 fragments need more input registers than gfx12 fragments.
+Compilation can succeed yet spill or reduce occupancy. Shared-memory and
+barrier assumptions need physical execution. BF16 arithmetic can change token
+selection even when a float reference tolerance passes.
+Keep the gfx1100 default disabled if correctness fails or the measured path
+regresses. Record the exact failure and required repair. Do not hide a failure
+behind a skipped test, a CPU fallback, or a model that misses the call site.
+Do not merge without independent review. Prepare a reviewable MR only after
+the stated end-to-end gate passes, or report the measured blocker precisely.
+
+## Evidence
+
+Store concise receipts under `docs/bench-evidence/rocm-rdna3-attention-wmma/`.
+Retain full logs, arrays, traces, compiler output, source hashes, commands,
+checkpoint provenance, and return codes in the task's ignored build directory.
+
+## Row inventory
+
+| ID | Upstream source | Local anchor | Tests and evidence | Spec | State | Owner | Issue |
+|---|---|---|---|---|---|---|---|
+| `BACKEND-ROCM-RDNA3-WMMA-ATTN` | vLLM prefix prefill at e126687a9a; rocWMMA 2.2.1 gfx11 BF16 | `PagedAttnPrefillSharedKWmma` | Gates in this spec | [This spec](rocm-rdna3-attention-wmma.md) | `SPIKE` | Codex, single-agent user direction | `ISSUE-LOCAL-01M2HK0GFJDRXXAAA8F0014XQQ` |

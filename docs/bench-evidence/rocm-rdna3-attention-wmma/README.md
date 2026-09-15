@@ -101,7 +101,8 @@ Primary source chain: `gemma3.py:159-189` selects rotary configuration and
 attention, `linear_scaling_rope.py:37-127` builds the rotary cache, and
 `prefix_prefill.py::context_attention_fwd` supplies the array reference.
 The softcap extension uses `triton_unified_attention.py::unified_attention`.
-Both real-model traces use rocprofv3. The primary trace contains
+Both real-model traces use rocprofv3: [native 1.3.5](native-profiler-version.txt)
+and [primary 1.3.2](primary-profiler-version.txt). The primary trace contains
 `kernel_paged_attention_2d`; the native trace contains the SharedK WMMA
 specialization. Whole-run kernel counts include initialization and graph
 capture and do not establish GEMM invocation parity.
@@ -204,12 +205,16 @@ cmake --build build-rdna3-attn -j4
 
 Compile `tools/rocm_attn_wmma/capture.cpp`, `model_capture.cpp`, and `bench.cpp`
 with C++20, the repository includes, whole-archive `libvllm.a`,
-`libblake3_vendored.a`, and the HIP/hipBLAS libraries. Exact compiler command
-arrays and environment snapshots accompany the raw evidence.
+`libblake3_vendored.a`, and the HIP/hipBLAS libraries. Exact compiler commands are retained for [array capture](attn-capture-final-build-command.json),
+[public capture](model-capture-final-build-command.json), and
+[benchmark capture](attn-warm-bench-build-command.json). Environment snapshots
+accompany the raw evidence.
 
 `primary.py generate` creates the array manifest. Run its `primary` mode with
 the pinned runtime, then `capture.cpp` under each explicit knob value.
-`primary.py compare` enforces the recorded tolerances. `model_primary.py`
+`primary.py compare` enforces the recorded tolerances. The final source binary
+passes all ten cases with [opt-in](source-final-optin-compare.json) and with
+the [default policy](source-final-default-compare.json). `model_primary.py`
 generates the original prompt IDs and captures primary outputs.
 `model_capture.cpp MODEL MANIFEST OUTPUT` uses only the public C ABI.
 `bench.cpp MODEL MANIFEST OUTPUT` runs the untimed warm-up and each distinct

@@ -184,10 +184,26 @@ bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
       // TT arm at all and kQ2_K/kQ3_K stay owed; admitting an encoding
       // without its kernel throws at first forward with the model resident,
       // the exact failure this predicate exists to prevent.
+      // QUANT-GGUF-IQ-TENSTORRENT wave 1: kIQ3_XXS joins the set — its
+      // on-core decode is the int8-dot kernel's enc_sel 4
+      // (kq_vec_dot_iq3_xxs_q8_K, keepquant_kernel_code.h), staged as the
+      // same resident i32 word shadow (32 words = 98 B zero-padded to
+      // 128 B), and dispatched on the DEFAULT path (no env gate — the
+      // grouped arm has no IQ3_XXS decode to fall through to). The APEX
+      // I-Nano vehicle's 164 IQ3_XXS tensors are the artifact this admits.
       // tests/vllm/test_gguf_keep_quant.cpp pins the set; widening the arm
       // without widening the kernel reds it.
+      // QUANT-GGUF-IQ-TENSTORRENT wave 2: kIQ2_XXS (enc_sel 5) and kIQ2_S
+      // (enc_sel 6) join the set the same way — on-core decodes
+      // kq_vec_dot_iq2_xxs_q8_K / kq_vec_dot_iq2_s_q8_K
+      // (keepquant_kernel_code.h), staged as the same resident i32 word
+      // shadow (32 words = 66 B / 82 B zero-padded to 128 B), dispatched on
+      // the DEFAULT path. The APEX I-Nano vehicle's 44 IQ2_XXS + 89 IQ2_S
+      // tensors are the artifacts this admits.
       return dt == vt::DType::kQ4_K || dt == vt::DType::kQ5_K ||
-             dt == vt::DType::kQ6_K || dt == vt::DType::kQ8_0;
+             dt == vt::DType::kQ6_K || dt == vt::DType::kQ8_0 ||
+             dt == vt::DType::kIQ3_XXS || dt == vt::DType::kIQ2_XXS ||
+             dt == vt::DType::kIQ2_S;
     default:
       // CUDA falls back to the CPU kernel for anything it lacks
       // (cuda_quant_dot.cu:1841-1846); the CPU list IS the CPU capability.

@@ -1253,6 +1253,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/layers/rotary_embedding/dynamic_ntk_alpha_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/dynamic_ntk_scaling_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/llama3_rope.cpp
+  src/vllm/model_executor/layers/rotary_embedding/linear_scaling_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/phi3_long_rope_scaled_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/mrope.cpp

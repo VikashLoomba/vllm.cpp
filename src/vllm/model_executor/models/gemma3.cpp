@@ -96,7 +96,7 @@ Gemma3Layout MakeLayout(const HfConfig& cfg) {
 DBuf Gemma3AttnBlock(Dev d, const Gemma3AttnWeights& w, const HfConfig& cfg,
                      const Tensor& dhn, const StepInputs& si,
                      const CommonAttentionMetadata& meta, const PagedKvCache& kv,
-                     int64_t T, double rope_base, float attn_scale,
+                     int64_t T, double rope_base, const OwnedTensor& rope_cache, float attn_scale,
                      std::optional<int64_t> sliding_window) {
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
@@ -147,7 +147,13 @@ DBuf Gemma3AttnBlock(Dev d, const Gemma3AttnWeights& w, const HfConfig& cfg,
   vt::RopeArgs ra;
   ra.base = static_cast<float>(rope_base);
   ra.rotary_dim = static_cast<int>(Dh);  // full rotary_dim = head_dim
-  vt::RopeNeox(d.q, q3, k3, si.positions.t(), ra);
+  if (cfg.rope_parameters.rope_type == "linear") {
+    VT_CHECK(!rope_cache.Empty(), "gemma3: linear RoPE requires its loaded cache");
+    Tensor cache = ResidentWeight(d, rope_cache);
+    vt::RopeFromCache(d.q, q3, &k3, si.positions.t(), cache, ra);
+  } else {
+    vt::RopeNeox(d.q, q3, k3, si.positions.t(), ra);
+  }
 
   // Write rope'd K + V into the paged cache. On the bf16 default (== cache dtype)
   // no cast; an f32 cache (CPU-synthetic A/B) down/up-casts K/V to match.
@@ -220,7 +226,7 @@ DBuf Gemma3MlpBlock(Dev d, const Gemma3MlpWeights& w, const HfConfig& cfg,
 //   mlp  = Mlp(dh2)
 //   hidden = gemmaNorm(mlp)                      # post_feedforward (standalone)
 void RunLayer(Dev d, const Gemma3LayerWeights& layer, const HfConfig& cfg,
-              const Gemma3Layout& g, int64_t l, DBuf& hidden, DBuf& res,
+              const Gemma3Layout& g, const OwnedTensor& rope_cache, int64_t l, DBuf& hidden, DBuf& res,
               const StepInputs& si, const CommonAttentionMetadata& meta,
               const PagedKvCache& kv, int64_t T) {
   const int64_t H = cfg.hidden_size;
@@ -244,7 +250,7 @@ void RunLayer(Dev d, const Gemma3LayerWeights& layer, const HfConfig& cfg,
   std::optional<int64_t> window;
   if (sliding) window = g.sliding_window;
   DBuf attn = Gemma3AttnBlock(d, layer.attn, cfg, dhn.t(), si, meta, kv, T,
-                              rope_base, g.attn_scale, window);
+                              rope_base, rope_cache, g.attn_scale, window);
 
   // post_attention_layernorm (STANDALONE GemmaRMSNorm, sandwich): attn = norm(attn).
   // NOT-FUSABLE onto kFusedAddRmsNorm — a sublayer-output post-norm with NO residual
@@ -317,7 +323,8 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   StepInputs si = BuildStepInputs(d, positions, attn_meta, config);
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
-    RunLayer(d, weights.layers[static_cast<size_t>(l)], config, g, l, hidden, res, si,
+    RunLayer(d, weights.layers[static_cast<size_t>(l)], config, g,
+             g.IsSliding(l) ? weights.rope_local : weights.rope_global, l, hidden, res, si,
              attn_meta, attn_kv[static_cast<size_t>(l)], T);
 
   // Final GemmaRMSNorm over the fused stream (res += hidden; gemma norm) via catalog.

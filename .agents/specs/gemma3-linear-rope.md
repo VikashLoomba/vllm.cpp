@@ -8,9 +8,17 @@ Integration: one pull request, following the repository default.
 
 ## Now
 
-`SPIKE`. The developer explicitly authorized this prerequisite after the
+`ACTIVE`. The developer explicitly authorized this prerequisite after the
 gfx1100 attention gate exposed the missing formula. No subagents may be used.
 This session implements and validates it; independent human review remains due.
+
+The linear leaf, config, loader, and model routing are implemented. The five
+focused suites pass, including twelve frozen primary cache/rotation cases.
+Removing scaling or routing sliding layers to the global cache makes the
+focused tests fail. The real 4B model loads; its scalar attention control differs
+from the primary at one exact tied-token position. Combining this prerequisite
+with the gfx1100 WMMA admission produces all 96 primary token IDs. Final source
+integration and the attention row's performance gate remain in progress.
 
 ## Problem and scope
 
@@ -80,4 +88,4 @@ under the task build directory. Add a concise tracked report before review.
 
 | ID | Upstream source | Local anchor | Tests and evidence | Spec | State | Owner | Issue |
 |---|---|---|---|---|---|---|---|
-| `MODEL-GEMMA3-LINEAR-ROPE` | vLLM linear rotary and Gemma 3 at e126687a9 | `get_rope`, `Gemma3AttnBlock` | Gates above | [This spec](gemma3-linear-rope.md) | `SPIKE` | Codex, single-agent user direction | `ISSUE-LOCAL-01M2HMDT8EB7WZGW7SXQ9RWJVW` |
+| `MODEL-GEMMA3-LINEAR-ROPE` | vLLM linear rotary and Gemma 3 at e126687a9 | `get_rope`, `Gemma3AttnBlock` | Gates above | [This spec](gemma3-linear-rope.md) | `ACTIVE` | Codex, single-agent user direction | `ISSUE-LOCAL-01M2HMDT8EB7WZGW7SXQ9RWJVW` |

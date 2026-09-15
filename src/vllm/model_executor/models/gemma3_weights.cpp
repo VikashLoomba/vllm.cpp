@@ -23,12 +23,14 @@
 #include "vllm/model_executor/models/gemma3.h"
 
 #include <string>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/layers/rotary_embedding/base.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
 #include "vt/dtype.h"
 
@@ -97,6 +99,29 @@ Gemma3Weights LoadGemma3ForCausalLMWeights(
            "gemma3: num_hidden_layers must be positive");
 
   Gemma3Weights w;
+  if (config.rope_parameters.rope_type == "linear") {
+    auto build_cache = [&](const RopeParameters& params) {
+      auto rope = get_rope(config.head_dim, config.max_position_embeddings,
+          /*is_neox_style=*/true, params, vt::DType::kBF16);
+      const auto cache = rope->cos_sin_cache();
+      OwnedTensor out;
+      out.dtype = vt::DType::kBF16;
+      out.rank = 2;
+      out.shape[0] = cache.shape[0];
+      out.shape[1] = cache.shape[1];
+      out.bytes.resize(cache.Bytes());
+      std::memcpy(out.bytes.data(), cache.data, cache.Bytes());
+      return out;
+    };
+    w.rope_global = build_cache(config.rope_parameters);
+    // gemma3.py:170-178: sliding layers override the global scaling and theta.
+    RopeParameters local;
+    const auto local_base = config.raw.find("rope_local_base_freq");
+    local.rope_theta = local_base != config.raw.end() && local_base->is_number()
+                           ? local_base->get<double>() : 10000.;
+    local.rope_dim = config.head_dim;
+    w.rope_local = build_cache(local);
+  }
   // Gemma ties embeddings by default (Gemma3TextConfig.tie_word_embeddings=True).
   w.tie_word_embeddings = RawBool(config.raw, "tie_word_embeddings", true);
 

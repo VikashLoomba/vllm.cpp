@@ -33,6 +33,7 @@
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/gemma3.h"
+#include "vllm/model_executor/layers/rotary_embedding/base.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -176,6 +177,43 @@ TEST_CASE("gemma3 forward: CPU synthetic runs, finite, deterministic") {
   for (float x : a) REQUIRE(std::isfinite(x));
   const std::vector<float> b = RunTinyForward(c, w);
   CHECK(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+}
+
+TEST_CASE("gemma3 linear RoPE uses global scaling only on global layers") {
+  auto c = TinyConfig();
+  c.max_position_embeddings = 17;
+  c.rope_parameters.rope_type = "linear";
+  c.rope_parameters.rope_theta = c.rope_theta;
+  c.rope_parameters.factor = 8.;
+  auto cache = [&](vllm::RopeParameters params) {
+    auto rope = vllm::get_rope(c.head_dim, c.max_position_embeddings, true,
+                               params, DType::kBF16);
+    const auto src = rope->cos_sin_cache();
+    vllm::OwnedTensor out;
+    out.dtype = DType::kBF16;
+    out.rank = 2;
+    out.shape[0] = src.shape[0];
+    out.shape[1] = src.shape[1];
+    out.bytes.resize(src.Bytes());
+    std::memcpy(out.bytes.data(), src.data, src.Bytes());
+    return out;
+  };
+  auto scaled = TinyWeights(c);
+  scaled.rope_global = cache(c.rope_parameters);
+  vllm::RopeParameters local;
+  local.rope_theta = 10000.;
+  scaled.rope_local = cache(local);
+  auto unscaled = scaled;
+  auto plain_global = c.rope_parameters;
+  plain_global.factor = 1.;
+  unscaled.rope_global = cache(plain_global);
+  CHECK(RunTinyForward(c, scaled) != RunTinyForward(c, unscaled));
+  // Every layer is now sliding. Changing only the global cache has no effect.
+  c.raw["sliding_window_pattern"] = 100;
+  CHECK(RunTinyForward(c, scaled) == RunTinyForward(c, unscaled));
+  auto wrong_local = scaled;
+  wrong_local.rope_local = scaled.rope_global;
+  CHECK(RunTinyForward(c, scaled) != RunTinyForward(c, wrong_local));
 }
 
 TEST_CASE("gemma3 forward: sqrt(hidden) embed-scale is applied (differs from unscaled)") {

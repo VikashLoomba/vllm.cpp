@@ -74,6 +74,9 @@ struct Gemma3LayerWeights {
 // (lm_head aliases embed_tokens; the checkpoint has no lm_head.weight).
 struct Gemma3Weights {
   bool tie_word_embeddings = true;
+  // BF16 caches for linear configurations; global is scaled, local is default.
+  OwnedTensor rope_global;
+  OwnedTensor rope_local;
   OwnedTensor embed_tokens;  // bf16 [vocab, H]  (embed lookup; NOT scaled)
   OwnedTensor final_norm;    // bf16 [H]  (model.norm, GemmaRMSNorm)
   OwnedTensor lm_head;       // bf16 [H, vocab] Matmul-B; EMPTY when tied

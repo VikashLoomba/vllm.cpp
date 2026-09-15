@@ -298,6 +298,31 @@ vllm_engine_load(&mp, &engine);
 
 `vllm-cli` takes the same `--kv-cache-dtype` flag the server takes.
 
+## Gemma 3 4B text weights
+
+The BF16 text loader accepts Gemma 3's linear RoPE configuration. Global layers
+use its configured scaling factor; sliding layers use unscaled local RoPE.
+The validated source is [unsloth/gemma-3-4b-it at
+bf46152c47f5dd20b896357cb51abc4c03b8ee8c](https://huggingface.co/unsloth/gemma-3-4b-it/tree/bf46152c47f5dd20b896357cb51abc4c03b8ee8c).
+
+| BF16 source file | Bytes | SHA-256 |
+|---|---:|---|
+| `model-00001-of-00002.safetensors` | 4,961,251,752 | `eb5fd5e97ddd07b56778733e9653c07312529cb00980a318fc3e1c4e3b5a8f1f` |
+| `model-00002-of-00002.safetensors` | 3,639,026,128 | `fdde0e5aa5ced0fa203b3d50f4ab78168b7e3a3e08c6349f5cc9326666e1bb13` |
+
+Download both shards and the configuration/tokenizer files from that revision.
+The source has a vision wrapper. Export its text tensors for the text loader:
+
+```sh
+python3 tools/gemma3_linear_rope/export_text.py /models/gemma3-4b-original /models/gemma3-4b-text
+vllm-cli --model /models/gemma3-4b-text --prompt "Explain how computer memory works." --max-tokens 32
+```
+
+The exporter checks the pinned shard hashes, preserves all retained tensor
+bytes and text parameters, and records output hashes. The resulting text
+weights contain 7,760,526,336 tensor bytes. This recipe covers BF16 safetensors;
+the Gemma 3 text loader does not provide a GGUF quantized arm or the vision tower.
+
 ## Disabling a model's sliding window
 
 Gemma-2, Gemma-3, Gemma-4, OLMo-2 and Muse-Glimmer apply a model-level sliding

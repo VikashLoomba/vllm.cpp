@@ -137,6 +137,23 @@ cache-table shape changes, graph opt-out, and captured scratch ownership.
 Repeat idle performance after exact outputs. This remains part of
 ISSUE-LOCAL-01M2HQEEXHD2B0BT3N71HQ0CRZ and the same reviewable MR.
 
+### Remaining decode launch costs (15 September 2026)
+
+The final block-16 comparison still owes about 0.38 ms per output token.
+The trace places the 262208-column greedy selector at 138.7 us on one
+256-thread block. Test a larger block for this low-batch gfx1100 shape,
+through `vt::GreedyArgmax`, retaining the existing comparison and lowest-index
+tie rule. Check ragged vocabularies, ties across lanes, BF16 and FP32 inputs,
+and the unchanged model continuations before accepting a speed result.
+
+The embedding wrapper allocates and frees its bounds record synchronously
+on every step. Keep its checked `vt::Embedding` contract and its position
+outside the decode graph. Test stream-ordered allocation, copy and release,
+with exception-safe cleanup. Preserve rejection of negative and upper-bound
+IDs, repeated calls after rejection, and both index widths. Retain either
+change only after its focused tests and repeated model measurements pass.
+These repairs belong to ISSUE-LOCAL-01M2HQEEXHD2B0BT3N71HQ0CRZ.
+
 ### Expanded-gate repair design (15 September 2026)
 
 The developer requests resolving the opt-in blockers and publishing a ready MR.

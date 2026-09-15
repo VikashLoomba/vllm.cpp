@@ -153,6 +153,15 @@ witness must require the new grid's two column groups, and static resources
 must stay spill-free for every admitted tile. Retain this partition only if
 repeated end-to-end measurements improve after exact model output.
 
+The output-column partition preserved all twenty exact fixtures but regressed
+block-16 decode to 64.06 and 60.86 tokens/s. Reject it. The next candidate
+computes QK for two consecutive key tiles in parallel waves, then processes
+the two original softmax/PV tiles in their original order. Pair tiles only
+for block sizes 16 and 32; retain one tile for block 64. QK coordinates are
+independent across keys. The candidate must preserve each score's D reduction,
+each online softmax update, and each PV accumulator's order. Apply the same
+exact-output, resource and repeated-model gates as the rejected partition.
+
 ### Remaining decode launch costs (15 September 2026)
 
 The final block-16 comparison still owes about 0.38 ms per output token.

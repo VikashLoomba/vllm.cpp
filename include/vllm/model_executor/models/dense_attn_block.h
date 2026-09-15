@@ -27,6 +27,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -34,12 +35,11 @@
 #include <vector>
 
 #include "vllm/model_executor/models/dense_device_glue.h"
-
-#include "vllm/model_executor/models/dense_nvfp4_gemm.h"   // NVFP4 W4A16 dispatch
-#include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/ActivePool (shared)
-#include "vllm/model_executor/models/kv_cache_route.h"  // KV-FP8 W3 store/read route
-#include "vllm/model_executor/models/qwen3.h"         // Qwen3DenseAttnWeights, PagedKvCache
-#include "vllm/model_executor/models/tensor_parallel.h"  // TensorParallel/TpAllReduceSum (W2)
+#include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // NVFP4 W4A16 dispatch
+#include "vllm/model_executor/models/device_pool.h"       // DevicePool/Pool/ActivePool (shared)
+#include "vllm/model_executor/models/kv_cache_route.h"    // KV-FP8 W3 store/read route
+#include "vllm/model_executor/models/qwen3.h"             // Qwen3DenseAttnWeights, PagedKvCache
+#include "vllm/model_executor/models/tensor_parallel.h"   // TensorParallel/TpAllReduceSum (W2)
 #include "vllm/platforms/interface.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"  // CommonAttentionMetadata
@@ -178,7 +178,10 @@ inline std::vector<float> WeightF32(const OwnedTensor& w) {
 
 // Device-resident raw-dtype view over an owned weight, uploaded ONCE (lazily) and
 // reused across every forward step (mirrors qwen3_5.cpp ResidentWeight).
-inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = {}) {
+// A generated cache can initialize its device storage with backend operations.
+// The callback runs only on the first device allocation. CPU uses host bytes.
+inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = {},
+                             const std::function<void(Tensor&)>& initialize = {}) {
   if (shape.empty()) shape.assign(w.shape, w.shape + w.rank);
   // HOST-POINTER ALIASING IS A CPU PROPERTY, NOT A "NOT-CUDA" PROPERTY.
   // This read `!is_cuda()`, which is true for kMETAL, kVULKAN and kXPU as well
@@ -239,10 +242,16 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
     // `w.bytes` borrows the safetensors mapping (ENG-LOAD-DIRECT-UPLOAD) the
     // source of this copy IS the file mapping, so the load moved the bytes once
     // rather than twice.
-    vllm::load_stats::AddDeviceUpload(nb);
-    d.b.Copy(d.q, p, w.bytes.data(), nb);
     Backend* bk = &d.b;
-    w.d_dev = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    auto owner = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    if (initialize) {
+      Tensor generated = w.ViewOn(p, d.q.device, shape);
+      initialize(generated);
+    } else {
+      vllm::load_stats::AddDeviceUpload(nb);
+      d.b.Copy(d.q, p, w.bytes.data(), nb);
+    }
+    w.d_dev = std::move(owner);
     // THE SOURCE PAGES ARE SPENT, AND THIS IS THE ARM QWEN4-EXP ACTUALLY TAKES.
     // The identical release landed first in `qwen3_5.cpp`'s own `ResidentWeight`
     // (the TU-local one, which shadows this function inside that file), and that

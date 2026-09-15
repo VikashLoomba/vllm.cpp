@@ -36,10 +36,10 @@ TEST_CASE("SharedK attention WMMA admits measured gfx1100 and retains gfx12") {
   CHECK_FALSE(vt::rocm::GcnArchNameIsGfx12PrefillWmma("gfx1100"));
 }
 
-TEST_CASE("SharedK gfx1100 WMMA requires opt-in until full model parity") {
+TEST_CASE("SharedK gfx1100 WMMA is enabled by default after full model parity") {
   using vt::rocm::SharedKAttentionWmmaEnabled;
   for (const char* arch : {"gfx1100", "gfx1100:xnack-"}) {
-    CHECK_FALSE(SharedKAttentionWmmaEnabled(arch, nullptr));
+    CHECK(SharedKAttentionWmmaEnabled(arch, nullptr));
     CHECK_FALSE(SharedKAttentionWmmaEnabled(arch, "0"));
     CHECK(SharedKAttentionWmmaEnabled(arch, "1"));
   }
@@ -52,6 +52,13 @@ TEST_CASE("SharedK gfx1100 WMMA requires opt-in until full model parity") {
     CHECK_FALSE(SharedKAttentionWmmaEnabled(arch, nullptr));
     CHECK_FALSE(SharedKAttentionWmmaEnabled(arch, "1"));
   }
+}
+
+TEST_CASE("Gemma matrix decode is admitted only on measured gfx1100") {
+  CHECK(vt::rocm::GcnArchNameHasGemmaDecodeWmma("gfx1100"));
+  CHECK(vt::rocm::GcnArchNameHasGemmaDecodeWmma("gfx1100:xnack-"));
+  for (const char* arch : {"gfx1101", "gfx1100junk", "gfx1151", "gfx1200", "gfx1201", ""})
+    CHECK_FALSE(vt::rocm::GcnArchNameHasGemmaDecodeWmma(arch));
 }
 
 namespace {

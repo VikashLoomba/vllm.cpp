@@ -23,8 +23,9 @@ int main(int argc, char** argv) {
     params.max_num_seqs = 1;
     params.max_model_len = 4096;
     params.max_num_batched_tokens = 4096;
-    params.block_size = 32;
-    params.num_blocks = 256;
+    params.block_size = manifest.value("block_size", 16);  // Pinned vLLM production default.
+    if (params.block_size <= 0) throw std::runtime_error("block_size must be positive");
+    params.num_blocks = (4096 + params.block_size - 1) / params.block_size;
     auto loaded = vllm::entrypoints::LoadedEngine::FromModelDir(argv[1], params);
     auto& engine = loaded->async_engine();
     const auto epoch = Clock::now();
@@ -51,6 +52,7 @@ int main(int argc, char** argv) {
     };
     const auto warmup = run(manifest.at("warmup"), 0);
     Json report = {{"cases", Json::array()}, {"warmup_output_token_ids", warmup.output_token_ids},
+                   {"block_size", params.block_size},
                    {"async_scheduling_enabled", loaded->async_scheduling_enabled()},
                    {"resolved_kv_cache_dtype", ResolvedKvCacheDTypeName(loaded->kv_cache_config())}};
     std::vector<double> ttfts, tpots, e2els;

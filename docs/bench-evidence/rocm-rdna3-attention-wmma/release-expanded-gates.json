@@ -1,0 +1,70 @@
+[
+  {
+    "label": "expanded16-default",
+    "native": "production-default-r0-wmmaNone.json",
+    "primary": "warm-diagnostic-primary.json",
+    "cases": [
+      {"name": "warmup", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique0", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique1", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique2", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique3", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique4", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique5", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique6", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique7", "exact": true, "first_difference": null, "output_count": 32}
+    ],
+    "passed": true
+  },
+  {
+    "label": "expanded16-scalar",
+    "native": "production-default-r0-wmma0.json",
+    "primary": "warm-diagnostic-primary.json",
+    "cases": [
+      {"name": "warmup", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique0", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique1", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique2", "exact": false, "first_difference": 14, "output_count": 32},
+      {"name": "unique3", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique4", "exact": false, "first_difference": 11, "output_count": 32},
+      {"name": "unique5", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique6", "exact": false, "first_difference": 13, "output_count": 32},
+      {"name": "unique7", "exact": false, "first_difference": 9, "output_count": 32}
+    ],
+    "passed": false
+  },
+  {
+    "label": "expanded32-default",
+    "native": "warm-block32-native-r0-wmmaNone.json",
+    "primary": "warm-block32-primary-r0.json",
+    "cases": [
+      {"name": "warmup", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique0", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique1", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique2", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique3", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique4", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique5", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique6", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique7", "exact": true, "first_difference": null, "output_count": 32}
+    ],
+    "passed": true
+  },
+  {
+    "label": "expanded32-scalar",
+    "native": "warm-block32-native-r0-wmma0.json",
+    "primary": "warm-block32-primary-r0.json",
+    "cases": [
+      {"name": "warmup", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique0", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique1", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique2", "exact": false, "first_difference": 12, "output_count": 32},
+      {"name": "unique3", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique4", "exact": false, "first_difference": 11, "output_count": 32},
+      {"name": "unique5", "exact": true, "first_difference": null, "output_count": 32},
+      {"name": "unique6", "exact": false, "first_difference": 13, "output_count": 32},
+      {"name": "unique7", "exact": true, "first_difference": null, "output_count": 32}
+    ],
+    "passed": false
+  }
+]

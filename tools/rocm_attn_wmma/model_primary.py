@@ -39,7 +39,8 @@ def main():
     manifest = json.loads(args.manifest.read_text())
     # Keep production compilation/graphs and the default attention selection.
     llm = LLM(model=args.model, dtype="bfloat16", max_model_len=4096,
-              max_num_seqs=1, gpu_memory_utilization=0.85, seed=0)
+              max_num_seqs=1, gpu_memory_utilization=0.85, seed=0,
+              block_size=manifest.get("block_size", 16))
     if args.mode == "dtype":
         def inspect_head(model):
             import torch
@@ -53,7 +54,7 @@ def main():
         return
     sampling = SamplingParams(temperature=0., max_tokens=manifest["output_len"],
                               ignore_eos=True, logprobs=None if args.mode == "bench" else 5)
-    report = {"vllm_version": vllm.__version__, "cases": []}
+    report = {"vllm_version": vllm.__version__, "block_size": manifest.get("block_size", 16), "cases": []}
     if args.mode == "bench":
         import importlib.util
         path = Path(__file__).resolve().parents[1] / "bench/vllm_closed_loop_metrics.py"

@@ -1,0 +1,4 @@
+[
+  {"name": "local", "bf16_words": 33554432, "prototype_sha256": "2d5ef61279b72c74c4fa22167d282db563ed8b56950c362c84f4e8468bbc49b8", "primary_sha256": "2d5ef61279b72c74c4fa22167d282db563ed8b56950c362c84f4e8468bbc49b8", "byte_exact": true},
+  {"name": "global", "bf16_words": 268435456, "prototype_sha256": "ebd6fcc4d4e044bd6b6d40f8bd1c82ea4dbd7c0f5492c67be2e0e3f195b5f81a", "primary_sha256": "ebd6fcc4d4e044bd6b6d40f8bd1c82ea4dbd7c0f5492c67be2e0e3f195b5f81a", "byte_exact": true}
+]

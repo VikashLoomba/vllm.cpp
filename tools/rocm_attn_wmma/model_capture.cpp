@@ -42,7 +42,11 @@ int main(int argc, char** argv) {
     mp.device = 0;
     mp.max_num_seqs = 1;
     mp.max_model_len = 4096;
-    mp.num_blocks = 256;
+    // The pinned primary's production block size is 16. A manifest can
+    // request 32 to exercise the native API's separate default configuration.
+    mp.block_size = manifest.value("block_size", 16);
+    if (mp.block_size <= 0) throw std::runtime_error("block_size must be positive");
+    mp.num_blocks = (mp.max_model_len + mp.block_size - 1) / mp.block_size;
     mp.gpu_memory_utilization = 0.;
     if (vllm_engine_load(&mp, &engine) != VLLM_OK)
       throw std::runtime_error(vllm_last_error());
@@ -57,7 +61,7 @@ int main(int argc, char** argv) {
       sp.logits_processor = CaptureLogits;
       sp.logits_processor_user_data = &logits;
     }
-    Json report = {{"cases", Json::array()}};
+    Json report = {{"block_size", mp.block_size}, {"cases", Json::array()}};
     for (const auto& entry : manifest.at("cases")) {
       logits.name = entry.at("name").get<std::string>();
       auto prompt = entry.at("prompt_token_ids").get<std::vector<int32_t>>();

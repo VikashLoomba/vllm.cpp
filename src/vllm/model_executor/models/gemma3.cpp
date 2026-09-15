@@ -20,24 +20,28 @@
 //     < sliding_window, e.g. the short gate battery);
 //   - NO attention output gate, NO attention logit soft-cap, NO qkv bias.
 //
-// Numeric contract: bf16 per-op, matching vLLM's stores (dense_attn_block.h).
-#include "vllm/model_executor/layers/attention/attention.h"
+// On ROCm, linear-RoPE models use the executing e126687a9a compiled Gemma
+// boundaries: scaled embedding variance, Q/K norm plus RoPE, erf GeGLU, and
+// sandwich residual expressions. All model storage remains BF16. Other paths
+// retain the existing materialized per-operation boundaries.
 #include "vllm/model_executor/models/gemma3.h"
 
 #include <cmath>
 #include <cstdlib>
 #include <memory>
+#include <nlohmann/json.hpp>
+#include <numeric>
 #include <optional>
 #include <utility>
 #include <vector>
 
-#include <nlohmann/json.hpp>
-
-#include "vllm/model_executor/layers/linear.h"             // UnquantizedMlpGateUpGeluMethod seam
+#include "vllm/model_executor/layers/attention/attention.h"
+#include "vllm/model_executor/layers/linear.h"            // UnquantizedMlpGateUpGeluMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/glue
 #include "vllm/model_executor/models/device_pool.h"       // Pool
-#include "vllm/model_executor/models/qwen3_5_common.h"     // HostLogits
+#include "vllm/model_executor/models/qwen3_5_common.h"    // HostLogits
 #include "vt/backend.h"
+#include "vt/compiled_gemma.h"
 #include "vt/ops.h"
 #include "vt/recipes.h"  // kFusedAddRmsNorm (Tier-B2)
 
@@ -62,6 +66,13 @@ int64_t RawInt(const nlohmann::json& doc, const char* key, int64_t fallback) {
   const auto it = doc.find(key);
   if (it == doc.end() || it->is_null() || !it->is_number_integer()) return fallback;
   return it->get<int64_t>();
+}
+
+// The measured compiler partition is the linear-RoPE Gemma3 path. Keep the
+// existing non-linear models and materialized backends on their prior route.
+bool CompiledGemma(Dev d, const HfConfig& cfg) {
+  return cfg.rope_parameters.rope_type == "linear" &&
+         d.b.GetResidualNormPolicy() == vt::ResidualNormPolicy::kCompiledExpression;
 }
 
 // Per-layer Gemma-3 routing derived from the config.
@@ -142,15 +153,55 @@ DBuf Gemma3AttnBlock(Dev d, const Gemma3AttnWeights& w, const HfConfig& cfg,
   Tensor k3 = Reshape(k.t(), {T, Hkv, Dh});
   Tensor wqn = ResidentWeight(d, w.q_norm, {Dh});
   Tensor wkn = ResidentWeight(d, w.k_norm, {Dh});
-  vt::RmsNorm(d.q, q2, q2, wqn, vt::RmsNormArgs{eps, true});  // gemma=true (1+w)
-  vt::RmsNorm(d.q, k2, k2, wkn, vt::RmsNormArgs{eps, true});
+  const bool compiled = CompiledGemma(d, cfg);
+  if (!compiled || cfg.rope_parameters.rope_type != "linear") {
+    vt::RmsNorm(d.q, q2, q2, wqn, vt::RmsNormArgs{eps, true});
+    vt::RmsNorm(d.q, k2, k2, wkn, vt::RmsNormArgs{eps, true});
+  }
   vt::RopeArgs ra;
   ra.base = static_cast<float>(rope_base);
   ra.rotary_dim = static_cast<int>(Dh);  // full rotary_dim = head_dim
   if (cfg.rope_parameters.rope_type == "linear") {
     VT_CHECK(!rope_cache.Empty(), "gemma3: linear RoPE requires its loaded cache");
-    Tensor cache = ResidentWeight(d, rope_cache);
-    vt::RopeFromCache(d.q, q3, &k3, si.positions.t(), cache, ra);
+    Tensor cache =
+        compiled ? ResidentWeight(
+                       d, rope_cache, {},
+                       [&](Tensor& target) {
+                         // base.py:89-112 computes the cache on-device before its BF16 cast.
+                         // CPU libm differs even after BF16 rounding at long positions.
+                         const int64_t rows = target.shape[0];
+                         std::vector<int64_t> positions(static_cast<size_t>(rows));
+                         std::iota(positions.begin(), positions.end(), int64_t{0});
+                         DBuf indices(d, DType::kI64, {rows}, positions.data());
+                         // FP32 cache construction mirrors the primary; the resident cache is BF16.
+                         DBuf generated(d, DType::kF32, {rows, Dh});
+                         auto args = ra;
+                         args.linear_scaling_factor =
+                             sliding_window.has_value()
+                                 ? 1.f
+                                 : static_cast<float>(cfg.rope_parameters.factor.value_or(1.));
+                         vt::RopeCosSinCache(d.q, generated.t(), indices.t(), args);
+                         vt::CastBf16(d.q, target, generated.t());
+                       })
+                 : ResidentWeight(d, rope_cache);
+    if (compiled) {
+      vt::FusedBinding binding{};
+      binding.n = 8;
+      binding.op[0] = &q2;
+      binding.op[1] = &wqn;
+      binding.op[2] = &k2;
+      binding.op[3] = &wkn;
+      binding.op[4] = &q3;
+      binding.op[5] = &k3;
+      binding.op[6] = &cache;
+      binding.op[7] = const_cast<Tensor*>(&si.positions.t());
+      vt::FusedParams params{};
+      params.eps = eps;
+      params.rope = ra;
+      vt::FusedChain(d.q, vt::kAttnQkNormRopeGemma, binding, params);
+    } else {
+      vt::RopeFromCache(d.q, q3, &k3, si.positions.t(), cache, ra);
+    }
   } else {
     vt::RopeNeox(d.q, q3, k3, si.positions.t(), ra);
   }
@@ -189,6 +240,10 @@ DBuf Gemma3AttnBlock(Dev d, const Gemma3AttnWeights& w, const HfConfig& cfg,
         /*per_layer=*/std::nullopt, sliding_window,
         v1::AttentionType::kDecoder,
         /*disable_model_sliding_window=*/DisableSlidingWindowActive());
+  // ROCM_ATTN passes W-1 into prefix_prefill's strict distance < window mask
+  // (rocm_attn.py:309,475; prefix_prefill.py:435-437 at e126687a9a).
+  // AttentionWindow itself remains inclusive for all shared-op callers.
+  if (compiled && pa.window_size && pa.window_size->left > 0) --pa.window_size->left;
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);
 
@@ -210,7 +265,8 @@ DBuf Gemma3MlpBlock(Dev d, const Gemma3MlpWeights& w, const HfConfig& cfg,
   // (layers::UnquantizedMlpGateUpGeluMethod). Byte-for-byte the inline sequence —
   // folds Gemma-3 onto the shared MlpGateUpMethodBase descriptor. (Tier-C1,
   // arch-fusion-fold-plan-2026-07-30.)
-  DBuf act = layers::UnquantizedMlpGateUpGeluMethod(&w.gate_up_proj, I).Apply(d, dh2);
+  DBuf act = layers::UnquantizedMlpGateUpGeluMethod(&w.gate_up_proj, I, CompiledGemma(d, cfg))
+                 .Apply(d, dh2);
   Tensor wd = ResidentWeight(d, w.down_proj);
   DBuf down(d, DType::kBF16, {T, H});
   vt::MatmulBT(d.q, down.t(), act.t(), wd);
@@ -225,9 +281,9 @@ DBuf Gemma3MlpBlock(Dev d, const Gemma3MlpWeights& w, const HfConfig& cfg,
 //   res += attn;     dh2 = gemmaNorm(res)       # pre_feedforward  (fused)
 //   mlp  = Mlp(dh2)
 //   hidden = gemmaNorm(mlp)                      # post_feedforward (standalone)
-void RunLayer(Dev d, const Gemma3LayerWeights& layer, const HfConfig& cfg,
-              const Gemma3Layout& g, const OwnedTensor& rope_cache, int64_t l, DBuf& hidden, DBuf& res,
-              const StepInputs& si, const CommonAttentionMetadata& meta,
+void RunLayer(Dev d, const Gemma3LayerWeights& layer, const HfConfig& cfg, const Gemma3Layout& g,
+              const OwnedTensor& rope_cache, const OwnedTensor& next_norm, int64_t l, DBuf& hidden,
+              DBuf& res, const StepInputs& si, const CommonAttentionMetadata& meta,
               const PagedKvCache& kv, int64_t T) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
@@ -238,8 +294,11 @@ void RunLayer(Dev d, const Gemma3LayerWeights& layer, const HfConfig& cfg,
   // composite is byte-identical to the standalone `vt::RmsNorm(..., &res)`. (Tier-B2,
   // arch-fusion-fold-plan-2026-07-30.)
   Tensor w_in = ResidentWeight(d, layer.input_layernorm, {H});
+  const bool compiled = CompiledGemma(d, cfg);
   DBuf dhn(d, DType::kBF16, {T, H});
-  if (FusedChainAdoptEnabled())
+  if (compiled)
+    dhn = std::move(hidden);  // Already normalized at the preceding partition boundary.
+  else if (FusedChainAdoptEnabled())
     vt::FusedChain(d.q, dhn.t(), hidden.t(), w_in, &res.t(), vt::kFusedAddRmsNorm, eps);
   else
     vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, gemma, &res.t());
@@ -251,6 +310,21 @@ void RunLayer(Dev d, const Gemma3LayerWeights& layer, const HfConfig& cfg,
   if (sliding) window = g.sliding_window;
   DBuf attn = Gemma3AttnBlock(d, layer.attn, cfg, dhn.t(), si, meta, kv, T,
                               rope_base, rope_cache, g.attn_scale, window);
+
+  if (compiled) {
+    Tensor post_attn = ResidentWeight(d, layer.post_attention_layernorm, {H});
+    Tensor pre_ff = ResidentWeight(d, layer.pre_feedforward_layernorm, {H});
+    DBuf dh2(d, DType::kBF16, {T, H});
+    vt::FusedChain(d.q, dh2.t(), vt::SandwichNormInputs{attn.t(), res.t(), post_attn, pre_ff}, eps);
+    DBuf mlp = Gemma3MlpBlock(d, layer.mlp, cfg, dh2.t(), T);
+    Tensor post_ff = ResidentWeight(d, layer.post_feedforward_layernorm, {H});
+    Tensor next = ResidentWeight(d, next_norm, {H});
+    hidden = DBuf(d, DType::kBF16, {T, H});
+    vt::FusedChain(d.q, hidden.t(),
+                   vt::SandwichNormInputs{attn.t(), res.t(), post_attn, next, &mlp.t(), &post_ff},
+                   eps, l + 1 < cfg.num_hidden_layers ? &res.t() : nullptr);
+    return;
+  }
 
   // post_attention_layernorm (STANDALONE GemmaRMSNorm, sandwich): attn = norm(attn).
   // NOT-FUSABLE onto kFusedAddRmsNorm — a sublayer-output post-norm with NO residual
@@ -315,22 +389,34 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   }
   const float nsqrt = std::sqrt(static_cast<float>(H));
   const double normalizer = static_cast<double>(vt::BF16ToF32(vt::F32ToBF16(nsqrt)));
-  vt::MulScalar(d.q, hidden.t(), hidden.t(), normalizer);
-
+  const bool compiled = CompiledGemma(d, config);
   DBuf res(d, DType::kBF16, {T, H});
-  res.Zero(d);
+  if (compiled) {
+    DBuf normed(d, DType::kBF16, {T, H});
+    Tensor first_norm = ResidentWeight(d, weights.layers.front().input_layernorm, {H});
+    vt::FusedChain(d.q, normed.t(), hidden.t(), first_norm,
+                   vt::ScaledRmsNormArgs{static_cast<float>(normalizer), eps}, res.t());
+    hidden = std::move(normed);
+  } else {
+    vt::MulScalar(d.q, hidden.t(), hidden.t(), normalizer);
+    res.Zero(d);
+  }
 
   StepInputs si = BuildStepInputs(d, positions, attn_meta, config);
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunLayer(d, weights.layers[static_cast<size_t>(l)], config, g,
-             g.IsSliding(l) ? weights.rope_local : weights.rope_global, l, hidden, res, si,
-             attn_meta, attn_kv[static_cast<size_t>(l)], T);
+             g.IsSliding(l) ? weights.rope_local : weights.rope_global,
+             l + 1 < config.num_hidden_layers ? weights.layers[l + 1].input_layernorm
+                                              : weights.final_norm,
+             l, hidden, res, si, attn_meta, attn_kv[static_cast<size_t>(l)], T);
 
   // Final GemmaRMSNorm over the fused stream (res += hidden; gemma norm) via catalog.
   Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});
   DBuf dnorm(d, DType::kBF16, {T, H});
-  if (FusedChainAdoptEnabled())
+  if (compiled)
+    dnorm = std::move(hidden);  // Final sandwich partition emitted the normalized state.
+  else if (FusedChainAdoptEnabled())
     vt::FusedChain(d.q, dnorm.t(), hidden.t(), w_fn, &res.t(), vt::kFusedAddRmsNorm, eps);
   else
     vt::RmsNorm(d.q, dnorm.t(), hidden.t(), w_fn, vt::RmsNormArgs{eps, true}, &res.t());

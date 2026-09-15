@@ -16,8 +16,11 @@ The existing quantized admission is separately implemented in PR #3187.
 
 The WMMA path passes the unchanged expanded 256-token gate after repairing
 compiled Gemma arithmetic, device RoPE caches, and attention accumulation.
-Default admission, fallback controls, final resource and performance checks,
-and review records remain active under ISSUE-LOCAL-01M2HQEEXHD2B0BT3N71HQ0CRZ.
+Default admission and both cache-block gates pass. Three alternating pairs
+measure 1.149x median model prefill versus scalar, with zero attention spills.
+The default remains on. Scalar expanded-token differences and full-model
+decode/latency/host-memory gaps remain explicit in the measured report.
+Repository checks and independent human review complete the MR handoff.
 [Measured report](../../docs/bench-evidence/rocm-rdna3-attention-wmma/README.md).
 
 ## Scope
@@ -25,8 +28,10 @@ and review records remain active under ISSUE-LOCAL-01M2HQEEXHD2B0BT3N71HQ0CRZ.
 Admit gfx1100 to the existing BF16 SharedK rocWMMA attention prefill kernel.
 Preserve the current gfx1200 and gfx1201 behavior. Keep other gfx11 targets
 excluded. Preserve head dimension 256, query-to-KV head ratio two, one request,
-at least 64 query tokens, BF16 buffers, and the existing scalar override. Gfx1100 requires explicit opt-in until
-the expanded token gate passes; preserve the gfx12 default.
+at least 64 query tokens, BF16 buffers, and the existing scalar override.
+Enable gfx1100 by default after the unchanged expanded gate passes.
+Preserve the gfx12 default. The gfx1100 single-query decode prerequisite
+operates independently of the prefill override.
 Do not enable the deferred dimension-512 WMMA arm or alter quantized dispatch.
 The quantized implementation in PR #3187 remains a separate reviewed change.
 
@@ -34,9 +39,10 @@ The quantized implementation in PR #3187 remains a separate reviewed change.
 
 The local implementation is
 `src/vt/rocm/rocm_paged_attn.hip::PagedAttnPrefillSharedKWmma`.
-Its 16 by 16 by 16 BF16 fragments accumulate FP32 through rocWMMA's public
-load, multiply, and store operations. Consumers read ordinary shared-memory
-matrices. They do not index the hardware fragment register representation.
+Its 16 by 16 by 16 BF16 fragments accumulate FP32. Loads and stores use
+rocWMMA's public operations. The gfx1100 MMA adapter aligns packed inputs
+with the executing primary, as specified below. Consumers read ordinary
+shared-memory matrices and never index accumulator coordinates.
 Installed rocWMMA 2.2.1 provides the corresponding gfx1100 operation in
 `internal/wmma_impl.hpp`, using the gfx11 BF16 wave32 builtin.
 
@@ -180,14 +186,18 @@ The dimension-256 decode repair is a correctness prerequisite on gfx1100.
 Enable it independently of the prefill-only environment switch, for a single
 query and one request with cache blocks at most 64. Keep the existing gfx12
 decode selection. Both prefill A/B arms then use the same repaired decoder.
-Retain the existing GQA/decode switches as their broader controls. Do not admit
+Retain the existing GQA/decode switches as their broader controls. The trace gate must
+separate multi-workgroup prefill launches from single-workgroup decode
+launches. A shared kernel name alone no longer proves prefill reachability. Do not admit
 short multi-token prefill through this prerequisite. Test that the default
 prefill path launches on gfx1100 and that its explicit disable retains the
 scalar prefill control. Repeat both full-model gates after this separation.
 
 Add focused primary-generated fixtures for these expressions, including
-nonuniform gamma, BF16 rounding boundaries, full/partial rotary dimensions,
-and two/three operand residual expressions. Capture red before each repair,
+nonuniform gamma, BF16 rounding boundaries, full rotary dimensions,
+and two/three operand residual expressions. The executing Gemma partition
+rotates all 256 coordinates. Generic rotary tests cover partial dimensions.
+Do not describe those generic tests as compiled Gemma parity evidence. Capture red before each repair,
 then green and production reachability. Preserve existing backend defaults
 outside the measured ROCm Gemma3 path. Run the unchanged original 96-token
 and expanded 256-token gates with scalar and WMMA controls. Investigate any
@@ -241,4 +251,4 @@ checkpoint provenance, and return codes in the task's ignored build directory.
 
 | ID | Upstream source | Local anchor | Tests and evidence | Spec | State | Owner | Issue |
 |---|---|---|---|---|---|---|---|
-| `BACKEND-ROCM-RDNA3-WMMA-ATTN` | vLLM prefix prefill at e126687a9a; rocWMMA 2.2.1 gfx11 BF16 | `PagedAttnPrefillSharedKWmma` | Gates in this spec | [This spec](rocm-rdna3-attention-wmma.md) | `ACTIVE` | Codex, single-agent user direction | `ISSUE-LOCAL-01M2HK0GFJDRXXAAA8F0014XQQ` |
+| `BACKEND-ROCM-RDNA3-WMMA-ATTN` | vLLM prefix prefill at e126687a9a; rocWMMA 2.2.1 gfx11 BF16 | `PagedAttnPrefillSharedKWmma`, `compiled_gemma`, Gemma `FusedChain`, resident cache initialization | Frozen primary expressions, device caches, public token/trace gates, resources, same-binary A/B | [This spec](rocm-rdna3-attention-wmma.md) | `ACTIVE` | Codex, single-agent user direction | `ISSUE-LOCAL-01M2HK0GFJDRXXAAA8F0014XQQ` |

@@ -1,199 +1,161 @@
-# gfx1100 attention WMMA and Gemma 3 linear RoPE
+# Default gfx1100 attention WMMA
 
 Rows: `BACKEND-ROCM-RDNA3-WMMA-ATTN`, `MODEL-GEMMA3-LINEAR-ROPE`,
 and `MODEL-GEMMA3-HEAD-DTYPE`.
-Specifications: [attention](../../../.agents/specs/rocm-rdna3-attention-wmma.md) and
-[linear RoPE](../../../.agents/specs/gemma3-linear-rope.md).
-Measured on 14 September 2026, local RX 7900 XTX, physical `gfx1100`.
-Independent human review is pending. The developer prohibited subagents.
+[Attention specification](../../../.agents/specs/rocm-rdna3-attention-wmma.md),
+[linear RoPE specification](../../../.agents/specs/gemma3-linear-rope.md).
+Measured on 15 September 2026, RX 7900 XTX, physical `gfx1100`.
 
 ## Result and scope
 
-**Draft candidate. Default gfx1100 enablement remains blocked.** The expanded
-256-token gate fails on four of eight requests with WMMA and three with scalar
-attention. The primary repeats exactly. Some differences have a non-tied
-primary winner. [Failure receipt](expanded-failures.json),
-[tracking issue](../../../.agents/issues/BACKEND-ROCM-RDNA3-WMMA-ATTN/ISSUE-LOCAL-01M2HQEEXHD2B0BT3N71HQ0CRZ.md).
-No full-model performance result is accepted from that workload.
+**gfx1100 uses rocWMMA prefill by default.** The public Gemma 3 4B path matches
+the pinned primary on the original 96-token gate and the expanded 256-token
+gate. Both gates pass with 16-token and 32-token cache blocks. No tolerance,
+prompt, or generated-token count was relaxed. See the
+[expanded default and scalar verdicts](release-expanded-gates.json),
+[original block-16 verdict](release-original16-default-gate.json), and
+[original block-32 dispatch verdict](release-default-gate.json).
 
-The original public load/completion gate matches all **96 generated token IDs** from
-pinned vLLM. A native trace records **102 WMMA dispatches**, one per layer in
-three 34-layer prefills. [Final receipt](public-final-gate.json), [default and scalar](default-final-gate.json).
-The same primary outputs repeat in a second run and in the profiler run.
+Admission requires BF16, head dimension 256, two query heads per KV head,
+one request, and at least 64 query tokens. `gfx1200` and `gfx1201` retain their
+default admission. Other gfx11 devices and the dimension-512 WMMA arm remain
+excluded. Quantized admission belongs to [PR #3187](https://github.com/mudler/vllm.cpp/pull/3187).
 
-Both compilation and runtime guards admit `gfx1100`, `gfx1200`, and `gfx1201`.
-Other gfx11 targets remain excluded. The existing BF16 kernel body is unchanged.
-Admission retains head dimension 256, two query heads per KV head, one request,
-and at least 64 query tokens. On gfx1100, explicitly set
-`VT_ATTN_PREFILL_SHAREDK_WMMA=1` to enter the experimental path. An unset knob
-keeps scalar attention. The existing gfx12 default remains enabled. A value
-starting with `0` selects the scalar control on every target.
-The deferred dimension-512 arm stays excluded.
+`VT_ATTN_PREFILL_SHAREDK_WMMA=0` selects scalar prefill. The gfx1100
+single-query decode repair remains common to both prefill controls, for cache
+blocks at most 64. The broader decode/GQA switches retain their existing role.
+The scalar control passes the original block-32 gate and all array tolerances.
+It differs on four expanded block-16 requests and three expanded block-32
+requests. These are retained failures, not distributional passes. Its scalar
+FP32 dot accumulation order differs from the primary's WMMA arithmetic.
+The default path resolves the reported opt-in blocker.
 
-The real 4B checkpoint exposed a missing prerequisite. The new linear rotary
-leaf mirrors the primary's position division and cache construction. Gemma 3
-loads BF16 global and local caches. Global layers apply factor eight. Sliding
-layers retain unscaled local rotary frequencies.
+Independent human review remains due. The developer prohibited subagents.
+The implementation session's mutation checks do not claim independent review.
 
-The broader gate then exposed an incorrect FP32 final projection. The primary
-projects into BF16, as its running model confirms in the
-[dtype receipt](primary-head-dtype-retry.json). The correction uses BF16 output
-and widens it at the existing runner boundary. Tied and untied heads fail the
-new assertion before correction. All 1510 focused forward assertions pass
-[afterward](head-green.txt), and the [mutation fails](head-mutation.json).
-This repair fixes the original scalar tied-token difference. It does not
-resolve the expanded gate.
+## Why the guard change needed more work
 
-## Identity and method
+The primary pin is vLLM `e126687a9a828d513c01a07cd69f025f27d63280`.
+The executing path exposed numerical boundaries that standalone layer source
+and float-tolerance attention tests did not establish:
+
+1. Gemma's final projection stores BF16. The original implementation stored
+   FP32. The existing runner widens the corrected BF16 logits for sampling.
+2. The compiled embedding norm computes variance before narrowing the scaled
+   embedding. Its normalized numerator and residual reload BF16 values.
+3. Compiled Q/K normalization retains FP32 through rotation, then stores BF16.
+   Reduction order and the contracted product in each rotary coordinate matter.
+4. ROCm selects erf GeGLU. Its compiled expression narrows after multiplication
+   by the up projection. Sandwich norms retain normalized operands in FP32
+   through residual addition. Their owned model buffers remain BF16.
+5. `rotary_embedding/base.py:89-112` builds the cache on the device. CPU libm
+   differed even after BF16 narrowing. The device implementation matches all
+   301,989,888 local/global BF16 cache words in the diagnostic full-cache run.
+   [Byte comparison and hashes](release-cache-proof.json).
+6. Primary attention narrows softmax probabilities to BF16 before PV. Prefill
+   and decode use different aligned key tiles. The executing decode IR folds
+   `acc += dot(P,V)` into the matrix accumulator. A separate delta then add
+   changed two first-decode attention words and later token selection.
+7. rocWMMA 2.2.1 rotates packed K operands in gfx11's upper half-wave. Triton
+   duplicates the lower half unchanged. Both encode the same mathematical dot,
+   but their FP32 rounding differs. The gfx1100 adapter preserves rocWMMA's
+   transforms and accumulator layout, then aligns packed inputs before MMA.
+
+`rocm_rdna3_wmma.h` adapts AMD's MIT-licensed rocWMMA glue. It depends on
+header implementation types tested with **rocWMMA 2.2.1**. This dependency is
+isolated in that file. gfx12 retains the public `mma_sync` operation. No code
+indexes accumulator coordinates. QK and PV consumers use ordinary shared
+matrices through public fragment loads and stores.
+
+The compiled Gemma path enters through `ModelRegistry::Forward`, typed
+`vt::FusedChain` bindings, the merged MLP seam, and `vt::PagedAttention`.
+It selects linear-RoPE models on the compiled-expression backend policy.
+Other model routes retain their materialized behavior. Resident cache
+initialization uses the shared lazy resident-weight seam. It creates an FP32
+cache temporarily, then stores BF16 once. No persistent FP32 residual is added.
+
+## Identity and executing references
 
 Base: `31509d91f1dcdc5285b845d998a3f7b6da1097f9`.
-Primary: vLLM `e126687a9a828d513c01a07cd69f025f27d63280`.
-Native: HIP 7.15.26333, Clang 23, rocWMMA 2.2.1, production HIP flags including
-`-O1`, target `gfx1100`. The controls compile the same translation unit for
-`gfx1200` and `gfx1201`. Physical RDNA4 execution is unavailable on this host.
+Native: HIP 7.15.26333, Clang 23, rocWMMA 2.2.1, production flags
+`-O1 -ffp-contract=off -Wall -Wextra -Werror`.
+Primary container: `sha256:80aab4c182a1f3eeebe286173977e57fcaf10a049b41f475655b35d285de31dc`.
+Primary compilation and graphs remain enabled. No eager-only denominator is used.
 
 Checkpoint: `unsloth/gemma-3-4b-it@bf46152c47f5dd20b896357cb51abc4c03b8ee8c`.
-The [usage recipe](../../USAGE.md#gemma-3-4b-text-weights) records source shard
-sizes and hashes. The text export retains all 444 text tensors and their
-7,760,526,336 payload bytes. Both engines consume that identical export.
-[Independent reread of every exported tensor](rope-export-verified.json).
-No text config value, rotary factor, or tensor payload is changed.
+Both engines load the same lossless text export. All 444 retained tensors and
+7,760,526,336 payload bytes are unchanged. The
+[weight recipe](../../USAGE.md#gemma-3-4b-text-weights) records shard hashes,
+sizes, and the export command. [Export verification](rope-export-verified.json).
+This change does not add the vision tower or a Gemma GGUF loader.
 
-Every GPU run selects device zero and holds `/home/vikash/gpu.lock`.
-The monitored device is PCI `0000:03:00.0`, sysfs `card1/device`.
-Boot ID: `2c176325-618c-43da-9f8e-ea0491635f38`.
-Clocks vary dynamically. Monitors record clock samples, GPU utilization, process
-memory, device-wide memory, exact commands, and return codes. Memory peaks are
-sampled values, not continuous maxima or equal-capacity tensor comparisons.
+Primary execution anchors at the pinned revision:
 
-## Correctness and reachability
+- `gemma3.py:159-189`: rotary and attention configuration.
+- `activation.py:451-464`: ROCm erf selection.
+- `rocm_attn.py:459-480`, `chunked_prefill_paged_decode.py`, and
+  `prefix_prefill.py::_fwd_kernel`: prefill execution.
+- `kernel_paged_attention_2d`: decode. Its generated TTGIR folds PV into the
+  scaled accumulator at lines 320 to 331.
+- Generated modules `cpjgc4xo3dj77l3xvynxdob4hutmkehaur7hymz34uyfdq5ygyxs.py`
+  and `cycnctzmkc6yjxbdnjsayvhkrt7wcw2yzliovagbbvctjna42lab.py`: initial and
+  intermediate compiled partitions. The fixture generator pins their SHA-256.
 
-| Gate | Observed result | Receipt |
+Every GPU command holds `/home/vikash/gpu.lock`, selects device zero, and
+monitors PCI `0000:03:00.0`. Native and primary traces both use rocprofv3,
+versions 1.3.5 and 1.3.2 respectively. [Trace identities and counts](release-traces.json).
+Whole-run traces include initialization and capture. They do not claim GEMM
+invocation parity. Clock and memory samples, boot identity, exact commands,
+return codes, and executable hashes accompany the raw measurements.
+
+## Correctness and production reachability
+
+| Gate | Observed result | Evidence |
 |---|---|---|
-| Architecture red/green | Three admission assertions fail before the guard change. Initial green: 16 cases, 97 assertions. Final policy: 17 cases, 120 assertions | [Red](arch-red.txt), [initial green](arch-green.txt), [final](arch-final.txt) |
-| Frozen physical P1 | 32,768 outputs, finite, zero tolerance violations, max absolute error 0.00390494 | Raw `wmma/` receipt |
-| Primary attention arrays | All 10 cases pass with WMMA enabled and disabled | [Enabled](primary-vs-on.json), [scalar](primary-vs-off.json) |
-| Linear rotary arrays | Twelve primary cases pass in both layouts and F32/BF16, including multiple factors | [Focused tests](rope-focused-tests.txt) |
-| Public real-model gate | Prompt lengths 122, 516, 1205. Each generates 32 exact greedy IDs | [Inputs](model-manifest.json), [final native](source-final-trace-wmma1.json), [primary](model-primary.json) |
-| Focused regressions | 13 registered suites pass | [CTest](source-final-ctest.txt) |
-| Mutations | Removing gfx1100 admission, the production launch, linear scaling, or sliding-cache selection fails | [Final guard/default](final-guard-mutations.json), [launch](mutation-launch.json), [rotary](rope-mutations.json) |
+| Default admission | Old predicate fails two assertions. New predicate passes 18 cases and 128 assertions | [Red](default-admission-red.txt), [green](default-admission-green.txt) |
+| Public default block 32 | 96/96 tokens, 102 WMMA prefill launches, zero scratch | [Default](release-default-gate.json) |
+| Public scalar block 32 | 96/96 tokens, 102 scalar prefill launches, zero scratch | [Scalar](release-scalar-gate.json) |
+| Expanded default | 256/256 tokens plus exact warm-up, blocks 16 and 32 | [Verdicts](release-expanded-gates.json) |
+| Attention arrays | All ten declared cases pass in both arms, max absolute error 0.0078125 | [Default](release-arrays-default-comparison.json), [scalar](release-arrays-scalar-comparison.json) |
+| Compiled expressions | Seven frozen primary cases, cache samples, ownership/error checks | [Focused regressions](release-final-regressions.txt) |
+| Final focused regression set | 14/14 CTest entries pass | [CTest](release-final-regressions.txt) |
+| Production mutation | Deleting WMMA prefill keeps 96 exact tokens and WMMA decode, but the prefill witness fails | [Mutation](release-launch-mutation.json) |
 
-The physical array extensions cover lengths 64, 79, 257, 1024, and 2048,
-nonzero prefixes, shuffled blocks, causal and noncausal attention, local windows,
-and softcap 30. The primary prefix-prefill suite supplies small uniform inputs
-and `atol=1e-4, rtol=0`. BF16, single-request shapes, NumPy seed-zero generation,
-and these tails adapt its F16 multi-request harness. They do not reproduce
-Torch's random stream byte-for-byte. High-amplitude extensions retain the frozen
-P1 gate's `atol=0.015, rtol=0.01`. No tolerance changed after measurement.
-Small-input maximum absolute error is at most 0.000003814697. Stress error is
-at most 0.0078125. Every output remains BF16.
+The trace validator distinguishes prefill from decode by launch geometry.
+Decode shares the same WMMA kernel name. Counting that name alone would let
+a deleted prefill branch pass. The scratch mutation leaves source bytes
+unchanged and fails specifically because zero of 102 prefill launches remain.
 
-Before the head correction, the scalar real-model control first differed on prompt zero at generated index
-28. Its two candidate logits are 26.1496639 and 26.1048012. The primary gives
-both candidates identical log probabilities and chooses the other token.
-[Retained diagnostic](scalar-tie-diagnostic.json). Full scalar logits remain in
-the raw evidence. Both explicit controls now pass the original 96-token gate unchanged. The
-expanded 256-token gate remains failing.
-The old Gemma 1B checkpoint-dependent test bodies skip without their checkpoint.
-Synthetic routing checks and the actual public 4B run supply distinct evidence.
+Array cases cover tails, prefixes, shuffled cache blocks, causal/noncausal
+attention, sliding windows, and softcap. The primary suite's small-input
+`atol=1e-4, rtol=0` is unchanged. BF16 stress cases retain the previously
+registered P1 `atol=0.015, rtol=0.01`. Real-model diagnostic captures establish
+exact Q/K, GeGLU, sandwich-norm, and attention intermediates separately from
+these tolerance gates. [Full prefill GEMM boundaries](normdiv-unique2-comparison.json),
+[544 real GeGLU comparisons](real-gelu-replay-comparison.json).
 
-Primary source chain: `gemma3.py:159-189` selects rotary configuration and
-attention, `linear_scaling_rope.py:37-127` builds the rotary cache, and
-`prefix_prefill.py::context_attention_fwd` supplies the array reference.
-The softcap extension uses `triton_unified_attention.py::unified_attention`.
-Both real-model traces use rocprofv3: [native 1.3.5](native-profiler-version.txt)
-and [primary 1.3.2](primary-profiler-version.txt). The primary trace contains
-`kernel_paged_attention_2d`; the native trace contains the SharedK WMMA
-specialization. Whole-run kernel counts include initialization and graph
-capture and do not establish GEMM invocation parity.
+Physical RDNA4 execution is unavailable. Cross-compilation is the narrower
+result. Old Gemma 1B checkpoint-dependent test bodies remain skipped because
+their checkpoint is absent. The public 4B gate supplies actual model execution.
 
-## Registers, spills, and shared memory
+## Registers and spills
 
-| Attention target | Compiler VGPR | Compiler SGPR | VGPR/SGPR spills | Private bytes | Static LDS bytes |
+| Target | Compiler VGPR | Compiler SGPR | VGPR/SGPR spills | Private bytes | Total LDS bytes |
 |---|---:|---:|---:|---:|---:|
-| gfx1100 | 73 | 64 | 0 / 0 | 0 | 4880 |
-| gfx1200 | 68 | 67 | 0 / 0 | 0 | 4880 |
-| gfx1201 | 68 | 67 | 0 / 0 | 0 | 4880 |
+| gfx1100 | 89 | 86 | 0 / 0 | 0 | 58768 |
+| gfx1200 | 76 | 87 | 0 / 0 | 0 | 58768 |
+| gfx1201 | 76 | 87 | 0 / 0 | 0 | 58768 |
 
-[Final compiler metadata](resources-final.json) describes
-`PagedAttnPrefillSharedKWmma<2,8,16,32,false>`, wave32.
-The gfx1100 ISA contains `v_wmma_f32_16x16x16_bf16`.
-The runtime trace reports allocation units of **80 VGPR and 128 SGPR** and zero
-scratch bytes. These allocation counts differ from compiler usage counts.
-The launch requests 49,152 additional dynamic LDS bytes, totaling 54,032 bytes
-with static LDS. The profiler's LDS column reports 5120 rounded static bytes.
-
-The separately implemented [quantized PR #3187](https://github.com/mudler/vllm.cpp/pull/3187)
-is not duplicated here. Its existing build object reports:
-
-| Quantized kernel, F32 and BF16 outputs | VGPR | SGPR | VGPR spills | Private bytes | Static LDS bytes |
-|---|---:|---:|---:|---:|---:|
-| Q6_K | 188 | 23 | 0 | 0 | 24576 |
-| Q4_K | 192 | 22 | 154 | 620 | 25600 |
-
-[Metadata](quant-resources.json), [object identity](quant-object.json).
-Q4_K spills remain a tuning cost. The public quantized regression still passes
-all 1024 logits and its four generated IDs exactly against the scalar control.
-[Recheck](quant-public-recheck.txt). This does not advance that PR's task oracle
-pin or close its existing full-model performance gaps.
-
-## Kernel timing
-
-Four alternating scalar/enabled process pairs use the same binary, five warm-up
-calls, and 1000 timed calls per case. Each timing includes enqueue and final
-synchronization. [All kernel values](perf-summary.json), [monitor summary](perf-monitor-summary.json).
-
-| Case | Scalar µs | WMMA µs | Speedup |
-|---|---:|---:|---:|
-| T64, small input | 61.31 | 35.36 | 1.73× |
-| T79, local window | 29.00 | 19.52 | 1.49× |
-| T257, prefix | 318.39 | 200.04 | 1.59× |
-| T64, stress | 60.07 | 34.63 | 1.73× |
-| T79, stress | 26.89 | 19.51 | 1.38× |
-| T257, stress | 313.54 | 197.92 | 1.58× |
-| Softcap | 29.86 | 19.39 | 1.54× |
-| Noncausal | 152.35 | 47.94 | 3.18× |
-| T1024 | 2052.02 | 1145.93 | 1.79× |
-| T2048 | 6548.63 | 3796.02 | 1.73× |
-
-## Full-model timing disposition
-
-The first benchmark repeated two prompts and mostly measured prefix-cache
-reuse plus first-use costs. Its results remain diagnostic. A second workload
-uses eight distinct prompts of 518 and 1207 tokens, one untimed warm-up,
-32 output tokens, and concurrency one. Both engines load the identical model
-once per process and retain their production scheduling and cache defaults.
-vLLM keeps compilation and graphs enabled. This expanded workload exposes the
-remaining token failures, so its rates cannot establish a performance gain.
-
-The [diagnostic values and ratios](model-diagnostic-metrics.json) retain prefill,
-decode, latency, and sampled memory axes. They are rejected measurements.
-The retained JSON files record all outputs and raw timing axes:
-[WMMA](head-fixed-warm-wmma1.json), [scalar](head-fixed-warm-wmma0.json),
-[primary](warm-primary-r0.json). Their sampled memory includes model loading.
-The primary reserves a larger KV pool than the native 256-block pool. Memory
-ratios do not establish equal-capacity tensor footprints. The next hypothesis
-is the first layer and operation where intermediate BF16 values diverge on
-`unique7`, whose first mismatch is the second generated token in both controls.
-A teacher-forced layer capture must use the primary prefix before that token.
-
-## Gate disposition
-
-- Architecture compilation, physical array correctness, and zero attention
-  spills: satisfied.
-- Original public 96-token gate: satisfied in both explicit controls after
-  the head correction.
-- Expanded 256-token gate and accepted full-model performance: failing under
-  the linked issue. No distributional waiver or reduced token set is used.
-- Physical RDNA4 regression and the old 1B checkpoint body: pending their
-  hardware and checkpoint resources. Cross-compilation and synthetic tests
-  supply their narrower results.
-- Independent review: pending a human reviewer under the user instruction
-  prohibiting subagents.
+[Compiler metadata](release-resources.json) describes
+`PagedAttnPrefillSharedKWmma<2,8,16,64,false>`, wave32.
+The launch uses 49,152 dynamic LDS bytes and 9,616 static bytes.
+The gfx1100 runtime allocates 96 VGPR and 128 SGPR, with zero scratch.
+Allocation units differ from compiler usage counts. The ISA contains
+`v_wmma_f32_16x16x16_bf16`.
 
 ## Reproduce
 
-The implementation and harness use the normal HIP build:
+Use the normal HIP build:
 
 ```sh
 cmake -S . -B build-rdna3-attn -G Ninja \
@@ -203,47 +165,90 @@ cmake -S . -B build-rdna3-attn -G Ninja \
 cmake --build build-rdna3-attn -j4
 ```
 
-Compile `tools/rocm_attn_wmma/capture.cpp`, `model_capture.cpp`, and `bench.cpp`
-with C++20, the repository includes, whole-archive `libvllm.a`,
-`libblake3_vendored.a`, and the HIP/hipBLAS libraries. Exact compiler commands are retained for [array capture](attn-capture-final-build-command.json),
+Exact link commands are retained for [array capture](attn-capture-final-build-command.json),
 [public capture](model-capture-final-build-command.json), and
-[benchmark capture](attn-warm-bench-build-command.json). Environment snapshots
-accompany the raw evidence.
+[benchmark capture](attn-warm-bench-build-command.json).
+`model_capture.cpp MODEL MANIFEST OUTPUT` uses the public C ABI.
+`bench.cpp MODEL MANIFEST OUTPUT` runs one untimed warm-up, then distinct
+requests through `LoadedEngine` and `AsyncLLM`. A manifest can select
+`block_size`, default 16. The native public API default remains 32.
 
-`primary.py generate` creates the array manifest. Run its `primary` mode with
-the pinned runtime, then `capture.cpp` under each explicit knob value.
-`primary.py compare` enforces the recorded tolerances. The final source binary
-passes all ten cases with [opt-in](source-final-optin-compare.json) and with
-the [default policy](source-final-default-compare.json). `model_primary.py`
-generates the original prompt IDs and captures primary outputs.
-`model_capture.cpp MODEL MANIFEST OUTPUT` uses only the public C ABI.
-`bench.cpp MODEL MANIFEST OUTPUT` runs the untimed warm-up and each distinct
-request through `LoadedEngine` and `AsyncLLM`.
+Run `model_primary.py capture MODEL MANIFEST --output OUTPUT` in the pinned
+primary runtime. Trace the native capture with rocprofv3, then run:
 
-Trace the public capture with `rocprofv3 --kernel-trace --output-format csv`.
-`validate_model.py MANIFEST PRIMARY NATIVE TRACE --layers 34 --output RECEIPT`
-requires all prompt/output IDs, 102 WMMA calls, and zero scratch bytes.
-An output-only unit test cannot replace this production-dispatch gate.
+```sh
+python3 tools/rocm_attn_wmma/validate_model.py \
+  MANIFEST PRIMARY NATIVE TRACE --layers 34 --output RECEIPT
+```
 
-Raw evidence remains under the task's ignored `build-rdna3-attn/evidence`.
-The prerequisite worktrees retain their initial red and mutation builds.
-Failed commands, pre-correction results, diagnostics, traces, arrays, full
-logits, and source identities remain available. No failed attempt is deleted.
+For a scalar trace, add `--arm scalar`. The validator checks every input and
+output ID, expected prefill geometry, 102 prefill launches, and zero scratch.
+The seven compiled fixtures are generated by
+`tools/rocm_attn_wmma/compiled_gemma_primary.py` using the pinned generated
+modules. `rope_cache_primary.py` exports sparse samples from the primary's
+actual full device caches. Their manifests record hashes and parameters.
 
-## Repository checks
+[Historical opt-in report](history-opt-in.md) preserves the prior failures,
+rejected timing runs, and earlier receipts. Raw arrays, traces, generated
+code, logits, and failed commands remain in `build-rdna3-attn/evidence`.
 
-The final source build passes all 13 focused CTest entries. The final CPU
-architecture suite passes 17 cases and 120 assertions. The actual translation
-unit compiles for all three admitted targets. Removing admission or changing
-the gfx1100 default to enabled makes the policy tests fail.
+## Performance
 
-[Full preflight](preflight.txt) completes with zero failed gates and twelve
-skips. It retains the repository's argument-dependent checks and seven
-NumPy-dependent skips on the host Python. The seven NumPy suites pass in a
-separate isolated environment. Its five optional adherence-model subcases
-remain unavailable. The x86 ISA check passes against the actual compile
-commands. ARM, CUDA, and Triton AOT gates are narrowly inapplicable to this
-HIP-only change. [Path classification](classification.txt) passes separately. The initial
-commit-message paragraph errors were repaired without changing the source tree.
-The final trailer and style gates pass.
-This qualified result is not an all-green readiness claim.
+All measurements follow token correctness. Three alternating process pairs use
+one identical native binary. Each process loads once, runs an untimed warm-up,
+and then measures distinct requests at concurrency one. No primary prefix-cache
+or graph default is disabled. Clocks remain dynamic. The monitor records an
+idle device baseline and serializes every job with the same GPU mutex.
+
+The A/B workload uses the original 122-token request as warm-up, followed by
+the original 516-token and 1205-token requests. Each generates 32 tokens.
+Both native arms and both primary repeats match all outputs. Cache blocks are
+32 tokens on both sides. These cases isolate the speed comparison from the
+expanded scalar control's known numerical failures. The expanded correctness
+gate remains unchanged and mandatory for the default path.
+
+| Model A/B axis, median of three run means | Scalar | Default WMMA | WMMA/scalar |
+|---|---:|---:|---:|
+| Prefill tokens/s | 3357.61 | 3857.88 | 1.149 |
+| Decode tokens/s | 34.237 | 34.278 | 1.001 |
+| Time to first token, ms | 256.284 | 223.050 | 0.870 |
+| Time per output token, ms | 29.208 | 29.173 | 0.999 |
+| Request latency, ms | 1161.729 | 1127.421 | 0.970 |
+| Sampled peak RSS, bytes | 9714163712 | 9444880384 | 0.972 |
+| Sampled peak PSS, bytes | 9708867584 | 9439588352 | 0.972 |
+| Sampled peak device VRAM, bytes | 11133571072 | 11133566976 | 1.000 |
+
+The first WMMA run has slower prefill than its scalar pair. All samples remain
+in the [values, ratios, commands, and monitor summary](release-model-performance.json).
+The report uses medians without removing that sample. Decode changes by 0.12%,
+which does not establish a decode speed gain. Memory samples include loading
+and do not establish an activation-memory reduction.
+
+The unchanged expanded workload has eight distinct 518/1207-token prompts,
+one warm-up, and 256 measured output tokens. Cache blocks are 16 on both sides.
+All three default native runs and both primary runs match exactly.
+
+| Expanded workload axis | Primary median, two runs | Default median, three runs | Native/primary |
+|---|---:|---:|---:|
+| Prefill tokens/s | 6193.43 | 6445.24 | 1.041 |
+| Decode tokens/s | 66.494 | 26.606 | 0.400 |
+| Time to first token, ms | 139.264 | 133.820 | 0.961 |
+| Time per output token, ms | 15.039 | 37.586 | 2.499 |
+| Request latency, ms | 605.471 | 1299.306 | 2.146 |
+| Sampled peak RSS, bytes | 8460455936 | 9579806720 | 1.132 |
+| Sampled peak PSS, bytes | 7196875776 | 9574513664 | 1.330 |
+| Sampled peak device VRAM, bytes | 23074590720 | 11133571072 | 0.483 |
+
+The primary reserves a larger KV pool. Its VRAM ratio does not compare equal
+cache capacity. Full-model decode, latency, and host-memory parity remain
+**failing** performance axes. This MR establishes correct default attention
+and a measured improvement over scalar prefill. It does not establish overall
+performance parity with vLLM. The next traceable decode hypothesis is the
+512-thread matrix specialization and accumulator rescaling for one query,
+especially at block size 16. The next host-memory hypothesis is the lifetime
+of loader caches and source mappings. Neither gap is an architectural ceiling.
+
+The ten array cases use five warm-up calls and 1000 timed calls per process,
+with three alternating pairs. Outputs repeat byte-for-byte against the final
+correctness captures. Every case improves, from **1.12× to 2.92×**.
+[Per-case timings and every repeat](release-kernel-performance.json).

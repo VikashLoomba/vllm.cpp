@@ -1,0 +1,16 @@
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+===============================================================================
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vt/test_rocm_arch.cpp:39:
+TEST CASE:  SharedK gfx1100 WMMA is enabled by default after full model parity
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vt/test_rocm_arch.cpp:42: ERROR: CHECK( SharedKAttentionWmmaEnabled(arch, nullptr) ) is NOT correct!
+  values: CHECK( false )
+
+/home/vikash/vllm.cpp-rdna3-wmma-attn/tests/vt/test_rocm_arch.cpp:42: ERROR: CHECK( SharedKAttentionWmmaEnabled(arch, nullptr) ) is NOT correct!
+  values: CHECK( false )
+
+===============================================================================
+[doctest] test cases:  17 |  16 passed | 1 failed | 0 skipped
+[doctest] assertions: 120 | 118 passed | 2 failed |
+[doctest] Status: FAILURE!

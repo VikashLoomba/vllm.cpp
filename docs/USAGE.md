@@ -323,6 +323,14 @@ bytes and text parameters, and records output hashes. The resulting text
 weights contain 7,760,526,336 tensor bytes. This recipe covers BF16 safetensors;
 the Gemma 3 text loader does not provide a GGUF quantized arm or the vision tower.
 
+On gfx1100, eligible BF16 attention prefills use rocWMMA by default. The path
+requires head dimension 256, two query heads per KV head, one request, and at
+least 64 query tokens. `VT_ATTN_PREFILL_SHAREDK_WMMA=0` selects scalar prefill.
+The gfx1100 single-query WMMA decode prerequisite remains enabled in both
+prefill controls. Other gfx11 targets remain excluded. See the
+[correctness and performance evidence](bench-evidence/rocm-rdna3-attention-wmma/README.md)
+for the validated workload and the scalar control's numerical limitation.
+
 ## Disabling a model's sliding window
 
 Gemma-2, Gemma-3, Gemma-4, OLMo-2 and Muse-Glimmer apply a model-level sliding

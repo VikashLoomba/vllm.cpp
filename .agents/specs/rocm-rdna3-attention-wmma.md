@@ -197,6 +197,14 @@ Stream-ordered allocation preserved tokens but regressed block-16 decode to
 identity, cleared before each use, with stream synchronization before return.
 The shared seam retains its allocation for process lifetime. A changed queue
 identity gets a separate record; a native stream-handle reuse cannot alias it.
+The 1024-thread selector and merged preamble bring block-16 TPOT to 15.07 ms,
+near the current primary's 15.02 ms. Test 32 independent vocabulary partitions
+for at most four gfx1100 rows with at least 65536 columns, then reduce their
+(value, original-index) winners. Maximum selection adds no floating-point
+rounding; preserve the lowest original index on every tie. Use the shared
+scratch seam, keyed by queue identity, with a fixed 128-partial bound and
+explicit prewarm refusal during capture. The existing small-row route stays.
+Run the large/ragged/tie/all-negative-infinity cases and exact model gates.
 These repairs belong to ISSUE-LOCAL-01M2HQEEXHD2B0BT3N71HQ0CRZ.
 
 ### Expanded-gate repair design (15 September 2026)

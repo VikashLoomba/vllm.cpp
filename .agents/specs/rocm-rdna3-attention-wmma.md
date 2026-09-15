@@ -34,6 +34,17 @@ All 657 affected host translation units compile. Final HIP compilation and
 the repeated 20-test regression set pass. Independent human review remains due. The row stays ACTIVE until the work lands.
 [Measured report](../../docs/bench-evidence/rocm-rdna3-attention-wmma/README.md).
 
+### Bundle the regression fixtures (15 September 2026)
+
+Package the 44 frozen tensors into one `cases.bin` and one JSON manifest,
+following `tests/fixtures/rocm_attn_gate_split`. Preserve every tensor byte,
+shape, dtype, source pin, and SHA-256. Store each tensor's offset and byte
+count. The test reader must validate the bundle size and slice bounds.
+Consolidate expression and RoPE export in the existing primary generator so
+regeneration produces the same layout. Compare all slices against the prior
+commit, then rerun the CPU and physical ROCm compiled-Gemma tests. Keep the
+runtime implementation and numerical assertions unchanged.
+
 ### Pin the embedding bounds readback (15 September 2026)
 
 The integrated block-16 medians are 66.4774 native and 66.4976 primary tokens

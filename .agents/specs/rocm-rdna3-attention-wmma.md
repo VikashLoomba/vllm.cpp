@@ -108,11 +108,32 @@ QKV input and output byte-identical for the failing unique7 prefill and decode.
 
 The affected attention paths also owe the primary's aligned key tiles and
 BF16 probability conversion before PV. Update dimension-256 SharedK scalar,
-SharedK WMMA, and GQA decode with the executing unified-attention softmax
+SharedK WMMA, and GQA decode with the executing ROCm attention softmax
 expression. Preserve dimension-512 behavior. Export actual layer-zero Q/K/V
 and attention outputs to distinguish kernel arithmetic from model-front-end
 differences. A scratch FP32-buffer experiment is diagnostic evidence only;
 the implementation must keep BF16 buffers and use typed shared fusion calls.
+
+The executing chain is `rocm_attn.py:459-480`, then
+`chunked_prefill_paged_decode.py`. Prefill enters `prefix_prefill.py::_fwd_kernel`;
+decode enters `kernel_paged_attention_2d`. Current-chunk prefill uses 64 keys,
+cached-prefix prefill uses 32, and decode uses `min(block_size, 128)`.
+The primary production cache block is 16. Set the native gate harness to 16
+for the identical workload, and retain separate coverage of its default 32.
+The pinned ROCm backend passes `sliding_window - 1` into a strict-distance
+kernel mask. Adapt this at the Gemma model boundary; the shared inclusive
+window contract remains unchanged.
+
+The generated ISA uses BF16 WMMA for QK and PV. With exact layer-zero Q/K,
+unique4 still differs in seven prefill outputs and eight first-decode outputs.
+Test a WMMA PV accumulator against these captures. Reuse the Q tile storage
+for accumulator rescaling after QK, reload Q for each next tile, and reuse
+score storage for BF16 probabilities after every score reader synchronizes.
+Keep FP32 accumulator fragments in registers and keep total LDS below 64 KiB.
+Use public rocWMMA load/store operations for accumulator layout conversion.
+If necessary, carry the same matrix arithmetic into dimension-256 GQA decode.
+Record this prerequisite separately from prefill acceleration and test its
+resources and performance. Do not change dimension-512 or quantized paths.
 
 Add focused primary-generated fixtures for these expressions, including
 nonuniform gamma, BF16 rounding boundaries, full/partial rotary dimensions,
